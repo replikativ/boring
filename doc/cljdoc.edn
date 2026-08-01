@@ -1,0 +1,12 @@
+{:cljdoc.doc/tree
+ [["Readme" {:file "README.md"}]
+  ["Guides" {}
+   ["Interop with other languages" {:file "doc/INTEROP.md"}]
+   ["Extending" {:file "doc/EXTENDING.md"}]
+   ["Performance" {:file "doc/PERFORMANCE.md"}]
+   ["Datahike dump codec" {:file "doc/MIGRATE-CODEC.md"}]]
+  ["Format" {}
+   ["Compatibility policy" {:file "doc/COMPATIBILITY.md"}]
+   ["Shapes" {:file "doc/SHAPES.md"}]
+   ["Security" {:file "doc/SECURITY.md"}]]
+  ]}

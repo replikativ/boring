@@ -1,0 +1,131 @@
+version: 2.1
+
+# The jobs here are deliberately thin wrappers around bin/ci. Logic that lives
+# only inside a YAML file cannot be run before it is pushed; bin/ci is verified
+# locally and CI just calls it.
+#
+# Every job stores target/ci-logs as an artifact. That is not boilerplate: an
+# intermittent failure in this project went permanently undiagnosed because the
+# test output was piped through `tail -3`, discarding the FAIL block that names
+# the test and its generative seed. A failing CI run must leave behind enough to
+# diagnose it the FIRST time, because generative failures may not recur.
+
+orbs:
+  tools: replikativ/clj-tools@0
+
+executors:
+  # Needs both a JVM (Java hot path, JDK 9+ for the byte[] VarHandles) and node
+  # (the ClojureScript suite runs under node, not karma).
+  clj-node:
+    docker:
+      - image: cimg/clojure:1.11-node
+    working_directory: ~/repo
+
+commands:
+  restore-deps:
+    steps:
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "deps.edn" }}
+            - v1-deps-
+  save-deps:
+    steps:
+      - save_cache:
+          key: v1-deps-{{ checksum "deps.edn" }}
+          paths:
+            - ~/.m2
+            - ~/.gitlibs
+            - .cpcache
+  store-logs:
+    steps:
+      - store_artifacts:
+          path: target/ci-logs
+          destination: ci-logs
+
+jobs:
+  jvm:
+    executor: clj-node
+    steps:
+      - checkout
+      - restore-deps
+      - run:
+          name: JVM conformance, golden corpus and generative suite
+          command: bin/ci jvm
+      - save-deps
+      - store-logs
+
+  # The reference readers in interop/ are documentation that executes. Without
+  # this job a wire change would silently invalidate doc/INTEROP.md.
+  interop:
+    executor: clj-node
+    steps:
+      - checkout
+      - restore-deps
+      - run:
+          name: Install cbor2
+          command: pip3 install --user cbor2
+      - run:
+          name: Reference readers in other languages
+          command: bin/ci interop
+      - store-logs
+
+  cljs:
+    executor: clj-node
+    steps:
+      - checkout
+      - restore-deps
+      - run:
+          name: ClojureScript suite (advanced compilation, node)
+          command: bin/ci cljs
+      - store-logs
+
+  # Fuzzing is a gate, not a nice-to-have: every round of it so far in this
+  # project has found something. Split from the test jobs so a fuzz failure is
+  # immediately distinguishable from a conformance regression.
+  fuzz:
+    executor: clj-node
+    steps:
+      - checkout
+      - restore-deps
+      - run:
+          name: Mutation fuzzing, JVM
+          command: bin/ci fuzz
+      - run:
+          name: Mutation fuzzing, ClojureScript
+          command: bin/ci fuzz-cljs
+      - store-logs
+
+workflows:
+  build-and-test:
+    jobs:
+      - jvm
+      - cljs
+      - interop
+      - fuzz
+      - tools/format:
+          context: docker-deploy
+      # Release, mirroring konserve: deploy to Clojars from main only, then cut
+      # the GitHub release. `clj -T:build deploy` runs bin/check-artifact first
+      # and refuses to publish a jar that fails it, so the gate is on the
+      # publish path and not merely on the test path.
+      - tools/deploy:
+          context:
+            - clojars-deploy
+            - docker-deploy
+          filters:
+            branches:
+              only: main
+          requires:
+            - jvm
+            - cljs
+            - interop
+            - fuzz
+      - tools/release:
+          context:
+            - github-token
+            - docker-deploy
+          filters:
+            branches:
+              only: main
+          requires:
+            - tools/deploy

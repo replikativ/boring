@@ -1,0 +1,49 @@
+.cache/
+.vscode/
+/resources
+/target
+/classes
+/checkouts
+pom.xml.asc
+*.jar
+*.class
+/.lein-*
+/.nrepl-port
+/.repl*
+out
+.shadow-cljs
+.cpcache
+.cljs_node_repl/
+.calva
+.lsp
+.dir-locals.el
+node_modules
+public
+
+.idea
+*.iml
+
+# clj-async-profiler output
+/prof/
+
+# shallow clones of other CBOR implementations, pulled in only to mine their
+# test corpora — never part of the build
+/impls/
+target/ci-logs/
+
+# internal design scratch (not part of the published library)
+.internal/
+
+# python bytecode from the interop reference readers
+__pycache__/
+*.pyc
+
+# Rust reference reader build output; Cargo.lock IS committed so CI
+# resolves the same ciborium a reviewer did.
+interop/rust/target/
+target/release/
+
+# local agent scratch, not part of the project
+.agents/
+.codex/
+.claude/

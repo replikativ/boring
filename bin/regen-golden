@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Regenerate the frozen golden bytes, then format them.
+#
+# READ THE DIFF afterwards. Every changed line in test/boring/golden_v1.cljc is a
+# wire-format change: either deliberate and documented, or a bug.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+clojure -T:build javac
+clojure -M:dev -e "(require 'gen-golden)(gen-golden/-main)"
+clojure -M:ffix >/dev/null
+echo
+echo "Now read the diff:  git diff test/boring/golden_v1.cljc"

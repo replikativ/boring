@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Regenerate interop/fixture.cbor, the file the reference readers are tested
+# against. A diff here is a wire change -- re-run the reference readers.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+clojure -T:build javac
+clojure -M:dev -e "(require 'gen-interop-fixture)(gen-interop-fixture/-main)"

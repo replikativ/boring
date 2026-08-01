@@ -1,0 +1,39 @@
+boring
+Copyright 2026 Christian Weilbach and contributors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+## Runtime dependencies
+
+The only runtime dependency is org.clojure/clojure, under the Eclipse Public
+License 1.0. Depending on an EPL library does not place this work under the
+EPL: EPL-1.0's copyleft applies to Contributions to the EPL Program itself,
+not to separate works that merely use it. This is the ordinary arrangement for
+Apache-2.0-licensed Clojure libraries.
+
+## Test- and benchmark-scope dependencies
+
+These are used to test and to measure against, are declared only in the :test
+and :bench aliases, and are NOT distributed in boring's jar. Consumers of
+boring never receive them by way of this project.
+
+  com.taoensso/nippy          Eclipse Public License 1.0
+  com.s-exp/hako              Mozilla Public License 2.0
+  org.clojure/data.fressian   Eclipse Public License 1.0
+  mvxcvi/clj-cbor             Public Domain
+  criterium/criterium         Eclipse Public License 1.0
+
+None of their code is copied into this repository, and none must be.
+
+`boring.stress-test` exercises boring against `taoensso.nippy/stress-data` by
+CALLING it as a test-scope dependency. That distinction is load-bearing:
+vendoring a copy of that data into this repository would make the containing
+file a derivative of EPL-1.0 code, which is precisely what this project's
+licensing is arranged to avoid. If the dependency ever becomes inconvenient,
+the answer is to write our own corpus, not to copy theirs.
+
+## Test vectors
+
+test/boring/vectors.cljc contains the test vectors from RFC 8949 Appendix A.
+Code components of IETF RFCs are provided under the Simplified BSD License per
+the IETF Trust Legal Provisions (BCP 78).

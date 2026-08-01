@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Build the jar and check the things that are only true of the ARTIFACT.
+#
+# CI tested sources and never built, opened or loaded a jar. That is why the
+# published jar carried Java 25 bytecode against a documented JDK 9 minimum,
+# and shipped neither LICENSE nor NOTICE, while every gate was green.
+#
+# A consumer receives this file and nothing else, so this is the only check
+# that looks at what they actually get.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+MIN_CLASS_VERSION=53          # 53 = Java 9; keep in step with build.clj's --release
+
+# `--release` checks the exact candidate: BORING_VERSION must be set and must
+# not be a snapshot. Without it this checks whatever the working tree builds,
+# which is the right default for CI and the wrong one for a publish.
+RELEASE_MODE=0
+[ "${1:-}" = "--release" ] && RELEASE_MODE=1
+if [ "$RELEASE_MODE" = 1 ]; then
+  [ -n "${BORING_VERSION:-}" ] || { echo "FAILED: --release needs BORING_VERSION set"; exit 1; }
+  case "$BORING_VERSION" in
+    *-SNAPSHOT) echo "FAILED: --release refuses a snapshot version ($BORING_VERSION)"; exit 1 ;;
+  esac
+fi
+
+echo "building..."
+jar_out=$(clojure -T:build jar)
+echo "$jar_out"
+jar_file=$(printf '%s\n' "$jar_out" | sed -n 's/^built //p')
+[ -f "$jar_file" ] || { echo "FAILED: no jar at '$jar_file'"; exit 1; }
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+(cd "$work" && unzip -q "$OLDPWD/$jar_file")
+
+fail=0
+note () { echo "   $1"; }
+bad ()  { echo "   FAILED: $1"; fail=1; }
+
+# --- class-file version ----------------------------------------------------
+worst=0
+while read -r cls; do
+  v=$(javap -verbose -cp "$work" "${cls%.class}" 2>/dev/null \
+        | sed -n 's/.*major version: \([0-9]*\).*/\1/p' | head -1)
+  [ -n "$v" ] && [ "$v" -gt "$worst" ] && worst=$v
+done < <(cd "$work" && find . -name '*.class' | sed 's|^\./||; s|/|.|g')
+
+if [ "$worst" -eq 0 ]; then
+  bad "no classes found in the jar"
+elif [ "$worst" -gt "$MIN_CLASS_VERSION" ]; then
+  bad "class-file major version $worst > $MIN_CLASS_VERSION — the jar will not load on the documented minimum JDK"
+else
+  note "class-file version $worst (<= $MIN_CLASS_VERSION) ok"
+fi
+
+# --- legal files -----------------------------------------------------------
+for f in META-INF/LICENSE META-INF/NOTICE; do
+  [ -f "$work/$f" ] && note "$f present" || bad "$f missing from the jar"
+done
+
+# --- POM metadata Maven Central requires -----------------------------------
+pom=$(find "$work/META-INF/maven" -name pom.xml | head -1)
+[ -n "$pom" ] || bad "no pom.xml in the jar"
+for tag in description url licenses scm developers; do
+  grep -q "<$tag>" "$pom" && note "pom <$tag> present" || bad "pom is missing <$tag>"
+done
+
+# --- sources are shipped alongside the classes -----------------------------
+for f in boring/core.clj boring/core.cljs boring/data.cljc; do
+  [ -f "$work/$f" ] && note "$f present" || bad "$f missing from the jar"
+done
+
+# --- and it actually LOADS and round-trips, from the jar alone -------------
+# No src on the classpath: this is the consumer's view.
+# `|| st=$?`, not a bare assignment. Under `set -e` a failing command
+# substitution exits the script AT THE ASSIGNMENT, so the diagnostic branch
+# below was unreachable and a genuine failure looked like an abrupt exit with
+# nothing to act on. Being part of a `||` list exempts it from set -e.
+st=0
+out=$(cd "$work" && clojure -Sdeps '{:deps {}}' -Scp "$OLDPWD/$jar_file:$(clojure -Spath -Sdeps '{:deps {org.clojure/clojure {:mvn/version "1.12.0"}}}')" \
+        -M -e '(require (quote [boring.core :as b]))
+               (let [v {:a [1 2.5] :b #{:x} :c (java.util.UUID/randomUUID)}]
+                 (println (if (= v (b/decode (b/encode v))) "ROUNDTRIP-OK" "ROUNDTRIP-FAIL")))' 2>&1 | tail -5) || st=$?
+if [ "$st" = 0 ] && printf '%s' "$out" | grep -q ROUNDTRIP-OK; then
+  note "loads and round-trips from the jar alone"
+else
+  bad "consuming the jar failed (exit $st):"; echo "$out"
+fi
+
+echo
+if [ "$fail" -eq 0 ]; then echo "artifact ok: $jar_file"; else echo "ARTIFACT CHECK FAILED"; exit 1; fi

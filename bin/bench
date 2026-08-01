@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Run the full benchmark suite and keep the output.
+#
+# A benchmark you cannot reproduce is an anecdote, so this writes the machine
+# description alongside the numbers and keeps every run rather than
+# overwriting. Takes several minutes -- criterium is thorough.
+#
+#   bin/bench                    everything
+#   bin/bench size compress      just the deterministic sections (fast)
+#   bin/bench ab                 just the interleaved comparison
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mkdir -p target/bench
+clojure -T:build javac
+out="target/bench/$(date +%Y%m%d-%H%M%S).txt"
+echo "writing $out"
+clojure -M:bench -m suite "$@" 2>&1 | tee "$out"
+echo
+echo "saved: $out"

@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+#
+# Everything CI runs, in one place, runnable locally.
+#
+# The CI config stays a thin caller of this script on purpose: logic that only
+# exists inside a YAML file cannot be tested before it is pushed.
+#
+# Every step writes its FULL output to target/ci-logs/ and greps the file.
+# That is not incidental. An earlier intermittent failure in this project went
+# permanently undiagnosed because the test command was piped through `tail -3`,
+# which kept the summary line and discarded the FAIL block naming the test and
+# its generative seed. Never pipe a test run through head/tail.
+#
+# Usage:
+#   bin/ci             # everything
+#   bin/ci jvm         # one stage: jvm | cljs | fuzz | fuzz-cljs
+set -uo pipefail
+
+cd "$(dirname "$0")/.."
+LOGS=target/ci-logs
+mkdir -p "$LOGS"
+
+FAILED=()
+
+run () {
+  local name="$1"; shift
+  local log="$LOGS/$name.log"
+  echo "──▶ $name"
+  if "$@" >"$log" 2>&1; then
+    # A zero exit is not sufficient: clojure.test's runner reports failures in
+    # its summary, and the cljs runner sets exitCode itself. Check both.
+    if grep -qE "^(FAIL|ERROR)( in)?\b|[1-9][0-9]* (failures|errors)|UNTYPED FAILURES" "$log"; then
+      echo "   FAILED (non-zero failure count) — $log"
+      grep -E "^Ran |failures, |^(FAIL|ERROR) in" "$log" | head -20
+      FAILED+=("$name")
+    else
+      echo "   ok — $(grep -E '^Ran |assertions,' "$log" | tail -1)"
+    fi
+  else
+    echo "   FAILED (exit $?) — $log"
+    tail -30 "$log"
+    FAILED+=("$name")
+  fi
+}
+
+# A ClojureScript warning does not fail the compile, so a green CI is no
+# evidence of a quiet build. This turns warnings that point at OUR OWN sources
+# into a failed stage. Third-party noise is deliberately not gated on: we
+# cannot fix it and blocking on it would train people to ignore the gate.
+#
+# Scope, stated because it is easy to over-claim: this catches the :redef and
+# :undeclared-var class -- the one that has actually bitten us twice, with
+# reset! and with decimal?/rational? shadowing clojure.core in every downstream
+# build. It does NOT catch :infer-warning, which cljs.main only emits under
+# `:infer-externs true` -- a setting stricter than shadow-cljs's default
+# `:auto`, and one that reports 86 warnings here for property access on
+# js/DataView and js/Map that carry no renaming risk. The consumer-level check
+# is a shadow-cljs build; ../konserve-sync's :boring-test build compiles this
+# whole stack and is expected to report zero.
+check_no_warnings () {
+  local name="$1"
+  local log="$LOGS/$name.log"
+  local hits
+  hits=$(grep -aE "^WARNING" "$log" | grep -aE "boring/(core|writer|reader|data|conform)" || true)
+  if [ -n "$hits" ]; then
+    echo "   FAILED (compiler warnings in boring's own sources) — $log"
+    echo "$hits" | head -20
+    FAILED+=("$name-warnings")
+  fi
+}
+
+# `deps.edn` puts target/classes on the classpath for the compiled Java. A
+# `clj -T:build jar` used to stage `src` into the same directory, leaving a copy
+# of boring/core.clj that SHADOWED the real source -- CI then tested whatever
+# was current at the last jar, and passed. Build stages into target/jar now;
+# this asserts it stays that way rather than trusting it to.
+check_classes_are_javac_only () {
+  local strays
+  strays=$(find target/classes -mindepth 1 -maxdepth 1 ! -name org 2>/dev/null || true)
+  if [ -n "$strays" ]; then
+    echo "   FAILED — non-javac output on the test classpath, shadowing src/:"
+    echo "$strays"
+    FAILED+=("classes-polluted")
+  fi
+}
+
+# A :local/root in an alias CI runs resolves on the author's machine, where the
+# sibling checkout happens to exist, and nowhere else. `:cljs-deps` carried
+# `com.github.pkpkpk/fress {:local/root "../fress"}` and every CLJS job failed
+# on a fresh clone with "Local lib not found" before compiling a line -- while
+# passing locally. Benchmark peers belong in :cljs-bench, which CI never runs.
+CI_ALIASES="lint test nippy-stress hasch cljs-deps bench"
+check_no_local_roots () {
+  local bad=""
+  for a in $CI_ALIASES; do
+    if clojure -A:"$a" -Spath >/dev/null 2>&1; then :; else
+      bad="$bad $a"
+    fi
+  done
+  if [ -n "$bad" ]; then
+    echo "   FAILED — alias(es) CI depends on do not resolve from a clean checkout:$bad"
+    echo "   usually a :local/root pointing at a sibling directory"
+    FAILED+=("alias-unresolvable")
+  fi
+}
+
+# clj-kondo. It was red for one unused-require warning and nothing gated on
+# it, which is how a lint command becomes decorative.
+stage_lint () {
+  check_no_local_roots
+  run lint clojure -M:lint
+}
+
+stage_jvm () {
+  run javac clojure -T:build javac
+  check_classes_are_javac_only
+  run jvm-tests clojure -M:test
+}
+
+# Coverage measured against nippy's reference stress data rather than our own
+# fixtures, which share the encoder author's blind spots. Own alias: nippy is
+# EPL-1.0 and never touches the main suite's classpath.
+stage_nippy () {
+  run nippy-stress clojure -M:nippy-stress
+}
+
+# The optional hasch integration. Its own alias because hasch is NOT a runtime
+# dependency of boring -- a consumer who requires boring.hasch supplies it.
+stage_hasch () {
+  run hasch clojure -M:hasch
+}
+
+stage_cljs () {
+  run cljs-compile clojure -M:cljs-deps -m cljs.main \
+      -co '{:language-in :ecmascript-next}' -O advanced -t node \
+      -o target/cljs-test.js -c cljsbench.runner
+  check_no_warnings cljs-compile
+  run cljs-tests node target/cljs-test.js
+}
+
+# Every round of fuzzing so far has found something, so it is a gate, not a
+# nice-to-have. Counts are kept modest enough to run on every push.
+# The reference readers in interop/ are documentation that EXECUTES. A snippet
+# in a markdown file rots silently; this one breaks the build.
+stage_interop () {
+  if python3 -c "import cbor2" 2>/dev/null; then
+    run interop-python python3 interop/test_read_boring.py
+  else
+    echo "\u2500\u2500\u25b6 interop-python"
+    echo "   SKIPPED - python3 cbor2 not installed (pip install cbor2)"
+  fi
+}
+
+# A second language over the SAME fixture. Python and Rust disagreeing is the
+# signal worth paying for -- one reader can be wrong in the same direction as
+# the writer, two independent ones are much less likely to be.
+stage_interop_rust () {
+  if command -v cargo >/dev/null 2>&1; then
+    run interop-rust cargo run --quiet --manifest-path interop/rust/Cargo.toml \
+        -- interop/fixture.cbor
+  elif [ -n "${CI:-}" ]; then
+    echo "──▶ interop-rust"
+    echo "   FAILED — cargo missing, and CI must not skip a required reader"
+    FAILED+=("interop-rust-missing")
+  else
+    echo "──▶ interop-rust"
+    echo "   SKIPPED — cargo not installed (https://rustup.rs)"
+  fi
+}
+
+# The jar is what a consumer receives; everything above this tests sources.
+# Two release blockers hid in exactly that gap -- Java 25 bytecode against a
+# documented JDK 9 minimum, and no LICENSE or NOTICE in the artifact -- while
+# every other stage was green.
+stage_artifact () {
+  run artifact bin/check-artifact
+}
+
+stage_fuzz () {
+  run fuzz-jvm clojure -M:bench -m fuzz 50000
+}
+
+stage_fuzz_cljs () {
+  run fuzz-cljs-compile clojure -M:cljs-deps -m cljs.main \
+      -co '{:language-in :ecmascript-next}' -O advanced -t node \
+      -o target/cljs-fuzz.js -c cljsbench.fuzz
+  run fuzz-cljs node target/cljs-fuzz.js 50000
+}
+
+case "${1:-all}" in
+  jvm)       stage_jvm ;;
+  cljs)      stage_cljs ;;
+  nippy)     stage_nippy ;;
+  hasch)     stage_hasch ;;
+  interop)   stage_interop; stage_interop_rust ;;
+  artifact)  stage_artifact ;;
+  lint)      stage_lint ;;
+  fuzz)      stage_fuzz ;;
+  fuzz-cljs) stage_fuzz_cljs ;;
+  all)       stage_lint; stage_jvm; stage_nippy; stage_hasch; stage_cljs; stage_interop; stage_interop_rust; stage_artifact; stage_fuzz; stage_fuzz_cljs ;;
+  *)         echo "unknown stage: $1"; exit 2 ;;
+esac
+
+echo
+if [ ${#FAILED[@]} -eq 0 ]; then
+  echo "all stages passed — logs in $LOGS/"
+  exit 0
+else
+  echo "FAILED stages: ${FAILED[*]}"
+  echo "full logs in $LOGS/ — read them, do not re-run and hope"
+  exit 1
+fi

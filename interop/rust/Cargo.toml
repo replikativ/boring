@@ -1,0 +1,15 @@
+[package]
+name = "read-boring"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# ciborium is the de-facto CBOR crate for Rust: no_std-capable, serde-based,
+# and -- the reason it is the right thing to test against -- it exposes tags
+# through `ciborium::value::Value::Tag` rather than swallowing them.
+ciborium = "0.2"
+
+[[bin]]
+name = "read-boring"
+path = "src/main.rs"
