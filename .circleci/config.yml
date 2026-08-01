@@ -104,6 +104,9 @@ jobs:
                 | sh -s -- -y --profile minimal --default-toolchain stable
             fi
             echo 'source $HOME/.cargo/env' >> $BASH_ENV
+            # Printed because a cbor2 version difference between this image and
+            # a developer machine is exactly what broke tag 39 here once.
+            python3 -c 'import importlib.metadata as m; print("cbor2", m.version("cbor2"))'
       - run:
           name: Reference readers in Python and Rust
           command: bin/ci interop

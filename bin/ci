@@ -114,9 +114,28 @@ stage_lint () {
   run lint clojure -M:lint
 }
 
+# Every stage that loads the Java hot path needs it compiled first.
+#
+# Locally that is free: `bin/ci` runs stage_jvm before everything else, so
+# target/classes is always there by the time anything else looks. On CircleCI
+# each job is a FRESH container, so `bin/ci fuzz` ran with no target/classes
+# and died with `ClassNotFoundException: org.replikativ.boring.Reader` -- a
+# failure that cannot happen locally, which is why ordering was never the
+# contract it looked like. Stages declare what they need instead.
+# Called once from the dispatch below, for every stage, rather than by the
+# stages that happen to need it. Two separate CircleCI jobs -- fuzz, then cljs
+# -- died with `ClassNotFoundException: org.replikativ.boring.Reader` because
+# the list of "stages that need javac" was wrong, and it was wrong invisibly:
+# locally stage_jvm always runs first and builds them. One call site cannot
+# drift out of date.
+ensure_classes () {
+  if [ ! -f target/classes/org/replikativ/boring/Reader.class ]; then
+    run javac clojure -T:build javac
+    check_classes_are_javac_only
+  fi
+}
+
 stage_jvm () {
-  run javac clojure -T:build javac
-  check_classes_are_javac_only
   run jvm-tests clojure -M:test
 }
 
@@ -189,6 +208,8 @@ stage_fuzz_cljs () {
       -o target/cljs-fuzz.js -c cljsbench.fuzz
   run fuzz-cljs node target/cljs-fuzz.js 50000
 }
+
+ensure_classes
 
 case "${1:-all}" in
   jvm)       stage_jvm ;;

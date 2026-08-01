@@ -1,6 +1,20 @@
 {:paths ["src" "target/classes"]
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}}
 
+ ;; boring has a Java hot path, so `target/classes` on :paths above is BUILT,
+ ;; not checked in. This tells tools.deps how to build it, which is what makes
+ ;; boring usable as a source dependency at all: konserve, kabel,
+ ;; konserve-sync and datahike all depend on it via :local/root, and without
+ ;; this a consumer gets `ClassNotFoundException: org.replikativ.boring.Reader`
+ ;; unless someone happened to have run a build in this directory first.
+ ;;
+ ;; Consumers run `clj -X:deps prep` once; `-Sforce` after boring's Java
+ ;; changes. It does NOT apply to the Maven artifact -- that jar already
+ ;; carries the compiled classes -- only to :local/root and :git/url deps.
+ :deps/prep-lib {:ensure "target/classes"
+                 :alias :build
+                 :fn javac}
+
  :aliases
  {:dev
   {:extra-paths ["dev" "test" "bench"]

@@ -104,7 +104,16 @@ def _shaped_array(payload):
     return [dict(zip(keys, row)) for row in rows]
 
 
-def _tag_hook(decoder, tag):
+def _tag_hook(*args):
+    """cbor2 calls this with the CBORTag, but WHERE in the argument list has
+    moved between releases -- CI installed a newer cbor2 than the machine this
+    was written on and passed a bool where the tag was expected, so tag 39
+    failed to decode with `'bool' object has no attribute 'tag'`. Pick the
+    CBORTag out of whatever we are handed rather than pinning a signature."""
+    tag = next((a for a in args if isinstance(a, cbor2.CBORTag)), None)
+    if tag is None:
+        raise TypeError(
+            "cbor2 called tag_hook without a CBORTag: %r" % (args,))
     if tag.tag == TAG_IDENTIFIER:
         s = tag.value
         return Keyword(s) if s.startswith(":") else Symbol(s)
