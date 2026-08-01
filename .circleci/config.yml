@@ -14,11 +14,18 @@ orbs:
   tools: replikativ/clj-tools@0
 
 executors:
-  # Needs both a JVM (Java hot path, JDK 9+ for the byte[] VarHandles) and node
-  # (the ClojureScript suite runs under node, not karma).
+  # Needs both a JVM and node (the ClojureScript suite runs under node, not
+  # karma).
+  #
+  # JDK 21, not the image default. `cimg/clojure:1.11-node` ships JDK 17, and
+  # the ClojureScript compiler's closure-compiler is built for class file
+  # version 65 (Java 21): every CLJS job died with UnsupportedClassVersionError
+  # before compiling a line. The jar itself is still `--release 9` -- the build
+  # JDK and the target JDK are different things, and bin/check-artifact asserts
+  # the second one.
   clj-node:
     docker:
-      - image: cimg/clojure:1.11-node
+      - image: cimg/clojure:1.12-openjdk-21.0-node
     working_directory: ~/repo
 
 commands:
@@ -49,24 +56,63 @@ jobs:
       - checkout
       - restore-deps
       - run:
+          name: Lint
+          command: bin/ci lint
+      - run:
           name: JVM conformance, golden corpus and generative suite
           command: bin/ci jvm
+      # These two were green locally and not run here at all, which is the
+      # worst combination: a gate nobody is watching.
+      - run:
+          name: nippy stress-data coverage
+          command: bin/ci nippy
+      - run:
+          name: hasch content-addressing
+          command: bin/ci hasch
+      - run:
+          name: Built artifact — class-file version, legal files, POM
+          command: bin/ci artifact
       - save-deps
       - store-logs
 
   # The reference readers in interop/ are documentation that executes. Without
   # this job a wire change would silently invalidate doc/INTEROP.md.
+  # Both readers, or neither. bin/ci FAILS rather than skips the Rust reader
+  # when CI is set, because a reference reader that silently does not run is
+  # worse than one that is absent -- the point of two independent readers is
+  # that they disagree.
   interop:
     executor: clj-node
     steps:
       - checkout
       - restore-deps
+      - restore_cache:
+          keys:
+            - v1-rust-{{ checksum "interop/rust/Cargo.lock" }}
+            - v1-rust-
       - run:
-          name: Install cbor2
-          command: pip3 install --user cbor2
+          # The image has python3 but no pip, and no Rust at all. The first
+          # run here failed with `pip3: command not found`.
+          name: Install python3-pip, cbor2 and Rust
+          command: |
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3-pip
+            pip3 install --user --break-system-packages cbor2 \
+              || pip3 install --user cbor2
+            if ! command -v cargo >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable
+            fi
+            echo 'source $HOME/.cargo/env' >> $BASH_ENV
       - run:
-          name: Reference readers in other languages
+          name: Reference readers in Python and Rust
           command: bin/ci interop
+      - save_cache:
+          key: v1-rust-{{ checksum "interop/rust/Cargo.lock" }}
+          paths:
+            - ~/.cargo
+            - ~/.rustup
+            - interop/rust/target
       - store-logs
 
   cljs:

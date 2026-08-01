@@ -41,8 +41,24 @@
                 org.clojure/data.fressian {:mvn/version "1.1.0"}}
    :main-opts ["-m" "boring.nippy-bench"]}
 
-  ;; Peers for comparative benchmarking. hako needs a local `clj -T:build install`
-  ;; from ../hako and JDK 25; it is intentionally not a hard dep of the library.
+  ;; The fuzzer, split out of :bench so CI can run it.
+  ;;
+  ;; `bin/ci fuzz` used :bench, which drags in `com.s-exp/hako` -- a comparison
+  ;; peer that is NOT published to Central or Clojars and only exists after a
+  ;; local `clj -T:build install` from ../hako. That resolves on a machine that
+  ;; has done it and nowhere else, so the alias guard in bin/ci could not catch
+  ;; it (it DOES resolve locally, from ~/.m2) and the first CircleCI run died
+  ;; with "Could not find artifact com.s-exp:hako:jar:1.0.0-alpha35".
+  ;;
+  ;; fuzz.clj needs boring and test.check. Nothing else belongs here.
+  :fuzz
+  {:extra-paths ["bench" "test" "target/classes"]
+   :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}}
+   :main-opts ["-m" "fuzz"]}
+
+  ;; Peers for comparative benchmarking. LOCAL ONLY -- hako needs a local
+  ;; `clj -T:build install` from ../hako and JDK 25, so no CI job may use this
+  ;; alias. See :fuzz above for what that cost us.
   :bench
   {:extra-paths ["bench" "test" "target/classes"]
    :extra-deps {criterium/criterium {:mvn/version "0.4.6"}

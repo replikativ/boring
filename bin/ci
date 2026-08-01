@@ -89,7 +89,10 @@ check_classes_are_javac_only () {
 # `com.github.pkpkpk/fress {:local/root "../fress"}` and every CLJS job failed
 # on a fresh clone with "Local lib not found" before compiling a line -- while
 # passing locally. Benchmark peers belong in :cljs-bench, which CI never runs.
-CI_ALIASES="lint test nippy-stress hasch cljs-deps bench"
+# Exactly the aliases a CI job uses. :bench is deliberately ABSENT: it depends
+# on hako, which is a local install, and listing it here would assert a
+# property that is false on every machine but this one.
+CI_ALIASES="lint test nippy-stress hasch cljs-deps fuzz"
 check_no_local_roots () {
   local bad=""
   for a in $CI_ALIASES; do
@@ -177,7 +180,7 @@ stage_artifact () {
 }
 
 stage_fuzz () {
-  run fuzz-jvm clojure -M:bench -m fuzz 50000
+  run fuzz-jvm clojure -M:fuzz 50000
 }
 
 stage_fuzz_cljs () {
