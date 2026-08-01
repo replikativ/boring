@@ -264,6 +264,25 @@
   ^TagRegistry [^TagRegistry reg wire-name map-ctor]
   (.withRecord reg wire-name map-ctor))
 
+(defn register-records
+  "Register many record constructors at once, from a map of wire name ->
+  `map->Record`. Returns a NEW registry.
+
+  Equivalent to threading `register-record` over the map, but one operation
+  rather than N. On the JVM that matters: a registry copies its whole backing
+  map per registration, which is the right trade for one built at startup and
+  the wrong one for a caller that derives a registry per operation. konserve's
+  serializer protocol hands you handlers per read, so the natural fold cost N
+  map copies per read and overtook fressian past ~20 handlers.
+
+  Keys are `str`ed, so a map keyed by symbols -- incognito's shape -- works
+  directly.
+
+  Still memoise if you derive a registry per operation; this only makes the
+  un-memoised path O(1) copies instead of O(N)."
+  ^TagRegistry [^TagRegistry reg ctors]
+  (.withRecords reg ^java.util.Map ctors))
+
 (defn register-record-class
   "JVM-only convenience: derive both the wire name and the `map->Name`
   constructor from `cls` by reflection. Returns a NEW registry.

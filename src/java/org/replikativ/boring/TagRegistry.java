@@ -97,6 +97,30 @@ public final class TagRegistry {
     }
 
     /** Override the wire name emitted for `cls`, for the encode direction. */
+    /**
+     * Register many record constructors in ONE copy of the backing map.
+     *
+     * <p>`withRecord` copies the whole map per call, which is the right trade
+     * for a registry built once at startup and the wrong one for a caller that
+     * folds a handler map in per operation -- konserve's serializer protocol
+     * hands you handlers per read, so the natural implementation cost N copies
+     * per read and overtook fressian past ~20 handlers.
+     *
+     * <p>Callers who derive a registry per operation should still memoise it;
+     * this makes the un-memoised path O(1) copies instead of O(N).
+     */
+    public TagRegistry withRecords(Map<?, ?> ctors) {
+        if (ctors == null || ctors.isEmpty()) return this;
+        Map<String, clojure.lang.IFn> copy = new HashMap<>(recordCtors);
+        // Keys are stringified HERE rather than by the caller, so a symbol-keyed
+        // map -- incognito's shape, and what konserve hands us -- needs no
+        // intermediate map built just to change the key type.
+        for (Map.Entry<?, ?> e : ctors.entrySet()) {
+            copy.put(String.valueOf(e.getKey()), (clojure.lang.IFn) e.getValue());
+        }
+        return new TagRegistry(writers, readers, copy, recordNames);
+    }
+
     public TagRegistry withRecordName(Class<?> cls, String name) {
         return new TagRegistry(writers, readers, recordCtors,
                                plus(recordNames, cls, name));
