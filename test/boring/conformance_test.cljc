@@ -1720,3 +1720,74 @@
         :types  [(tally :pass type-results) (count type-results)]})))
 
 #?(:clj (defn -main [& _] (gap-report)))
+
+;; ---------------------------------------------------------------- registry
+;;
+;; The registry had no test coverage at all before this, on either platform,
+;; despite being the public extension point. These pin the contract that
+;; `register-record` and `register-records` are equivalent, that a registry is
+;; a VALUE (registering never mutates the one you passed), and that an
+;; unregistered record still survives as an inert value.
+
+(defrecord RegPoint [x y])
+
+(def ^:private point-name
+  ;; The name a RegPoint carries on the wire, as boring derives it. Asserted
+  ;; rather than hard-coded so the test does not encode the JVM's spelling and
+  ;; then fail on ClojureScript, where the munging differs.
+  (data/record-type-name (->RegPoint 1 2)))
+
+(deftest unregistered-record-survives
+  (testing "no registration at all: the value comes back inert but complete,
+            carrying its wire name and fields, and re-encodes identically"
+    (let [bs   (boring/encode (->RegPoint 1 2))
+          back (boring/decode bs)]
+      (is (not (instance? RegPoint back)) "not reconstructed without a ctor")
+      (is (= point-name (data/record-type back)) "but the name survives")
+      (is (= {:x 1 :y 2} (data/record-fields back)) "and so do the fields")
+      (is (= (c/bytes->hex bs) (c/bytes->hex (boring/encode back)))
+          "and it re-encodes to the same bytes, so passthrough is lossless"))))
+
+(deftest register-record-reconstructs
+  (testing "one registration is enough, and only the READ side needs it --
+            writing a record never requires registration"
+    (let [reg (boring/register-record (boring/tag-registry) point-name map->RegPoint)]
+      (is (= (->RegPoint 1 2)
+             (boring/decode (boring/encode (->RegPoint 1 2)) {:registry reg}))))))
+
+(deftest register-records-equals-threading-register-record
+  (testing "the bulk form is exactly the fold, for one entry and for many"
+    (let [ctors {point-name map->RegPoint}
+          one   (boring/register-record  (boring/tag-registry) point-name map->RegPoint)
+          bulk  (boring/register-records (boring/tag-registry) ctors)
+          v     (->RegPoint 3 4)
+          bs    (boring/encode v)]
+      (is (= v (boring/decode bs {:registry one})))
+      (is (= v (boring/decode bs {:registry bulk})) "bulk registers the same thing"))
+
+    (testing "and with several entries, against the same registry threaded"
+      (let [names  (mapv #(str "reg.T" %) (range 12))
+            ctors  (into {} (map (fn [n] [n map->RegPoint])) names)
+            folded (reduce-kv boring/register-record (boring/tag-registry) ctors)
+            bulk   (boring/register-records (boring/tag-registry) ctors)]
+        (doseq [n names]
+          (let [bs (boring/encode (data/unknown-record n {:x 1 :y 2}))]
+            (is (= (->RegPoint 1 2) (boring/decode bs {:registry folded})))
+            (is (= (->RegPoint 1 2) (boring/decode bs {:registry bulk}))
+                (str "bulk and folded agree for " n))))))
+
+    (testing "symbol keys work directly -- incognito's shape"
+      (let [reg (boring/register-records (boring/tag-registry)
+                                         {(symbol point-name) map->RegPoint})]
+        (is (= (->RegPoint 5 6)
+               (boring/decode (boring/encode (->RegPoint 5 6)) {:registry reg})))))))
+
+(deftest a-registry-is-a-value
+  (testing "registering returns a NEW registry and leaves the old one alone --
+            on both platforms, so registration code can be threaded in .cljc"
+    (let [empty-reg (boring/tag-registry)
+          with-one  (boring/register-records empty-reg {point-name map->RegPoint})
+          bs        (boring/encode (->RegPoint 7 8))]
+      (is (= (->RegPoint 7 8) (boring/decode bs {:registry with-one})))
+      (is (not (instance? RegPoint (boring/decode bs {:registry empty-reg})))
+          "the registry we started from is unchanged"))))
