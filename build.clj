@@ -1,9 +1,13 @@
 (ns build
   (:require [clojure.java.shell]
+            [borkdude.gh-release-artifact :as gh]
             [clojure.tools.build.api :as b]
-            [deps-deploy.deps-deploy :as dd]))
+            [deps-deploy.deps-deploy :as dd])
+  (:import (clojure.lang ExceptionInfo)))
 
+(def org "replikativ")
 (def lib 'org.replikativ/boring)
+(def current-commit (b/git-process {:git-args "rev-parse HEAD"}))
 
 ;; The commit count as the patch component, matching konserve (0.9.x), hasch
 ;; (0.4.x) and the rest of the stack. Yes, this means a documentation commit
@@ -126,3 +130,44 @@
               :version version
               :jar-file jar-file
               :class-dir jar-dir}))
+
+;; ---------------------------------------------------------------------------
+;; GitHub release, called by the clj-tools orb's `tools/release` job as
+;; `clojure -T:build release`. Mirrors konserve's, including the backoff: the
+;; asset upload races the release creation often enough that a single attempt
+;; fails intermittently, which is worse than slow.
+
+(defn- fib [a b] (lazy-seq (cons a (fib b (+ a b)))))
+
+(defn- retry-with-fib-backoff [retries exec-fn test-fn]
+  (loop [idle-times (take retries (fib 1 2))]
+    (let [result (exec-fn)]
+      (if (test-fn result)
+        (do (println "Returned: " result)
+            (if-let [sleep-ms (first idle-times)]
+              (do (println "Retrying with remaining back-off times (in s): " idle-times)
+                  (Thread/sleep (* 1000 ^long sleep-ms))
+                  (recur (rest idle-times)))
+              result))
+        result))))
+
+(defn- try-release []
+  (try (gh/overwrite-asset {:org org
+                            :repo (name lib)
+                            :tag version
+                            :commit current-commit
+                            :file jar-file
+                            :content-type "application/java-archive"
+                            :draft false})
+       (catch ExceptionInfo e
+         (assoc (ex-data e) :failure? true))))
+
+(defn release
+  "Attach the built jar to a GitHub release. Needs GITHUB_TOKEN."
+  [_]
+  (jar nil)
+  (println "Trying to release artifact...")
+  (let [ret (retry-with-fib-backoff 10 try-release :failure?)]
+    (if (:failure? ret)
+      (do (println "GitHub release failed!") (System/exit 1))
+      (println (:url ret)))))

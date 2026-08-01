@@ -147,12 +147,27 @@ jobs:
 workflows:
   build-and-test:
     jobs:
+      # The orb's own jobs -- deploy, release, format -- do NOT check out. Only
+      # `tools/setup` does, and it persists the tree to the workspace that the
+      # others attach. Without it here, `tools/deploy` attached an empty
+      # workspace and died with "Specified aliases are undeclared: [:build]"
+      # followed by "Unqualified function can't be resolved: deploy": there was
+      # no deps.edn to read.
+      #
+      # setup_cljs stays false. It runs `npm ci`, and boring has no
+      # package-lock.json -- the ClojureScript suite is cljs.main plus node with
+      # no npm dependencies at all.
+      - tools/setup:
+          context: docker-deploy
+          setup_cljs: false
       - jvm
       - cljs
       - interop
       - fuzz
       - tools/format:
           context: docker-deploy
+          requires:
+            - tools/setup
       # Release, mirroring konserve: deploy to Clojars from main only, then cut
       # the GitHub release. `clj -T:build deploy` runs bin/check-artifact first
       # and refuses to publish a jar that fails it, so the gate is on the
@@ -165,6 +180,7 @@ workflows:
             branches:
               only: main
           requires:
+            - tools/setup
             - jvm
             - cljs
             - interop

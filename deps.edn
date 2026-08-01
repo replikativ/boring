@@ -117,9 +117,16 @@
    :jvm-opts ["-server" "-Xmx4g" "--enable-native-access=ALL-UNNAMED"]
    :main-opts ["-m" "nrepl.cmdline" "--port" "47921"]}
 
+  ;; `-T:build`. The gh-release-artifact deps are what the clj-tools orb's
+  ;; `tools/release` job needs; konserve carries the same set.
   :build
   {:deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}
-          slipset/deps-deploy {:mvn/version "0.2.2"}}
+          slipset/deps-deploy {:mvn/version "0.2.2"}
+          io.github.borkdude/gh-release-artifact
+          {:git/sha "b946558225a7839f6a0f644834e838e190dc2262"}
+          babashka/babashka.curl {:mvn/version "0.1.2"}
+          babashka/fs {:mvn/version "0.3.17"}
+          cheshire/cheshire {:mvn/version "5.11.0"}}
    :ns-default build}
 
   ;; Same names as the rest of replikativ, so the shared CircleCI orb finds them.
