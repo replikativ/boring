@@ -28,6 +28,18 @@ public final class Reader {
     private byte[] buf;
     private int pos;
 
+    /**
+     * Scratch for buildMap's duplicate-key hashes, reused across maps.
+     *
+     * A fresh int[n] per map is invisible in a timing benchmark and obvious in
+     * an allocation one: decoding 200 five-key maps allocated 200 arrays.
+     *
+     * Safe as a field despite nested maps: buildMap runs only after every value
+     * of its map has been read, so an inner map's check completes before the
+     * outer map's begins, and nothing in it calls back into read().
+     */
+    private int[] dupHashes = new int[16];
+
     /** Unknown tags surface as TaggedValue rather than throwing. DATAHIKE-
      *  REQUIREMENTS.md §7 wants strict-by-default; set false for that. */
     public boolean tolerateUnknownTags = true;
@@ -766,7 +778,8 @@ public final class Reader {
         if (n == 0) return clojure.lang.PersistentArrayMap.EMPTY;
         if (checkDuplicateKeys && n > 1) {
             if (fitsArrayMap(kvs, n)) {
-                int[] hashes = new int[n];
+                if (dupHashes.length < n) dupHashes = new int[Math.max(n, dupHashes.length * 2)];
+                final int[] hashes = dupHashes;
                 for (int i = 0; i < n; i++) hashes[i] = clojure.lang.Util.hasheq(kvs[i * 2]);
                 for (int i = 0; i < n; i++) {
                     for (int j = i + 1; j < n; j++) {
@@ -850,30 +863,58 @@ public final class Reader {
     }
 
     private Object readTypedArray(int tag, int elemSize) {
-        Object v = read();
-        if (!(v instanceof byte[]))
+        // Decode straight out of `buf` where we can. Going through read()
+        // always materialised the payload as an intermediate byte[], so a
+        // long[1000] cost 8 KB of copy on top of the 8 KB result -- exactly
+        // double, and the whole allocation gap to hako on that payload.
+        //
+        // "Where we can" matters: a byte string takes a stringref index, and
+        // the table entry IS the byte[]. When this payload qualifies for one we
+        // must materialise it anyway, or a later reference resolves to nothing
+        // and our table desynchronises against every other implementation --
+        // silently, and in the direction that hurts interop most. So the copy
+        // is skipped only when no index is owed: always under :interop and
+        // :canonical, and below the index threshold under :clojure.
+        int h = u8();
+        if ((h >> 5) != 2)
             throw Err.of("bad-tag-content", "boring: typed-array tag " + tag + " must wrap a byte string");
-        byte[] b = (byte[]) v;
-        if (b.length % elemSize != 0)
+        int info = h & 0x1F;
+        if (info == 31)
+            throw Err.of("bad-tag-content",
+                "boring: typed-array tag " + tag + " must wrap a definite-length byte string");
+        int blen = checkCount(arg(info), 1);
+        if (blen % elemSize != 0)
             throw Err.of("bad-tag-content", "boring: typed-array tag " + tag + " payload is not a multiple of " + elemSize);
-        int n = b.length / elemSize;
+
+        final byte[] b;
+        final int off;
+        if (srActive && blen >= minLenForIndex(srCount)) {
+            b = java.util.Arrays.copyOfRange(buf, pos, pos + blen);
+            off = 0;
+            srPut(b);
+        } else {
+            b = buf;
+            off = pos;
+        }
+        pos += blen;
+        int n = blen / elemSize;
         switch (tag) {
             case 77: { short[] a = new short[n];
-                       for (int i = 0; i < n; i++) a[i] = (short) SHORT_LE.get(b, i << 1);
+                       for (int i = 0; i < n; i++) a[i] = (short) SHORT_LE.get(b, off + (i << 1));
                        return a; }
             case 78: { int[] a = new int[n];
-                       for (int i = 0; i < n; i++) a[i] = (int) INT_LE.get(b, i << 2);
+                       for (int i = 0; i < n; i++) a[i] = (int) INT_LE.get(b, off + (i << 2));
                        return a; }
             case 79: { long[] a = new long[n];
-                       for (int i = 0; i < n; i++) a[i] = (long) LONG_LE.get(b, i << 3);
+                       for (int i = 0; i < n; i++) a[i] = (long) LONG_LE.get(b, off + (i << 3));
                        return a; }
             case 85: { float[] a = new float[n];
                        for (int i = 0; i < n; i++)
-                           a[i] = Float.intBitsToFloat((int) INT_LE.get(b, i << 2));
+                           a[i] = Float.intBitsToFloat((int) INT_LE.get(b, off + (i << 2)));
                        return a; }
             case 86: { double[] a = new double[n];
                        for (int i = 0; i < n; i++)
-                           a[i] = Double.longBitsToDouble((long) LONG_LE.get(b, i << 3));
+                           a[i] = Double.longBitsToDouble((long) LONG_LE.get(b, off + (i << 3)));
                        return a; }
             // ---- READ-ONLY interop. RFC 8746 defines 24 typed-array tags; boring
             // WRITES five (the signed little-endian integers plus f32/f64 LE),
@@ -888,37 +929,37 @@ public final class Reader {
             // back different is the failure this codec exists to prevent.
             case 64: case 68: {                     // uint8, uint8 clamped
                 short[] a = new short[n];
-                for (int i = 0; i < n; i++) a[i] = (short) (b[i] & 0xFF);
+                for (int i = 0; i < n; i++) a[i] = (short) (b[off + i] & 0xFF);
                 return a; }
             case 72: {                              // sint8
                 byte[] a = new byte[n];
-                System.arraycopy(b, 0, a, 0, n);
+                System.arraycopy(b, off, a, 0, n);
                 return a; }
             case 65: case 69: {                     // uint16 BE / LE
                 int[] a = new int[n];
                 for (int i = 0; i < n; i++)
-                    a[i] = (tag == 65 ? (short) SHORT_BE.get(b, i << 1)
-                                      : (short) SHORT_LE.get(b, i << 1)) & 0xFFFF;
+                    a[i] = (tag == 65 ? (short) SHORT_BE.get(b, off + (i << 1))
+                                      : (short) SHORT_LE.get(b, off + (i << 1))) & 0xFFFF;
                 return a; }
             case 73: {                              // sint16 BE
                 short[] a = new short[n];
-                for (int i = 0; i < n; i++) a[i] = (short) SHORT_BE.get(b, i << 1);
+                for (int i = 0; i < n; i++) a[i] = (short) SHORT_BE.get(b, off + (i << 1));
                 return a; }
             case 66: case 70: {                     // uint32 BE / LE
                 long[] a = new long[n];
                 for (int i = 0; i < n; i++)
-                    a[i] = (tag == 66 ? (int) INT_BE.get(b, i << 2)
-                                      : (int) INT_LE.get(b, i << 2)) & 0xFFFFFFFFL;
+                    a[i] = (tag == 66 ? (int) INT_BE.get(b, off + (i << 2))
+                                      : (int) INT_LE.get(b, off + (i << 2))) & 0xFFFFFFFFL;
                 return a; }
             case 74: {                              // sint32 BE
                 int[] a = new int[n];
-                for (int i = 0; i < n; i++) a[i] = (int) INT_BE.get(b, i << 2);
+                for (int i = 0; i < n; i++) a[i] = (int) INT_BE.get(b, off + (i << 2));
                 return a; }
             case 67: case 71: {                     // uint64 BE / LE
                 long[] a = new long[n];
                 for (int i = 0; i < n; i++) {
-                    long u = tag == 67 ? (long) LONG_BE.get(b, i << 3)
-                                       : (long) LONG_LE.get(b, i << 3);
+                    long u = tag == 67 ? (long) LONG_BE.get(b, off + (i << 3))
+                                       : (long) LONG_LE.get(b, off + (i << 3));
                     // Above 2^63 a uint64 has no lossless long. Refuse rather than
                     // hand back a negative number that silently is not the value.
                     if (u < 0)
@@ -930,23 +971,23 @@ public final class Reader {
                 return a; }
             case 75: {                              // sint64 BE
                 long[] a = new long[n];
-                for (int i = 0; i < n; i++) a[i] = (long) LONG_BE.get(b, i << 3);
+                for (int i = 0; i < n; i++) a[i] = (long) LONG_BE.get(b, off + (i << 3));
                 return a; }
             case 80: case 84: {                     // float16 BE / LE -- widened, lossless
                 float[] a = new float[n];
                 for (int i = 0; i < n; i++)
-                    a[i] = halfBitsToFloat((tag == 80 ? (short) SHORT_BE.get(b, i << 1)
-                                                      : (short) SHORT_LE.get(b, i << 1)) & 0xFFFF);
+                    a[i] = halfBitsToFloat((tag == 80 ? (short) SHORT_BE.get(b, off + (i << 1))
+                                                      : (short) SHORT_LE.get(b, off + (i << 1))) & 0xFFFF);
                 return a; }
             case 81: {                              // f32 BE
                 float[] a = new float[n];
                 for (int i = 0; i < n; i++)
-                    a[i] = Float.intBitsToFloat((int) INT_BE.get(b, i << 2));
+                    a[i] = Float.intBitsToFloat((int) INT_BE.get(b, off + (i << 2)));
                 return a; }
             case 82: {                              // f64 BE
                 double[] a = new double[n];
                 for (int i = 0; i < n; i++)
-                    a[i] = Double.longBitsToDouble((long) LONG_BE.get(b, i << 3));
+                    a[i] = Double.longBitsToDouble((long) LONG_BE.get(b, off + (i << 3)));
                 return a; }
             default: throw Err.of("malformed", "boring: unhandled typed array " + tag);
         }
