@@ -198,7 +198,11 @@
    (rd/read! r)))
 
 (defn decode-seq
-  "Lazily decode consecutive top-level CBOR items (RFC 8742 sequence)."
+  "Lazily decode consecutive top-level CBOR items (RFC 8742 sequence).
+
+  Memory is bounded by the item being realised, not by `bs` — but `bs` itself
+  is already in memory. Use `decode-seq-from` to read a source larger than the
+  heap."
   ([bs] (decode-seq bs nil))
   ([bs opts]
    (let [r (configure-reader! (rd/reader bs) opts)]
@@ -206,6 +210,99 @@
         (lazy-seq
          (when-not (rd/at-end? r)
            (cons (rd/read-next! r) (step)))))))))
+
+(defn- grow
+  "A Uint8Array of at least `n` bytes holding `buf`'s contents."
+  [buf n]
+  (if (>= (.-length buf) n)
+    buf
+    (let [out (js/Uint8Array. n)]
+      (.set out buf 0)
+      out)))
+
+(defn decode-seq-from
+  "Lazily decode a CBOR sequence (RFC 8742) from a PULL SOURCE, in bounded
+  memory.
+
+  `pull` is `(fn [] -> Uint8Array | nil)`: return the next block of bytes, or
+  nil at end of input. On Node that is a `fs.readSync` loop, which is
+  synchronous and therefore composes with a lazy seq exactly as the JVM's
+  `InputStream` arity does.
+
+  This closes an asymmetry inside ClojureScript boring, not merely against the
+  JVM: `write-seq!` has always streamed OUT — it takes a sink and never holds
+  the document — while the read side took only a `Uint8Array`, so a sequence
+  larger than the heap had no symmetric path in.
+
+  Bounded memory means bounded by the LARGEST SINGLE ITEM plus the block size,
+  not by the source. That is the real limit and it is not a compromise: an item
+  has to fit in memory to be a value at all, so streaming can only ever mean a
+  sequence of items — which is exactly what a datahike dump is.
+
+  Deliberately NOT an async API. A pull function that returned a promise could
+  not drive a lazy seq, and a push decoder for genuinely async sources is a
+  different shape with different ergonomics; conflating them produces something
+  bad at both. Files — the case this exists for — read synchronously on Node.
+
+  `:chunk-size` (default 64 KiB) is how much is requested at a time — the same
+  option name the JVM arity uses, since the point of this is symmetry. The
+  caller owns the source and closes it."
+  ([pull] (decode-seq-from pull nil))
+  ([pull opts]
+   (let [o (resolve-opts opts)
+         block (get opts :chunk-size 65536)
+         r (configure-reader! (rd/reader (js/Uint8Array. 0)) o)
+         state (atom {:buf (js/Uint8Array. block) :limit 0 :last-good 0 :eof? false})]
+     ;; `last-good` is the offset just past the last COMPLETE item, NOT the
+     ;; reader's current position. A failed read leaves the position somewhere
+     ;; mid-item — and past the end of the valid bytes, since the byte reader
+     ;; advances before it can discover it has run out — so compacting from the
+     ;; position would copy a negative number of bytes. Rewind to the last item.
+     (letfn [(refill!
+               []
+               (let [{:keys [buf limit last-good eof?]} @state
+                     rest-len (- limit last-good)
+                     _ (when (pos? last-good)
+                         (.set buf (.subarray buf last-good limit) 0))
+                     buf (grow buf (+ rest-len block))
+                     ^js/Uint8Array chunk (when-not eof? (pull))
+                     n (if (and chunk (pos? (.-length chunk))) (.-length chunk) -1)
+                     _ (when (pos? n)
+                         (.set buf chunk rest-len))
+                     new-limit (if (pos? n) (+ rest-len n) rest-len)]
+                 (swap! state assoc :buf buf :limit new-limit :last-good 0
+                        :eof? (or eof? (neg? n)))
+                 (rd/reset! r (.subarray buf 0 new-limit))
+                 (pos? n)))
+             (step []
+               (lazy-seq
+                (if-not (rd/at-end? r)
+                  (let [v (try
+                            {:ok (rd/read-next! r)}
+                            (catch :default e
+                              ;; From INSIDE the reader, "the buffer ends
+                              ;; mid-item" and "the document declares an
+                              ;; impossible count" are indistinguishable: a
+                              ;; declared count is validated against the bytes
+                              ;; REMAINING, which on a partial buffer is exactly
+                              ;; what a hostile count looks like. So both are
+                              ;; retried while more data can still arrive — and
+                              ;; the ORIGINAL exception is kept, to be rethrown
+                              ;; if it cannot, rather than reporting every
+                              ;; malformed document as a truncation.
+                              (if (#{:boring/truncated-input :boring/bad-count}
+                                   (:type (ex-data e)))
+                                {:need-more e}
+                                (throw e))))]
+                    (cond
+                      (contains? v :ok)
+                      (do (swap! state assoc :last-good (rd/position r))
+                          (cons (:ok v) (step)))
+                      (refill!) (step)
+                      :else (throw (:need-more v))))
+                  (when (refill!) (step)))))]
+       (refill!)
+       (step)))))
 
 (defn write-seq!
   "Encode each value as a consecutive top-level item, appending to `sink`, a

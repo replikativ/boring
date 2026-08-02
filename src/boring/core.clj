@@ -570,7 +570,22 @@
                       (do (vswap! state assoc :last-good (.position r))
                           (cons (:ok v) (step)))
                       (refill!) (step)
-                      :else (throw (:need-more v))))
+                      ;; Out of data and still incomplete. The retained
+                      ;; exception is rethrown as-is when it is already typed,
+                      ;; but a raw IndexOutOfBoundsException gets the same
+                      ;; conversion `with-decode-errors` applies at every other
+                      ;; entry point. Without this, `decode-seq-from` was the
+                      ;; ONE reader that leaked a bare
+                      ;; "Index 19 out of bounds for length 19" for a truncated
+                      ;; input, where `decode` and `decode-seq` both name it —
+                      ;; so the caller reading a short dump was told nothing
+                      ;; about what was wrong with it.
+                      :else
+                      (let [e (:need-more v)]
+                        (throw (if (instance? IndexOutOfBoundsException e)
+                                 (ex-info "boring: input ended mid-value (truncated or malformed)"
+                                          {:type :boring/truncated-input} e)
+                                 e)))))
                   (when (refill!) (step)))))]
        (refill!)
        (step)))))

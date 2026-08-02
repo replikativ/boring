@@ -4,7 +4,8 @@
   (:require [cljs.test :as t]
             [boring.conformance-test]
             [boring.generative-test]
-            [boring.golden-test]))
+            [boring.golden-test]
+            [boring.streaming-test]))
 
 (enable-console-print!)
 
@@ -14,6 +15,7 @@
   (set! (.-exitCode js/process) (if (t/successful? m) 0 1)))
 
 (defn -main [& _]
-  (t/run-tests 'boring.conformance-test 'boring.generative-test 'boring.golden-test))
+  (t/run-tests 'boring.conformance-test 'boring.generative-test 'boring.golden-test
+               'boring.streaming-test))
 
 (set! *main-cli-fn* -main)
