@@ -9,13 +9,26 @@
 
   Options (all optional):
 
-    :profile        :clojure (default) | :interop | :canonical
+    :profile        :clojure (default) | :interop | :archival | :canonical
     :float-policy   :preserve-width (default) | :shortest
     :stringref      true (default under :clojure) | false
 
   See doc/COMPATIBILITY.md for what each profile promises about the bytes.
   :float-policy exists because datahike's dumps must not narrow a double to a
-  float -- the class, not just the value, has to survive."
+  float -- the class, not just the value, has to survive.
+
+  The four profiles answer four different questions:
+
+    :clojure    round-trip fidelity within Clojure, smallest bytes.
+    :interop    can any conformant CBOR reader read this? (no extensions)
+    :archival   will two exports of the same data be identical, AND do JVM
+                types survive? (sorted keys + fixed-width floats)
+    :canonical  do these bytes agree octet-for-octet with other canonical
+                encoders? (RFC 8949 4.2.2, which narrows floats)
+
+  :archival and :canonical are NOT the same and cannot be: RFC determinism
+  requires the shortest float form, which discards the Double/Float
+  distinction. Pick by which of the two you actually need."
   (:require [boring.data :as data]
             [clojure.string :as str])
   (:import (org.replikativ.boring Reader TagRegistry Writer)))
@@ -49,6 +62,18 @@
                :canonical-order :rfc8949}
    :interop   {:stringref false :float-policy :preserve-width :canonical false
                :shapes false :canonical-order :rfc8949}
+   ;; :archival differs from :interop in exactly one bit -- sorted map keys --
+   ;; and from :canonical in exactly one -- float width. That is not an accident:
+   ;; determinism and type identity are separate axes, and RFC 8949's
+   ;; deterministic profile happens to pin both. A dump that must outlive the
+   ;; database wants sorted keys (so two exports diff clean and one can be signed)
+   ;; AND fixed-width floats (so a Double does not come back a Float). Before this
+   ;; profile existed that combination was unreachable: :canonical locks
+   ;; :float-policy and :interop locks :canonical, so the one thing datahike's
+   ;; dumps actually need could not be said. It does NOT claim RFC deterministic
+   ;; conformance -- that name belongs to :canonical alone.
+   :archival  {:stringref false :float-policy :preserve-width :canonical true
+               :shapes false :canonical-order :rfc8949}
    :canonical {:stringref false :float-policy :shortest       :canonical true
                :shapes false :canonical-order :rfc8949}
    ;; clj-cbor's length-first key order (RFC 7049 3.9), as its own profile
@@ -80,6 +105,11 @@
 (def ^:private profile-locked
   {:clojure           #{:canonical :canonical-order}
    :interop           #{:canonical :canonical-order :stringref :shapes}
+   ;; Everything is locked, as under :canonical: both bits are what the profile
+   ;; MEANS. `:float-policy :shortest` here would just be :canonical spelled
+   ;; oddly, and `:canonical false` would just be :interop -- two more ways to
+   ;; say things that already have names.
+   :archival          #{:canonical :canonical-order :stringref :shapes :float-policy}
    :canonical         #{:canonical :canonical-order :stringref :shapes :float-policy}
    :canonical-rfc7049 #{:canonical :canonical-order :stringref :shapes :float-policy}})
 

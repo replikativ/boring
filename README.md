@@ -158,8 +158,15 @@ why it is worth stating. `{:incl-metadata? false}` opts out.
 ```clojure
 (boring/encode v {:profile :clojure})    ; default — compact, Clojure-native
 (boring/encode v {:profile :interop})    ; no extensions; maximally portable
-(boring/encode v {:profile :canonical})  ; deterministic bytes, for signing
+(boring/encode v {:profile :archival})   ; stable bytes AND host types — dumps
+(boring/encode v {:profile :canonical})  ; RFC 8949 §4.2; agrees with cbor2 et al
 ```
+
+`:archival` and `:canonical` both sort map keys; they differ on floats.
+`:canonical` implements RFC 8949 §4.2.2 shortest-form, so a `Double` may come
+back a `Float` — correct for interchange, wrong for a database dump.
+`:archival` keeps the width. Pick by whether you need to agree with *other
+encoders* (`:canonical`) or to get *your own types back* (`:archival`).
 
 There is also `:canonical-rfc7049`, which uses [clj-cbor][]'s length-first key
 order instead of RFC 8949's bytewise one. It is a separate profile rather than

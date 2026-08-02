@@ -77,8 +77,18 @@ standard other languages read natively.
 
 ## 2. Determinism — signable dumps
 
-The PR wants byte-identical re-export so a dump can be signed. Under
-`{:profile :canonical}`:
+The PR wants byte-identical re-export so a dump can be signed. Use
+**`{:profile :archival}`**, not `{:profile :canonical}`.
+
+> **Corrected.** This section previously recommended `:canonical`. That was
+> wrong, and wrong in the one way that matters here: `:canonical` implements RFC
+> 8949 §4.2.2, which requires the shortest float form that round-trips — so it
+> narrows **every** `Double` that fits, and they decode back as `Float`. That is
+> §1's bug reintroduced, and *worse* than clj-cbor, which mangles only zero, NaN
+> and ±Inf while leaving `1.5` and `2.0` alone. `:archival` sorts keys exactly
+> the same way but keeps `:float-policy :preserve-width`.
+
+Under `{:profile :archival}`:
 
 ```
 - same value encoded twice is byte-identical: true
