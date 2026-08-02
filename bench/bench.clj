@@ -5,13 +5,37 @@
 
   The second question this once answered -- does the hot path have to be Java?
   -- was settled by a pure-Clojure writer that was never committed. Its numbers
-  are in doc/PERFORMANCE.md."
+  are in doc/PERFORMANCE.md.
+
+  TIER MATCHING. This table used to call `hako/encode` and `hako/decode` while
+  calling boring's REUSED-writer `encode-into!` and reused-reader
+  `decode-with`. hako's encode/decode build a fresh Writer and a fresh confined
+  Arena per call and copy the result out; hako's author confirms they exist for
+  porting convenience and that `encode-into!` / `decode-into!` are the paths he
+  expects code to be built on. So the old row measured boring's fast path
+  against hako's slow one -- it even bound a `hako/writer` on line 41 and then
+  never used it.
+
+  Both sides now reuse their codec. See `hako-tiers` (criterium, three tiers,
+  plus bytes/op) and `hako-ab` (interleaved, drift-resistant) for the full
+  matrix."
   (:require [boring.core :as boring]
             [taoensso.nippy :as nippy]
             [clj-cbor.core :as cbor]
             [s-exp.hako :as hako]
             [criterium.core :as crit])
-  (:import (org.replikativ.boring Reader Writer)))
+  (:import (org.replikativ.boring Reader Writer)
+           (java.lang.foreign MemorySegment ValueLayout)))
+
+(defn seg->bytes
+  "hako's `encode-into!` hands back a MemorySegment slice into the writer's
+  arena, valid only until the next call. Copying it out is what makes it
+  comparable to `boring/encode-into!`, which returns a fresh byte[]."
+  ^bytes [^MemorySegment seg]
+  (let [n (.byteSize seg)
+        arr (byte-array n)]
+    (MemorySegment/copy seg ValueLayout/JAVA_BYTE 0 arr 0 n)
+    arr))
 
 (def payloads
   [["small-map"      {:name "Alice" :tags #{:a :b :c} :score 42}]
@@ -49,7 +73,7 @@
                        (fmt (safe #(t (fn [] (boring/encode-into! w v)))))
                        (fmt (safe #(t (fn [] (do (.reset w-nosr) (.writeValue w-nosr v) (.toByteArray w-nosr))))))
                        (fmt (safe #(t (fn [] (nippy/fast-freeze v)))))
-                       (fmt (safe #(t (fn [] (hako/encode v)))))
+                       (fmt (safe #(t (fn [] (seg->bytes (hako/encode-into! hw v))))))
                        (fmt (safe #(t (fn [] (cbor/encode v)))))))
       (flush))
 
@@ -61,11 +85,12 @@
       (let [rb (safe #(boring/encode-into! w v))
             nb (nippy/fast-freeze v)
             hb (safe #(hako/encode v))
+            hrd (when (bytes? hb) (hako/reader ^bytes hb))
             cb (cbor/encode v)]
         (println (format "%-16s %s %s %s %s" nm
                          (fmt (if (bytes? rb) (safe #(t (fn [] (boring/decode-with rdr rb)))) rb))
                          (fmt (safe #(t (fn [] (nippy/fast-thaw nb)))))
-                         (fmt (if (bytes? hb) (safe #(t (fn [] (hako/decode hb)))) hb))
+                         (fmt (if hrd (safe #(t (fn [] (hako/decode-into! hrd hb)))) hb))
                          (fmt (safe #(t (fn [] (cbor/decode cb)))))))
         (flush)))
 

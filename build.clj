@@ -41,22 +41,37 @@
 (defn clean [_] (b/delete {:path "target"}))
 
 (defn javac
-  "Compile the Java hot path. Targets JDK 9+ — no FFM, no --enable-native-access."
+  "Compile the Java hot path — TWO source sets at TWO release levels.
+
+  `src/java` targets JDK 9: the codec, and a `ByteSource` interface that names
+  no FFM type. `src/java22` targets JDK 22: `SegmentSource`, the MemorySegment
+  implementation of that interface, for mmap'ed and off-heap input.
+
+  One jar can hold class files of mixed versions, because the JVM rejects a
+  class only when it LOADS it. A JDK 9 process runs the codec and never
+  touches SegmentSource; ask it for a segment and you get NoClassDefFoundError
+  at that call rather than a jar that will not load at all. This is what keeps
+  JDK 21 LTS — the incumbent, since 22/23/24 are non-LTS and already EOL — a
+  supported runtime while 22+ additionally gets mmap.
+
+  --release, NOT -source/-target. -target alone still compiles against the
+  BUILD JDK's class library, so a method added after the target release links
+  fine here and throws NoSuchMethodError on the user's JVM. --release pins the
+  API too. Without it the jar carried class-file major version 69 (Java 25, the
+  build JDK) while the README promised JDK 9+, so every advertised runtime
+  except 25 failed with UnsupportedClassVersionError. Nothing caught it because
+  CI tested SOURCES and never built or loaded the jar."
   [_]
   (b/javac {:src-dirs ["src/java"]
             :class-dir class-dir
             :basis @basis
-            ;; --release, NOT -source/-target. -target alone still compiles
-            ;; against the BUILD JDK's class library, so a method added after
-            ;; the target release links fine here and throws NoSuchMethodError
-            ;; on the user's JVM. --release pins the API too.
-            ;;
-            ;; Without this the jar carried class-file major version 69
-            ;; (Java 25, the build JDK) while the README promised JDK 9+, so
-            ;; every advertised runtime except 25 failed with
-            ;; UnsupportedClassVersionError. Nothing caught it because CI
-            ;; tested SOURCES and never built or loaded the jar.
-            :javac-opts ["--release" "9" "-Xlint:-options"]}))
+            :javac-opts ["--release" "9" "-Xlint:-options"]})
+  ;; Second, against JDK 22, with the release-9 output on the classpath so
+  ;; SegmentSource can see the ByteSource interface it implements.
+  (b/javac {:src-dirs ["src/java22"]
+            :class-dir class-dir
+            :basis (update @basis :classpath assoc class-dir {:path-key :none})
+            :javac-opts ["--release" "22" "-Xlint:-options"]}))
 
 (defn jar
   "Ships the compiled Java classes alongside the Clojure and ClojureScript

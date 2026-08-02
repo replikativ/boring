@@ -8,6 +8,7 @@
 #   bin/bench                    everything
 #   bin/bench size compress      just the deterministic sections (fast)
 #   bin/bench ab                 just the interleaved comparison
+#   bin/bench skip nav           the walk-vs-decode and cursor-vs-decode tables (JDK 22+)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p target/bench

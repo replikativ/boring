@@ -29,7 +29,14 @@ Three kinds of thing live in this directory:
 | `suite.clj` | the entry point above — runs the others in the right order, with one global warmup |
 | `ab.clj` | A/B harness that interleaves two codecs in short bursts. Use this, not criterium, whenever the machine is not quiet — criterium measures A for ~7s then B for ~7s and background load drift makes that comparison meaningless. Includes a global warmup, because per-cell warmup was not enough (hako's small-map encode measured 2.52 / 1.30 / 1.15 / 1.08 µs across four consecutive runs). |
 | `bench.clj` | main JVM competitive benchmark vs nippy, hako, clj-cbor |
+| `hako_ab.clj` | **the tier-matched boring-vs-hako table**, time and allocation. Quote this one, not `bench.clj`'s hako column: `hako/encode` builds a fresh Writer and Arena per call and is not the path hako is meant to be used through, so pairing it against boring's reused writer measured our fast path against their slow one. Also carries the heap-only caveat on the allocation columns |
 | `alloc.clj` | bytes allocated per op via `ThreadMXBean` — the axis timing benchmarks miss |
+| `mmap.clj` | selective decode out of an mmap'ed CBOR file: random-probe cost against a no-copy floor and against `pread`, plus what zero-copy is worth on bytestring payloads |
+| `mmap_write.clj` | whether mmap helps *encoding* (it does not — a buffered stream wins; the interesting number is that I/O is only 19% of the job) |
+| `mmap_compress.clj` | chunked zstd against random access: the ratio-vs-lookup-cost curve that picks a chunk size, and why filesystem compression is the wrong regime for selective reads |
+| `nav.clj` | what `boring.nav` actually delivers on the SHIPPED api — path lookup, `count`, reduce, and blob handling, against decode-then-`get-in`. The prototype numbers that motivated the layer were an upper bound; these are what a caller gets |
+| `skip.clj` | how cheap it is to walk past a CBOR value without decoding it — the inner loop of any cursor/zipper/`get-in` over the wire format. Also runs one scanner over `byte[]`, a heap segment and an mmap'ed segment. **Its Clojure segment numbers are an interop artifact**; `java/FfmProbe.java` shows the backings at parity in Java, which is the language the reader is written in |
+| `java/FfmProbe.java` | standalone (no classpath) probe: `byte[]`+VarHandle vs heap vs native `MemorySegment`, and the big-endian intrinsification cliff. Run it on more than one JIT — the finding differs between C2 and Graal. See "Why the hot path is `byte[]`" in `doc/PERFORMANCE.md` |
 | `fuzz.clj` | mutation fuzzer over valid encodings. Found 154 untyped failures per 60k mutants on its first run. Run it after any decoder change. |
 | `prof.clj` | clj-async-profiler driver for the JVM decode loop |
 | `large.clj` | MB-scale payloads and streaming throughput, with a bounded-memory check |

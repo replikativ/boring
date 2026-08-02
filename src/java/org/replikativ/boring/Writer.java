@@ -16,6 +16,20 @@ import java.util.Set;
  * MemorySegment. Requires JDK 9+, and no flags -- an FFM path would need
  * --enable-native-access on current JDKs.
  *
+ * Re-measured since against a NATIVE segment, which that first round never
+ * covered. Naively, big-endian access to an off-heap segment costs 5.63 ns
+ * against 1.37 for byte[] on stock HotSpot 25 -- but that 4.1x is the JIT
+ * declining to intrinsify a non-native ValueLayout, not a cost of off-heap
+ * memory, and it vanishes if you access in native order and call
+ * Long.reverseBytes (a bswap intrinsic): 1.38 ns, byte-identical output.
+ *
+ * So FFM is available at parity on stock HotSpot, and byte[] is kept for
+ * reasons other than raw scalar speed: no --enable-native-access, JDK 9+
+ * rather than 22+, endian-neutrality without a manual swap, and an encode path
+ * that already measures 0 bytes/op allocated. Graal additionally penalises
+ * native-segment WRITES 1.6x. bench/java/FfmProbe.java reproduces all of it;
+ * doc/PERFORMANCE.md has the tables and the decode-side caveat.
+ *
  * This class comment used to end "prototype scope: bignums, ratios, instants,
  * typed arrays and the tag registry are not here yet." All of those ship. See
  * doc/COMPATIBILITY.md for the complete list of what is emitted.
