@@ -24,6 +24,12 @@
                :canonical-order :rfc8949}
    :interop   {:stringref false :float-policy :preserve-width :canonical false
                :shapes false :canonical-order :rfc8949}
+   ;; :archival -- sorted keys AND fixed-width floats; see the JVM boring.core
+   ;; for the reasoning. Kept in step with the JVM table deliberately: these two
+   ;; maps are the same contract written twice, and a profile that exists on one
+   ;; platform and not the other is a dump a browser peer cannot read.
+   :archival  {:stringref false :float-policy :preserve-width :canonical true
+               :shapes false :canonical-order :rfc8949}
    :canonical {:stringref false :float-policy :shortest       :canonical true
                :shapes false :canonical-order :rfc8949}
    ;; clj-cbor's length-first key order (RFC 7049 3.9), as its own profile
@@ -55,6 +61,7 @@
 (def ^:private profile-locked
   {:clojure           #{:canonical :canonical-order}
    :interop           #{:canonical :canonical-order :stringref :shapes}
+   :archival          #{:canonical :canonical-order :stringref :shapes :float-policy}
    :canonical         #{:canonical :canonical-order :stringref :shapes :float-policy}
    :canonical-rfc7049 #{:canonical :canonical-order :stringref :shapes :float-policy}})
 

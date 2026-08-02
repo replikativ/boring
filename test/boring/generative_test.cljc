@@ -188,6 +188,88 @@
                   (and (= m1 m2)
                        (c/same-bytes? (boring/encode m1 opts) (boring/encode m2 opts))))))
 
+;; ---------------------------------------------------------------- :archival
+;;
+;; :archival is the profile a dump uses: sorted map keys AND fixed-width floats.
+;; It must satisfy everything :canonical does for determinism, while satisfying
+;; the one thing :canonical cannot -- JVM float width survives. Both halves are
+;; asserted, because either alone is already provided by an existing profile and
+;; would not need a new one.
+
+(defspec archival-encoding-is-order-independent 100
+  (prop/for-all [kvs (gen/vector (gen/tuple gen-ident gen/large-integer) 0 8)]
+                (let [opts {:profile :archival}
+                      m1 (into {} kvs)
+                      m2 (into {} (reverse (vec m1)))]
+                  (and (= m1 m2)
+                       (c/same-bytes? (boring/encode m1 opts) (boring/encode m2 opts))))))
+
+(defspec archival-encoding-reaches-a-fixpoint 200
+  ;; The signable-dump guarantee: verify the bytes, re-encode the value, get the
+  ;; same bytes. Same property :canonical has, and the reason :archival exists at
+  ;; all rather than just using :interop, which preserves insertion order.
+  (prop/for-all [v gen-value]
+                (let [opts {:profile :archival}
+                      bs1 (boring/encode v opts)
+                      once (boring/decode bs1 opts)
+                      bs2 (boring/encode once opts)]
+                  (and (c/same-bytes? bs1 bs2)
+                       (c/equiv? once (boring/decode bs2 opts))))))
+
+#?(:clj
+   (deftest archival-preserves-float-width
+     ;; datahike #633: a :db.type/double came back a Float because the codec
+     ;; narrowed on encode. Under :canonical it still would -- RFC 8949 4.2.2
+     ;; mandates shortest form -- which is exactly why a dump cannot use that
+     ;; profile and why this test names both.
+     (let [A {:profile :archival}
+           C {:profile :canonical}
+           class-of (fn [v opts] (class (boring/decode (boring/encode v opts) opts)))]
+       (doseq [v [(double 0.0) (double 1.5) (double 2.0) (double 65504.0)
+                  (double ##NaN) (double ##Inf) (double ##-Inf)]]
+         (is (= Double (class-of v A))
+             (str v " must stay a Double under :archival"))
+         (is (= Float (class-of v C))
+             (str v " narrows under :canonical — the reason :archival exists")))
+       (doseq [v [(float 0.0) (float 1.5)]]
+         (is (= Float (class-of v A)) (str v " must stay a Float under :archival"))))))
+
+(deftest archival-emits-no-extensions
+  ;; A dump is read by foreign implementations years later; stringref (tags
+  ;; 25/256) is a schmorp extension most of them do not implement, so emitting
+  ;; it would defeat the point of choosing CBOR.
+  (let [bs (boring/encode {:a "repeated" :b "repeated"} {:profile :archival})]
+    (is (not= [0xd9 0x01 0x00]
+              (mapv #(bit-and % 0xff) (take 3 (seq bs))))
+        "no tag 256 stringref namespace")))
+
+(deftest every-profile-exists-on-both-platforms
+  ;; `profile-defaults` is written out twice — once in boring/core.clj and once
+  ;; in boring/core.cljs — so a profile added to one and forgotten in the other
+  ;; compiles fine and fails at runtime, on one platform only. That is precisely
+  ;; what happened when :archival was added: the JVM suite was green and the
+  ;; ClojureScript suite raised :boring/unknown-profile three times.
+  ;;
+  ;; This list is the contract. Adding a profile means adding it here, which
+  ;; fails on whichever platform has not been updated.
+  (doseq [p [:clojure :interop :archival :canonical :canonical-rfc7049]]
+    (is (some? (boring/encode {:a 1 :b (double 2.0)} {:profile p}))
+        (str p " must be a known profile on this platform")))
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+               (boring/encode {:a 1} {:profile :no-such-profile}))
+      "and an unknown one must still be refused"))
+
+(deftest archival-locks-the-bits-that-define-it
+  ;; Both bits ARE the profile. Allowing either to be overridden would just be
+  ;; :canonical or :interop under another name, which is the ambiguity the
+  ;; locking exists to prevent.
+  (doseq [conflicting [{:profile :archival :float-policy :shortest}
+                       {:profile :archival :canonical false}
+                       {:profile :archival :stringref true}]]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                 (boring/encode {:a 1} conflicting))
+        (str (pr-str conflicting) " must be refused"))))
+
 (defn- decode-outcome
   "Decode `bs`, classifying the result. Anything other than a value or a typed
   boring error is a defect — including StackOverflowError and OutOfMemoryError,

@@ -293,6 +293,39 @@ Until the registration lands, a decoder that does not know the tag surfaces a
 "unrecognised extension" and never to silent corruption. Shaped arrays are also
 off by default (`:shapes true` opts in), so nothing writes this tag unasked.
 
+## The archival profile
+
+`:archival` is sorted keys **and** fixed-width floats: `{:stringref false
+:float-policy :preserve-width :canonical true :shapes false :canonical-order
+:rfc8949}`. Every bit of it is locked, because both halves are what the name
+means.
+
+It exists because determinism and type identity are separate axes that RFC
+8949's deterministic profile happens to pin together. Before it, the
+combination was unreachable — `:canonical` locks `:float-policy` and `:interop`
+locks `:canonical` — so a caller who needed reproducible bytes *and* a `Double`
+that stays a `Double` had no way to say so.
+
+Reach for it when the artifact must outlive the process that wrote it: a
+database dump, an archive, an audit trail. Two exports of the same data are
+byte-identical, so one can be signed and a re-export diffs clean, while
+`java.lang.Double` and `java.lang.Float` still survive the round trip.
+
+What it does **not** claim is RFC 8949 deterministic conformance. That name
+belongs to `:canonical` alone, and the difference is exactly the float rule:
+§4.2.2 requires the shortest form that round-trips, which discards the width
+distinction. If you need to agree octet-for-octet with a foreign canonical
+encoder, use `:canonical` and accept the narrowing; if you need your own types
+back, use `:archival` and accept that the bytes are boring's own convention.
+
+| | `:interop` | `:archival` | `:canonical` |
+|---|---|---|---|
+| extensions emitted | none | none | none |
+| map key order | insertion | sorted | sorted |
+| `(double 2.0)` decodes as | `Double` | `Double` | `Float` |
+| two equal maps ⇒ same bytes | no | yes | yes |
+| RFC 8949 §4.2 conformant | no | no | yes |
+
 ## Two canonical profiles
 
 `:canonical` follows RFC 8949 §4.2: bytewise lexicographic key order.
@@ -360,9 +393,16 @@ Two consequences worth stating plainly, because both surprise people:
 - **Canonical is lossy.** It reduces a bignum that fits to a basic integer and
   narrows a float to its shortest round-tripping form. A `BigInteger` may come
   back a `Long`; a `Double` may come back narrower. That is required, not a
-  defect — you cannot both sign a document and preserve a host type the wire
-  has no room for. Use `:clojure` or `:interop` when type fidelity matters
-  more than a stable byte sequence.
+  defect — you cannot both agree octet-for-octet with other canonical encoders
+  and preserve a host type the wire has no room for. Use `:clojure` or
+  `:interop` when type fidelity matters more than interchange agreement.
+
+  If what you actually want is a *stable byte sequence* rather than agreement
+  with other encoders — two exports that diff clean, a dump you can sign — use
+  **`:archival`**, which sorts keys the same way but keeps float width. See
+  "The archival profile" below. Reaching for `:canonical` because it is the one
+  with determinism in the name is the mistake this paragraph exists to prevent:
+  it will silently turn every `Double` in your dump into a `Float`.
 
 - **Canonical output containing an integral float is not byte-identical across
   platforms.** ClojureScript has one number type, so `1.0` *is* the integer `1`
