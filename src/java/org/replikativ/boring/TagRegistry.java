@@ -39,7 +39,7 @@ import java.util.Map;
 public final class TagRegistry {
 
     /** Class -> {tag, writer-fn}. Identity-keyed: exact class match only. */
-    private final Map<Class<?>, Object[]> writers;
+    private final Map<Class<?>, TagWriter> writers;
     /** tag -> reader-fn */
     private final Map<Long, clojure.lang.IFn> readers;
     /** wire name -> map->Record constructor */
@@ -51,7 +51,7 @@ public final class TagRegistry {
     public static final TagRegistry EMPTY = new TagRegistry(
         Map.of(), Map.of(), Map.of(), Map.of());
 
-    private TagRegistry(Map<Class<?>, Object[]> writers,
+    private TagRegistry(Map<Class<?>, TagWriter> writers,
                         Map<Long, clojure.lang.IFn> readers,
                         Map<String, clojure.lang.IFn> recordCtors,
                         Map<Class<?>, String> recordNames) {
@@ -100,7 +100,7 @@ public final class TagRegistry {
                 + " consulted, so a handler for it could never run. Registering one"
                 + " silently did nothing. Wrap the value in a type of your own, or"
                 + " use :encode-fallback.");
-        return new TagRegistry(plus(writers, cls, new Object[]{tag, writeFn}),
+        return new TagRegistry(plus(writers, cls, new TagWriter(tag, writeFn)),
                                readers, recordCtors, recordNames);
     }
 
@@ -153,7 +153,24 @@ public final class TagRegistry {
                                plus(recordNames, cls, name));
     }
 
-    public Object[] writerFor(Class<?> cls) { return writers.get(cls); }
+    /**
+     * The registered writer for `cls`, or null.
+     *
+     * Returns an IMMUTABLE holder, not the registry's own array. It used to
+     * hand back the live `Object[]`, so a Java caller could rewrite the tag or
+     * the function after publication -- contradicting this class's whole
+     * immutability claim, and doing it through a data race rather than an
+     * assignment anyone could see. A defensive copy would also close it, but it
+     * would allocate on every encode of a registered type; final fields cost
+     * nothing and cannot be written at all.
+     */
+    public static final class TagWriter {
+        public final long tag;
+        public final clojure.lang.IFn fn;
+        TagWriter(long tag, clojure.lang.IFn fn) { this.tag = tag; this.fn = fn; }
+    }
+
+    public TagWriter writerFor(Class<?> cls) { return writers.get(cls); }
     public clojure.lang.IFn readerFor(long tag) { return readers.get(tag); }
     public clojure.lang.IFn recordCtor(String name) { return recordCtors.get(name); }
 

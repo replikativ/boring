@@ -263,6 +263,40 @@ browser.
   class whose fields are `static final`, so publication is safe by
   construction. An earlier design published them through mutable statics.
 
+- **What `fork` shares, and what that requires of you.** A fork separates parser
+  state; it deliberately does NOT copy the bytes, because copying a mapping
+  would defeat the point of mapping it. So the source itself must not change
+  while anyone is reading it:
+
+  - do not mutate a `byte[]` you have handed to `decode` or `nav`;
+  - a custom `ByteSource` must support concurrent reads;
+  - a read-only mmap stops writes *through that mapping*, not writes or
+    truncation by another descriptor or process. Map immutable files, publish
+    by atomic rename, and do not rewrite or truncate one while an arena is
+    live. Truncating mapped storage can fault at the OS level rather than
+    surfacing as a CBOR error.
+
+- **`decode-seq` and `decode-seq-from` are single-consumer.** Each closes over
+  one mutable reader, and the streaming form over an `InputStream` and a refill
+  buffer as well. Do not realise different tails concurrently or pull from
+  several workers. Clojure's `LazySeq` realisation reduces accidental overlap
+  but is not an API-level guarantee about the enclosed reader, and it does not
+  make an `InputStream` thread-safe. Detach each item first, then parallelise.
+
+- **Handlers are not re-entrant with respect to the codec that invoked them.** A
+  registered handler or `:encode-fallback` that captures and re-enters the same
+  reusable Writer or Reader will clobber its position, depth, stringref
+  namespace or scratch state. This takes an explicit closure to arrange, so it
+  is trusted-code behaviour rather than an input-driven hazard -- but it is not
+  checked, and the failure is silent corruption rather than an error.
+
+- **Registry values are immutable, handler functions are yours.** The maps are
+  final and copy-on-write, so building and publishing a registry is safe.
+  `TagRegistry.writerFor` returns an immutable holder rather than the
+  registry's own array, so a Java caller cannot rewrite a tag or function after
+  publication. The handler functions themselves are user code and must be
+  thread-safe if the registry is shared.
+
 ## Reporting
 
 Findings in this file came from fuzzing, from reading other implementations

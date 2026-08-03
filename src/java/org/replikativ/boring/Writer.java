@@ -1997,10 +1997,10 @@ public final class Writer {
         //
         // An explicit registration is an instruction, so it wins. Nobody can be
         // broken by this who was not already being ignored.
-        Object[] handler = registry.writerFor(c);
+        TagRegistry.TagWriter handler = registry.writerFor(c);
         if (handler != null) {
-            writeTag(((Number) handler[0]).longValue());   // validated, not raw head
-            writeValue(((clojure.lang.IFn) handler[1]).invoke(x));
+            writeTag(handler.tag);                        // validated, not raw head
+            writeValue(handler.fn.invoke(x));
             return;
         }
 
