@@ -196,10 +196,18 @@ public final class Writer {
      * with the typed arrays already emitted for the 1D case, so a matrix costs
      * one tag plus a dimensions array on top of a bulk little-endian copy.
      *
-     * Only RECTANGULAR arrays take this path. A ragged array is not a
-     * multi-dimensional array in RFC 8746's sense, so it falls back to a plain
-     * CBOR array of typed arrays -- still correct, still round-trips, just
-     * without the shape declared up front.
+     * Only RECTANGULAR arrays take this path -- including a ZERO-ROW one, which
+     * is 0x0 and whose element type is known from the array's own class. A
+     * ragged array is not a multi-dimensional array in RFC 8746's sense, so it
+     * falls back to a plain CBOR array of typed arrays.
+     *
+     * That fallback preserves the VALUES but not the type: a ragged
+     * `double[][]` decodes as a vector of `double[]`, not as `double[][]`. The
+     * comment here used to say "still round-trips", which is true of the
+     * numbers and false of the type -- the distinction this library otherwise
+     * takes care to keep. Declaring it rather than fixing it: a type-preserving
+     * frame for ragged matrices would be a private tag, and RFC 8746 has
+     * nothing to say about them.
      */
     private static final int TAG_MULTI_DIM_ROW = 40;
 
@@ -852,6 +860,24 @@ public final class Writer {
      * (datahike #633).
      */
     private void writeShortestFloat(double d) {
+        // ONE representation for NaN, matching ClojureScript and RFC 8949's own
+        // examples (0xf97e00).
+        //
+        // `toHalf` carried a float NaN's payload bits and its sign through, so
+        // 7ff8000000000001 emitted f97e00 while 7ffaaaa000000000 emitted f97eaa
+        // and a negative NaN emitted f9fe00 -- three encodings of one value
+        // under the profile whose entire purpose is that the same value gives
+        // the same bytes, on every platform. ClojureScript already normalised.
+        //
+        // Nothing is lost: boring exposes no NaN-payload or signalling-NaN
+        // type, and decoding collapses every half NaN to Float.NaN, so those
+        // bits were never observable as a value distinction -- only as a
+        // determinism hole. RFC 8949 says a deterministic protocol without
+        // intentional NaN-payload support should pick one form.
+        //
+        // Only on the :shortest path. `:preserve-width` still emits the exact
+        // f64 bits, because preserving the width is what it is for.
+        if (Double.isNaN(d)) { writeF16((short) 0x7E00); return; }
         float f = (float) d;
         if (Double.compare((double) f, d) != 0) { writeF64(d); return; }
         short h = toHalf(f);
@@ -1295,13 +1321,24 @@ public final class Writer {
      * plain array of rows.
      */
     private void writeMatrix(Object[] rows, Class<?> rowType) {
-        boolean rectangular = rows.length > 0;
-        int cols = rows.length > 0 ? rowLen(rows[0]) : 0;
-        for (Object r : rows) {
-            // A null row is not a shape, and a differing length is not a
-            // rectangle. Either way tag 40 does not apply.
-            if (r == null || rowLen(r) != cols) { rectangular = false; break; }
+        // `rows[0]` is inspected only AFTER it is known non-null. The length was
+        // read before the loop's own null check, so a null FIRST row threw a raw
+        // NullPointerException and the documented null-row fallback was
+        // unreachable for exactly the row most likely to be null.
+        boolean rectangular = rows.length == 0 || rows[0] != null;
+        int cols = rectangular && rows.length > 0 ? rowLen(rows[0]) : 0;
+        if (rectangular) {
+            for (Object r : rows) {
+                // A null row is not a shape, and a differing length is not a
+                // rectangle. Either way tag 40 does not apply.
+                if (r == null || rowLen(r) != cols) { rectangular = false; break; }
+            }
         }
+        // A ZERO-ROW matrix is rectangular -- 0x0 -- and `rowType` carries the
+        // element type the rows would have had, so tag 40 round-trips it as the
+        // 2-D array it is. Treating it as non-rectangular sent it down the
+        // fallback and it came back a PersistentVector, silently losing the
+        // source type on a value with no content to disagree about.
         if (!rectangular) {
             head(ARRAY, rows.length);
             for (Object r : rows) writeValue(r);
@@ -1314,25 +1351,31 @@ public final class Writer {
         writeLong(cols);
         // The flat payload is one typed array, so the whole matrix is a single
         // bulk copy per row rather than a value-at-a-time encode.
-        int n = rows.length * cols;
+        // long before narrowing: `rows.length * cols` could wrap negative and slip
+        // past the size check in typedArrayHeader, which takes a long.
+        long n = (long) rows.length * cols;
+        if (n > Integer.MAX_VALUE)
+            throw Err.of("value-too-large",
+                "boring: matrix of " + rows.length + "x" + cols
+                + " elements exceeds what one typed array can hold");
         if (rowType == double[].class) {
-            typedArrayHeader(TAG_ARR_F64_LE, (long) n * 8);
+            typedArrayHeader(TAG_ARR_F64_LE, n * 8);
             for (Object r : rows) { double[] d = (double[]) r;
                 for (int i = 0; i < cols; i++) { LONG_LE.set(buf, pos, Double.doubleToRawLongBits(d[i])); pos += 8; } }
         } else if (rowType == long[].class) {
-            typedArrayHeader(TAG_ARR_S64_LE, (long) n * 8);
+            typedArrayHeader(TAG_ARR_S64_LE, n * 8);
             for (Object r : rows) { long[] d = (long[]) r;
                 for (int i = 0; i < cols; i++) { LONG_LE.set(buf, pos, d[i]); pos += 8; } }
         } else if (rowType == int[].class) {
-            typedArrayHeader(TAG_ARR_S32_LE, (long) n * 4);
+            typedArrayHeader(TAG_ARR_S32_LE, n * 4);
             for (Object r : rows) { int[] d = (int[]) r;
                 for (int i = 0; i < cols; i++) { INT_LE.set(buf, pos, d[i]); pos += 4; } }
         } else if (rowType == float[].class) {
-            typedArrayHeader(TAG_ARR_F32_LE, (long) n * 4);
+            typedArrayHeader(TAG_ARR_F32_LE, n * 4);
             for (Object r : rows) { float[] d = (float[]) r;
                 for (int i = 0; i < cols; i++) { INT_LE.set(buf, pos, Float.floatToRawIntBits(d[i])); pos += 4; } }
         } else {
-            typedArrayHeader(TAG_ARR_S16_LE, (long) n * 2);
+            typedArrayHeader(TAG_ARR_S16_LE, n * 2);
             for (Object r : rows) { short[] d = (short[]) r;
                 for (int i = 0; i < cols; i++) { SHORT_LE.set(buf, pos, d[i]); pos += 2; } }
         }

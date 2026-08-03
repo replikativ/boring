@@ -2023,12 +2023,36 @@ public final class Reader {
                     throw Err.of("bad-tag-content",
                         "boring: only 2-dimensional tag 40 arrays are supported, got "
                         + dims.size() + " dimensions", "tag", 40L);
-                int rows = ((Number) dims.get(0)).intValue();
-                int cols = ((Number) dims.get(1)).intValue();
-                Object flat = l.get(1);
-                if (rows < 0 || cols < 0)
+                // TYPES CHECKED BEFORE THEY ARE USED. Casting the dimensions
+                // straight to Number and asking `Array.getLength` for the
+                // payload's length let a WELL-FORMED tag with wrong-shaped
+                // content escape as a raw ClassCastException or
+                // IllegalArgumentException -- contradicting doc/SECURITY.md's
+                // typed-failure guarantee. The byte fuzzer rarely builds a
+                // valid tag around invalid content, which is the limitation
+                // that document already names.
+                Object d0 = dims.get(0), d1 = dims.get(1);
+                if (!(d0 instanceof Number) || !(d1 instanceof Number)
+                    || d0 instanceof Double || d0 instanceof Float
+                    || d1 instanceof Double || d1 instanceof Float)
+                    throw Err.of("bad-tag-content",
+                        "boring: tag 40 dimensions must be integers", "tag", 40L);
+                long rowsL = ((Number) d0).longValue(), colsL = ((Number) d1).longValue();
+                if (rowsL < 0 || colsL < 0)
                     throw Err.of("bad-tag-content", "boring: negative tag 40 dimension",
                                  "tag", 40L);
+                if (rowsL > Integer.MAX_VALUE || colsL > Integer.MAX_VALUE
+                    || rowsL * colsL > Integer.MAX_VALUE)
+                    throw Err.of("bad-tag-content",
+                        "boring: tag 40 dimensions " + rowsL + "x" + colsL
+                        + " exceed the largest array this platform can build", "tag", 40L);
+                int rows = (int) rowsL, cols = (int) colsL;
+                Object flat = l.get(1);
+                if (flat == null || !flat.getClass().isArray()
+                    || flat instanceof Object[])
+                    throw Err.of("bad-tag-content",
+                        "boring: tag 40 payload must be a primitive typed array, got "
+                        + (flat == null ? "nil" : flat.getClass().getName()), "tag", 40L);
                 int declared = java.lang.reflect.Array.getLength(flat);
                 // The dimensions come from the wire and the payload length comes
                 // from the wire; if they disagree the item is malformed, and
