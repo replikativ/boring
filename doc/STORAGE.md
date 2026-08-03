@@ -168,14 +168,31 @@ Three traps, in order of how much they cost:
    the last item.
 
 Reaching item *n* costs *n* skips, so tailing and scanning are cheap while
-seeking into the middle of a large file is not. If you need that, seal the
-sequence with an index:
+seeking into the middle of a large file is not. **`write-seq!` therefore seals
+the sequence with an index by default** (stride 16):
 
 ```clojure
-(boring/write-seq! w events out {:stringref false :index 8})
+(boring/write-seq! w events out)              ; indexed, stride 16
+(boring/write-seq! w events out {:index 8})   ; finer, bigger
+(boring/write-seq! w events out {:index 0})   ; off
 ```
 
-That appends one extra CBOR item holding the offsets of every 8th item, and
+Four things follow from the default:
+
+- **`:stringref false` is forced** whenever a stride is set, and passing
+  `:stringref true` alongside `:index` throws rather than one silently winning.
+  On a sequence this costs nothing — the stringref table resets per top-level
+  item, so short records never amortise it and dropping it is a ~1.5% *saving*.
+- **A sequence too small to benefit gets no frame at all.** `:index-min`
+  (default 16) gates it, so 15 small items cost no more than they did before.
+- **`decode-seq` hides the frame.** You get your items, not your items plus a
+  trailing `#boring/index`. A foreign reader sees the extra item and can ignore
+  it; only the final position is treated this way.
+- **`encode` is untouched and stays untouched.** Appending to a single value
+  would stop it being a single well-formed CBOR item. A sequence is already
+  `application/cbor-seq`, where extra items are the point.
+
+The frame is one extra CBOR item holding the offsets of every Nth item, and
 `nav/items` then jumps rather than skips — on 200 000 records, reaching the last
 one takes **10.6 ms** unindexed against **0.6 µs** indexed, for 0.68% of the
 file. The
@@ -208,16 +225,111 @@ Lookup cost scales with chunk size; **ratio saturates almost immediately**.
 4 KB reaches 77% of whole-file ratio and aligns with the granularity mmap gives
 you anyway.
 
-This is the argument *against* filesystem compression here, not for it: btrfs
-compresses 128 KiB extents and ZFS a 128 KiB recordsize, landing at the bottom
-of that table with no knob to turn. It is the right choice if you scan most of
-the file, and the wrong one if you read a few records out of a large one.
+**ZFS and btrfs land at the bottom of that table by DEFAULT, but the knob
+exists.** An earlier version of this section said there was none; that was
+wrong. ZFS `recordsize` is settable per dataset and is exactly the chunk column
+above:
+
+```
+zfs create -o recordsize=16K -o compression=lz4 rpool/blobs
+```
+
+It applies only to files written after it is set. At the 128 KiB default a cold
+random read of a 200-byte record decompresses a whole 128 KiB record — roughly
+600x read amplification, which is most of the cold latency measured below.
+Turning it down trades ratio for amplification along the same curve.
+
+Measured on a real 209 MB / 1 000 000-record file on ZFS with lz4 at the 128 KiB
+default: **208 901 831 bytes apparent, 19 997 696 on disk — 10.45x**, with mmap
+and the index working untouched. So filesystem compression is the right answer
+when you control the filesystem, and the qualifier matters: ZFS or btrfs on
+Linux only. macOS APFS has no per-dataset switch, NTFS compression is LZNT1 and
+poor under random access, and a stock VPS is usually ext4 with none at all.
+There the same file occupies its full 209 MB and everything else still works.
 
 Compression also forecloses zero-copy — a chunk must be decompressed onto the
 heap — so compression and the blob win are **alternatives for the same bytes**.
 A common split is to leave the hot segment uncompressed and compress on
 rotation, which works cleanly because chunk boundaries can fall on item
 boundaries.
+
+## At scale
+
+Numbers from a 209 MB, 1 000 000-record file, ZFS/lz4, JDK 25, warm ARC unless
+stated. Extrapolations to a terabyte assume ~1000 files of 1 GB.
+
+| | |
+|---|---:|
+| index open (expand deltas to absolutes) — warm | 10–15 ms / 62 500 anchors |
+| index open — first call in a process | 137 ms (JIT, not I/O) |
+| `nav/fork` — reuse an already-expanded index | 45 µs |
+| random record read, warm | 10.8 µs |
+| random record read, cold | 54–242 µs |
+
+Reading a small field out of every file in a terabyte therefore costs roughly a
+**minute of index work in total**, plus one cold read per file. You never touch
+the terabyte: the index frame is at the end of each file, and mmap faults in
+only the pages you land on.
+
+Three things that surprise people, in order of how much they cost:
+
+1. **Do not whole-file compress.** A single zstd blob per 1 GB file forces
+   decompressing a gigabyte to read 200 bytes. This is what a naive
+   store-then-compress pipeline does, and it is the one shape that defeats
+   everything above. Compress at the filesystem, or in blocks — see below.
+2. **Navigating to a single field is not always faster than decoding the
+   record.** Measured on 5-key records: `(nav/value (get cursor :k))` took
+   13.3 µs against 10.8 µs to decode the whole record. Scanning encoded keys
+   costs more than decoding a small map. The per-field path wins on LARGE
+   containers, which is what `:index-min` exists to select. At scale, "pull out
+   a small bit" should mean *seek to the right record with the index and decode
+   it whole*.
+3. **Open the index once per file and `fork` per thread.** Expansion is 10–15 ms
+   and a fork is 45 µs — three orders of magnitude. A cursor is not
+   thread-safe; `fork` is how you share one expanded index across threads.
+
+### If you need compression off ZFS
+
+Do not put it inside the CBOR. Stack it underneath, in independently
+decompressible blocks with their own offset table — which is what
+[zstd's seekable format][zstd-seekable] already specifies: a series of
+independent frames plus a seek table in a *skippable* frame at the end. A
+seekable-zstd file is still a valid zstd file, so `zstd -d` yields the ordinary
+CBOR sequence with its ordinary index, while a seekable reader decompresses one
+frame. boring's index maps item to decompressed offset; the seek table maps
+decompressed offset to frame. The two compose and neither knows the other
+exists.
+
+The same shape is [BGZF][bgzf] in genomics (gzip blocks plus a `.gzi`), Parquet
+pages, ORC compression blocks, and Avro's object container. **No production
+format fuses compression into the document format**; they all layer it, and the
+reason is exactly the one stringref runs into below.
+
+[zstd-seekable]: https://github.com/facebook/zstd/tree/dev/contrib/seekable_format
+[bgzf]: https://samtools.github.io/hts-specs/SAMv1.pdf
+
+### Why stringref and the index are mutually exclusive
+
+`boring.nav` refuses a stringref document, and indexing therefore forces
+`:stringref false`. This is not a limitation of the implementation.
+
+A stringref (tag 25) is an index into a table built *incrementally, in
+occurrence order, while decoding*. To resolve one at offset X you must already
+have decoded everything from the namespace start to X — the precise opposite of
+seeking. Any compression whose dictionary is built by the decoder as it goes has
+this property: LZ77's window, gzip, and stringref alike.
+
+The schemes that DO permit random access all use a **static** dictionary
+available up front — Parquet's dictionary pages, [FSST][fsst]'s symbol table, a
+trained zstd dictionary. Given the table, any single value decodes alone.
+
+That is the whole distinction, and it is why the answer is to layer rather than
+fuse. It is also why the cost of giving stringref up is small: stringref is
+2.09x on record-shaped data where whole-file zstd is 36.7x, and stringref *plus*
+zstd is only 10% better than zstd alone. Give it up and let a real compressor
+work.
+
+[fsst]: https://www.vldb.org/pvldb/vol13/p2649-boncz.pdf
 
 ## Updating
 

@@ -374,7 +374,32 @@
   w)
 
 (defn encode
-  "Encode `v` to a fresh byte[]."
+  "Encode `v` to a fresh byte[]: ONE CBOR data item, and never anything else.
+
+  This is the interchange primitive. The bytes are `application/cbor`, any CBOR
+  reader in any language consumes them whole, and nothing is appended -- an
+  index frame would make the result stop being a single well-formed item (RFC
+  8949 3, \"still has bytes remaining after the outermost encoded item\").
+
+  IF YOU ARE STORING RATHER THAN SENDING, you probably want one of:
+
+  - `write-seq!` for many values -- a CBOR sequence (RFC 8742), indexed by
+    default, so `boring.nav/items` and `boring.mmap` can seek into it instead
+    of scanning. Reaching the last of 200k items: 10.6 ms unindexed, 1-2 us
+    indexed.
+  - `encode-indexed` for ONE large value you will navigate into. Same idea, and
+    the result is a two-item sequence rather than a single item.
+
+  Neither is a better `encode`; they produce a different artifact. The reason
+  this is not an option here is that `:index` would silently change what the
+  return value IS -- one item becomes a sequence, `application/cbor` becomes
+  `application/cbor-seq` -- which is a change of kind, not of setting.
+
+  Note the size trade, which runs the other way: indexing forces
+  `:stringref false`, because `boring.nav` cannot resolve a string reference
+  from an offset. On a value holding many similar records that costs about 2x.
+  Under a compressor it is noise -- zstd reaches 37x where stringref reaches
+  2.09x -- so see doc/STORAGE.md before optimising this by hand."
   (^bytes [v] (encode v nil))
   (^bytes [v opts]
    (let [o (resolve-opts opts)]
