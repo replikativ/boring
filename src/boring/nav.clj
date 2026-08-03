@@ -677,6 +677,22 @@
   clojure.lang.Seqable
   (seq [this] (seq (into [] this)))
 
+  ;; `count` on the items of a sequence threw AbstractMethodError -- on ordinary,
+  ;; undamaged data. `Items` implemented Seqable, Indexed and IReduceInit but
+  ;; not Counted, so `clojure.core/count` fell through to an abstract method.
+  ;; Nothing caught it because every test reaches for `seq`, `nth` or `reduce`.
+  ;;
+  ;; O(1) when the sequence was sealed with an index -- the item total is the
+  ;; sentinel node's count -- and a walk otherwise, which is what counting a
+  ;; CBOR sequence costs when nothing recorded the total. `Cursor` can promise
+  ;; O(1) unconditionally because a container's count is in its head; a
+  ;; sequence has no head at all.
+  clojure.lang.Counted
+  (count [this]
+    (if-let [t (:total idx)]
+      (long t)
+      (reduce (fn [^long n _] (inc n)) 0 this)))
+
   clojure.lang.Indexed
   (nth [this i] (.nth this i nil))
   (nth [_ i nf]

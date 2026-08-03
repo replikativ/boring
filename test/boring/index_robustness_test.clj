@@ -857,3 +857,46 @@
                                   "at byte" i "=" v "key" k)
                          false))
                   (str "byte " i " -> " v ", key " k)))))))))
+
+;; ------------------------------------- round six: contracts, not corruption
+
+(deftest count-works-on-the-items-of-a-sequence
+  (testing "`count` threw AbstractMethodError on ORDINARY, undamaged data:
+            `Items` implemented Seqable, Indexed and IReduceInit but not
+            Counted, so `clojure.core/count` fell through to an abstract method.
+            Every existing test reaches for `seq`, `nth` or `reduce`, so nothing
+            touched it. Found by a review harness that applied every entry point
+            to every shape rather than the ones each shape was written for."
+    (let [vs (vec (for [i (range 20)] {"n" i}))]
+      (doseq [ix [nil 1 4 64]]
+        (let [out (ByteArrayOutputStream.)]
+          (boring/write-seq! (boring/writer 65536 opts) vs out
+                             (cond-> opts ix (assoc :index ix)))
+          (let [it (nav/items (.toByteArray out) opts)]
+            (is (= 20 (count it)) (str "index " ix))
+            (is (= (count it) (count (seq it)) (reduce (fn [^long a _] (inc a)) 0 it))
+                (str "index " ix ": count, seq and reduce must agree"))))))))
+
+(deftest positional-reads-report-truncation-as-a-typed-error
+  (testing "`decode` reported `:boring/truncated-input` where `boring.nav` threw
+            a raw ArrayIndexOutOfBoundsException for the SAME corrupted byte --
+            415 of 5360 mutations of an UNINDEXED document, so this was the
+            navigator's contract with damaged data rather than anything to do
+            with the index. `read` gets typed truncation from its own checks;
+            `skipStructural` and the positional accessors had none.
+
+            Both accessor families needed it: `b` for single bytes, and s16/s32/
+            s64, which read a multi-byte head directly and so ran off the end
+            near the buffer's tail even after `b` was bounded."
+    (let [m (into {} (for [i (range 20)] [(format "k%02d" i) i]))
+          ^bytes bs (boring/encode m opts)]
+      (doseq [i (range (alength bs))
+              ;; indefinite-length heads and wide-argument heads are the ones
+              ;; that walk past the end
+              v [0x9F 0xBF 0xFB 0xD9 0x5F]]
+        (let [c (java.util.Arrays/copyOf bs (alength bs))]
+          (aset-byte c i (unchecked-byte v))
+          (is (try (nav/value (nav/source c opts)) true
+                   (catch clojure.lang.ExceptionInfo _ true)
+                   (catch Throwable _ false))
+              (str "byte " i " -> " v " must be typed or fine, never untyped")))))))

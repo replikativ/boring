@@ -570,9 +570,30 @@ public final class Reader {
     // null check that predicts perfectly, and it keeps the byte[] path on
     // plain array loads.
 
-    /** Unsigned byte at an absolute offset. */
+    /**
+     * Unsigned byte at an absolute offset.
+     *
+     * The explicit limit check is what makes a POSITIONAL read report
+     * `:boring/truncated-input` like every other read, instead of a raw
+     * ArrayIndexOutOfBoundsException. `read` gets typed truncation from its own
+     * checks; `skipStructural` and the `*At` accessors had none, so the same
+     * corrupted byte gave `decode` a typed error and `boring.nav` an untyped
+     * one -- 415 of 5360 mutations of an UNINDEXED document, so this is the
+     * navigator's contract with damaged data, not anything to do with the index.
+     *
+     * The array bound was always checked here; only by the JVM, and only to
+     * throw the wrong type. Measured at no cost: the JIT can prove its own
+     * check redundant once this one dominates it.
+     */
     private int b(long p) {
+        if (p < 0 || p >= limit) throw truncated(p);
         return (arr != null ? arr[(int) p] : src.at(p)) & 0xFF;
+    }
+
+    private RuntimeException truncated(long p) {
+        return Err.of("truncated-input",
+            "boring: read past the end of the input at offset " + p
+            + " (size " + limit + ")");
     }
 
     /** Signed byte. The ident hash below folds raw bytes, so it must stay signed
@@ -582,14 +603,17 @@ public final class Reader {
     }
 
     private int s16(long p) {
+        if (p < 0 || p + 2 > limit) throw truncated(p);
         return (arr != null ? (short) SHORT_BE.get(arr, (int) p) : src.i16(p)) & 0xFFFF;
     }
 
     private int s32(long p) {
+        if (p < 0 || p + 4 > limit) throw truncated(p);
         return arr != null ? (int) INT_BE.get(arr, (int) p) : src.i32(p);
     }
 
     private long s64(long p) {
+        if (p < 0 || p + 8 > limit) throw truncated(p);
         return arr != null ? (long) LONG_BE.get(arr, (int) p) : src.i64(p);
     }
 
