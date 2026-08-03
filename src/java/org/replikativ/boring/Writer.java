@@ -370,10 +370,10 @@ public final class Writer {
     /** Added to every recorded offset, so `write-seq!` gets file offsets. */
     private long idxBase = 0;
 
-    private int[] idxOffs = new int[32];
+    private long[] idxOffs = new long[32];
     private int[] idxCnts = new int[32];
     private boolean[] idxSrt = new boolean[32];
-    private int[][] idxSlots = new int[32][];
+    private long[][] idxSlots = new long[32][];
     private int idxN = 0;
 
     /**
@@ -417,7 +417,7 @@ public final class Writer {
     // in this picture and is not thread-safe anyway, so there is nothing for a
     // barrier to protect.
 
-    private int[] idxSeq = new int[1024];
+    private long[] idxSeq = new long[1024];
     private int idxSeqN = 0;
     private int idxItems = 0;
     private int idxItemCountdown = 1;
@@ -440,7 +440,7 @@ public final class Writer {
     public int idxItemTotal() { return idxItems; }
 
     /** Offsets of every `stride`th top-level item. */
-    public int[] idxItemOffsets() { return java.util.Arrays.copyOf(idxSeq, idxSeqN); }
+    public long[] idxItemOffsets() { return java.util.Arrays.copyOf(idxSeq, idxSeqN); }
 
     public void idxReset() {
         // Null the slot references, do not merely forget the count. Each slot
@@ -455,7 +455,7 @@ public final class Writer {
         idxItemCountdown = 1;
     }
     public int idxCount() { return idxN; }
-    public int[] idxContainers() { return java.util.Arrays.copyOf(idxOffs, idxN); }
+    public long[] idxContainers() { return java.util.Arrays.copyOf(idxOffs, idxN); }
     public int[] idxCounts()     { return java.util.Arrays.copyOf(idxCnts, idxN); }
     public Object[] idxSlots()   { return java.util.Arrays.copyOf(idxSlots, idxN); }
     public boolean[] idxSorted() { return java.util.Arrays.copyOf(idxSrt, idxN); }
@@ -514,13 +514,22 @@ public final class Writer {
      * Refusing is right until the format carries wider offsets: an unindexed
      * file is correct and a wrongly-indexed one is not.
      */
-    private int checkedOffset(long v) {
-        if (v < 0 || v > Integer.MAX_VALUE)
+    /**
+     * ABSOLUTE offsets are 64-bit. They used to be capped at 2 GiB because the
+     * index stored them as int32, which made a mapping larger than that
+     * unindexable -- historically fine, and not any more.
+     *
+     * The wire is unchanged for files that do not need the range: `seal-index!`
+     * still emits int32 when every offset fits, so an existing file is
+     * byte-identical, and promotes to sint64 only when it must. That is the
+     * same narrowest-type-that-fits rule the slot deltas already use, and the
+     * CBOR tag carries the width so no flag is needed.
+     */
+    private long checkedOffset(long v) {
+        if (v < 0)
             throw Err.of("index-offset-overflow",
-                "boring: an index offset reached " + v + ", past the 2 GiB the index"
-                + " format stores. Write this sequence without :index, or rotate the"
-                + " file before it reaches 2 GiB.");
-        return (int) v;
+                "boring: an index offset came out negative (" + v + ")");
+        return v;
     }
 
     /** The current position as a FILE offset, unchecked.
@@ -542,11 +551,11 @@ public final class Writer {
      *  `write-seq!` path, where each item is encoded whole and the base moves
      *  between items. Exactly one of the two is ever non-zero -- a streaming
      *  `write-seq!` leaves `idxBase` at 0 and lets `flushed` span the items. */
-    private int idxOffset(long off) { return checkedOffset(off + flushed + idxBase); }
+    private long idxOffset(long off) { return checkedOffset(off + flushed + idxBase); }
 
     /** `off` is a FILE offset, captured by `absOffset()` when the container
      *  started -- not a buffer position to be resolved now. See absOffset(). */
-    private void fillNode(int slot, long off, int n, int[] anchors, boolean sorted) {
+    private void fillNode(int slot, long off, int n, long[] anchors, boolean sorted) {
         idxOffs[slot] = checkedOffset(off);
         idxCnts[slot] = n;
         idxSlots[slot] = anchors;
@@ -1249,7 +1258,7 @@ public final class Writer {
     private void writeSeqAsArray(clojure.lang.ISeq s, int n) {
         long start = absOffset();
         head(ARRAY, n);
-        int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
+        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
         int a = 0, countdown = 1, seen = 0;
         for (; s != null; s = s.next()) {
@@ -1268,7 +1277,7 @@ public final class Writer {
     private void writeArrayOf(Iterable it, int n) {
         long start = absOffset();
         head(ARRAY, n);
-        int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
+        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
         int a = 0, countdown = 1, seen = 0;
         for (Object o : it) {
@@ -1291,7 +1300,7 @@ public final class Writer {
         head(MAP, n);
         // Iterated as a SEQ rather than an entrySet, so this cannot delegate to
         // writeMapValue without changing field order on some record types.
-        int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
+        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
         boolean sorted = true;
         int prevK0 = -1, prevK1 = -1;
@@ -1421,7 +1430,7 @@ public final class Writer {
             return;
         }
 
-        int[] anchors = new int[anchorCount(n)];
+        long[] anchors = new long[anchorCount(n)];
         int slot = reserveNode();
         // EVERY adjacent key pair, not just the anchors.
         //
@@ -1778,7 +1787,7 @@ public final class Writer {
         head(TAG, TAG_SET);
         long start = absOffset();                       // the array, not the tag
         head(ARRAY, n);
-        int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
+        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
         int a = 0, countdown = 1;
         for (int j = 0; j < n; j++) {
@@ -1917,7 +1926,7 @@ public final class Writer {
         // No comparisons on either branch: the sort just ran, so its comparator
         // is the whole answer.
         boolean sorted = !legacyCanonicalOrder;
-        int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
+        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
         int a = 0, countdown = 1;
         for (int j = 0; j < n; j++) {
@@ -2500,7 +2509,7 @@ public final class Writer {
             int n = l.size();
             long start = absOffset();
             head(ARRAY, n);
-            int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
+            long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
             int slot = anchors != null ? reserveNode() : -1;
             int a = 0, countdown = 1, seen = 0;
             if (x instanceof java.util.RandomAccess) {

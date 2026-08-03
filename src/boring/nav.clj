@@ -85,7 +85,7 @@
   found, and the caller walks."
   ^long [^Nav nav ^long off]
   (if-let [idx (.idx nav)]
-    (let [^ints cs (:containers idx)]
+    (let [^longs cs (:containers idx)]
       (loop [lo 0 hi (dec (alength cs))]
         (if (> lo hi)
           -1
@@ -251,9 +251,9 @@
     ;; `(max 0 (min (dec m) hi))` still yields 0 and `aget` threw straight at
     ;; the caller of `get`. Cheaper to notice here than to special-case both
     ;; branches, and it also covers any future node that turns out empty.
-    (if (or (neg? ns) (zero? (alength ^ints (nth (:slots idx) ns))))
+    (if (or (neg? ns) (zero? (alength ^longs (nth (:slots idx) ns))))
       (scan-map r (.headEndAt r off) n probe)
-      (let [^ints slot (nth (:slots idx) ns)
+      (let [^longs slot (nth (:slots idx) ns)
             stride (long (:stride idx))
             m (alength slot)]
         ;; Entries after anchor a, which is NOT always `stride`: the last
@@ -308,7 +308,7 @@
         (if (neg? ns)
           (loop [i 0 p (.headEndAt r off)]
             (if (= i idx) p (recur (inc i) (.skipFrom r p))))
-          (let [^ints slot (nth (:slots ix) ns)
+          (let [^longs slot (nth (:slots ix) ns)
                 stride (long (:stride ix))
                 anchor (quot idx stride)]
             (loop [i (* anchor stride) p (long (aget slot anchor))]
@@ -534,6 +534,7 @@
           bs))))
 
 (def ^:private shorts-class (class (short-array 0)))
+(def ^:private ints-class (class (int-array 0)))
 
 (defn- expand-slot
   "A slot's deltas, back to the absolute offsets every lookup path expects.
@@ -552,33 +553,44 @@
 
   Bytes are masked because Java's are signed; shorts are not, because the writer
   only narrows to sint16 within the positive range."
-  ^ints [s ^long base]
+  ^longs [s ^long base]
   (cond
     (bytes? s)
-    (let [^bytes a s n (alength a) out (int-array n)]
+    (let [^bytes a s n (alength a) out (long-array n)]
       (loop [k 0 acc base]
         (if (= k n)
           out
           (let [v (+ acc (bit-and (aget a k) 0xFF))]
-            (aset-int out k (int v))
+            (aset out k v)
             (recur (inc k) v)))))
 
     (instance? shorts-class s)
-    (let [^shorts a s n (alength a) out (int-array n)]
+    (let [^shorts a s n (alength a) out (long-array n)]
       (loop [k 0 acc base]
         (if (= k n)
           out
           (let [v (+ acc (aget a k))]
-            (aset-int out k (int v))
+            (aset out k v)
             (recur (inc k) v)))))
 
-    :else
-    (let [^ints a s n (alength a) out (int-array n)]
+    (instance? ints-class s)
+    (let [^ints a s n (alength a) out (long-array n)]
       (loop [k 0 acc base]
         (if (= k n)
           out
           (let [v (+ acc (aget a k))]
-            (aset-int out k (int v))
+            (aset out k v)
+            (recur (inc k) v)))))
+
+    ;; sint64 (tag 79), the fourth width. Only written when two anchors are more
+    ;; than 2 GiB apart, but a reader must accept what a writer may emit.
+    :else
+    (let [^longs a s n (alength a) out (long-array n)]
+      (loop [k 0 acc base]
+        (if (= k n)
+          out
+          (let [v (+ acc (aget a k))]
+            (aset out k v)
             (recur (inc k) v)))))))
 
 (defn- index-payload
@@ -614,11 +626,24 @@
           ;; about boring's own footer.
           saved (.-maxDepth r)
           _ (set! (.-maxDepth r) (int (max saved 32)))
-          [stride ^ints containers ^ints counts slots sorted _]
+          [stride raw-containers ^ints counts slots sorted _]
           (try (boring.data/frame-payload (.readFrom r ptr))
-               (finally (set! (.-maxDepth r) (int saved))))]
+               (finally (set! (.-maxDepth r) (int saved))))
+          ;; CONTAINERS ARRIVE AT EITHER WIDTH. `seal-index!` emits int32 when
+          ;; every offset fits and sint64 when one does not, and the CBOR tag is
+          ;; the declaration -- the same narrowest-that-fits rule the slot
+          ;; deltas have always used. Normalising to long here means one shape
+          ;; downstream and no width test in the binary search.
+          ^longs containers (cond
+                              (instance? (Class/forName "[J") raw-containers)
+                              raw-containers
+                              (instance? (Class/forName "[I") raw-containers)
+                              (let [^ints a raw-containers
+                                    out (long-array (alength a))]
+                                (dotimes [i (alength a)] (aset out i (long (aget a i))))
+                                out)
+                              :else nil)]
       (when (and (int? stride) (pos? (long stride)) containers
-                 (instance? (Class/forName "[I") containers)
                  (instance? (Class/forName "[I") counts)
                  (sequential? slots) (sequential? sorted)
                  ;; STRUCTURE, not just decodability. Detection proves something
@@ -659,7 +684,7 @@
                    (fn [i]
                      (let [c (long (aget containers (int i)))
                            cnt (long (aget counts (int i)))
-                           ^ints a (nth abs-slots i)
+                           ^longs a (nth abs-slots i)
                            want (if (zero? cnt) 0 (inc (quot (dec cnt) st)))]
                        (and (= (alength a) want)
                             ;; The node must describe a container that IS THERE
@@ -802,7 +827,7 @@
       ;; destructured `total` as nil and compared it, so `nth` threw an NPE --
       ;; on the 3-arity not-found form too, leaving no safe way to call it,
       ;; while `seq` and `reduce` on the same object worked.
-      (if-let [^ints offsets (:offsets idx)]
+      (if-let [^longs offsets (:offsets idx)]
         ;; O(1) to the anchor, then at most stride-1 skips.
         (let [stride (long (:stride idx))
               total (long (:total idx))]

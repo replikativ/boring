@@ -299,21 +299,38 @@
         (is (every? nil? (seq ^objects (.get f w)))
             "no anchor array may stay reachable after a reset")))))
 
-(deftest an-index-offset-past-2gb-is-refused-not-wrapped
-  (testing "the index stores offsets as int32. Past 2 GiB the cast silently
-            produced NEGATIVE offsets: `containers` stopped ascending so the
-            binary search broke, and sequence `nth` seeked to a negative
-            position. An unindexed file is correct; a wrongly-indexed one is
-            not, so this refuses rather than wraps."
-    (let [^org.replikativ.boring.Writer w (boring/writer 65536 opts)]
-      ;; Integer/MAX_VALUE is 2147483647, so a base this close overflows on the
-      ;; first anchor rather than tens of bytes later.
-      (.setIndex w (int 1) (int 4) 2147483640)
-      (is (thrown? clojure.lang.ExceptionInfo
-                   (boring/encode-buffered! w (vec (range 40)))))
-      (testing "and the sequence-offset path is checked too"
+(deftest an-index-offset-past-2gb-is-carried-not-wrapped
+  (testing "index offsets are 64-bit. They used to be int32, which capped an
+            indexed artifact at 2 GiB -- historically roomy, and not any more.
+            Before the cap was enforced the cast produced NEGATIVE offsets:
+            `containers` stopped ascending so the binary search broke, and
+            sequence `nth` seeked to a negative position. Then it threw. Now it
+            carries them, and the wire promotes to sint64 only when it must.
+
+            `idxBase` is what makes this testable without a 2 GiB file: it is
+            added to every recorded offset, so a base past 2^31 sends every
+            anchor into 64-bit territory on a document of a few hundred bytes."
+    (let [^org.replikativ.boring.Writer w (boring/writer 65536 opts)
+          base 3000000000]                       ; Integer/MAX_VALUE is 2147483647
+      (.setIndex w (int 1) (int 4) base)
+      (is (pos? (boring/encode-buffered! w (vec (range 40))))
+          "encodes rather than throwing")
+      (let [^longs cs (.idxContainers w)]
+        (is (pos? (alength cs)))
+        (is (every? #(> % Integer/MAX_VALUE) (seq cs))
+            (str "every container offset must be past 2^31, got " (vec cs)))
+        (is (apply < (seq cs)) "and they must still ascend, which is what the
+                                binary search depends on"))
+      (testing "the sequence-offset path carries the range too"
         (.setIndex w (int 1) (int 4) 0)
-        (is (thrown? clojure.lang.ExceptionInfo (.idxItem w 3000000000)))))))
+        (.idxItem w 3000000000)
+        (is (= [3000000000] (vec (.idxItemOffsets w)))
+            "a 3 GB item offset survives intact rather than wrapping negative")))
+    (testing "a negative offset is still refused -- it cannot arise from a walk,
+              so it means the arithmetic went wrong"
+      (let [^org.replikativ.boring.Writer w (boring/writer 65536 opts)]
+        (.setIndex w (int 1) (int 4) 0)
+        (is (thrown? clojure.lang.ExceptionInfo (.idxItem w -1)))))))
 
 ;; ------------------------------------------- issues outside the index itself
 ;;

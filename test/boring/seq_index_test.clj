@@ -381,9 +381,9 @@
       ;; so it is correctly skipped. What must be present is the set's array
       ;; and the inner map -- both of which live UNDER a tag, and neither of
       ;; which would exist if tags were stepped over.
-      (is (= 2 (alength ^ints (:containers idx)))
+      (is (= 2 (alength ^longs (:containers idx)))
           (str "expected the set's array and the inner map, got "
-               (alength ^ints (:containers idx))))
+               (alength ^longs (:containers idx))))
       (is (every? #(>= % 200) (seq ^ints (:counts idx)))
           "both nodes should be the 200-entry containers"))))
 

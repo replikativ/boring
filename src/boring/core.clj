@@ -802,8 +802,8 @@
              ;; returns nil when no node clears the threshold, and the body is
              ;; returned unsealed. This makes the two agree.
              (or (>= (long (.idxItemTotal ^Writer w)) min-entries)
-                 (pos? (alength ^ints (.idxContainers ^Writer w)))))
-      (let [^ints cs (.idxContainers ^Writer w)
+                 (pos? (alength ^longs (.idxContainers ^Writer w)))))
+      (let [^longs cs (.idxContainers ^Writer w)
             ^ints ns (.idxCounts ^Writer w)
             sl (.idxSlots ^Writer w)
             so (.idxSorted ^Writer w)
@@ -815,9 +815,12 @@
              ;; it claims each node's slot when it writes the container's head,
              ;; and a pre-order walk visits containers in increasing offset --
              ;; so prepending is all the ordering that is needed.
-            containers (int-array (inc m))
+            ;; OFFSETS ARE 64-BIT in memory; `seal-index!` narrows them on the
+            ;; wire when they fit, so a file under 2 GiB is byte-identical to
+            ;; what it was before the widening.
+            containers (long-array (inc m))
             counts (int-array (inc m))]
-        (aset containers 0 (int -1))
+        (aset containers 0 (long -1))
         (aset counts 0 (int (.idxItemTotal ^Writer w)))
         (System/arraycopy cs 0 containers 1 m)
         (System/arraycopy ns 0 counts 1 m)
@@ -858,7 +861,7 @@
                   (.abortStream ^Writer w)
                   (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
                   (throw t)))]
-    (if (and indexing? (pos? (alength ^ints (.idxContainers ^Writer w))))
+    (if (and indexing? (pos? (alength ^longs (.idxContainers ^Writer w))))
       ;; NO SENTINEL NODE HERE, unlike `write-seq!`. That node stands for the
       ;; sequence itself so `nav/items` can seek between top-level items; this
       ;; writes ONE value, which `nav/source` navigates into. Adding a node for
@@ -1040,7 +1043,7 @@
                           (= stride 1) n
                           :else (inc (quot (dec n) stride)))
                     0)
-                kept (when keep? (int-array m))
+                kept (when keep? (long-array m))
                   ;; EVERY adjacent key pair decides `sorted`, not the anchors.
                   ;; Comparing the anchor sample was unsound and returned WRONG
                   ;; ANSWERS: `sorted` licenses a binary search that then scans
@@ -1053,7 +1056,7 @@
                       (if (= i n)
                         q
                         (do (when (and keep? (zero? (rem i stride)))
-                              (aset ^ints kept (quot i stride) (int q)))
+                              (aset ^longs kept (quot i stride) (long q)))
                             (when (and srt (aget ^booleans srt 0) (>= (long prev) 0)
                                        (>= (.compareItemsAt r (long prev) q) 0))
                               (aset ^booleans srt 0 false))
@@ -1109,7 +1112,7 @@
   "Shape accumulated nodes into the map `seal-index!` takes. Once per sequence."
   [^java.util.ArrayList acc]
   (let [idx (vec (sort-by first acc))]
-    {:containers (int-array (map #(nth % 0) idx))
+    {:containers (long-array (map #(nth % 0) idx))
      :counts (int-array (map #(nth % 1) idx))
      :slots (mapv #(nth % 2) idx)
      :sorted (mapv #(nth % 3) idx)}))
@@ -1163,7 +1166,7 @@
                  ;; somebody else wrote may not answer with an Error.
                  (throw (ex-info "boring: index walk ran out of stack; this document is too deeply nested to index"
                                  {:type :boring/max-depth-exceeded}))))]
-     (when (pos? (alength ^ints (:containers idx)))
+     (when (pos? (alength ^longs (:containers idx)))
        (assoc idx :stride stride)))))
 
 (defn- delta-slot
@@ -1194,9 +1197,9 @@
   entries ascend and no CBOR item is zero bytes -- but the narrow encodings
   cannot represent one, so the check is what makes that an assumption about the
   walk rather than about the file."
-  [^ints offs ^long base]
+  [^longs offs ^long base]
   (let [n (alength offs)
-        d (int-array n)]
+        d (long-array n)]
     (loop [i 0 prev base mn Long/MAX_VALUE mx Long/MIN_VALUE]
       (if (= i n)
         (cond
@@ -1210,10 +1213,19 @@
             (dotimes [k n] (aset-short s k (unchecked-short (aget d k))))
             s)
 
+          (and (>= mn Integer/MIN_VALUE) (<= mx Integer/MAX_VALUE))
+          (let [a (int-array n)]
+            (dotimes [k n] (aset-int a k (unchecked-int (aget d k))))
+            a)
+
+          ;; sint64 (tag 79), the fourth tier. Only reachable when two anchors
+          ;; are more than 2 GiB apart, which needs items that large -- but the
+          ;; tier costs nothing to have, because the CBOR tag declares the width
+          ;; and a narrower slot is still emitted whenever one fits.
           :else d)
-        (let [v (long (aget offs i))
+        (let [v (aget offs i)
               delta (- v prev)]
-          (aset-int d i (int delta))
+          (aset d i delta)
           (recur (inc i) v (min mn delta) (max mx delta)))))))
 
 (defn- long->8-bytes* ^bytes [^long v]
@@ -1266,7 +1278,23 @@
             (let [n (long (.position ^Writer (write-root! w item opts)))]
               (.write out (.buffer w) 0 (int n))
               n))]
-    (let [{:keys [stride ^ints containers counts slots sorted]} index
+    (let [{:keys [stride ^longs containers counts slots sorted]} index
+          ;; NARROWEST TYPE THAT HOLDS THEM, exactly as the slot deltas do. A
+          ;; file whose offsets fit in int32 emits int32 and is byte-identical
+          ;; to what it was before offsets became 64-bit; one that does not
+          ;; promotes to sint64, and the CBOR tag tells a reader which it got.
+          wire-containers (if (and (pos? (alength containers))
+                                   (let [mx (areduce containers i m Long/MIN_VALUE
+                                                     (max m (aget containers i)))
+                                         mn (areduce containers i m Long/MAX_VALUE
+                                                     (min m (aget containers i)))]
+                                     (or (< mx Integer/MIN_VALUE) (> mx Integer/MAX_VALUE)
+                                         (< mn Integer/MIN_VALUE) (> mn Integer/MAX_VALUE))))
+                            containers
+                            (let [a (int-array (alength containers))]
+                              (dotimes [i (alength containers)]
+                                (aset-int a i (unchecked-int (aget containers i))))
+                              a))
           packed (vec (map-indexed
                        (fn [i s]
                        ;; The sequence node's sentinel offset is -1, and a file
@@ -1275,7 +1303,7 @@
                        slots))
           item (data/unknown-record
                 index-name
-                [(long stride) containers counts packed (vec sorted)
+                [(long stride) wire-containers counts packed (vec sorted)
                  (long->8-bytes* (long data-len))])]
     ;; The frame goes out under the SAME options as the data it describes.
     ;; `write-to!`'s 2-arity resolves the WRITER's options instead, so
