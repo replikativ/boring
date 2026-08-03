@@ -185,10 +185,20 @@ compared by content rather than identity. Keys that merely *look* alike stay
 distinct, per §5.6.1: `1` and `1.0` are different keys, and so are the text
 string `"a"` and the byte string `h'61'`.
 
-`{:check-duplicate-keys false}` turns this off, and it is the wrong default for
-anything reading untrusted input: silent last-wins is how two implementations
-end up disagreeing about what a document says, which is a parser differential
-with a signature check on the other side of it.
+`{:check-duplicate-keys false}` turns this off, giving **last-wins** — RFC 8949
+§5.6's second approach — on both platforms and at every map size. It is the
+wrong default for anything reading untrusted input: silent last-wins is how two
+implementations end up disagreeing about what a document says, which is a
+parser differential with a signature check on the other side of it.
+
+**Known gap, stated rather than implied.** Duplicate detection compares encoded
+bytes for *byte-string* keys and host equality for everything else. Host array
+equality is identity on both platforms, so two content-equal **typed-array**
+keys (a `short[]`, a `Uint8Array`) are not detected, and neither are
+content-equal elements of a tag-258 set. Such a document decodes to a map or set
+with more entries than the wire describes. The byte-string scan is also O(n²) in
+the number of keys, which is attacker-controlled work on read. Both want the
+same fix — compare a hash of each key's *encoded* bytes — and neither is done.
 
 ## Realistic harms, in order
 

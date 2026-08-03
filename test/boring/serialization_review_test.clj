@@ -641,3 +641,41 @@
         (let [^java.nio.ByteBuffer tiny (java.nio.ByteBuffer/allocate 4)]
           (is (thrown? java.nio.BufferOverflowException
                        (boring/write-to-buffer! w {:a "much too long for four bytes"} tiny))))))))
+
+;; ------------------------------------------------ :check-duplicate-keys (F5)
+
+(deftest check-duplicate-keys-is-wired-and-yields-a-valid-map
+  (testing "doc/SECURITY.md documented `:check-duplicate-keys false` as the way
+            to turn duplicate rejection off. The Java field existed and
+            defaulted to true, but NO entry point ever set it -- so the option
+            was silently ignored and a duplicate map still threw with it set. A
+            documented safety control that does nothing is worse than one that
+            does not exist."
+    (let [dup (unhex "a201010102")]                    ; {1:1, 1:2}
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"duplicate map key"
+                            (boring/decode dup o))
+          "rejected by default, on `decode`")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"duplicate map key"
+                            (vec (boring/decode-seq dup o)))
+          "and on `decode-seq`, which configures its reader separately")
+      (testing "with the option off the duplicate is kept LAST-WINS, and the
+                result is a VALID map. `new PersistentArrayMap(kvs)` adopts its
+                array without inspecting it, so this used to hand back a map
+                with two equal keys: count 2, `get` returning the first. RFC
+                8949 5.6 offers reject, keep-one, or hand-to-the-application --
+                a corrupt host map is none of them."
+        (doseq [decode-fn [#(boring/decode dup (assoc o :check-duplicate-keys false))
+                           #(first (boring/decode-seq dup (assoc o :check-duplicate-keys false)))]]
+          (let [m (decode-fn)]
+            (is (= {1 2} m))
+            (is (= 1 (count m)))
+            (is (= m (into {} m)) "round-trips through into, so it is well formed"))))
+      (testing "and above the array-map threshold the two sizes agree"
+        ;; 9 pairs, one key repeated -> PersistentHashMap path
+        (let [big (unhex (str "a9" (apply str (for [i (range 8)] (format "%02x%02x" i i)))
+                              "0009"))]
+          (is (thrown? clojure.lang.ExceptionInfo (boring/decode big o)))
+          (let [m (boring/decode big (assoc o :check-duplicate-keys false))]
+            (is (= 8 (count m)) "nine pairs, key 0 repeated -> eight distinct")
+            (is (= 9 (get m 0)) "and the LAST value for the repeated key wins")
+            (is (= m (into {} m)))))))))

@@ -547,6 +547,13 @@
   ;; counts ITEMS rather than bytes.
   (set! (.-maxItems r) (long (get opts :max-items 0)))
   (set! (.-validateUtf8 r) (boolean (get opts :validate-utf8 true)))
+  ;; WIRED, having been documented and then never applied. doc/SECURITY.md
+  ;; describes `:check-duplicate-keys false` as the way to turn duplicate
+  ;; rejection off; the Java field existed and defaulted to true, but no entry
+  ;; point ever set it, so the option was silently ignored and a duplicate map
+  ;; still threw with it set. A documented safety control that does nothing is
+  ;; worse than one that does not exist.
+  (set! (.-checkDuplicateKeys r) (boolean (get opts :check-duplicate-keys true)))
   (set! (.-autoConstructRecords r)
         (boolean (get opts :auto-construct-records? false)))
   ;; ALWAYS set, never `when-let` -- see `configure!`.
@@ -1453,6 +1460,13 @@
   ;; counts ITEMS rather than bytes.
      (set! (.-maxItems r) (long (get opts :max-items 0)))
      (set! (.-validateUtf8 r) (boolean (get opts :validate-utf8 true)))
+  ;; WIRED, having been documented and then never applied. doc/SECURITY.md
+  ;; describes `:check-duplicate-keys false` as the way to turn duplicate
+  ;; rejection off; the Java field existed and defaulted to true, but no entry
+  ;; point ever set it, so the option was silently ignored and a duplicate map
+  ;; still threw with it set. A documented safety control that does nothing is
+  ;; worse than one that does not exist.
+     (set! (.-checkDuplicateKeys r) (boolean (get opts :check-duplicate-keys true)))
      (set! (.-autoConstructRecords r)
            (boolean (get opts :auto-construct-records? false)))
      (set! (.-registry r) (or (:registry opts) TagRegistry/EMPTY))

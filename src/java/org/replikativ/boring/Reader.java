@@ -1498,8 +1498,20 @@ public final class Reader {
                 }
             }
         }
+        // WITH THE CHECK OFF, LAST-WINS -- never a corrupt map.
+        //
+        // `new PersistentArrayMap(kvs)` ADOPTS the array without inspecting it,
+        // so duplicate keys produced a map with two equal keys: `count` said 2
+        // and `get` returned the first, which is not a valid Clojure map and is
+        // the same defect class as adopting an oversized vector tail. RFC 8949
+        // 5.6 offers three approaches -- reject, keep one, or hand duplicates to
+        // the application -- and a corrupt host map is none of them.
+        //
+        // `createAsIfByAssoc` is last-wins, matching what the hash-map branch
+        // below has always done, so the two sizes now agree instead of
+        // differing at the array-map threshold.
         if (fitsArrayMap(kvs, n)) {
-            return new clojure.lang.PersistentArrayMap(kvs);
+            return clojure.lang.PersistentArrayMap.createAsIfByAssoc(kvs);
         }
         return clojure.lang.PersistentHashMap.create(kvs);
     }

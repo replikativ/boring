@@ -179,6 +179,10 @@
                      :option :auto-construct-records?})))
   (set! (.-maxDepth r) (get opts :max-depth 1024))
   (set! (.-validateUtf8 r) (boolean (get opts :validate-utf8 true)))
+  ;; WIRED, having been documented and then never applied on either platform.
+  ;; The field existed and defaulted to true, but nothing set it, so
+  ;; `:check-duplicate-keys false` was silently ignored. See the JVM core.
+  (set! (.-checkDuplicateKeys r) (boolean (get opts :check-duplicate-keys true)))
   ;; ALWAYS set, never `when-let` -- a reusable reader kept the previous
   ;; call's registry. See the JVM core for the reproduction.
   (set! (.-registry r) (:registry opts))
