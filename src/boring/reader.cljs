@@ -480,6 +480,22 @@
          (str "boring: " nm " must wrap an array") {:tag 27}))
   argument)
 
+(defn- nest-dims
+  "Nested vectors for a tag-40 payload of any dimensionality, row-major.
+
+  `cnt` is the number of elements in the block at `offset`, so each level
+  divides rather than re-multiplying the remaining shape. The product was
+  checked against the payload length before the first call, which is what makes
+  the indexing here total."
+  [flat typed? shape dim offset cnt]
+  (let [len (nth shape dim)]
+    (if (= dim (dec (count shape)))
+      (mapv (fn [i] (if typed? (aget flat (+ offset i)) (nth flat (+ offset i))))
+            (range len))
+      (let [sub (quot cnt len)]
+        (mapv (fn [i] (nest-dims flat typed? shape (inc dim) (+ offset (* i sub)) sub))
+              (range len))))))
+
 (defn- cbor-integer?
   "An integer as CBOR means it: a JS number with no fractional part, or a
   BigInt. `number?` alone is true of 1.5."
@@ -807,26 +823,57 @@
     40 (let [l (read! r)]
          (when-not (and (vector? l) (= 2 (count l)))
            (err :boring/bad-tag-content "boring: tag 40 must wrap [dims flat-array]" {:tag 40}))
-         (let [dims (nth l 0) flat (nth l 1)]
-           (when-not (and (vector? dims) (= 2 (count dims)))
+         (let [dims (nth l 0)
+               flat0 (nth l 1)
+               ;; RFC 8746 3.1.1 allows a Homogeneous Array (tag 41) as payload.
+               flat (if (and (data/tagged-value? flat0) (= 41 (:tag flat0)))
+                      (:value flat0) flat0)]
+           ;; ANY DIMENSIONALITY -- 3.1.1 never bounds the count, and demanding
+           ;; exactly two rejected the RFC's own 3-D examples.
+           (when-not (and (vector? dims) (pos? (count dims)))
              (err :boring/bad-tag-content
-                  "boring: only 2-dimensional tag 40 arrays are supported" {:tag 40}))
-           (let [rows (nth dims 0) cols (nth dims 1)
-                 declared (.-length flat)]
-             (when (or (neg? rows) (neg? cols))
-               (err :boring/bad-tag-content "boring: negative tag 40 dimension" {:tag 40}))
+                  "boring: tag 40 dimensions array must not be empty" {:tag 40}))
+           (let [shape (mapv (fn [d]
+                               (when-not (cbor-integer? d)
+                                 (err :boring/bad-tag-content
+                                      "boring: tag 40 dimensions must be integers" {:tag 40}))
+                               ;; "unsigned integers distinct from zero" (3.1.1)
+                               (when-not (pos? d)
+                                 (err :boring/bad-tag-content
+                                      (str "boring: tag 40 dimension " d " is not an unsigned "
+                                           "integer distinct from zero")
+                                      {:tag 40}))
+                               d)
+                             dims)
+                 total (reduce * 1 shape)
+                 ;; TYPE-CHECKED BEFORE IT IS USED. Reading `.-length` off
+                 ;; whatever the wire supplied and calling `.subarray` on it
+                 ;; escaped as a raw TypeError for a text-string payload,
+                 ;; straight through doc/SECURITY.md's typed-failure guarantee.
+                 typed? (.isView js/ArrayBuffer flat)
+                 declared (cond typed? (.-length flat)
+                                (vector? flat) (count flat)
+                                :else
+                                (err :boring/bad-tag-content
+                                     (str "boring: tag 40 payload must be a CBOR array, a typed "
+                                          "array or a homogeneous array, got " (pr-str flat))
+                                     {:tag 40}))]
              ;; Dimensions and payload length both come from the wire; if they
              ;; disagree the item is malformed, and trusting the dimensions
              ;; would be an unchecked allocation.
-             (when (not= (* rows cols) declared)
+             (when (not= total declared)
                (err :boring/bad-tag-content
-                    (str "boring: tag 40 dimensions " rows "x" cols
+                    (str "boring: tag 40 dimensions " (pr-str dims)
                          " do not match the " declared "-element payload")
                     {:tag 40}))
-             (let [out (make-array rows)]
-               (dotimes [i rows]
-                 (aset out i (.subarray flat (* i cols) (* (inc i) cols))))
-               out))))
+             (if (and (= 2 (count shape)) typed?)
+               ;; A 2-D typed array keeps the zero-copy array-of-subarrays it
+               ;; has always produced; everything else becomes nested vectors.
+               (let [rows (nth shape 0) cols (nth shape 1) out (make-array rows)]
+                 (dotimes [i rows]
+                   (aset out i (.subarray flat (* i cols) (* (inc i) cols))))
+                 out)
+               (nest-dims flat typed? shape 0 0 total)))))
 
     37 (let [bs (read! r)]
          (when-not (and (instance? js/Uint8Array bs) (= 16 (.-length bs)))

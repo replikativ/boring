@@ -1535,6 +1535,37 @@ public final class Reader {
         return (java.util.List) o;
     }
 
+    /** `:tag`/`:value` of a `boring.data.TaggedValue`, looked up rather than cast.
+     *  The record is defined in Clojure, which compiles AFTER this class, so
+     *  `instanceof` is not available here -- `ILookup` is. */
+    private static final clojure.lang.Keyword KW_TAG = clojure.lang.Keyword.intern("tag");
+    private static final clojure.lang.Keyword KW_VALUE = clojure.lang.Keyword.intern("value");
+
+    /** One element of a tag-40 payload, which may be a typed array or a CBOR array. */
+    private static Object elementAt(Object flat, int i) {
+        if (flat instanceof java.util.List) return ((java.util.List) flat).get(i);
+        return java.lang.reflect.Array.get(flat, i);
+    }
+
+    /** Nested vectors for a tag-40 payload of any dimensionality, row-major.
+     *
+     *  `count` is the number of elements in the block starting at `offset`, so
+     *  each level divides rather than re-multiplying the remaining shape. The
+     *  product was range-checked against the payload length before the first
+     *  call, which is what makes the indexing here total. */
+    private static Object nestDims(Object flat, int[] shape, int dim, int offset, int count) {
+        int len = shape[dim];
+        Object[] out = new Object[len];
+        if (dim == shape.length - 1) {
+            for (int i = 0; i < len; i++) out[i] = elementAt(flat, offset + i);
+        } else {
+            int sub = count / len;
+            for (int i = 0; i < len; i++)
+                out[i] = nestDims(flat, shape, dim + 1, offset + i * sub, sub);
+        }
+        return PersistentVector.adopt(out);
+    }
+
     private static java.math.BigInteger integerContent(Object o, int tag) {
         if (o instanceof clojure.lang.BigInt) return ((clojure.lang.BigInt) o).toBigInteger();
         if (o instanceof java.math.BigInteger) return (java.math.BigInteger) o;
@@ -2333,10 +2364,13 @@ public final class Reader {
                     throw Err.of("bad-tag-content",
                         "boring: tag 40 first element must be a dimensions array", "tag", 40L);
                 java.util.List dims = (java.util.List) dimsRaw;
-                if (dims.size() != 2)
+                // ANY DIMENSIONALITY. RFC 8746 3.1.1 describes "an array ... of
+                // dimensions, which are unsigned integers distinct from zero"
+                // and never bounds how many. Demanding exactly two rejected the
+                // RFC's own 3-D examples -- conforming input, refused.
+                if (dims.isEmpty())
                     throw Err.of("bad-tag-content",
-                        "boring: only 2-dimensional tag 40 arrays are supported, got "
-                        + dims.size() + " dimensions", "tag", 40L);
+                        "boring: tag 40 dimensions array must not be empty", "tag", 40L);
                 // TYPES CHECKED BEFORE THEY ARE USED. Casting the dimensions
                 // straight to Number and asking `Array.getLength` for the
                 // payload's length let a WELL-FORMED tag with wrong-shaped
@@ -2345,42 +2379,73 @@ public final class Reader {
                 // typed-failure guarantee. The byte fuzzer rarely builds a
                 // valid tag around invalid content, which is the limitation
                 // that document already names.
-                Object d0 = dims.get(0), d1 = dims.get(1);
-                if (!(d0 instanceof Number) || !(d1 instanceof Number)
-                    || d0 instanceof Double || d0 instanceof Float
-                    || d1 instanceof Double || d1 instanceof Float)
-                    throw Err.of("bad-tag-content",
-                        "boring: tag 40 dimensions must be integers", "tag", 40L);
-                long rowsL = ((Number) d0).longValue(), colsL = ((Number) d1).longValue();
-                if (rowsL < 0 || colsL < 0)
-                    throw Err.of("bad-tag-content", "boring: negative tag 40 dimension",
-                                 "tag", 40L);
-                if (rowsL > Integer.MAX_VALUE || colsL > Integer.MAX_VALUE
-                    || rowsL * colsL > Integer.MAX_VALUE)
-                    throw Err.of("bad-tag-content",
-                        "boring: tag 40 dimensions " + rowsL + "x" + colsL
-                        + " exceed the largest array this platform can build", "tag", 40L);
-                int rows = (int) rowsL, cols = (int) colsL;
+                int nd = dims.size();
+                int[] shape = new int[nd];
+                long total = 1;
+                for (int i = 0; i < nd; i++) {
+                    Object d = dims.get(i);
+                    if (!(d instanceof Number) || d instanceof Double || d instanceof Float
+                        || (d instanceof java.math.BigInteger
+                            && ((java.math.BigInteger) d).bitLength() > 31))
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 40 dimensions must be integers", "tag", 40L);
+                    long dv = ((Number) d).longValue();
+                    // "distinct from zero" is the RFC's wording, so 0 is not a
+                    // conforming dimension -- and boring already declines to
+                    // EMIT a zero-row matrix as tag 40 for the same reason.
+                    if (dv <= 0)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 40 dimension " + dv + " is not an unsigned integer "
+                            + "distinct from zero", "tag", 40L);
+                    if (dv > Integer.MAX_VALUE)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 40 dimension " + dv
+                            + " exceeds the largest array this platform can build", "tag", 40L);
+                    shape[i] = (int) dv;
+                    total *= dv;
+                    if (total > Integer.MAX_VALUE)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 40 dimensions " + dims
+                            + " exceed the largest array this platform can build", "tag", 40L);
+                }
                 Object flat = l.get(1);
-                if (flat == null || !flat.getClass().isArray()
-                    || flat instanceof Object[])
-                    throw Err.of("bad-tag-content",
-                        "boring: tag 40 payload must be a primitive typed array, got "
+                // THREE PAYLOAD SHAPES, all conforming per 3.1.1: "any one of a
+                // CBOR array of major type 4, a Typed Array, or a Homogeneous
+                // Array". boring accepted only the middle one, which is why
+                // Figure 2 of the defining RFC did not decode here.
+                if (flat instanceof clojure.lang.ILookup
+                    && Long.valueOf(41L).equals(clojure.lang.RT.get(flat, KW_TAG)))
+                    flat = clojure.lang.RT.get(flat, KW_VALUE);
+                int declared;
+                boolean typed = flat != null && flat.getClass().isArray()
+                                && !(flat instanceof Object[]);
+                if (typed) declared = java.lang.reflect.Array.getLength(flat);
+                else if (flat instanceof java.util.List) declared = ((java.util.List) flat).size();
+                else throw Err.of("bad-tag-content",
+                        "boring: tag 40 payload must be a CBOR array, a typed array or a "
+                        + "homogeneous array, got "
                         + (flat == null ? "nil" : flat.getClass().getName()), "tag", 40L);
-                int declared = java.lang.reflect.Array.getLength(flat);
                 // The dimensions come from the wire and the payload length comes
                 // from the wire; if they disagree the item is malformed, and
-                // allocating rows*cols on the strength of the dimensions alone
+                // allocating the product on the strength of the dimensions alone
                 // would be an unchecked allocation.
-                if ((long) rows * cols != declared)
+                if (total != declared)
                     throw Err.of("bad-tag-content",
-                        "boring: tag 40 dimensions " + rows + "x" + cols
+                        "boring: tag 40 dimensions " + dims
                         + " do not match the " + declared + "-element payload", "tag", 40L);
-                Class<?> comp = flat.getClass().getComponentType();
-                Object out = java.lang.reflect.Array.newInstance(comp, rows, cols);
-                for (int r = 0; r < rows; r++)
-                    System.arraycopy(flat, r * cols, ((Object[]) out)[r], 0, cols);
-                return out;
+                // A 2-D typed array keeps its dedicated primitive matrix type
+                // (double[][], long[][]), which is what boring writes and what
+                // `boring.core` dispatches on. Everything else -- any other
+                // dimensionality, or a plain CBOR array payload -- becomes
+                // nested vectors, the only shape that generalises.
+                if (nd == 2 && typed) {
+                    Class<?> comp = flat.getClass().getComponentType();
+                    Object out = java.lang.reflect.Array.newInstance(comp, shape[0], shape[1]);
+                    for (int r = 0; r < shape[0]; r++)
+                        System.arraycopy(flat, r * shape[1], ((Object[]) out)[r], 0, shape[1]);
+                    return out;
+                }
+                return nestDims(flat, shape, 0, 0, (int) total);
             }
             case 37: {                                       // UUID
                 Object v = read();

@@ -50,6 +50,11 @@
    ["tag40-bad-arity" "d8288101"]
    ["tag40-dims-not-nums" "d828828161784400000000"]
    ["tag40-flat-not-arr" "d828828102627879"]
+   ;; DIMS OF ARITY 2, so the payload check is actually reached. The case above
+   ;; has a 1-element dims array, so it tripped the dimensionality check and
+   ;; never touched the payload -- which is how ClojureScript's `.-length` /
+   ;; `.subarray` on a text string escaped as a raw TypeError.
+   ["tag40-text-payload" "d8288282010363616263"]
    ["tag40-dim-mismatch" "d828828109d84e480000000000000000"]
    ["tag258-not-array" "d9010201"]
    ["tag1002-not-map" "d903ea01"]

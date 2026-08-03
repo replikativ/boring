@@ -53,18 +53,33 @@
              ["float dimension"       [[1.5 2] (byte-array 4)]]
              ["negative dimension"    [[-1 2] (byte-array 4)]]
              ["payload not an array"  [[2 2] "not-an-array"]]
-             ["payload a vector"      [[2 2] [1 2 3 4]]]
-             ["payload nil"           [[0 0] nil]]
+             ["zero dimension"        [[0 0] nil]]
              ["dimensions overflow"   [[100000000 100000000] (byte-array 4)]]
-             ["three dimensions"      [[1 2 3] (byte-array 6)]]]]
+             ["empty dimensions"      [[] (byte-array 0)]]
+             ["dims/payload mismatch" [[2 3] [1 2 3 4 5]]]]]
       (let [bs (boring/encode (data/tagged-value 40 content) o)]
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"tag 40|dimension|2-dimensional"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"tag 40|dimension|payload"
                               (boring/decode bs o))
             (str label " must be a typed :boring/bad-tag-content")))))
   (testing "and a valid matrix still decodes"
     (let [m (into-array (Class/forName "[D")
                         [(double-array [1.0 2.0]) (double-array [3.0 4.0])])]
-      (is (= "[[D" (.getName (class (boring/decode (boring/encode m o) o))))))))
+      (is (= "[[D" (.getName (class (boring/decode (boring/encode m o) o)))))))
+  ;; RFC 8746 3.1.1 admits "any one of a CBOR array of major type 4, a Typed
+  ;; Array, or a Homogeneous Array" as the payload, and bounds the dimension
+  ;; count nowhere. boring demanded a typed array and exactly two dimensions,
+  ;; so Figure 2 of the defining RFC did not decode -- conforming input,
+  ;; refused, which doc/COMPATIBILITY.md calls the worst kind of interop bug.
+  (testing "the shapes RFC 8746 permits all decode"
+    (let [d #(boring/decode (boring/encode (data/tagged-value 40 %) o) o)]
+      (is (= [[2 4 8] [4 16 256]] (d [[2 3] [2 4 8 4 16 256]]))
+          "Figure 2: a plain CBOR array payload")
+      (is (= [[2 4 8] [4 16 256]] (d [[2 3] (data/tagged-value 41 [2 4 8 4 16 256])]))
+          "a tag-41 Homogeneous Array payload")
+      (is (= [[[1 2] [3 4]] [[5 6] [7 8]]] (d [[2 2 2] [1 2 3 4 5 6 7 8]]))
+          "three dimensions")
+      (is (= [1 2 3] (d [[3] [1 2 3]]))
+          "one dimension"))))
 
 ;; ------------------------------------------------------------------- S6
 
