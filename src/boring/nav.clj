@@ -482,9 +482,20 @@
 
 (defn value
   "Realise the subtree at the cursor into a Clojure value, through the ordinary
-  decoder -- same registry, same records, same everything."
-  [^Cursor c]
-  (realize (.nav c) (.off c)))
+  decoder -- same registry, same records, same everything.
+
+  TOTAL on non-cursors, which is not tidiness but a trap removed. `get` returns
+  a CURSOR when it descends a map or array, and the REALISED VALUE when it
+  descends a tag -- because a tag's reader is arbitrary, so structure does not
+  imply semantics. That is documented, but it means `(value (get c k))` worked
+  or threw a ClassCastException depending on the WIRE REPRESENTATION of the
+  thing you asked for: a sorted-map is a tag, a plain map is not, and the caller
+  cannot see the difference from the outside. Anything already realised is
+  returned unchanged."
+  [c]
+  (if (instance? Cursor c)
+    (let [^Cursor c c] (realize (.nav c) (.off c)))
+    c))
 
 (defn value-type
   "What is at the cursor, without decoding it: :map :array :text :bytes :tag

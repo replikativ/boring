@@ -3,7 +3,7 @@
   The portable ones live in `boring.canonical-parity-test`, because the whole
   lesson of that review was that a `.clj` test beside the JVM implementation
   does not cover a guarantee the library makes on two runtimes."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [are deftest is testing]]
             [clojure.zip]
             [boring.core :as boring]
             [boring.data :as data]
@@ -332,3 +332,53 @@
         (testing "a forked CURSOR works too, and keeps its position"
           (let [c (nav/source (boring/encode {"a" {"b" 7}} o) o)]
             (is (= 7 (nav/value (get-in (nav/fork c) ["a" "b"]))))))))))
+
+(deftest value-is-total-so-lookups-behave-the-same-through-tags
+  (testing "`get` returns a CURSOR when it descends a map or array and the
+            REALISED VALUE when it descends a tag -- documented, because a tag's
+            reader is arbitrary. But it meant `(value (get c k))` threw a
+            ClassCastException or not depending on the WIRE REPRESENTATION of
+            what you asked for: a sorted-map is a tag, a plain map is not, and
+            the caller cannot tell from the outside. Found by writing that
+            expression in a probe and having it fail on the sorted case only."
+    (let [c (nav/source (boring/encode {"plain"  {"y" 2}
+                                        "sorted" (into (sorted-map) {"x" 1 "y" 2})
+                                        "set"    #{1 2}
+                                        "vec"    [1 2]} o) o)]
+      (is (= 2 (nav/value (get (get c "plain") "y"))))
+      (is (= 2 (nav/value (get (get c "sorted") "y")))
+          "the same expression must work through a tag")
+      (is (= 2 (nav/value (nth (get c "vec") 1))))
+      (is (= #{1 2} (nav/value (get c "set"))))
+      (is (nil? (nav/value (get (get c "plain") "zz")))
+          "and a miss stays nil rather than becoming an exception"))))
+
+(deftest the-concurrency-detector-does-not-fire-on-single-threaded-use
+  (testing "a false positive would break correct code, which is worse than the
+            bug the detector exists for. Every nesting shape a caller can
+            reasonably build: realising children inside a reduce, a full zipper
+            traversal, binary search through a sorted map, count inside a
+            reduce, and `compareItemsAt`, which calls skipFrom twice."
+    (let [nested {"a" {"b" [1 2 {"c" #{1 2 3}}]}
+                  "d" (into (sorted-map) {"x" 1 "y" 2})
+                  "e" (vec (for [i (range 30)] {"n" i "s" (str i)}))}
+          bs (boring/encode nested o)
+          out (java.io.ByteArrayOutputStream.)]
+      (boring/write-seq! (boring/writer 8192 o)
+                         (vec (for [i (range 50)] {"n" i "v" [i i]})) out
+                         (assoc o :index 4 :index-min 2))
+      (let [seqbs (.toByteArray out)
+            c (nav/source bs o)
+            it (nav/items seqbs o)]
+        (are [x] (some? x)
+          (nav/value (get-in c ["a" "b"]))
+          (doall (map nav/value (seq (get-in c ["a" "b"]))))
+          (reduce (fn [a x] (conj a (nav/value x))) [] (get c "e"))
+          (reduce (fn [a x] (conj a (nav/value (get x "n")))) [] it)
+          (reduce (fn [a x] (conj a (nav/value (nth (get x "v") 1)))) [] it)
+          (loop [z (nav/zipper c) n 0]
+            (if (or (clojure.zip/end? z) (> n 400)) n (recur (clojure.zip/next z) (inc n))))
+          (nav/value (get (get c "d") "y"))
+          (reduce (fn [a x] (+ (long a) (long (count x)))) 0 it)
+          (doall (map (fn [i] (nav/value (nth it i))) (range 50)))
+          (doall (map nav/byte-span (seq (get c "e")))))))))
