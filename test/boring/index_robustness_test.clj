@@ -290,3 +290,104 @@
       (testing "and the sequence-offset path is checked too"
         (.setIndex w (int 1) (int 4) 0)
         (is (thrown? clojure.lang.ExceptionInfo (.idxItem w 3000000000)))))))
+
+;; ------------------------------------------- issues outside the index itself
+;;
+;; Found by the same reviews. Two of these are on `main` and therefore in a
+;; released version; none is caused by the index, but all of them ship with it.
+
+(defrecord Widget [a b])
+
+(deftest nav-realises-with-the-decode-options-it-was-given
+  (testing "`nav/source` promised that `opts` \"are the decode options
+            realisation will use (:registry and friends)\" and that realising
+            goes through the ordinary reader, \"same registry, same records\".
+            The Reader was left at its defaults, so `opts` reached only the
+            ENCODE side used for key probes. A registered record came back as a
+            raw tag-27 frame instead of the type, and a caller's `:max-depth` --
+            a security bound -- was not enforced on this path at all."
+    (let [reg (-> (boring/tag-registry) (boring/register-record-class Widget))
+          o {:stringref false :registry reg}
+          bs (boring/encode {"w" (->Widget 1 2)} o)]
+      (is (= (boring/decode bs o) (nav/value (nav/source bs o)))
+          "nav must realise exactly what decode returns")
+      (is (instance? Widget (nav/value (get (nav/source bs o) "w")))
+          "and a registered record must come back as the record type"))
+    (testing "and :max-depth is enforced rather than ignored"
+      (let [deep (reduce (fn [acc _] [acc]) [] (range 40))
+            bs (boring/encode deep {:stringref false})]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (nav/value (nav/source bs {:stringref false :max-depth 4}))))))))
+
+(deftest a-failed-read-does-not-poison-the-readers-depth
+  (testing "`enter()` incremented before throwing, and only array/map unwind it
+            in a finally -- so a rejected read permanently consumed a level of
+            budget on a Reader that `boring.nav` shares across every lookup. A
+            later, perfectly shallow read then failed because of an earlier one."
+    (let [deep (boring/encode (reduce (fn [acc _] [acc]) [] (range 20))
+                              {:stringref false})
+          shallow (boring/encode [1 2 3] {:stringref false})
+          o {:stringref false :max-depth 4}]
+      (dotimes [_ 5]
+        (is (thrown? clojure.lang.ExceptionInfo (nav/value (nav/source deep o)))))
+      (is (= [1 2 3] (nav/value (nav/source shallow o)))
+          "a shallow value must still read after repeated deep failures"))))
+
+(deftest nested-tags-are-bounded-by-max-depth
+  (testing "arrays and maps charged the depth budget; tag payloads did not, so
+            tag recursion was the one nesting maxDepth failed to bound and
+            enough of them blew the stack. `skip` must agree with `read` about
+            the limit, or the cheap path routes around the expensive path's
+            bound -- and skipping is what navigation does."
+    ;; c0 = tag 0, repeated, then a small int
+    (let [bs (byte-array (concat (repeat 40 (unchecked-byte 0xC0)) [(byte 0)]))
+          r (org.replikativ.boring.Reader. bs)]
+      (set! (.-maxDepth r) (int 4))
+      (is (thrown? clojure.lang.ExceptionInfo (.skipFrom r 0))
+          "skipping deeply nested tags must hit the depth limit"))))
+
+(deftest canonical-maps-refuse-keys-that-encode-identically
+  (testing "distinct keys can encode to the same bytes -- Long 1 and
+            BigInteger.ONE are both `01` -- and a map with two identical CBOR
+            keys is output boring's own decoder rejects. Canonical SETS always
+            checked this; maps did not, so the same hazard produced an
+            unreadable document rather than an error."
+    (let [m (doto (java.util.IdentityHashMap.)
+              (.put (Long/valueOf 1) "a")
+              (.put java.math.BigInteger/ONE "b"))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"encode identically"
+                            (boring/encode m {:profile :canonical}))))))
+
+(deftest a-collection-that-lies-about-its-size-is-refused
+  (testing "the head is written from size() BEFORE the entries, so a mismatch is
+            a malformed document regardless. With an index it is worse: the
+            anchor array is sized from the same number, so an over-run walks off
+            it and an under-fill lets the NEXT item be swallowed as the missing
+            element -- which, in an indexed sequence, was the index frame."
+    (let [liar (proxy [java.util.AbstractCollection] []
+                 (size [] 1)
+                 (iterator [] (.iterator (java.util.ArrayList. [1 2]))))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reported 1 entries"
+                            (boring/encode liar {:stringref false}))))
+    (let [liar (proxy [java.util.AbstractCollection] []
+                 (size [] 2)
+                 (iterator [] (.iterator (java.util.ArrayList. [1]))))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reported 2 entries"
+                            (boring/encode liar {:stringref false}))))))
+
+(deftest write-seq-3-arity-uses-the-writers-options
+  (testing "`write-to!` and `encode-into!` fall back to the writer's resolved
+            options; `write-seq!` resolved nil instead. So a writer built with
+            {:stringref false} -- which is exactly what a navigable file needs --
+            silently emitted stringref output through this one entry point, and
+            `boring.nav` then refused to read what it had just written."
+    (let [w (boring/writer 65536 {:stringref false})
+          a (ByteArrayOutputStream.)
+          b (ByteArrayOutputStream.)
+          vs (vec (for [i (range 5)] {"msg" "repeated" "n" i}))]
+      (boring/write-seq! w vs a)
+      (boring/write-seq! w vs b {:stringref false})
+      (is (= (seq (.toByteArray a)) (seq (.toByteArray b)))
+          "the 3-arity must match passing the writer's own opts explicitly")
+      (is (= vs (mapv nav/value (seq (nav/items (.toByteArray a) {:stringref false}))))
+          "and the result must be navigable"))))

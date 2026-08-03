@@ -114,7 +114,16 @@
                     (instance? ByteSource src) (Reader. ^ByteSource src)
                     :else (fail :boring/unsupported-source
                                 "boring.nav: expected a byte[] or a ByteSource"
-                                {:got (class src)}))]
+                                {:got (class src)}))
+        ;; The Reader was previously left at its defaults, so `opts` reached
+        ;; only the ENCODE side (`probe-for`). Every decode option was silently
+        ;; dropped: `:registry` was ignored, so a registered record came back as
+        ;; a raw `#boring/record` frame instead of the type -- contradicting
+        ;; both this namespace's promise that realising goes "through the
+        ;; ordinary reader, same registry, same records" and `source`'s that
+        ;; `opts` "are the decode options realisation will use". A caller's
+        ;; `:max-depth`, which is a security bound, was not enforced here at all.
+        _ (boring/configure-reader! r opts)]
     (when (.hasStringrefRoot r)
       (fail :boring/stringref-not-navigable
             (str "boring.nav: this document opens a stringref namespace, and a "

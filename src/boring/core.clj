@@ -444,7 +444,11 @@
        (throw (ex-info "boring: input ended mid-value (truncated or malformed)"
                        {:type :boring/truncated-input} e#)))))
 
-(defn- configure-reader!
+(defn ^:no-doc configure-reader!
+  "Apply decode options to a Reader. Public only so `boring.nav` can apply the
+  SAME options its docstrings promise -- it realises values through this reader,
+  so a differently-configured one would decode differently from `decode`.
+  Not part of the supported API."
   ^Reader [^Reader r opts]
   (set! (.-tolerateUnknownTags r) (boolean (get opts :tolerate-unknown-tags true)))
   (set! (.-instantAsDate r) (not= :instant (get opts :instant-type :date)))
@@ -541,7 +545,13 @@
   mean buffering the whole sequence in memory. ZIP's central directory and
   Parquet's footer are at the end for the same reason. See `seal-index!` if you
   are writing items incrementally rather than from a seq."
-  (^long [^Writer w values ^java.io.OutputStream out] (write-seq! w values out nil))
+  ;; The 3-arity uses the WRITER'S options, like `write-to!` and
+  ;; `encode-into!`. It resolved nil instead, so a writer built
+  ;; `(writer n {:stringref false})` -- the setting a navigable file requires --
+  ;; silently emitted stringref output through this one entry point, and
+  ;; `boring.nav` then refused to read the result.
+  (^long [^Writer w values ^java.io.OutputStream out]
+   (write-seq! w values out (writer-opts w)))
   (^long [^Writer w values ^java.io.OutputStream out opts]
    (let [o (resolve-opts opts)
          stride (long (or (:index opts) 0))

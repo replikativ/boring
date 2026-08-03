@@ -348,8 +348,16 @@ public final class Reader {
                 return;
             }
             case 6:
+                // A tag counts toward the depth budget. Without this, tag
+                // recursion was the one nesting that maxDepth did not bound --
+                // `c0 c0 c0 ... 00` skipped happily with maxDepth 1 and blew
+                // the stack with enough of them, turning a documented SECURITY
+                // limit into one that holds for containers only. `read()`
+                // already charges for tags; skipping has to agree, or the
+                // cheap path is the way around the expensive path's bound.
                 arg(info);
-                skipStructural();
+                enter();
+                try { skipStructural(); } finally { exit(); }
                 return;
             default:                       // major 7: arg() covers the width
                 if (info == 31)
@@ -393,18 +401,26 @@ public final class Reader {
         finally { pos = save; }
     }
 
-    /** Offset just past the whole value at `p`. */
+    /**
+     * Offset just past the whole value at `p`.
+     *
+     * Restores `depth` as well as `pos`. These positional entry points are the
+     * navigator's whole interface to the Reader, and it calls them on values
+     * that may legitimately fail -- a probe into a malformed index, a
+     * too-deep subtree. Leaving depth raised made the NEXT, unrelated call
+     * fail too.
+     */
     public long skipFrom(long p) {
-        long save = pos;
+        long save = pos; int d = depth;
         try { pos = p; skipValue(); return pos; }
-        finally { pos = save; }
+        finally { pos = save; depth = d; }
     }
 
-    /** Decode the value at `p`. Does not disturb the caller's position. */
+    /** Decode the value at `p`. Does not disturb the caller's position or depth. */
     public Object readFrom(long p) {
-        long save = pos;
+        long save = pos; int d = depth;
         try { pos = p; return read(); }
-        finally { pos = save; }
+        finally { pos = save; depth = d; }
     }
 
     /**
@@ -575,10 +591,18 @@ public final class Reader {
     }
 
     private void enter() {
-        if (++depth > maxDepth)
+        // Check BEFORE incrementing. `++depth > maxDepth` left depth raised on
+        // the throwing path, and only array/map have a `finally { exit(); }` to
+        // unwind it -- so a rejected read permanently consumed a level of the
+        // budget on a Reader that callers reuse. Two positional reads later, a
+        // perfectly shallow value was refused because of an earlier one that
+        // failed. `boring.nav` shares one Reader across every lookup, so this
+        // reached the navigation path.
+        if (depth + 1 > maxDepth)
             throw Err.of("max-depth-exceeded",
                 "boring: nesting deeper than maxDepth (" + maxDepth + ")",
                 "max-depth", (long) maxDepth);
+        depth++;
     }
 
     private void exit() { depth--; }

@@ -1042,18 +1042,39 @@ public final class Writer {
                 + " differently. Convert to a plain map/set, or register a handler.");
     }
 
+    /**
+     * A collection's reported size disagreed with what iterating it yielded.
+     *
+     * The head is written from `size()` BEFORE the entries, so a mismatch is a
+     * malformed document either way -- a head claiming five elements with four
+     * behind it. With an index it is worse: the anchor array is sized from the
+     * same number, so an over-run walks off it, and an under-fill leaves the
+     * following item to be swallowed as the missing element. Refusing beats
+     * emitting bytes that do not decode.
+     *
+     * Reachable from a concurrently mutated map, a weakly consistent
+     * collection, or a custom `size()` that lies.
+     */
+    private void countMismatch(int declared, int actual) {
+        throw Err.of("collection-size-mismatch",
+            "boring: a collection reported " + declared + " entries and yielded "
+            + actual + ". It was probably mutated while being encoded.");
+    }
+
     private void writeSeqAsArray(clojure.lang.ISeq s, int n) {
         int start = pos;
         head(ARRAY, n);
         int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
-        int a = 0, countdown = 1;
+        int a = 0, countdown = 1, seen = 0;
         for (; s != null; s = s.next()) {
+            if (++seen > n) countMismatch(n, seen);
             if (anchors != null && --countdown == 0) {
                 anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
             writeValue(s.first());
         }
+        if (seen != n) countMismatch(n, seen);
         if (anchors != null) fillNode(slot, start, n, anchors, false);
     }
 
@@ -1064,13 +1085,15 @@ public final class Writer {
         head(ARRAY, n);
         int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
-        int a = 0, countdown = 1;
+        int a = 0, countdown = 1, seen = 0;
         for (Object o : it) {
+            if (++seen > n) countMismatch(n, seen);
             if (anchors != null && --countdown == 0) {
                 anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
             writeValue(o);
         }
+        if (seen != n) countMismatch(n, seen);
         if (anchors != null) fillNode(slot, start, n, anchors, false);
     }
 
@@ -1154,10 +1177,11 @@ public final class Writer {
         // containers big enough to be indexed at all.
         boolean sorted = true;
         int prevK0 = -1, prevK1 = -1;
-        int a = 0, countdown = 1;
+        int a = 0, countdown = 1, seen = 0;
 
         for (Object o : m.entrySet()) {
             Map.Entry e = (Map.Entry) o;
+            if (++seen > n) countMismatch(n, seen);
             if (--countdown == 0) { anchors[a++] = idxOffset(pos); countdown = idxStride; }
             int k0 = pos;
             writeValue(e.getKey());
@@ -1166,6 +1190,7 @@ public final class Writer {
             prevK0 = k0; prevK1 = pos;
             writeValue(e.getValue());
         }
+        if (seen != n) countMismatch(n, seen);
         fillNode(slot, start, n, anchors, sorted);
     }
 
@@ -1424,6 +1449,13 @@ public final class Writer {
         scratch.inclMetadata = this.inclMetadata;
         scratch.maxDepth = this.maxDepth;
         scratch.depthOffset = this.depth;
+        // The claim above is "EVERY behaviour-affecting option is inherited",
+        // and this one was not: an :encode-fallback configured to rescue an
+        // unsupported value worked everywhere except in a map KEY or a set
+        // ELEMENT under :canonical, where those are pre-encoded here. The
+        // option silently did not apply exactly where the document was hardest
+        // to fix by hand.
+        scratch.encodeFallback = this.encodeFallback;
         // The index fields are the one group DELIBERATELY not inherited, and
         // this is checked rather than commented because getting it wrong is
         // silent: the scratch writer encodes keys into its own buffer, so any
@@ -1462,6 +1494,19 @@ public final class Writer {
         java.util.Arrays.sort(order, (p, q) -> legacy
             ? compareBytesLengthFirst(encodedKeys[p], encodedKeys[q])
             : compareBytes(encodedKeys[p], encodedKeys[q]));
+
+        // Distinct keys can encode identically -- Long 1 and BigInteger.ONE
+        // both reduce to `01` -- and a map with two identical CBOR keys is
+        // output that boring's OWN decoder rejects as :boring/duplicate-map-key.
+        // Canonical SETS have always checked this; maps did not, so the same
+        // hazard produced an unreadable document instead of an error. Only
+        // reachable from a map that considers such keys distinct (an
+        // IdentityHashMap, a custom comparator), which is why it survived.
+        for (int j = 1; j < n; j++)
+            if (compareBytes(encodedKeys[order[j - 1]], encodedKeys[order[j]]) == 0)
+                throw Err.of("canonical-duplicate",
+                    "boring: two map keys encode identically under :canonical ("
+                    + keys[order[j - 1]] + " and " + keys[order[j]] + ")");
 
         int start = pos;
         head(MAP, n);
@@ -2059,8 +2104,9 @@ public final class Writer {
             head(ARRAY, n);
             int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
             int slot = anchors != null ? reserveNode() : -1;
-            int a = 0, countdown = 1;
+            int a = 0, countdown = 1, seen = 0;
             if (x instanceof java.util.RandomAccess) {
+                // Indexed by position, so it cannot yield more or fewer than n.
                 for (int i = 0; i < n; i++) {
                     if (anchors != null && --countdown == 0) {
                         anchors[a++] = idxOffset(pos); countdown = idxStride;
@@ -2069,11 +2115,13 @@ public final class Writer {
                 }
             } else {
                 for (Object o : l) {
+                    if (++seen > n) countMismatch(n, seen);
                     if (anchors != null && --countdown == 0) {
                         anchors[a++] = idxOffset(pos); countdown = idxStride;
                     }
                     writeValue(o);
                 }
+                if (seen != n) countMismatch(n, seen);
             }
             if (anchors != null) fillNode(slot, start, n, anchors, false);
             return;
