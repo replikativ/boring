@@ -547,45 +547,62 @@
          stride (long (or (:index opts) 0))
          indexing? (pos? stride)
          min-entries (long (or (:index-min opts) 16))
-         ;; Each item is scanned in the WRITER'S OWN BUFFER, right after it is
-         ;; encoded and before it is handed to the stream. That keeps write-seq!
-         ;; streaming -- no need to re-read the output, which may be a file --
-         ;; while still deriving the index from encoded bytes rather than from
-         ;; the writer's internals.
-         scan-rdr (when indexing? (Reader. (byte-array 1)))
-         nodes (when indexing? (java.util.ArrayList.))
-         offs (when indexing? (java.util.ArrayList.))
-         n-items (volatile! 0)
+         ;; Container nodes are captured BY THE WRITER as it encodes, not by
+         ;; walking the bytes afterwards. The writer already knows the offset it
+         ;; is about to write to and a container's entry count before emitting
+         ;; it, so the nodes fall out of encoding. Walking instead cannot beat
+         ;; ~31% of encode time however it is written, because CBOR containers
+         ;; are element-counted and stepping over a subtree means walking it.
+         ;;
+         ;; `build-index` still exists and is still the reference implementation
+         ;; -- it is the only way to index bytes somebody else wrote, and
+         ;; `boring.writer-index-test` pins the two against each other.
+         _ (when indexing? (.idxReset ^Writer w))
          total (reduce (fn [^long total v]
-                         (when (and indexing? (zero? (rem (long @n-items) stride)))
-                           (.add ^java.util.ArrayList offs (int total)))
-                         (vswap! n-items inc)
+                         ;; `total` is this item's offset in the file. The
+                         ;; writer folds it into every offset it records, so the
+                         ;; nodes come out file-relative with no second pass,
+                         ;; and it counts the items itself -- a volatile here
+                         ;; measured slower than the boxing it was meant to
+                         ;; replace, because a volatile write is a barrier.
+                         (when indexing?
+                           (.setIndex ^Writer w (int stride) (int min-entries) total)
+                           (.idxItem ^Writer w total))
                          (let [n (long (.position ^Writer (write-root! w v o)))]
-                           (when indexing?
-                             (.reset ^Reader scan-rdr (buffer w))
-                             ;; Straight into the sequence-wide accumulator.
-                             ;; Shaping a per-item result and copying out of it
-                             ;; cost more than the walk it described.
-                             (scan-into! scan-rdr 0 n stride min-entries total nodes))
                            (.write out (.buffer w) 0 (int n))
                            (+ total n)))
                        0
                        values)]
      (if indexing?
-       (let [;; The sequence itself is a node at the sentinel offset -1: it has
+       (let [^ints cs (.idxContainers ^Writer w)
+             ^ints ns (.idxCounts ^Writer w)
+             sl (.idxSlots ^Writer w)
+             so (.idxSorted ^Writer w)
+             m (alength cs)
+             ;; The sequence itself is a node at the sentinel offset -1: it has
              ;; no container header on the wire, but it behaves like one, and a
-             ;; sentinel keeps a single uniform node list rather than two.
-             all (cons [-1 (int @n-items) (int-array offs) false] (vec nodes))
-             sorted-nodes (vec (sort-by first all))]
-         (+ total
-            (long (seal-index!
-                   w out
-                   {:stride stride
-                    :containers (int-array (map #(nth % 0) sorted-nodes))
-                    :counts (int-array (map #(nth % 1) sorted-nodes))
-                    :slots (mapv #(nth % 2) sorted-nodes)
-                    :sorted (mapv #(nth % 3) sorted-nodes)}
-                   total))))
+             ;; sentinel keeps a single uniform node list rather than two. It
+             ;; sorts first, and the writer's own nodes are already ascending --
+             ;; it claims each node's slot when it writes the container's head,
+             ;; and a pre-order walk visits containers in increasing offset --
+             ;; so prepending is all the ordering that is needed.
+             containers (int-array (inc m))
+             counts (int-array (inc m))]
+         (aset containers 0 (int -1))
+         (aset counts 0 (int (.idxItemTotal ^Writer w)))
+         (System/arraycopy cs 0 containers 1 m)
+         (System/arraycopy ns 0 counts 1 m)
+         (let [items (.idxItemOffsets ^Writer w)]
+           (.setIndex ^Writer w (int 0) (int 0) 0)   ; capture off again
+           (+ total
+              (long (seal-index!
+                     w out
+                     {:stride stride
+                      :containers containers
+                      :counts counts
+                      :slots (into [items] sl)
+                      :sorted (into [false] so)}
+                     total)))))
        total))))
 
 (def ^:const index-name

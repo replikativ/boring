@@ -428,7 +428,7 @@
                        (/ (timed #(nth unindexed 199999) 3 2) 1000.0))))
     (flush)
     (doseq [st [1 8 16 64 256]]
-      (let [bs (build st)
+      (let [^bytes bs (build st)
             idx (- (alength bs) plain)
             ;; the slot as it sits on the wire, BEFORE expansion -- its class is
             ;; the width, since the CBOR element type is what declares it
@@ -473,9 +473,61 @@
   (println "keys (:canonical / :archival) additionally allow binary search; arrays")
   (println "index positionally under any profile."))
 
+;; ------------------------------------------------------------- write cost
+;;
+;; What INDEXING costs at write time, against a baseline that is not rigged.
+;;
+;; Two rules this section exists to enforce, both learned the hard way here.
+;;
+;; The baseline must be a real `BufferedOutputStream` to a real file. Earlier
+;; numbers used a Clojure `proxy` sink, which is slow enough to pad the
+;; denominator and quietly shrink every overhead percentage computed from it.
+;;
+;; Every path is warmed before any path is timed, and the cases interleave. Two
+;; warmup iterations and a straight loop put whichever case ran first at a
+;; disadvantage large enough to INVERT the ranking -- one run had "no index"
+;; slower than a stride-1 index, which is impossible and was the harness.
+
+(defn run-write []
+  (let [opts {:stringref false}
+        vs (vec (for [i (range 50000)]
+                  {"ts" (+ 1700000000 (* i 37)) "lvl" "info" "n" i
+                   "msg" (str "event " i)
+                   "ctx" {"thread" (str "w" (mod i 8)) "ns" "app.core"}}))
+        cases [["no index" opts]
+               ["stride 1" (assoc opts :index 1)]
+               ["stride 8" (assoc opts :index 8)]
+               ["stride 16" (assoc opts :index 16)]
+               ["stride 16, min 2" (assoc opts :index 16 :index-min 2)]]
+        f (doto (File/createTempFile "boring-write-bench" ".cbor") .deleteOnExit)
+        w (boring/writer 65536 opts)
+        run (fn [o] (let [t0 (System/nanoTime)]
+                      (with-open [out (java.io.BufferedOutputStream.
+                                       (FileOutputStream. f) 262144)]
+                        (boring/write-seq! w vs out o))
+                      (/ (- (System/nanoTime) t0) 1e6)))]
+    (println "\nWRITE COST — 50 000 log records, BufferedOutputStream to a file")
+    ;; warm EVERY case before timing ANY of them
+    (dotimes [_ 8] (doseq [[_ o] cases] (run o)))
+    (let [samples (reduce (fn [m _] (reduce (fn [m [label o]]
+                                              (update m label (fnil conj []) (run o)))
+                                            m cases))
+                          {} (range 10))
+          base (apply min (samples "no index"))]
+      (println (format "  %-20s %9s %9s %10s" "case" "min ms" "median" "vs base"))
+      (doseq [[label _] cases]
+        (let [xs (vec (sort (samples label)))
+              mn (first xs)]
+          (println (format "  %-20s %9.2f %9.2f %9.0f%%"
+                           label mn (nth xs (quot (count xs) 2))
+                           (* 100.0 (/ (- mn base) base))))
+          (flush))))
+    (println "  (file size" (.length f) "bytes)")))
+
 (defn -main [& args]
   (let [only (set args)
         run? (fn [k] (or (empty? only) (contains? only (name k))))]
     (when (run? :skip) (run-skip))
     (when (run? :cursor) (run-cursor))
-    (when (run? :index) (run-index))))
+    (when (run? :index) (run-index))
+    (when (run? :write) (run-write))))

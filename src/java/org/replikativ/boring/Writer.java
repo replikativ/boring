@@ -337,6 +337,137 @@ public final class Writer {
      *  encoding 4.4x slower than plain on keyword-keyed maps. */
     private Writer canonicalScratch;
 
+    // ---- container index, captured while encoding -------------------------
+    //
+    // The writer already knows every offset it is about to write to, and it
+    // knows a container's entry count before emitting a byte of it. So the
+    // index falls out of encoding rather than out of a second pass over the
+    // result, which is what `boring.core/index-walk` does. That walk cannot
+    // beat 31% of encode time no matter how it is written, because CBOR
+    // containers are element-counted and stepping over a subtree means walking
+    // it. Nothing here needs a subtree's LENGTH -- only where its entries
+    // start -- which is why the same property that makes reading expensive
+    // makes writing free.
+    //
+    // Off unless `setIndex` is called. `idxStride == 0` is the off switch and
+    // is checked once per container, never per byte.
+    //
+    // DELIBERATELY NOT inherited by `canonicalSubWriter`: a scratch writer
+    // encodes map keys into its OWN buffer, so any node it recorded would
+    // carry offsets into bytes that get copied elsewhere. See the assertion
+    // there.
+
+    private int idxStride = 0;
+    private int idxMinEntries = 16;
+    /** Added to every recorded offset, so `write-seq!` gets file offsets. */
+    private long idxBase = 0;
+
+    private int[] idxOffs = new int[32];
+    private int[] idxCnts = new int[32];
+    private boolean[] idxSrt = new boolean[32];
+    private int[][] idxSlots = new int[32][];
+    private int idxN = 0;
+
+    /** Turn capture on. `stride` of 0 turns it off. */
+    public void setIndex(int stride, int minEntries, long base) {
+        this.idxStride = stride;
+        this.idxMinEntries = minEntries;
+        this.idxBase = base;
+    }
+
+    // ---- sequence offsets -------------------------------------------------
+    //
+    // `write-seq!` also wants the offset of every Nth top-level ITEM, which it
+    // knows from its own running byte count. Two earlier homes for that list
+    // both cost more than this one:
+    //
+    //   java.util.ArrayList  boxes an Integer per item -- at stride 1 that is
+    //                        one allocation per record
+    //   a Clojure volatile   avoids the boxing and costs MORE: three volatile
+    //   holding an int[]     reads and two volatile writes per anchor, and a
+    //                        volatile write is a store barrier. Measured, this
+    //                        was slower than the boxing it replaced.
+    //
+    // A plain Java field needs neither. The writer is already the mutable thing
+    // in this picture and is not thread-safe anyway, so there is nothing for a
+    // barrier to protect.
+
+    private int[] idxSeq = new int[1024];
+    private int idxSeqN = 0;
+    private int idxItems = 0;
+    private int idxItemCountdown = 1;
+
+    /**
+     * A top-level item begins at `off`. Records an anchor every `stride`th one
+     * and counts them all, so the caller needs no per-item state of its own.
+     */
+    public void idxItem(long off) {
+        if (idxStride <= 0) return;
+        if (--idxItemCountdown == 0) {
+            if (idxSeqN == idxSeq.length) idxSeq = java.util.Arrays.copyOf(idxSeq, idxSeqN * 2);
+            idxSeq[idxSeqN++] = (int) off;
+            idxItemCountdown = idxStride;
+        }
+        idxItems++;
+    }
+
+    /** How many top-level items `idxItem` has seen. */
+    public int idxItemTotal() { return idxItems; }
+
+    /** Offsets of every `stride`th top-level item. */
+    public int[] idxItemOffsets() { return java.util.Arrays.copyOf(idxSeq, idxSeqN); }
+
+    public void idxReset() {
+        idxN = 0;
+        idxSeqN = 0;
+        idxItems = 0;
+        idxItemCountdown = 1;
+    }
+    public int idxCount() { return idxN; }
+    public int[] idxContainers() { return java.util.Arrays.copyOf(idxOffs, idxN); }
+    public int[] idxCounts()     { return java.util.Arrays.copyOf(idxCnts, idxN); }
+    public Object[] idxSlots()   { return java.util.Arrays.copyOf(idxSlots, idxN); }
+    public boolean[] idxSorted() { return java.util.Arrays.copyOf(idxSrt, idxN); }
+
+    /** Anchors an indexed container of `n` entries needs at the current stride. */
+    private int anchorCount(int n) {
+        return idxStride == 1 ? n : ((n - 1) / idxStride) + 1;
+    }
+
+    private boolean indexing(int n) {
+        return idxStride > 0 && n >= idxMinEntries;
+    }
+
+    /**
+     * Claim this container's slot BEFORE its entries are written, and fill it
+     * after.
+     *
+     * Order is the point. A node is only complete when its container ends, so
+     * appending on completion yields post-order -- every child before its
+     * parent -- and `read-index` binary-searches the container offsets, so it
+     * needs them ascending. Claiming at the head instead makes the array
+     * pre-order, and a pre-order DFS visits containers in strictly increasing
+     * start offset: a container starts before all of its descendants, and
+     * siblings ascend. So the array comes out sorted with no sort.
+     */
+    private int reserveNode() {
+        if (idxN == idxOffs.length) {
+            int m = idxN * 2;
+            idxOffs = java.util.Arrays.copyOf(idxOffs, m);
+            idxCnts = java.util.Arrays.copyOf(idxCnts, m);
+            idxSrt = java.util.Arrays.copyOf(idxSrt, m);
+            idxSlots = java.util.Arrays.copyOf(idxSlots, m);
+        }
+        return idxN++;
+    }
+
+    private void fillNode(int slot, long off, int n, int[] anchors, boolean sorted) {
+        idxOffs[slot] = (int) (off + idxBase);
+        idxCnts[slot] = n;
+        idxSlots[slot] = anchors;
+        idxSrt[slot] = sorted;
+    }
+
     private static final clojure.lang.Keyword K_N =
         clojure.lang.Keyword.intern(null, "n");
     private static final clojure.lang.Keyword K_TAG =
@@ -862,31 +993,122 @@ public final class Writer {
     }
 
     private void writeSeqAsArray(clojure.lang.ISeq s, int n) {
+        int start = pos;
         head(ARRAY, n);
-        for (; s != null; s = s.next()) writeValue(s.first());
+        int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
+        int slot = anchors != null ? reserveNode() : -1;
+        int a = 0, countdown = 1;
+        for (; s != null; s = s.next()) {
+            if (anchors != null && --countdown == 0) {
+                anchors[a++] = pos + (int) idxBase; countdown = idxStride;
+            }
+            writeValue(s.first());
+        }
+        if (anchors != null) fillNode(slot, start, n, anchors, false);
+    }
+
+    /** An array of `n` elements from any Iterable, indexed if it is big enough. */
+    @SuppressWarnings("rawtypes")
+    private void writeArrayOf(Iterable it, int n) {
+        int start = pos;
+        head(ARRAY, n);
+        int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
+        int slot = anchors != null ? reserveNode() : -1;
+        int a = 0, countdown = 1;
+        for (Object o : it) {
+            if (anchors != null && --countdown == 0) {
+                anchors[a++] = pos + (int) idxBase; countdown = idxStride;
+            }
+            writeValue(o);
+        }
+        if (anchors != null) fillNode(slot, start, n, anchors, false);
     }
 
     @SuppressWarnings("rawtypes")
     private void writeRecordFields(Object fields) {
         Map m = (Map) fields;
         if (canonical) { writeMapCanonical(m); return; }
-        head(MAP, m.size());
+        int n = m.size();
+        int start = pos;
+        head(MAP, n);
+        // Iterated as a SEQ rather than an entrySet, so this cannot delegate to
+        // writeMapValue without changing field order on some record types.
+        int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
+        int slot = anchors != null ? reserveNode() : -1;
+        boolean sorted = true;
+        int prevK0 = -1, prevK1 = -1;
+        int a = 0, countdown = 1;
         for (clojure.lang.ISeq s = clojure.lang.RT.seq(fields); s != null; s = s.next()) {
             Map.Entry e = (Map.Entry) s.first();
+            boolean anchor = (anchors != null && --countdown == 0);
+            int k0 = pos;
+            if (anchor) { anchors[a++] = k0 + (int) idxBase; countdown = idxStride; }
             writeValue(e.getKey());
+            if (anchor) {
+                if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
+                    sorted = false;
+                prevK0 = k0; prevK1 = pos;
+            }
             writeValue(e.getValue());
         }
+        if (anchors != null) fillNode(slot, start, n, anchors, sorted);
+    }
+
+    /**
+     * Bytewise comparison of two encoded items already sitting in `buf`,
+     * matching {@link Reader#compareItemsAt}: shorter first when one is a
+     * prefix of the other.
+     */
+    private int cmpInBuf(int a0, int a1, int b0, int b1) {
+        int an = a1 - a0, bn = b1 - b0, n = Math.min(an, bn);
+        for (int i = 0; i < n; i++) {
+            int x = buf[a0 + i] & 0xFF, y = buf[b0 + i] & 0xFF;
+            if (x != y) return x < y ? -1 : 1;
+        }
+        return Integer.compare(an, bn);
     }
 
     @SuppressWarnings("rawtypes")
     private void writeMapValue(Map m) {
         if (canonical) { writeMapCanonical(m); return; }
-        head(MAP, m.size());
+        int n = m.size();
+        int start = pos;
+        head(MAP, n);
+
+        if (!indexing(n)) {                     // the ordinary path, untouched
+            for (Object o : m.entrySet()) {
+                Map.Entry e = (Map.Entry) o;
+                writeValue(e.getKey());
+                writeValue(e.getValue());
+            }
+            return;
+        }
+
+        int[] anchors = new int[anchorCount(n)];
+        int slot = reserveNode();
+        // `sorted` is not assumed here: this is the NON-canonical path, so keys
+        // arrive in whatever order the map iterates. A sorted-map or an
+        // array-map built in order is sorted in fact, and the byte-derived
+        // index would notice, so this one does too -- comparing only ANCHOR
+        // keys, which is what a reader binary-searches.
+        boolean sorted = true;
+        int prevK0 = -1, prevK1 = -1;
+        int a = 0, countdown = 1;
+
         for (Object o : m.entrySet()) {
             Map.Entry e = (Map.Entry) o;
+            boolean anchor = (--countdown == 0);
+            int k0 = pos;
+            if (anchor) { anchors[a++] = k0 + (int) idxBase; countdown = idxStride; }
             writeValue(e.getKey());
+            if (anchor) {
+                if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
+                    sorted = false;
+                prevK0 = k0; prevK1 = pos;
+            }
             writeValue(e.getValue());
         }
+        fillNode(slot, start, n, anchors, sorted);
     }
 
     // ---- time, uuid, rational ----------------------------------------------
@@ -1104,8 +1326,18 @@ public final class Writer {
                     + items[order[j - 1]] + " and " + items[order[j]] + ")");
 
         head(TAG, TAG_SET);
+        int start = pos;                       // the array, not the tag
         head(ARRAY, n);
-        for (int j = 0; j < n; j++) writeValue(items[order[j]]);
+        int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
+        int slot = anchors != null ? reserveNode() : -1;
+        int a = 0, countdown = 1;
+        for (int j = 0; j < n; j++) {
+            if (anchors != null && --countdown == 0) {
+                anchors[a++] = pos + (int) idxBase; countdown = idxStride;
+            }
+            writeValue(items[order[j]]);
+        }
+        if (anchors != null) fillNode(slot, start, n, anchors, false);
     }
 
     /**
@@ -1134,6 +1366,15 @@ public final class Writer {
         scratch.inclMetadata = this.inclMetadata;
         scratch.maxDepth = this.maxDepth;
         scratch.depthOffset = this.depth;
+        // The index fields are the one group DELIBERATELY not inherited, and
+        // this is checked rather than commented because getting it wrong is
+        // silent: the scratch writer encodes keys into its own buffer, so any
+        // node it recorded would carry offsets into bytes that are then copied
+        // somewhere else entirely -- a plausible-looking index pointing at the
+        // wrong places, which no round-trip test would catch.
+        if (scratch.idxStride != 0)
+            throw Err.of("index-scratch-leak",
+                "boring: the canonical scratch writer must never index");
         return scratch;
     }
 
@@ -1164,14 +1405,25 @@ public final class Writer {
             ? compareBytesLengthFirst(encodedKeys[p], encodedKeys[q])
             : compareBytes(encodedKeys[p], encodedKeys[q]));
 
+        int start = pos;
         head(MAP, n);
+        // The cheapest site of all: keys arrive already encoded, so an anchor
+        // is just `pos` before the copy, and `sorted` is TRUE by construction
+        // -- this method just sorted them -- so it costs no comparisons at all.
+        int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
+        int slot = anchors != null ? reserveNode() : -1;
+        int a = 0, countdown = 1;
         for (int j = 0; j < n; j++) {
             int k = order[j];
+            if (anchors != null && --countdown == 0) {
+                anchors[a++] = pos + (int) idxBase; countdown = idxStride;
+            }
             ensure(encodedKeys[k].length);
             System.arraycopy(encodedKeys[k], 0, buf, pos, encodedKeys[k].length);
             pos += encodedKeys[k].length;
             writeValue(vals[k]);
         }
+        if (anchors != null) fillNode(slot, start, n, anchors, true);
     }
 
     public void writeBoolean(boolean b) { u8(SIMPLE | (b ? 21 : 20)); }
@@ -1712,23 +1964,21 @@ public final class Writer {
             return;
         }
 
-        if (x instanceof Map) {
-            Map m = (Map) x;
-            if (canonical) { writeMapCanonical(m); return; }
-            head(MAP, m.size());
-            for (Object o : m.entrySet()) {
-                Map.Entry e = (Map.Entry) o;
-                writeValue(e.getKey());
-                writeValue(e.getValue());
-            }
-            return;
-        }
+        // These four delegated to inline copies of the loops in writeMapValue
+        // and writeSeqAsArray. Duplicated loops meant the index hook had to be
+        // written four more times, and the first attempt missed exactly this
+        // one -- plain Clojure maps never reached the instrumented method, so
+        // every map came back unindexed while the named method looked correct.
+        if (x instanceof Map) { writeMapValue((Map) x); return; }
         if (x instanceof Set) {
             Set s = (Set) x;
             if (canonical) { writeSetCanonical(s); return; }
             head(TAG, TAG_SET);
-            head(ARRAY, s.size());
-            for (Object o : s) writeValue(o);
+            // The node describes the ARRAY, not the tag: the byte walk descends
+            // tags and indexes the container beneath, so `start` is taken after
+            // the tag head or the two would disagree about this container's
+            // offset.
+            writeArrayOf(s, s.size());
             return;
         }
         if (x instanceof List) {
@@ -1738,18 +1988,32 @@ public final class Writer {
                 if (shape != null) { writeShapedArray(l, shape); return; }
             }
             int n = l.size();
+            int start = pos;
             head(ARRAY, n);
+            int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
+            int slot = anchors != null ? reserveNode() : -1;
+            int a = 0, countdown = 1;
             if (x instanceof java.util.RandomAccess) {
-                for (int i = 0; i < n; i++) writeValue(l.get(i));
+                for (int i = 0; i < n; i++) {
+                    if (anchors != null && --countdown == 0) {
+                        anchors[a++] = pos + (int) idxBase; countdown = idxStride;
+                    }
+                    writeValue(l.get(i));
+                }
             } else {
-                for (Object o : l) writeValue(o);
+                for (Object o : l) {
+                    if (anchors != null && --countdown == 0) {
+                        anchors[a++] = pos + (int) idxBase; countdown = idxStride;
+                    }
+                    writeValue(o);
+                }
             }
+            if (anchors != null) fillNode(slot, start, n, anchors, false);
             return;
         }
         if (x instanceof java.util.Collection) {
             java.util.Collection col = (java.util.Collection) x;
-            head(ARRAY, col.size());
-            for (Object o : col) writeValue(o);
+            writeArrayOf(col, col.size());
             return;
         }
         // A fallback turns "one bad field kills the document" into "one bad
