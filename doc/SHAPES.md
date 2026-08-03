@@ -325,15 +325,13 @@ Each entry costs 4 bytes; a lookup scans up to *N*-1 items. On 200 000 items of
 The sweet spot moves with item size — the scan cost is per item, the index cost
 per entry — so there is no default worth baking in.
 
-### What it does NOT do
+### Reaching into an item
 
-This indexes **top-level items in a sequence**. It says nothing about the
-structure inside an item, so descending into a map is still a scan, and that
-scan is linear in the map's width: measured 0.35 µs at 10 keys and 276 µs at
-5 000. A hierarchical index — key or path to offset, carried in the same
-trailing item — would fit this mechanism unchanged. The open question there is
-not how to carry it but *what to index*, which is a schema decision rather than
-an encoding one.
+The offsets above locate top-level items. The same trailing item also carries a
+node per **container**, which is what reaches inside one — see "part two"
+below. That was written as future work in an earlier draft of this document and
+has since shipped; the sequence offsets are simply the node at the sentinel
+offset −1, so both live in one uniform list.
 
 
 ---
