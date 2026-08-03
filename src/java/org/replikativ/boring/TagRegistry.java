@@ -94,6 +94,12 @@ public final class TagRegistry {
 
     public TagRegistry withWriter(Class<?> cls, long tag, clojure.lang.IFn writeFn) {
         checkTag(tag);
+        if (cls != null && !Writer.isRegisterableClass(cls))
+            throw Err.of("unregisterable-class",
+                "boring: " + cls.getName() + " is written before the registry is"
+                + " consulted, so a handler for it could never run. Registering one"
+                + " silently did nothing. Wrap the value in a type of your own, or"
+                + " use :encode-fallback.");
         return new TagRegistry(plus(writers, cls, new Object[]{tag, writeFn}),
                                readers, recordCtors, recordNames);
     }

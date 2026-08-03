@@ -1949,7 +1949,41 @@ public final class Reader {
                     throw Err.of("bad-tag-content", "boring: tag 1002 must wrap a map",
                                  "tag", 1002L);
                 java.util.Map m = (java.util.Map) v;
+                // RFC 9581's map rules, ENFORCED rather than assumed.
+                //
+                // Both numbers used to go through longValue(), which silently
+                // TRUNCATED: `{1 1.5}` is a perfectly valid one-and-a-half
+                // second duration and decoded as one second. A wrong value is
+                // the worst outcome available here, and the writer's own
+                // `{1 seconds, -9 nanos}` subset hid it because round trips
+                // never produce the other forms.
+                //
+                // The rules below are the RFC's. What boring does not represent
+                // -- decimal-fraction and bigfloat bases (keys 4 and 5), and
+                // the scaled-fraction keys other than -9 -- is REFUSED with a
+                // typed error naming the key, rather than reported as "no base
+                // value" or ignored. Refusing a conforming form we cannot carry
+                // losslessly is honest; truncating it is not.
                 Object sec = m.get(1L), nano = m.get(-9L);
+                for (Object k : m.keySet()) {
+                    if (!(k instanceof Number)) continue;
+                    long kk = ((Number) k).longValue();
+                    if (kk == 4 || kk == 5)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 base key " + kk + " (decimal fraction /"
+                            + " bigfloat) is not a form boring represents", "tag", 1002L);
+                    // Unsigned keys are CRITICAL in RFC 9581: a reader that does
+                    // not understand one must fail rather than ignore it.
+                    if (kk >= 0 && kk != 1)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 has unknown critical key " + kk, "tag", 1002L);
+                    // Only one scaled fraction may appear, and only -9 is one
+                    // boring can carry exactly.
+                    if (kk < 0 && kk != -9)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 scaled-fraction key " + kk
+                            + " is not a form boring represents", "tag", 1002L);
+                }
                 if (sec == null)
                     throw Err.of("bad-tag-content",
                                  "boring: tag 1002 has no base value (key 1)", "tag", 1002L);
@@ -1959,11 +1993,39 @@ public final class Reader {
                 if (!(sec instanceof Number))
                     throw Err.of("bad-tag-content",
                                  "boring: tag 1002 base value must be a number", "tag", 1002L);
-                if (nano != null && !(nano instanceof Number))
+                boolean fracBase = (sec instanceof Double) || (sec instanceof Float);
+                if (nano == null) {
+                    if (!fracBase)
+                        return java.time.Duration.ofSeconds(((Number) sec).longValue());
+                    // A fractional base with no scaled fraction: exact, or refused.
+                    double d = ((Number) sec).doubleValue();
+                    if (Double.isNaN(d) || Double.isInfinite(d))
+                        throw Err.of("bad-tag-content",
+                                     "boring: tag 1002 base value is not finite", "tag", 1002L);
+                    double secs = Math.floor(d);
+                    long nanos = Math.round((d - secs) * 1e9);
+                    if (Math.abs((secs + nanos / 1e9) - d) > 1e-9)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 base value " + d
+                            + " is not representable to nanosecond precision", "tag", 1002L);
+                    return java.time.Duration.ofSeconds((long) secs, nanos);
+                }
+                // With a scaled fraction present, RFC 9581 requires an INTEGER
+                // base and an UNSIGNED fraction. Both were accepted and
+                // truncated before.
+                if (fracBase)
                     throw Err.of("bad-tag-content",
-                                 "boring: tag 1002 fraction must be a number", "tag", 1002L);
-                return java.time.Duration.ofSeconds(((Number) sec).longValue(),
-                                                    nano == null ? 0 : ((Number) nano).longValue());
+                        "boring: tag 1002 base value must be an integer when a"
+                        + " scaled fraction is present", "tag", 1002L);
+                if (!(nano instanceof Number) || nano instanceof Double || nano instanceof Float)
+                    throw Err.of("bad-tag-content",
+                                 "boring: tag 1002 fraction must be an integer", "tag", 1002L);
+                long nn = ((Number) nano).longValue();
+                if (nn < 0 || nn > 999999999L)
+                    throw Err.of("bad-tag-content",
+                        "boring: tag 1002 fraction " + nn
+                        + " is outside 0..999999999", "tag", 1002L);
+                return java.time.Duration.ofSeconds(((Number) sec).longValue(), nn);
             }
             case 1004: {                                     // full-date, RFC 8943
                 Object v = read();

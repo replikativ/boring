@@ -1313,6 +1313,28 @@ public final class Writer {
         pos += a.length << 1;
     }
 
+    /**
+     * Classes the writer emits BEFORE consulting the registry, so a handler
+     * registered for one of them can never run.
+     *
+     * These are the hottest scalars, dispatched first on purpose. The registry
+     * lookup was moved above the other built-ins precisely so that an explicit
+     * registration wins -- but it cannot be moved above these without putting a
+     * map lookup in front of every string and every long.
+     *
+     * So the registration is REFUSED instead. Silently doing nothing is the one
+     * unacceptable state: the same API worked or did not depending only on
+     * which class you named, and nothing said which.
+     */
+    public static boolean isRegisterableClass(Class<?> c) {
+        return !(c == String.class || c == Long.class || c == Integer.class
+                 || c == Short.class || c == Byte.class
+                 || c == Double.class || c == Float.class
+                 || c == Boolean.class || c == byte[].class
+                 || c == clojure.lang.Keyword.class
+                 || c == clojure.lang.Symbol.class);
+    }
+
     /** Length of a primitive row, without knowing which primitive it is. */
     private static int rowLen(Object row) { return java.lang.reflect.Array.getLength(row); }
 
@@ -1915,7 +1937,7 @@ public final class Writer {
         // broken by this who was not already being ignored.
         Object[] handler = registry.writerFor(c);
         if (handler != null) {
-            head(TAG, ((Number) handler[0]).longValue());
+            writeTag(((Number) handler[0]).longValue());   // validated, not raw head
             writeValue(((clojure.lang.IFn) handler[1]).invoke(x));
             return;
         }

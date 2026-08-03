@@ -148,3 +148,67 @@
             (let [[c arena] (mmap-source ok o)]
               (try (is (= {"a" 1} ((requiring-resolve 'boring.nav/value) c)))
                    (finally (.close ^java.lang.AutoCloseable arena))))))))))
+
+;; ------------------------------------------------------------------- S7
+
+(deftest duration-decoding-never-truncates-silently
+  (testing "both numbers went through longValue(), which TRUNCATED: `{1 1.5}` is
+            a valid one-and-a-half second duration and decoded as one second.
+            A wrong value is the worst outcome available, and the writer's own
+            `{1 seconds, -9 nanos}` subset hid it because round trips never
+            produce the other forms.
+
+            Everything boring cannot carry losslessly is refused by RFC 9581's
+            own rules, with a typed error naming the key -- refusing a
+            conforming form is honest, truncating it is not."
+    (letfn [(dur [m] (boring/decode (boring/encode (data/tagged-value 1002 m) o) o))]
+      (testing "forms boring represents"
+        (is (= (java.time.Duration/ofSeconds 2) (dur {1 2})))
+        (is (= (java.time.Duration/ofNanos 1500000000) (dur {1 1.5}))
+            "a fractional base must keep its fraction")
+        (is (= (java.time.Duration/ofNanos 2500000000) (dur {1 2 -9 500000000}))))
+      (testing "forms it does not, each a typed error rather than a wrong value"
+        (doseq [[label m] [["negative fraction"        {1 2 -9 -5}]
+                           ["fraction out of range"    {1 2 -9 1000000000}]
+                           ["fractional base with -9"  {1 1.5 -9 5}]
+                           ["decimal-fraction base"    {4 [-1 15]}]
+                           ["bigfloat base"            {5 [-1 15]}]
+                           ["unknown critical key"     {1 2 99 "x"}]
+                           ["other scaled fraction"    {1 2 -3 5}]
+                           ["no base"                  {-9 5}]]]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"tag 1002"
+                                (dur m))
+              label)))
+      (testing "and an ordinary Duration still round-trips"
+        (is (= (java.time.Duration/ofNanos 2500000000)
+               (boring/decode (boring/encode (java.time.Duration/ofNanos 2500000000) o) o)))))))
+
+;; ------------------------------------------------------------------- S9
+
+(deftest registrations-that-could-never-run-are-refused
+  (testing "the hottest scalars are dispatched before the registry is consulted,
+            so a handler registered for `String` or `Long` silently did nothing
+            -- while the same call for `UUID` or `URI` worked. The same API
+            working or not based only on the class, with nothing saying which,
+            is worse than not supporting it.
+
+            The lookup cannot move above these without putting a map probe in
+            front of every string and every long, so the registration is
+            refused instead -- at registration, where a caller can still act."
+    (doseq [c [String Long Integer Double Float Boolean
+               clojure.lang.Keyword clojure.lang.Symbol (Class/forName "[B")]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"could never run"
+                            (boring/register-tag (boring/tag-registry) 55555 c
+                                                 (fn [_] "x") nil))
+          (str (.getName c) " must be refused")))
+    (testing "and the classes that DO override still register and take effect"
+      (doseq [[c v] [[java.util.UUID (java.util.UUID/randomUUID)]
+                     [java.net.URI (java.net.URI. "http://x")]
+                     [java.io.File (java.io.File. "/tmp/x")]]]
+        (let [reg (boring/register-tag (boring/tag-registry) 55555 c
+                                       (fn [_] "OVERRIDDEN") (fn [v] v))
+              o' (assoc o :registry reg)]
+          (is (= "OVERRIDDEN" (boring/decode (boring/encode v o') o'))
+              (str (.getName c) " must be overridden")))))
+    (testing "a read-only registration needs no class and stays allowed"
+      (is (some? (boring/register-tag (boring/tag-registry) 55555 nil nil (fn [v] v)))))))
