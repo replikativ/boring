@@ -45,8 +45,10 @@ datom-shaped data it was built for, and slower on generic data — see
 ```
 
 The same code runs on the JVM and in the browser. A Python, Rust or Go program
-reads the bytes with its own CBOR library — [cbor2][], [ciborium][], fxamacker.
-[Interop](doc/INTEROP.md) has worked examples in each.
+reads the bytes with its own CBOR library — [cbor2][], [ciborium][],
+[fxamacker][]. [Interop](doc/INTEROP.md) has an executable reader in Python and
+Rust, both run in CI against a committed fixture; the Go and JavaScript
+sections are worked guidance, not running code.
 
 ## Install
 
@@ -192,6 +194,39 @@ that fits becomes a plain integer, floats narrow to their shortest form. You
 cannot both sign a document and preserve a host type the wire has no room for.
 [Compatibility](doc/COMPATIBILITY.md) spells out the consequences.
 
+## Reading without decoding
+
+`boring.nav` walks encoded CBOR and builds only what you ask for — and because
+a cursor implements `ILookup`, `clojure.core/get-in` works on it directly:
+
+```clojure
+(require '[boring.nav :as nav] '[boring.mmap :as mmap])
+
+(def c (nav/source bs {:stringref false}))
+(nav/value (get-in c ["customer-137" "name"]))   ; the other 199 are never built
+
+(mmap/with-mmap [c "events.cbor"]                ; JDK 22+; the file need not fit in heap
+  (nav/value (get-in c ["customer-137" "name"])))
+```
+
+Against decode-then-`get-in`: **21×** for one leaf, **~1400×** for `count`
+(O(1) — the element count is in the head), and **~290×** to locate a 1 MiB
+blob rather than materialise it. Memory-mapped, a random lookup beats one
+`pread` per item by 2.3×.
+
+This does not change CBOR. The wins come from *not decoding*, and CBOR's own
+design bounds them: byte strings are length-prefixed, so skipping one is a
+jump, but arrays and maps carry an element count rather than a byte length, so
+seeking a field is a scan. Zero-copy on payloads, lazy scanning on structure —
+not the O(1) field access of a format built for it, and still ordinary CBOR
+that `cbor2` and `ciborium` read.
+
+It is also not a free win everywhere: taking only the first item of a log is
+*slower* than `decode-seq`, which is already lazy.
+
+[Storage](doc/STORAGE.md) covers the model, memory mapping, writing logs,
+compression, and what can be updated in place.
+
 ## Status
 
 **The library is beta. The format is not.**
@@ -242,6 +277,8 @@ wire, which is where it is exercised on real data.
 - [Compatibility](doc/COMPATIBILITY.md) — the format promise and how it is enforced
 - [Security](doc/SECURITY.md) — threat model, and what is explicitly not guaranteed
 - [Shapes](doc/SHAPES.md) — the key-stripping extension, shipped and proposed
+- [Storage](doc/STORAGE.md) — navigation, memory mapping, log writing,
+  compression, and in-place update
 - [Migrate codec](doc/MIGRATE-CODEC.md) — boring vs clj-cbor vs EDN-lines as a
   datahike dump format: type exactness, determinism, 5M datoms under a 64 MiB heap
 
@@ -260,6 +297,7 @@ only, and are not distributed in boring's jar.
 [clj-cbor]: https://github.com/greglook/clj-cbor
 [cbor2]: https://github.com/agronholm/cbor2
 [ciborium]: https://github.com/enarx/ciborium
+[fxamacker]: https://github.com/fxamacker/cbor
 [nippy]: https://github.com/taoensso/nippy
 [hako]: https://github.com/mpenet/hako
 [fressian]: https://github.com/clojure/data.fressian

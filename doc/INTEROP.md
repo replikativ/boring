@@ -194,17 +194,18 @@ knowing before you write your own:
 
 The same four hooks, against these libraries:
 
-- **Rust** — [`ciborium`][ciborium] or [`serde_cbor`][serde_cbor]; match on
-  `Value::Tag(n, inner)`.
 - **Go** — [`fxamacker/cbor`][fxamacker], which is the most rigorous Go
   implementation; register a `TagSet`.
 - **JavaScript** — [`cbor-x`][cbor-x] or [`cbor`][cbor-js]; both expose a tag
   hook.
 
-**These are not yet executed in CI**, unlike the Python reader. Treat them as
-guidance until they are — the shape of the problem is identical, but I would
-rather say plainly that they are untested than imply a coverage that does not
-exist.
+**Neither is executed in CI**, unlike the Python and Rust readers above. Treat
+them as guidance — the shape of the problem is identical, but I would rather
+say plainly that they are untested than imply a coverage that does not exist.
+
+(Rust used to be in this list. It is not any more: `interop/rust` runs in CI
+and `bin/ci` FAILS rather than skips it when `CI` is set, because a reference
+reader that silently does not run is worse than one that is absent.)
 
 ## Guaranteeing no extensions
 
@@ -222,7 +223,6 @@ single hook — at the cost of a larger document.
 [rfc8746]: https://www.rfc-editor.org/rfc/rfc8746
 [stringref]: https://cbor.schmorp.de/stringref
 [ciborium]: https://docs.rs/ciborium
-[serde_cbor]: https://docs.rs/serde_cbor
 [fxamacker]: https://github.com/fxamacker/cbor
 [cbor-x]: https://github.com/kriszyp/cbor-x
 [cbor-js]: https://github.com/hildjj/node-cbor
