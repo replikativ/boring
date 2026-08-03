@@ -45,15 +45,21 @@ out = [
     "(ns boring.wg-bad)",
     "",
     "(def cases",
-    "  [",
 ]
+# Emitted in the shape `clj -M:ffix` produces -- opening bracket fused to the
+# first entry, closing paren to the last -- so regenerating leaves the tree
+# clean instead of handing the formatter a diff on a "do not hand-edit" file.
+rows = []
 for desc, hexs in entries:
     esc = desc.replace('\\', '\\\\').replace('"', '\\"')
     extra = ''
     if desc in EXEMPT:
         extra = ' :exempt-reason "%s"' % EXEMPT[desc]
-    out.append('   {:desc "%s" :hex "%s"%s}' % (esc, hexs.lower(), extra))
-out += ["  ])", ""]
+    rows.append('{:desc "%s" :hex "%s"%s}' % (esc, hexs.lower(), extra))
+out.append("  [" + rows[0])
+out += ["   " + r for r in rows[1:-1]]
+out.append("   " + rows[-1] + "])")
+out.append("")
 
 open(os.path.join(HERE, '..', 'test', 'boring', 'wg_bad.cljc'), 'w').write("\n".join(out))
 print("wrote %d cases, %d exempt" % (len(entries), sum(1 for d, _ in entries if d in EXEMPT)))
