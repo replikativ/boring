@@ -446,17 +446,49 @@
   ^bytes [^Writer w]
   (.buffer w))
 
+(defn- write-to-resolved!
+  "`write-to!` with options already resolved."
+  ^long [^Writer w v ^java.io.OutputStream out o]
+  (.beginStream w out)
+  (try
+    (write-root! w v o)
+    (.endStream w)
+    (catch Throwable t
+      ;; Detach WITHOUT flushing: whatever already reached `out` stays there,
+      ;; but the tail still in the buffer is half a value and must not follow it.
+      (.abortStream w)
+      (throw t))))
+
 (defn write-to!
   "Encode `v` into `w` and write its bytes straight to `out`, with no
-  intermediate array."
+  intermediate array and in BOUNDED MEMORY.
+
+  The writer's buffer is a chunk, not the whole encoding: when it fills, its
+  contents go to `out` and encoding continues. So the memory a value needs is
+  the buffer size you chose at `(writer n opts)`, not the size of the value.
+  Encoding a 1 GB structure used to grow the buffer to 1 GB -- a second copy of
+  something you already hold -- and now costs 64 KB or whatever you asked for.
+
+  Two consequences worth knowing:
+
+  - **Writes are not atomic.** Once a chunk has gone to `out` it cannot be
+    recalled, so a value that throws part-way leaves a partial prefix on the
+    stream. nippy's `freeze-to-out!` documents the same property for the same
+    reason. If you need all-or-nothing, stage into a `ByteArrayOutputStream`.
+  - **A single leaf larger than the buffer still grows it.** A 200 MB string or
+    byte array is one CBOR item with a length header, so it cannot be split
+    across chunks. Collections stream at every depth; leaves do not.
+
+  Returns the byte count."
+  ;; RESOLVED ONCE, by whichever arity was called -- the 3-arity's options come
+  ;; from the writer and `writer-opts` has already resolved them and stripped
+  ;; `:profile`. Delegating one arity to the other would re-resolve and throw
+  ;; `:boring/incompatible-options` for the sorting profiles, which is exactly
+  ;; the bug `write-seq!`'s 3-arity carried.
   ([^Writer w v ^java.io.OutputStream out]
-   (let [n (encode-buffered! w v)]
-     (.write out (.buffer w) 0 (int n))
-     n))
+   (write-to-resolved! w v out (writer-opts w)))
   ([^Writer w v ^java.io.OutputStream out opts]
-   (let [n (encode-buffered! w v opts)]
-     (.write out (.buffer w) 0 (int n))
-     n)))
+   (write-to-resolved! w v out (resolve-opts opts))))
 
 (defn write-to-buffer!
   "Encode `v` into `w` and copy its bytes into `bb`, returning the count.
@@ -724,28 +756,37 @@
          ;; `setIndex` starts a fresh capture; `idxBase` moves the base between
          ;; items without discarding what the earlier ones recorded.
         _ (when indexing? (.setIndex ^Writer w (int stride) (int min-entries) 0))
+        ;; STREAMED, not encode-then-copy. The writer holds one chunk rather
+        ;; than one whole item, so an item larger than the buffer no longer
+        ;; grows it -- which is the difference between a sequence of ordinary
+        ;; records and a sequence whose items are themselves large.
+        ;;
+        ;; `idxBase` is gone from this path. It existed to tell the writer where
+        ;; the current item starts so recorded offsets came out file-relative;
+        ;; `flushed` now tracks exactly that and spans items, so setting both
+        ;; would double-count. `idxOffset` adds the two and relies on only one
+        ;; being non-zero.
+        _ (.beginStream ^Writer w out)
         total (try
-                (reduce (fn [^long total v]
-                           ;; `total` is this item's offset in the file. The
-                           ;; writer folds it into every offset it records, so
-                           ;; the nodes come out file-relative with no second
-                           ;; pass, and it counts the items itself -- a volatile
-                           ;; here measured slower than the boxing it replaced,
-                           ;; because a volatile write is a barrier.
-                          (when indexing?
-                            (.idxBase ^Writer w total)
-                            (.idxItem ^Writer w total))
-                          (let [n (long (.position ^Writer (write-root! w v o)))]
-                            (.write out (.buffer w) 0 (int n))
-                            (+ total n)))
-                        0
-                        values)
+                (doseq [v values]
+                  ;; The item's own offset, taken BEFORE `write-root!` resets
+                  ;; the writer. `totalWritten` is flushed + the unflushed tail
+                  ;; of the previous item, which is exactly where this one
+                  ;; begins.
+                  (when indexing? (.idxItem ^Writer w (.totalWritten ^Writer w)))
+                  (write-root! w v o))
+                (.endStream ^Writer w)
                 (catch Throwable t
                    ;; Capture off on the way out, or a writer whose encode threw
                    ;; stays in capture mode with a stale base -- and every later
                    ;; `encode-into!` or unindexed `write-seq!` on that
                    ;; (deliberately long-lived) writer keeps allocating and
                    ;; retaining a node per container, invisibly and forever.
+                   ;;
+                   ;; `abortStream` rather than `endStream`: bytes already sent
+                   ;; cannot be recalled, but the half-item still in the buffer
+                   ;; must not follow them onto the stream.
+                  (.abortStream ^Writer w)
                   (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
                   (throw t)))]
     (if (and indexing?

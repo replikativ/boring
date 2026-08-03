@@ -523,11 +523,31 @@ public final class Writer {
         return (int) v;
     }
 
-    /** A buffer-relative position as a checked, file-relative index offset. */
-    private int idxOffset(long off) { return checkedOffset(off + idxBase); }
+    /** The current position as a FILE offset, unchecked.
+     *
+     *  Anything the index records has to be captured in these terms at the
+     *  moment it is observed. A buffer position resolved later is wrong as soon
+     *  as a flush has happened in between -- which is precisely the bug the
+     *  buffer-size equivalence property caught: a container's start was stored
+     *  as `pos` and turned into a file offset at `fillNode` time, by which point
+     *  `flushed` had moved, so the same value indexed a container at 58 with a
+     *  16-byte buffer and at 0 with a large one. */
+    private long absOffset() { return (long) pos + flushed + idxBase; }
 
+    /** A buffer-relative position as a checked, file-relative index offset.
+     *
+     *  `flushed` is what makes this work while streaming: `off` is a position in
+     *  the CURRENT chunk, and everything handed to the sink already sits in
+     *  front of it. `idxBase` does the same job for the non-streaming
+     *  `write-seq!` path, where each item is encoded whole and the base moves
+     *  between items. Exactly one of the two is ever non-zero -- a streaming
+     *  `write-seq!` leaves `idxBase` at 0 and lets `flushed` span the items. */
+    private int idxOffset(long off) { return checkedOffset(off + flushed + idxBase); }
+
+    /** `off` is a FILE offset, captured by `absOffset()` when the container
+     *  started -- not a buffer position to be resolved now. See absOffset(). */
     private void fillNode(int slot, long off, int n, int[] anchors, boolean sorted) {
-        idxOffs[slot] = idxOffset(off);
+        idxOffs[slot] = checkedOffset(off);
         idxCnts[slot] = n;
         idxSlots[slot] = anchors;
         idxSrt[slot] = sorted;
@@ -612,6 +632,12 @@ public final class Writer {
 
     /** Reset for reuse. Keeps the buffer; clears the stringref namespace. */
     public void reset() {
+        // WHILE STREAMING, RESET MEANS "the previous value is finished", so its
+        // tail has to reach the sink before `pos` goes to zero -- otherwise a
+        // `write-seq!` loop would silently drop the last partial chunk of every
+        // item. `flushed` deliberately survives, because it is the running file
+        // offset the index is built from and it spans items.
+        if (sink != null && pos > 0) flushChunk();
         pos = 0;
         depth = 0;
         metaWrapped = false;
@@ -652,11 +678,117 @@ public final class Writer {
     /** Largest array this JVM will reliably allocate. */
     private static final int MAX_BUFFER = Integer.MAX_VALUE - 8;
 
+    // ---- streaming ----------------------------------------------------------
+    //
+    // With a sink attached the buffer becomes a CHUNK rather than the whole
+    // encoding: when it fills, its contents go to the sink and `pos` returns to
+    // 0. That makes the memory a document needs bounded by the buffer size
+    // instead of by the document, which is the difference between encoding a
+    // 1 GB value and holding a second copy of it.
+    //
+    // The sink is set for the duration of one call and cleared after, rather
+    // than living on the writer. `encode`, `encode-buffered!` and `buffer` all
+    // depend on the bytes still being present when they return, so a writer
+    // that could stream at any moment would quietly break them; a writer only
+    // streams while somebody is holding the other end.
+    //
+    // NOT ATOMIC: once a chunk has gone to the sink it cannot be recalled, so a
+    // value that throws part-way leaves a partial prefix on the stream. nippy's
+    // `write-typed+meta-to-out!` documents the same property for the same
+    // reason. Callers who need all-or-nothing must stage elsewhere.
+    private java.io.OutputStream sink;
+    private long flushed;
+
+    /**
+     * Depth of spans PINNED against flushing: bytes the writer will have to read
+     * back, so they must stay in the buffer until it is done with them.
+     *
+     * This is not about map keys, though they are its only user today. The
+     * general hazard while streaming is DEFERRED RESOLUTION -- observing
+     * something at one moment and resolving it at a later one, by which point a
+     * flush may have invalidated it. There were two instances:
+     *
+     *   - A container's start, captured as a buffer position and turned into a
+     *     file offset at `fillNode` time. That needs no pin: capture it
+     *     absolutely when it is observed, which `absOffset()` now does.
+     *   - The index's `sorted` flag, which compares the previous key's BYTES
+     *     with the current key's. Bytes cannot be made absolute. The previous
+     *     key is copied out (see KeyOrder); the current one is read from the
+     *     buffer, so it is pinned instead.
+     *
+     * Without the pin a key split by a flush could not be compared, the
+     * container would be marked unsorted, and -- since `sorted` is part of the
+     * index frame -- the emitted BYTES would depend on the buffer size. The
+     * buffer-size equivalence property caught exactly that.
+     *
+     * A pinned span larger than the whole buffer grows it, the same concession
+     * leaves already get: one CBOR item with a length header cannot be split
+     * across chunks.
+     */
+    private int pinDepth;
+
+    /** Attach `out` and start counting from zero.
+     *
+     *  `pos` is zeroed here, and that is not tidiness: the first `reset()` of
+     *  the stream would otherwise FLUSH whatever a previous unrelated encode
+     *  left in the buffer, prefixing the stream with somebody else's bytes. */
+    public void beginStream(java.io.OutputStream out) {
+        sink = out;
+        flushed = 0;
+        pos = 0;
+        pinDepth = 0;
+    }
+
+    /** Detach WITHOUT flushing, for a write that threw. Whatever already
+     *  reached the sink stays there -- streaming is not atomic -- but the
+     *  half-written tail in the buffer must not be appended to it. */
+    public void abortStream() {
+        sink = null;
+        flushed = 0;
+        pos = 0;
+        pinDepth = 0;
+    }
+
+    /** Flush what is left and detach. Returns the total bytes handed to the sink. */
+    public long endStream() {
+        if (sink != null && pos > 0) flushChunk();
+        long n = flushed;
+        sink = null;
+        flushed = 0;
+        return n;
+    }
+
+    /** Bytes written for the current value, INCLUDING any already flushed.
+     *  `position()` stays buffer-relative because `buffer()` is indexed by it. */
+    public long totalWritten() { return flushed + pos; }
+
+    private void flushChunk() {
+        try {
+            sink.write(buf, 0, pos);
+        } catch (java.io.IOException e) {
+            throw Err.of("io-error", "boring: writing to the sink failed: " + e.getMessage(), e);
+        }
+        flushed += pos;
+        pos = 0;
+    }
+
     private void ensure(int n) {
         // `pos + n` in int wrapped negative for large values, so ensure()
         // silently skipped the grow and the following write ran off the end.
         long need = (long) pos + (long) n;
-        if (need > buf.length) grow(need);
+        if (need > buf.length) {
+            // Hand the finished prefix to the sink instead of growing. Safe at
+            // this point specifically: ensure() runs BEFORE the next n bytes are
+            // written, so everything in the buffer is a complete emitted prefix.
+            if (sink != null && pos > 0 && pinDepth == 0) {
+                flushChunk();
+                need = n;
+            }
+            // A single primitive larger than the whole buffer -- a long string,
+            // a big byte array -- still has to fit, so growth remains the
+            // fallback. It is the leaf case nippy also buffers whole.
+            if (need > buf.length) grow(need);
+        }
     }
 
     private void grow(long need) {
@@ -1115,7 +1247,7 @@ public final class Writer {
     }
 
     private void writeSeqAsArray(clojure.lang.ISeq s, int n) {
-        int start = pos;
+        long start = absOffset();
         head(ARRAY, n);
         int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
@@ -1134,7 +1266,7 @@ public final class Writer {
     /** An array of `n` elements from any Iterable, indexed if it is big enough. */
     @SuppressWarnings("rawtypes")
     private void writeArrayOf(Iterable it, int n) {
-        int start = pos;
+        long start = absOffset();
         head(ARRAY, n);
         int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
@@ -1155,7 +1287,7 @@ public final class Writer {
         Map m = (Map) fields;
         if (canonical) { writeMapCanonical(m); return; }
         int n = m.size();
-        int start = pos;
+        long start = absOffset();
         head(MAP, n);
         // Iterated as a SEQ rather than an entrySet, so this cannot delegate to
         // writeMapValue without changing field order on some record types.
@@ -1163,6 +1295,7 @@ public final class Writer {
         int slot = anchors != null ? reserveNode() : -1;
         boolean sorted = true;
         int prevK0 = -1, prevK1 = -1;
+        KeyOrder ko = null;
         int a = 0, countdown = 1;
         // Every adjacent pair, for the reason spelled out in writeMapValue: an
         // anchor sample does not establish that the container is ordered.
@@ -1174,11 +1307,18 @@ public final class Writer {
                 anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
             int k0 = pos;
-            writeValue(e.getKey());
+            long flushedAtKey = flushed;
+            pinDepth++;
+            try { writeValue(e.getKey()); } finally { pinDepth--; }
             if (anchors != null) {
-                if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
-                    sorted = false;
-                prevK0 = k0; prevK1 = pos;
+                if (sink == null) {
+                    if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
+                        sorted = false;
+                    prevK0 = k0; prevK1 = pos;
+                } else {
+                    if (ko == null) ko = new KeyOrder();
+                    sorted = trackKey(ko, sorted, k0, flushedAtKey);
+                }
             }
             writeValue(e.getValue());
         }
@@ -1191,6 +1331,56 @@ public final class Writer {
      * matching {@link Reader#compareItemsAt}: shorter first when one is a
      * prefix of the other.
      */
+    /**
+     * Key-order tracking that survives a flush.
+     *
+     * `cmpInBuf` compares the previous key to the current one by pointing at
+     * both in the buffer — the ONLY place anything reads emitted bytes back —
+     * and while streaming the previous key may already have gone to the sink.
+     * So in streaming mode the previous key is copied out instead of pointed
+     * at. The copy is per-container (containers nest, so this cannot be writer
+     * state) and only allocated for containers big enough to be indexed.
+     *
+     * If a single key is itself split across a flush there is nothing to compare
+     * against, and the container is marked UNSORTED. That is the conservative
+     * direction: `sorted` only ever licenses `boring.nav` to binary-search, so
+     * losing it costs a scan and can never return a wrong answer.
+     */
+    private static final class KeyOrder {
+        byte[] prev = null;
+        int prevLen = -1;
+        boolean lost = false;
+    }
+
+    /** Returns the new value of `sorted` after accounting for this key. */
+    private boolean trackKey(KeyOrder ko, boolean sorted, int k0, long flushedAtKeyStart) {
+        boolean spanned = flushed != flushedAtKeyStart;
+        if (sorted && ko.prevLen >= 0
+            && (spanned || ko.lost || cmpStashed(ko.prev, ko.prevLen, k0, pos) >= 0))
+            sorted = false;
+        if (spanned) {
+            ko.lost = true;
+            ko.prevLen = 0;
+        } else {
+            int len = pos - k0;
+            if (ko.prev == null || ko.prev.length < len) ko.prev = new byte[Math.max(len, 32)];
+            System.arraycopy(buf, k0, ko.prev, 0, len);
+            ko.prevLen = len;
+            ko.lost = false;
+        }
+        return sorted;
+    }
+
+    private int cmpStashed(byte[] a, int alen, int b0, int b1) {
+        int blen = b1 - b0;
+        int m = Math.min(alen, blen);
+        for (int i = 0; i < m; i++) {
+            int x = a[i] & 0xFF, y = buf[b0 + i] & 0xFF;
+            if (x != y) return x - y;
+        }
+        return alen - blen;
+    }
+
     private int cmpInBuf(int a0, int a1, int b0, int b1) {
         int an = a1 - a0, bn = b1 - b0, n = Math.min(an, bn);
         for (int i = 0; i < n; i++) {
@@ -1204,7 +1394,7 @@ public final class Writer {
     private void writeMapValue(Map m) {
         if (canonical) { writeMapCanonical(m); return; }
         int n = m.size();
-        int start = pos;
+        long start = absOffset();
         head(MAP, n);
 
         // CONTENT-EQUAL BYTE-STRING KEYS are one key in CBOR (RFC 8949 5.6) and
@@ -1248,6 +1438,7 @@ public final class Writer {
         // containers big enough to be indexed at all.
         boolean sorted = true;
         int prevK0 = -1, prevK1 = -1;
+        KeyOrder ko = null;
         int a = 0, countdown = 1, seen = 0;
 
         for (Object o : m.entrySet()) {
@@ -1255,10 +1446,17 @@ public final class Writer {
             if (++seen > n) countMismatch(n, seen);
             if (--countdown == 0) { anchors[a++] = idxOffset(pos); countdown = idxStride; }
             int k0 = pos;
-            writeValue(e.getKey());
-            if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
-                sorted = false;
-            prevK0 = k0; prevK1 = pos;
+            long flushedAtKey = flushed;
+            pinDepth++;
+            try { writeValue(e.getKey()); } finally { pinDepth--; }
+            if (sink == null) {
+                if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
+                    sorted = false;
+                prevK0 = k0; prevK1 = pos;
+            } else {
+                if (ko == null) ko = new KeyOrder();
+                sorted = trackKey(ko, sorted, k0, flushedAtKey);
+            }
             writeValue(e.getValue());
         }
         if (seen != n) countMismatch(n, seen);
@@ -1578,7 +1776,7 @@ public final class Writer {
                     + items[order[j - 1]] + " and " + items[order[j]] + ")");
 
         head(TAG, TAG_SET);
-        int start = pos;                       // the array, not the tag
+        long start = absOffset();                       // the array, not the tag
         head(ARRAY, n);
         int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
@@ -1705,7 +1903,7 @@ public final class Writer {
                     "boring: two map keys encode identically under :canonical ("
                     + keys[order[j - 1]] + " and " + keys[order[j]] + ")");
 
-        int start = pos;
+        long start = absOffset();
         head(MAP, n);
         // Sorted by construction -- but only under the RFC 8949 comparator.
         //
@@ -2300,7 +2498,7 @@ public final class Writer {
                 if (shape != null) { writeShapedArray(l, shape); return; }
             }
             int n = l.size();
-            int start = pos;
+            long start = absOffset();
             head(ARRAY, n);
             int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
             int slot = anchors != null ? reserveNode() : -1;
