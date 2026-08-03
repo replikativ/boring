@@ -213,14 +213,18 @@ workflows:
       # and refuses to publish a jar that fails it, so the gate is on the
       # publish path and not merely on the test path.
       #
-      # CHECK BEFORE THE NEXT RELEASE: `tools/deploy` runs on the ORB's
-      # executor, not on one declared here, and `clj -T:build deploy` now
-      # refuses to publish a jar without SegmentSource -- which a JDK older
-      # than 22 cannot build. If the orb's image is JDK 21, the release will
-      # fail this gate. That is the correct failure (better than silently
-      # shipping a jar whose boring.mmap cannot load) but it needs the orb's
-      # JDK confirmed, or the orb call pinned to a 22+ image, before merging to
-      # main. It was not verifiable from the machine this was written on.
+      # ORB JDK: CONFIRMED 22+, so this needs no pin. `tools/deploy` runs on
+      # the ORB's executor rather than one declared here, and `clj -T:build
+      # deploy` refuses a jar without SegmentSource, which a JDK older than 22
+      # cannot build. That gate landed in febbd40 and was, for a while, an
+      # open question here.
+      #
+      # It is answered: 0.1.9 and 0.1.10 are both on Clojars, both contain
+      # org/replikativ/boring/ffm/SegmentSource.class, and that class file
+      # reports major version 0x42 = 66 = Java 22. The orb built and published
+      # it twice. Checked by downloading the released jars, not by reading
+      # config -- which is why the earlier note stayed open, since it was
+      # written before either release existed.
       - tools/deploy:
           context:
             - clojars-deploy
