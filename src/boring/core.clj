@@ -634,37 +634,37 @@
               map? (= mj 5)]
           (if (neg? n)
             (.skipFrom r p)                       ; indefinite length: not indexable
-            (let [starts (int-array n)]
-              (let [end (loop [i 0 q (long (.headEndAt r p))]
-                          (if (= i n)
-                            q
-                            (do (aset starts i (int q))
-                                (recur (inc i)
-                                       (long (index-walk
-                                              r
-                                              (if map?
-                                                (long (index-walk r q stride min-entries base acc))
-                                                q)
-                                              stride min-entries base acc))))))]
-                (when (>= n min-entries)
-                  (let [kept (if (= stride 1)
-                               starts
-                               (let [m (inc (quot (dec (max n 1)) stride))
-                                     a (int-array m)]
-                                 (dotimes [j m] (aset a j (aget starts (* j stride))))
-                                 a))
-                        sorted (boolean
-                                (and map?
-                                     (loop [k 1]
-                                       (cond (>= k (alength kept)) true
-                                             (>= (.compareItemsAt r (aget kept (dec k))
-                                                                  (aget kept k)) 0) false
-                                             :else (recur (inc k))))))]
-                    (when (pos? base)
-                      (dotimes [k (alength kept)]
-                        (aset kept k (int (+ base (aget kept k))))))
-                    (.add acc [(int (+ base p)) (int n) kept sorted])))
-                end))))))))
+            (let [starts (int-array n)
+                  end (loop [i 0 q (long (.headEndAt r p))]
+                        (if (= i n)
+                          q
+                          (do (aset starts i (int q))
+                              (recur (inc i)
+                                     (long (index-walk
+                                            r
+                                            (if map?
+                                              (long (index-walk r q stride min-entries base acc))
+                                              q)
+                                            stride min-entries base acc))))))]
+              (when (>= n min-entries)
+                (let [kept (if (= stride 1)
+                             starts
+                             (let [m (inc (quot (dec (max n 1)) stride))
+                                   a (int-array m)]
+                               (dotimes [j m] (aset a j (aget starts (* j stride))))
+                               a))
+                      sorted (boolean
+                              (and map?
+                                   (loop [k 1]
+                                     (cond (>= k (alength kept)) true
+                                           (>= (.compareItemsAt r (aget kept (dec k))
+                                                                (aget kept k)) 0) false
+                                           :else (recur (inc k))))))]
+                  (when (pos? base)
+                    (dotimes [k (alength kept)]
+                      (aset kept k (int (+ base (aget kept k))))))
+                  (.add acc [(int (+ base p)) (int n) kept sorted])))
+              end)))))))
 
 (defn- scan-index
   "Index nodes for every container of at least `min-entries` entries in
