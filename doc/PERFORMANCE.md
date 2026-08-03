@@ -471,6 +471,20 @@ five fields per record it never builds. The blob rows are the shape that
 matters most: a bytestring is length-prefixed, so skipping one is a jump, and
 the cost of ignoring it does not scale with its size.
 
+A log is a CBOR sequence, which `nav/items` walks item by item:
+
+| 5 000 events, 360 KB | nav | decode-seq | ratio |
+|---|---:|---:|---:|
+| scan for the matching events | 1 542 µs | 5 330 µs | **3.5×** |
+| first event only (early exit) | 3.86 µs | 2.21 µs | **0.6×** |
+
+**That second row is where nav loses, and it is the useful one.** `decode-seq`
+is lazy, so stopping at the first item already decodes only that item — and for
+a single small item, a cursor plus a key probe costs more than just decoding
+it. Navigation wins by what it *skips* and what it never materialises. If you
+are going to touch nearly everything in a small item anyway, `decode` is the
+cheaper call.
+
 Two constraints are enforced rather than documented-and-hoped. Navigation
 refuses a `:stringref` document (a cursor holding only an offset cannot resolve
 an index into a table built from preceding strings), and refuses to descend

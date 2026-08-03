@@ -102,7 +102,14 @@
 
   `opts` are the decode options realisation will use (`:registry` and friends),
   and must describe how the document was WRITTEN. `:stringref false` is forced;
-  see the namespace docstring."
+  see the namespace docstring.
+
+  ADDRESSES THE FIRST ITEM ONLY. A log or stream is usually a CBOR sequence
+  (RFC 8742) -- many top-level items concatenated, which is what `write-to!` in
+  a loop produces -- and a cursor from here would navigate only the first of
+  them and silently ignore the rest. Use `items` for that. This is not an error
+  case, because a caller may legitimately navigate a value sitting in an
+  oversized scratch buffer."
   ([src] (source src nil))
   ([src opts] (cursor-at (nav-of src (or opts {})) 0)))
 
@@ -278,6 +285,42 @@
   "A reducible/seqable of child cursors (arrays) or MapEntries of realised key
   to value cursor (maps). Prefer `reduce` over `seq` in a hot loop."
   [^Cursor c] c)
+
+(deftype Items [^Nav nav]
+  clojure.lang.Seqable
+  (seq [this] (seq (into [] this)))
+
+  clojure.lang.IReduceInit
+  (reduce [_ f init]
+    (let [^Reader r (.rdr nav)
+          end (.size r)]
+      (loop [p 0 acc init]
+        (if (or (>= p end) (reduced? acc))
+          (unreduced acc)
+          (recur (.skipFrom r p) (f acc (cursor-at nav p)))))))
+
+  Object
+  (toString [_] "#boring.nav/items"))
+
+(defn items
+  "A reducible/seqable of cursors, one per TOP-LEVEL item, over a CBOR sequence
+  (RFC 8742) -- the shape `write-to!` in a loop produces, and the natural frame
+  for a log.
+
+  Each item is independently decodable, so this streams: nothing before the
+  cursor you are holding stays live, and `reduce` honours `reduced` so you can
+  stop early without walking the rest of the file. Reaching item n costs n
+  skips -- a skip being a structural walk, not a decode -- so tailing is cheap
+  and random access to the middle of a large file wants an offset index built
+  alongside the writes.
+
+      (transduce (comp (map nav/value) (filter #(= \"error\" (get % \"lvl\"))))
+                 conj [] (nav/items bs opts))
+
+  The `:stringref false` requirement applies per item, as everywhere in this
+  namespace."
+  ([src] (items src nil))
+  ([src opts] (Items. (nav-of src (or opts {})))))
 
 (defn zipper
   "A read-only clojure.zip zipper over the cursor. `down`, `right`, `node` and

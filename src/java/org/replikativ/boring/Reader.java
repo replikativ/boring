@@ -270,6 +270,10 @@ public final class Reader {
     public long position() { return pos; }
     public boolean atEnd() { return pos >= limit; }
 
+    /** Total addressable size. A navigator walking a CBOR sequence needs it to
+     *  know when it has run out of items. */
+    public long size() { return limit; }
+
     /** Rewind to an absolute offset. The navigator descends with this. */
     public void seek(long p) { this.pos = p; }
 

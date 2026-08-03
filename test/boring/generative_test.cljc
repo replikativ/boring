@@ -460,3 +460,41 @@
              first-key (reduce (fn [_ e] (reduced (key e))) nil c)]
          (and (= via-nav v)
               (or (empty? v) (contains? v first-key)))))))
+
+;; ------------------------------------------------------- CBOR sequences
+;;
+;; A log is a CBOR sequence (RFC 8742): top-level items concatenated, which is
+;; what `write-to!` in a loop produces. `nav/source` addresses only the FIRST
+;; of them -- deliberately, since a caller may be navigating a value inside an
+;; oversized scratch buffer -- so `nav/items` is what a log needs, and it must
+;; agree item-for-item with `decode-seq`.
+
+#?(:clj
+   (defspec nav-items-agrees-with-decode-seq 200
+     (prop/for-all [vs (gen/vector gen-value 0 8)]
+       (let [opts {:stringref false}
+             baos (java.io.ByteArrayOutputStream.)
+             w (boring/writer 4096)]
+         (doseq [v vs] (boring/write-to! w v baos opts))
+         (let [bs (.toByteArray baos)]
+           (and (= (count vs)
+                   (reduce (fn [n _] (inc n)) 0 (boring.nav/items bs opts)))
+                (c/equiv? (vec vs)
+                          (mapv boring.nav/value (seq (boring.nav/items bs opts))))
+                (c/equiv? (vec (boring/decode-seq bs opts))
+                          (mapv boring.nav/value (seq (boring.nav/items bs opts))))))))))
+
+;; `reduced` must stop the walk, which is what makes a transducer over a large
+;; log affordable -- otherwise every early-exit query still pays for the tail.
+#?(:clj
+   (defspec nav-items-short-circuits 200
+     (prop/for-all [vs (gen/vector gen/large-integer 1 10)]
+       (let [opts {:stringref false}
+             baos (java.io.ByteArrayOutputStream.)
+             w (boring/writer 4096)]
+         (doseq [v vs] (boring/write-to! w v baos opts))
+         (let [bs (.toByteArray baos)
+               seen (atom 0)]
+           (reduce (fn [_ c] (swap! seen inc) (reduced (boring.nav/value c)))
+                   nil (boring.nav/items bs opts))
+           (= 1 @seen))))))

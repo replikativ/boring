@@ -112,8 +112,49 @@
         (println (format "%-44s %9.2fµs %9.2fµs %7.0fx"
                          "read a field PAST the blob" a b (/ b a)))))
 
+    ;; The log shape: a CBOR sequence of events, scanned for the few that match.
+    ;; This is the case a logging backend actually has, and the one where
+    ;; `items` earns its keep -- a filter on one field never builds the other
+    ;; four, and `reduced` stops the walk where a decode-everything pass cannot.
+    (let [events (vec (for [i (range 5000)]
+                        {"lvl" (if (zero? (mod i 500)) "error" "info")
+                         "n" i
+                         "msg" (str "event number " i)
+                         "ctx" {"thread" "main" "ns" "app.core" "line" i}}))
+          baos (java.io.ByteArrayOutputStream.)
+          w (boring/writer 8192)
+          _ (doseq [e events] (boring/write-to! w e baos opts))
+          ^bytes log-bs (.toByteArray baos)
+          xf (comp (filter #(= "error" (nav/value (get % "lvl"))))
+                   (map #(nav/value (get % "n"))))]
+      (println (format "\nlog: %d events, %.1f KB as a CBOR sequence\n"
+                       (count events) (/ (alength log-bs) 1024.0)))
+      (println (format "%-44s %10s %10s %8s" "" "nav" "decode" "ratio"))
+      (let [[a b] (ab #(into [] xf (nav/items log-bs opts))
+                      #(into [] (comp (filter (fn [e] (= "error" (get e "lvl"))))
+                                      (map (fn [e] (get e "n"))))
+                             (boring/decode-seq log-bs opts))
+                      5 20)]
+        (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
+                         "scan a log for matching events" a b (/ b a))))
+      (let [[a b] (ab #(reduce (fn [_ c] (reduced (nav/value (get c "n")))) nil
+                               (nav/items log-bs opts))
+                      #(reduce (fn [_ e] (reduced (get e "n"))) nil
+                               (boring/decode-seq log-bs opts))
+                      50 20)]
+        (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
+                         "first event only (early exit)" a b (/ b a)))))
+
     (println "\nThe blob rows are the shape that matters most: skipping a bytestring")
     (println "is a jump, not a walk, so the cost of ignoring one does not scale")
     (println "with its size. Everything above is a byte[] source except where")
     (println "noted; off-heap decode costs ~1.35x, which is why the mmap row")
-    (println "trails the heap row.")))
+    (println "trails the heap row.")
+    (println)
+    (println "WHERE NAV LOSES, and it is worth knowing: the early-exit row is")
+    (println "SLOWER than decode-seq. decode-seq is lazy, so stopping at the")
+    (println "first item already decodes only that item -- and for one small")
+    (println "item, a cursor plus a key probe costs more than just decoding it.")
+    (println "nav wins by what it SKIPS and what it does not materialise. When")
+    (println "you are going to touch nearly everything in a small item anyway,")
+    (println "decode is the cheaper call.")))
