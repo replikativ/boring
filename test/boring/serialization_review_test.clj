@@ -550,3 +550,26 @@
             (is (thrown-with-msg? clojure.lang.ExceptionInfo #"byte range"
                                   (.bytesBetween r st e))
                 (str "[" st " " e ")"))))))))
+
+;; ------------------------------------------------------------ RFC 3339 years
+
+(deftest a-year-outside-0000-9999-is-refused-rather-than-emitted-malformed
+  (testing "RFC 3339's date-fullyear is 4DIGIT, so there is no conforming tag-0
+            or tag-1004 text for a year outside 0000-9999. java.time renders
+            those in ISO-8601's EXPANDED form -- `+12013-03-21T20:04:00Z` --
+            which boring emitted and then read back happily, so every
+            round-trip test passed while a foreign reader received a string no
+            conforming parser accepts. Refusing is the honest outcome: silently
+            rerouting to tag 1 would trade the interop bug for a precision one,
+            since tag 1 as a float cannot carry nanoseconds at these epochs."
+    (are [v] (thrown-with-msg? clojure.lang.ExceptionInfo #"outside 0000-9999"
+                               (boring/encode v o))
+      (java.time.Instant/parse "+12013-03-21T20:04:00Z")
+      (java.time.Instant/parse "-0001-03-21T20:04:00Z")
+      (java.time.LocalDate/parse "+12013-03-21")
+      (java.time.LocalDate/parse "-0001-03-21")))
+  (testing "and the ordinary range is untouched"
+    (are [v] (= v (boring/decode (boring/encode v o) (assoc o :instant-type :instant)))
+      (java.time.Instant/parse "2013-03-21T20:04:00Z")
+      (java.time.Instant/parse "0001-01-01T00:00:00Z")
+      (java.time.Instant/parse "9999-12-31T23:59:59Z"))))

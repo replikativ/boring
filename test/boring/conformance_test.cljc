@@ -942,7 +942,15 @@
         "a set over an indefinite-length array")
     ;; tag 39 around an integer -- degrades, does not throw
     (is (contains? (try-decode "d82701" interop-opts) :ok)
-        "an identifier tag over non-text content stays inert")))
+        "an identifier tag over non-text content stays inert")
+    ;; tag 0 "2016-12-31T23:59:60Z" -- a real leap second, legal RFC 3339 5.6
+    (let [leap (try-decode "c074323031362d31322d33315432333a35393a36305a" interop-opts)]
+      (is (contains? leap :ok)
+          "a leap second is a legal timestamp, not a malformed document")
+      (is (= "2016-12-31T23:59:60Z" (:value (:ok leap)))
+          "and the STRING survives: Instant.parse collapses :60 to :59 and
+           new Date rejects it outright, so neither platform has a lossless
+           native value -- preserving the text is the only honest option"))))
 
 (deftest every-malformed-tag-fails-typed
   (testing "a well-formed CBOR item of the WRONG SHAPE inside a tag boring

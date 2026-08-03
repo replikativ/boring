@@ -480,6 +480,28 @@
          (str "boring: " nm " must wrap an array") {:tag 27}))
   argument)
 
+(defn- leap-second?
+  "`:60` in the seconds field -- valid RFC 3339 (5.6), representable by neither
+  platform.
+
+  `Instant.parse` COLLAPSES it to :59 and `new Date` returns Invalid Date, so
+  there is no lossless native value to decode to on either side. Preserving the
+  string under an inert tag 0 is the only option that neither corrupts the
+  instant nor fails the document over a legal timestamp.
+
+  Index arithmetic rather than a regex, to mirror `Reader.isLeapSecond`
+  character for character: the two platforms must agree on exactly which
+  strings these are, or this fix trades one differential for another."
+  [s]
+  (let [i (.indexOf s ":")]
+    (if (neg? i)
+      false
+      (let [j (.indexOf s ":" (inc i))]
+        (and (>= j 0)
+             (< (+ j 2) (.-length s))
+             (= "6" (.charAt s (inc j)))
+             (= "0" (.charAt s (+ j 2))))))))
+
 (defn- nest-dims
   "Nested vectors for a tag-40 payload of any dimensionality, row-major.
 
@@ -733,12 +755,20 @@
           (err :boring/bad-tag-content
                (str "boring: tag 0 content is not a valid RFC 3339 instant: " s)
                {:tag 0 :value s}))
-        (let [d (js/Date. s)]
-          (when (js/isNaN (.getTime d))
-            (err :boring/bad-tag-content
-                 (str "boring: tag 0 content is not a valid RFC 3339 instant: " s)
-                 {:tag 0 :value s}))
-          d))
+        ;; A LEAP SECOND IS PRESERVED, NOT REJECTED. `new Date` returns Invalid
+        ;; Date for :60, which sent a legal RFC 3339 timestamp down the error
+        ;; path while the JVM handed back an inert tag 0 carrying the string --
+        ;; a semantic differential (value here, error there) on input a real
+        ;; producer emits. doc/SECURITY.md names those as their own defect
+        ;; class. Both platforms now preserve.
+        (if (leap-second? s)
+          (data/tagged-value 0 s)
+          (let [d (js/Date. s)]
+            (when (js/isNaN (.getTime d))
+              (err :boring/bad-tag-content
+                   (str "boring: tag 0 content is not a valid RFC 3339 instant: " s)
+                   {:tag 0 :value s}))
+            d)))
     1 (let [v (read! r)]
         (when-not (number? v)
           (err :boring/bad-tag-content "boring: tag 1 must wrap a number" {:tag 1}))

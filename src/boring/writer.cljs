@@ -685,10 +685,22 @@
       (write-value! w ((:fn h) x)))
 
     (instance? js/Date x)
-    (do (head! w TAG TAG-DATETIME)
-        ;; toISOString always prints milliseconds; ISO_INSTANT on the JVM omits
-        ;; them when zero. Normalise so both platforms emit the same bytes.
-        (write-string! w (.replace (.toISOString x) ".000Z" "Z")))
+    ;; toISOString always prints milliseconds; ISO_INSTANT on the JVM omits
+    ;; them when zero. Normalise so both platforms emit the same bytes.
+    (let [s (.replace (.toISOString x) ".000Z" "Z")]
+      ;; RFC 3339's date-fullyear is 4DIGIT. JS renders anything outside
+      ;; 0000-9999 in the expanded form (`+275760-09-13T00:00:00Z`), which no
+      ;; conforming parser accepts -- and boring read it back happily, so the
+      ;; round-trip tests saw nothing. The sign prefix is the marker; the
+      ;; 4-digit form never carries one. Matches Writer.rfc3339 on the JVM.
+      (when (or (= "+" (.charAt s 0)) (= "-" (.charAt s 0)))
+        (throw (ex-info
+                (str "boring: " s " has a year outside 0000-9999, which RFC 3339 cannot "
+                     "express, so there is no valid tag 0 text for it; encode the epoch "
+                     "value yourself if you need this range")
+                {:type :boring/unrepresentable-date :value s :tag 0})))
+      (head! w TAG TAG-DATETIME)
+      (write-string! w s))
 
     ;; Before uuid?: a RegExp is not a uuid, but keeping the registered-tag
     ;; branches together makes the ordering constraint visible.

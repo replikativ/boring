@@ -1269,9 +1269,34 @@ public final class Writer {
      * option picks which one to produce. CBOR has one time concept; the
      * distinction is a JVM artifact.
      */
+    /** RFC 3339's `date-fullyear` is `4DIGIT`, so there is no conforming tag-0
+     *  or tag-1004 text for a year outside 0000-9999.
+     *
+     *  java.time renders those in ISO-8601's EXPANDED form -- `+12013-03-21`,
+     *  `-0001-03-21` -- which boring happily emitted and happily read back, so
+     *  round-trip tests saw nothing while a foreign reader got a string no
+     *  conforming parser accepts. The sign prefix is exactly the marker: the
+     *  4-digit form never carries one.
+     *
+     *  Refused rather than silently rerouted to tag 1. Tag 1 as a float has
+     *  ~0.5us resolution at present epochs and worse at extreme ones, so
+     *  quietly switching would trade an interop bug for a precision bug -- and
+     *  a caller who genuinely wants year 12013 can write the epoch themselves. */
+    private static String rfc3339(String s, long tag) {
+        char c0 = s.charAt(0);
+        if (c0 == '+' || c0 == '-')
+            throw Err.of("unrepresentable-date",
+                "boring: " + s + " has a year outside 0000-9999, which RFC 3339 cannot "
+                + "express, so there is no valid tag " + tag + " text for it; encode the "
+                + "epoch value yourself if you need this range", "value", s, "tag", tag);
+        return s;
+    }
+
     public void writeInstant(java.time.Instant t) {
+        String s = rfc3339(java.time.format.DateTimeFormatter.ISO_INSTANT.format(t),
+                           TAG_DATETIME);
         head(TAG, TAG_DATETIME);
-        writeString(java.time.format.DateTimeFormatter.ISO_INSTANT.format(t));
+        writeString(s);
     }
 
     public void writeUUID(java.util.UUID u) {
@@ -2048,16 +2073,19 @@ public final class Writer {
             return;
         }
         if (c == java.time.LocalDate.class) {
+            // ISO-8601 == RFC 3339 full-date, but only inside 0000-9999; see rfc3339.
+            String s = rfc3339(x.toString(), TAG_FULL_DATE);
             head(TAG, TAG_FULL_DATE);
-            writeString(x.toString());               // ISO-8601, == RFC 3339 full-date
+            writeString(s);
             return;
         }
         if (c == java.sql.Date.class) {
             // A calendar date, not an instant: java.sql.Date's time-of-day is
             // meaningless and its toInstant() throws. Tag 1004 is the registered
             // full-date form, so it goes there rather than through tag 0.
+            String s = rfc3339(((java.sql.Date) x).toLocalDate().toString(), TAG_FULL_DATE);
             head(TAG, TAG_FULL_DATE);
-            writeString(((java.sql.Date) x).toLocalDate().toString());
+            writeString(s);
             return;
         }
         if (c == java.net.URI.class) {
