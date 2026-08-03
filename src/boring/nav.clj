@@ -680,7 +680,8 @@
   If the sequence was sealed with an offset index (`boring/write-seq!` with
   `:index N`), `nth` uses it: O(1) to the nearest anchor, then at most N-1
   skips. Without one it skips from the start. Either way the answer is the
-  same -- an index is an optimisation, never load-bearing for correctness, and
+  same -- an index is an optimisation, not load-bearing for correctness (see
+  doc/SHAPES.md for where that stops: a CRAFTED index is a trust boundary), and
   a missing, truncated or stale one falls back to scanning.
 
   Detecting the index is not only about speed. The index is itself a top-level

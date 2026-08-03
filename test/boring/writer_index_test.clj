@@ -132,7 +132,8 @@
 ;; the shrunk output was impossible for exactly that reason.
 ;;
 ;; This is a subset, not a disagreement, and a subset is legitimate: the index
-;; is an optimisation and never load-bearing, and a node for a two-element
+;; is an optimisation and not load-bearing against accidental damage (see
+;; doc/SHAPES.md on crafted indexes), and a node for a two-element
 ;; structural frame is pure overhead -- nobody navigates `[name, map]`. So the
 ;; contract is:
 ;;

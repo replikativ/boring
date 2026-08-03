@@ -183,8 +183,11 @@ offsets are stored as deltas in the narrowest type that holds them, so even a
 stride of 1 — no scan at all — costs 2.7% rather than the 10.9% absolute
 offsets would. `doc/SHAPES.md` has the format and the full stride table.
 
-The index is never load-bearing: a stale, corrupt or missing one falls back to
-scanning and returns the same answer. It does **not** survive appending, though
+The index is never load-bearing: a stale, randomly corrupt or missing one is
+detected, falls back to scanning, and returns the same answer. That guarantee
+stops at a *crafted* index — verifying every anchor would cost the scan the
+index exists to avoid, so the index frame is a trust boundary. `doc/SHAPES.md`
+has the detail. It does **not** survive appending, though
 — re-seal rather than append to a sealed file.
 
 ## Compression
