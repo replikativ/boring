@@ -92,3 +92,59 @@
             r (boring/decode (boring/encode m o) o)]
         (is (vector? r))
         (is (= [[1.0 2.0] [3.0]] (mapv vec r)))))))
+
+;; ------------------------------------------------------------------- S10
+
+(deftest tag-numbers-are-validated-at-registration
+  (testing "the registry accepted NEGATIVE tags and the writer's registered
+            branch emitted them through the unchecked head path -- so a handler
+            registered as tag -1 wrote `ff`, the CBOR break byte, followed by
+            its content. No exception, just output no reader can parse.
+
+            Validated at construction, which is where a caller can still do
+            something about it, rather than at emission where the value is
+            already half written."
+    (doseq [bad [-1 -40 Long/MIN_VALUE]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsigned"
+                            (boring/register-tag (boring/tag-registry) bad
+                                                 java.io.File (fn [f] (str f)) nil))
+          (str "write registration of tag " bad))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsigned"
+                            (boring/register-tag (boring/tag-registry) bad
+                                                 nil nil (fn [v] v)))
+          (str "read registration of tag " bad)))
+    (testing "and ordinary tag numbers still register"
+      (is (some? (boring/register-tag (boring/tag-registry) 40000 java.io.File
+                                      (fn [f] (str f)) (fn [v] (java.io.File. (str v)))))))))
+
+;; ------------------------------------------------------------------- S11
+
+(deftest mmap-closes-its-arena-when-construction-fails
+  (testing "the arena owns the mapping and the caller only learns about it
+            through the return value -- so anything that throws after it is
+            created leaks the mapping with no handle left to close it. Both
+            failure modes are reachable: a missing file, and a stringref
+            document, which `boring.nav` refuses by design."
+    (if-not (try (Class/forName "org.replikativ.boring.ffm.SegmentSource") true
+                 (catch Throwable _ false))
+      (is true "skipped: this JVM has no java.lang.foreign (JDK < 22)")
+      (let [mmap-source (requiring-resolve 'boring.mmap/mmap-source)
+            mmap-items (requiring-resolve 'boring.mmap/mmap-items)
+            stringref (doto (java.io.File/createTempFile "boring-arena" ".cbor")
+                        .deleteOnExit)]
+        (with-open [out (java.io.FileOutputStream. stringref)]
+          ;; written WITH stringref, which navigation refuses
+          (.write out ^bytes (boring/encode {"a" "aaaa" "b" "aaaa"})))
+        (doseq [f [mmap-source mmap-items]]
+          (is (thrown? clojure.lang.ExceptionInfo (f stringref))
+              "a stringref document must be refused")
+          (is (thrown? Exception (f (java.io.File. "/nonexistent/nope.cbor")))
+              "a missing file must throw"))
+        (testing "and a valid file still maps and reads"
+          (let [ok (doto (java.io.File/createTempFile "boring-arena-ok" ".cbor")
+                     .deleteOnExit)]
+            (with-open [out (java.io.FileOutputStream. ok)]
+              (.write out ^bytes (boring/encode {"a" 1} o)))
+            (let [[c arena] (mmap-source ok o)]
+              (try (is (= {"a" 1} ((requiring-resolve 'boring.nav/value) c)))
+                   (finally (.close ^java.lang.AutoCloseable arena))))))))))

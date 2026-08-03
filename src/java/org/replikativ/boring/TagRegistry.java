@@ -73,13 +73,34 @@ public final class TagRegistry {
      * @param writeFn (fn [value] -> value-to-encode) — returns a value the codec
      *                already knows how to write; it is written as the tag content
      */
+    /**
+     * A tag number the wire can carry.
+     *
+     * The registry accepted NEGATIVE tags, and the writer's registered branch
+     * emitted them through the unchecked head path -- so a handler registered
+     * as tag -1 wrote `ff`, the CBOR break byte, followed by its content. No
+     * exception, just malformed output that no reader can parse.
+     *
+     * CBOR's tag domain is [0, 2^64-1]; this API takes a long, so it can offer
+     * [0, Long.MAX_VALUE] and says so rather than truncating.
+     */
+    private static long checkTag(long tag) {
+        if (tag < 0)
+            throw Err.of("bad-tag-number",
+                "boring: tag numbers are unsigned; got " + tag
+                + ". This API accepts 0 to " + Long.MAX_VALUE + ".");
+        return tag;
+    }
+
     public TagRegistry withWriter(Class<?> cls, long tag, clojure.lang.IFn writeFn) {
+        checkTag(tag);
         return new TagRegistry(plus(writers, cls, new Object[]{tag, writeFn}),
                                readers, recordCtors, recordNames);
     }
 
     /** @param readFn (fn [decoded-content] -> value) */
     public TagRegistry withReader(long tag, clojure.lang.IFn readFn) {
+        checkTag(tag);
         return new TagRegistry(writers, plus(readers, tag, readFn),
                                recordCtors, recordNames);
     }

@@ -66,9 +66,18 @@
   references wrongly."
   ([file] (mmap-source file nil))
   ([file opts]
-   (let [arena (Arena/ofShared)
-         seg (mmap-segment file arena)]
-     [(nav/source (segment-source seg) opts) arena])))
+   ;; The arena is CLOSED if anything after it throws. It owns the mapping, and
+   ;; the caller only learns about it through the return value -- so a failure
+   ;; in `mmap-segment` (a missing file, a permissions error) or in the cursor
+   ;; construction (`boring.nav` refuses a stringref document) leaked the
+   ;; mapping with no handle left to close it.
+   (let [arena (Arena/ofShared)]
+     (try
+       (let [seg (mmap-segment file arena)]
+         [(nav/source (segment-source seg) opts) arena])
+       (catch Throwable t
+         (.close ^java.lang.AutoCloseable arena)
+         (throw t))))))
 
 (defn mmap-items
   "Map `file` as a CBOR SEQUENCE and return `[items arena]`, where `items` is
@@ -85,9 +94,18 @@
   it may escape, and the file must have been written `{:stringref false}`."
   ([file] (mmap-items file nil))
   ([file opts]
-   (let [arena (Arena/ofShared)
-         seg (mmap-segment file arena)]
-     [(nav/items (segment-source seg) opts) arena])))
+   ;; The arena is CLOSED if anything after it throws. It owns the mapping, and
+   ;; the caller only learns about it through the return value -- so a failure
+   ;; in `mmap-segment` (a missing file, a permissions error) or in the cursor
+   ;; construction (`boring.nav` refuses a stringref document) leaked the
+   ;; mapping with no handle left to close it.
+   (let [arena (Arena/ofShared)]
+     (try
+       (let [seg (mmap-segment file arena)]
+         [(nav/items (segment-source seg) opts) arena])
+       (catch Throwable t
+         (.close ^java.lang.AutoCloseable arena)
+         (throw t))))))
 
 (defmacro with-mmap
   "Map `file`, bind `binding` to a root cursor, and close the arena after.
