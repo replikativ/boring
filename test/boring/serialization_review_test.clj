@@ -1,5 +1,5 @@
 (ns boring.serialization-review-test
-  "Findings from doc/SERIALIZATION-CORRECTNESS-REVIEW.md that are JVM-specific.
+  "Findings from an internal serialization-correctness review that are JVM-specific.
   The portable ones live in `boring.canonical-parity-test`, because the whole
   lesson of that review was that a `.clj` test beside the JVM implementation
   does not cover a guarantee the library makes on two runtimes."
