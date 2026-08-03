@@ -4,9 +4,15 @@ Repeated map keys are where serialization size and decode time actually go.
 This file specifies what boring does about that today, what it should do about
 the case it currently misses, and the constraints any extension must respect.
 
-**Status:** tag 39649 is implemented. Tag 39650 is *specified here and not yet
-implemented* — it is a design under review, deliberately not in the first
-release. See "Why not in the first release" at the end.
+**Status:** tags 39649 and 39651 are implemented. Tag 39650 is *specified here
+and not yet implemented* — it is a design under review, deliberately not in the
+first release. See "Why not in the first release" at the end.
+
+| tag | what | status |
+|---|---|---|
+| 39649 | shaped array — repeated map keys hoisted out | implemented |
+| 39650 | scattered shapes | specified, not implemented |
+| 39651 | sequence offset index | implemented |
 
 ---
 
@@ -248,3 +254,83 @@ Three reasons, in order of weight:
 
 Specify it now, so the wire format and the security requirements are settled
 and reviewable. Ship it once the vertical is proven.
+
+
+---
+
+## Tag 39651, sequence offset index
+
+A CBOR sequence (RFC 8742) has no way to reach item *n* except by skipping the
+*n-1* before it. For a log that is fine while tailing and useless while seeking:
+reaching the last of 200 000 items measured 9 896 µs by skipping and 0.43 µs
+through an index — 23 000×.
+
+`boring/write-seq!` with `:index N` seals a sequence with one extra item:
+
+```
+<item> <item> ... <item>              the data section, untouched
+d9 9ae3  84                           tag 39651, array(4)
+   <stride>                           items covered per entry
+   <total>                            item count
+   <int32 array>                      byte offset of every Nth item
+   48 <8 bytes>                       back-pointer = data-section length
+```
+
+### Why the index is at the END
+
+Offsets are only known once the items are written, so a leading index would
+mean buffering the whole sequence in memory before emitting a byte — fatal for
+a log. ZIP's central directory and Parquet's footer sit at the end for exactly
+this reason. It also means a foreign reader sees every real item first and the
+metadata last, so one that stops early never encounters it.
+
+### How it is found, without leaving CBOR
+
+CBOR cannot be parsed backwards. The last element is therefore a byte string of
+exactly 8 bytes, which always encodes as `0x48` plus 8 — so a sealed file ends
+with 9 predictable bytes however large the offsets array is. Read them, take
+the pointer, seek.
+
+**Those 9 bytes are not a magic trailer.** They are the ordinary encoding of an
+ordinary byte string. The file remains a valid CBOR sequence end to end, and
+`cbor2` or `ciborium` reading it gets every data item plus one tagged value
+they can ignore.
+
+### The pointer verifies as well as locates
+
+It is both where the index begins and how long the data section is. A reader
+seeks there and checks for tag 39651; if it is not there the index is stale —
+the file was truncated, or appended to after sealing — and the reader scans
+instead. Three checks guard against a file that merely happens to end in the
+right shape: the tail must look like an 8-byte byte string, the pointer must be
+in range, and the target must actually be tag 39651.
+
+**The index is never load-bearing for correctness.** It is rebuildable by a
+full scan, discardable at any time, and a missing or damaged one changes only
+the speed. That is deliberate, and it is what the test suite pins.
+
+### Stride is a parameter, not a constant
+
+Each entry costs 4 bytes; a lookup scans up to *N*-1 items. On 200 000 items of
+~40 bytes:
+
+| stride | index | overhead | µs/lookup |
+|---:|---:|---:|---:|
+| 1 | 781 KB | 10.1% | 0.28 |
+| 8 | 98 KB | 1.3% | 0.46 |
+| 16 | 49 KB | 0.6% | 0.66 |
+| 64 | 12 KB | 0.2% | 2.1 |
+| 256 | 3 KB | 0.04% | 7.6 |
+
+The sweet spot moves with item size — the scan cost is per item, the index cost
+per entry — so there is no default worth baking in.
+
+### What it does NOT do
+
+This indexes **top-level items in a sequence**. It says nothing about the
+structure inside an item, so descending into a map is still a scan, and that
+scan is linear in the map's width: measured 0.35 µs at 10 keys and 276 µs at
+5 000. A hierarchical index — key or path to offset, carried in the same
+trailing item — would fit this mechanism unchanged. The open question there is
+not how to carry it but *what to index*, which is a schema decision rather than
+an encoding one.

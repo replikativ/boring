@@ -287,14 +287,64 @@
   to value cursor (maps). Prefer `reduce` over `seq` in a hot loop."
   [^Cursor c] c)
 
-(deftype Items [^Nav nav]
+(defn- read-seq-index
+  "The offset index sealed onto a CBOR sequence by `boring/write-seq!`, or nil.
+
+  CBOR cannot be parsed backwards, so the index is found through its last
+  element: an 8-byte byte string, which always encodes as `0x48` plus 8. Read
+  the final 9 bytes, take the pointer, seek there.
+
+  Three checks, because a file with no index could in principle end in those
+  same bytes: the tail must have that shape, the pointer must be in range, and
+  the byte at the pointer must actually begin tag 39651. A false positive needs
+  all three; a false negative just means scanning, which is always correct."
+  [^Nav nav]
+  (let [^Reader r (.rdr nav)
+        n (.size r)]
+    (when (>= n 9)
+      (let [bp (- n 9)]
+        (when (and (= 2 (.majorAt r bp)) (= 8 (.infoAt r bp)))
+          (let [^bytes ptr-bytes (.readFrom r bp)
+                ptr (areduce ptr-bytes i acc 0
+                             (bit-or (bit-shift-left acc 8)
+                                     (bit-and (aget ptr-bytes i) 0xFF)))]
+            (when (and (pos? ptr) (< ptr bp)
+                       (= 6 (.majorAt r ptr))
+                       (= boring/index-tag (.headArgAt r ptr)))
+              (let [tv (.readFrom r ptr)
+                    [stride total offsets _] (:value tv)]
+                (when (and (int? stride) (pos? (long stride)))
+                  {:stride (long stride) :total (long total)
+                   :offsets offsets :data-end ptr})))))))))
+
+(deftype Items [^Nav nav idx]
   clojure.lang.Seqable
   (seq [this] (seq (into [] this)))
+
+  clojure.lang.Indexed
+  (nth [this i] (.nth this i nil))
+  (nth [_ i nf]
+    (let [^Reader r (.rdr nav)
+          end (long (or (:data-end idx) (.size r)))]
+      (if-let [{:keys [^long stride ^ints offsets ^long total]} idx]
+        ;; O(1) to the anchor, then at most stride-1 skips.
+        (if (or (neg? i) (>= i total))
+          nf
+          (let [anchor (quot (long i) stride)]
+            (loop [k (* anchor stride) p (long (aget offsets anchor))]
+              (if (= k (long i)) (cursor-at nav p) (recur (inc k) (.skipFrom r p))))))
+        ;; No index: skip i times, or run out.
+        (loop [k 0 p 0]
+          (cond (>= p end) nf
+                (= k (long i)) (cursor-at nav p)
+                :else (recur (inc k) (.skipFrom r p)))))))
 
   clojure.lang.IReduceInit
   (reduce [_ f init]
     (let [^Reader r (.rdr nav)
-          end (.size r)]
+          ;; Stop at the data section's end, NOT the file's. Without this the
+          ;; index item itself would be yielded as if it were data.
+          end (long (or (:data-end idx) (.size r)))]
       (loop [p 0 acc init]
         (if (or (>= p end) (reduced? acc))
           (unreduced acc)
@@ -318,10 +368,21 @@
       (transduce (comp (map nav/value) (filter #(= \"error\" (get % \"lvl\"))))
                  conj [] (nav/items bs opts))
 
+  If the sequence was sealed with an offset index (`boring/write-seq!` with
+  `:index N`), `nth` uses it: O(1) to the nearest anchor, then at most N-1
+  skips. Without one it skips from the start. Either way the answer is the
+  same -- an index is an optimisation, never load-bearing for correctness, and
+  a missing, truncated or stale one falls back to scanning.
+
+  Detecting the index is not only about speed. The index is itself a top-level
+  item, so without recognising it this would yield it as though it were data.
+
   The `:stringref false` requirement applies per item, as everywhere in this
   namespace."
   ([src] (items src nil))
-  ([src opts] (Items. (nav-of src (or opts {})))))
+  ([src opts]
+   (let [nav (nav-of src (or opts {}))]
+     (Items. nav (read-seq-index nav)))))
 
 (defn zipper
   "A read-only clojure.zip zipper over the cursor. `down`, `right`, `node` and
