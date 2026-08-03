@@ -150,3 +150,35 @@
             (is (c/equiv? (nav/value (get mm k)) (get widths k))
                 (str "mmap disagreed on " k)))
           (finally (.close ^java.lang.AutoCloseable arena)))))))
+
+(deftest an-indexed-sequence-is-usable-over-a-mapping
+  (if-not ffm?
+    (is true "skipped: this JVM has no java.lang.foreign (JDK < 22)")
+    (testing "the index's slot arrays are DELTAS, decoded off the wire and
+              expanded once when the index loads. Over a mapping that decode
+              runs through the segment accessor rather than the byte[] fast
+              path, so this is the one place the two could disagree -- and a
+              disagreement would not throw, it would silently seek to the wrong
+              offset. Every stride is checked because each picks a different
+              element width, and the widths swap bytes differently."
+      (doseq [stride [1 8 64]]
+        (let [vs (vec (for [i (range 500)]
+                        {"n" i "msg" (str "event " i) "ok" (even? i)}))
+              o (java.io.ByteArrayOutputStream.)
+              _ (boring/write-seq! (boring/writer 65536 opts) vs o
+                                   (assoc opts :index stride))
+              ^bytes bs (.toByteArray o)
+              f (spit-bytes bs)
+              ;; `mmap-source` is the single-value shape and hands back a
+              ;; cursor; a sequence needs `mmap-items`.
+              [mapped arena] ((requiring-resolve 'boring.mmap/mmap-items) f opts)]
+          (try
+            (let [heap (nav/items bs opts)]
+              (is (= 500 (count (vec (seq mapped))))
+                  (str "stride " stride ": the index item must not be yielded as data"))
+              (doseq [i [0 1 7 8 9 250 498 499]]
+                (is (= (vs i)
+                       (nav/value (nth heap i))
+                       (nav/value (nth mapped i)))
+                    (str "stride " stride ", item " i))))
+            (finally (.close ^java.lang.AutoCloseable arena))))))))

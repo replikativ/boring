@@ -70,6 +70,25 @@
          seg (mmap-segment file arena)]
      [(nav/source (segment-source seg) opts) arena])))
 
+(defn mmap-items
+  "Map `file` as a CBOR SEQUENCE and return `[items arena]`, where `items` is
+  what `boring.nav/items` returns -- seqable, reducible, `nth`-able.
+
+  `mmap-source` is the single-value shape: it hands back a cursor at the root,
+  which is wrong for a file of many top-level items. This is the other one, and
+  it is the shape a log actually has. If the sequence was sealed with an index
+  (`write-seq!` with `:index N`), `nth` uses it here exactly as it does on the
+  heap -- which is the combination this whole feature is for: seek into a large
+  file without faulting in the pages you skipped.
+
+  Same rules as `mmap-source`: the caller closes the arena, nothing derived from
+  it may escape, and the file must have been written `{:stringref false}`."
+  ([file] (mmap-items file nil))
+  ([file opts]
+   (let [arena (Arena/ofShared)
+         seg (mmap-segment file arena)]
+     [(nav/items (segment-source seg) opts) arena])))
+
 (defmacro with-mmap
   "Map `file`, bind `binding` to a root cursor, and close the arena after.
 

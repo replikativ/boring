@@ -529,10 +529,12 @@
   `:index N` additionally seals the sequence with an offset index covering
   every Nth item, so `boring.nav/items` can jump to an item instead of skipping
   to it -- O(1) rather than O(n). N is the stride, and it is the size/speed
-  knob: every entry costs 4 bytes, while a lookup scans up to N-1 items. On
-  200k ~40-byte items, stride 1 cost 10% of the file and stride 16 cost 0.6%
-  for roughly 2.5x the lookup. The right N depends on item size, so it is a
-  parameter rather than a default.
+  knob: a lookup scans up to N-1 items, while every entry costs one to four
+  bytes depending on how far apart the anchors fall, since offsets are stored as
+  deltas in the narrowest typed array that holds them. On 200k ~37-byte items,
+  stride 1 costs 2.7% of the file and stride 16 costs 0.34% for roughly 14x the
+  seek. The right N depends on item size, so it is a parameter rather than a
+  default.
 
   The index goes at the END, which is what makes it compatible with appending:
   offsets are only known after the items are written, so a leading index would
@@ -728,6 +730,56 @@
      (when (pos? (alength ^ints (:containers idx)))
        (assoc idx :stride stride)))))
 
+(defn- delta-slot
+  "A slot's entry offsets, as deltas in the narrowest typed array that holds them.
+
+  Offsets inside a container ascend, so consecutive differences are small and
+  nearly uniform while the absolutes are large and unbounded. That is the whole
+  saving: on 50 000 ~66-byte log records the per-item deltas span 60..67, which
+  is a byte, against int32 absolutes reaching into the millions.
+
+  Widths, narrowest first -- a byte string (no tag at all), sint16 (tag 77),
+  sint32 (tag 78). Every one of these already round-trips through the codec, so
+  this adds NO format surface: the CBOR tag is the width declaration, which is
+  why there is no per-entry flag of the kind Postgres needs for its JEntry
+  array. Postgres reads offsets in place out of a TOAST'd datum; we materialise
+  the index once, so we can afford a representation that must be expanded.
+
+  The 0x7FFF bound, rather than 0xFFFF: tag 77 is SIGNED, and taking the last
+  32 KiB of range back would mean masking on read for a band that only opens up
+  when anchors are 32 KiB apart. Deltas that large take int32, which is what
+  they would have cost anyway.
+
+  `base` is what the first delta is measured from: the container's own offset,
+  or 0 for the sequence node. So slot[0] is a header width rather than a file
+  position, which keeps the first entry as narrow as the rest.
+
+  Falls back to int32 on a negative delta. That cannot arise from a walk --
+  entries ascend and no CBOR item is zero bytes -- but the narrow encodings
+  cannot represent one, so the check is what makes that an assumption about the
+  walk rather than about the file."
+  [^ints offs ^long base]
+  (let [n (alength offs)
+        d (int-array n)]
+    (loop [i 0 prev base mn Long/MAX_VALUE mx Long/MIN_VALUE]
+      (if (= i n)
+        (cond
+          (or (zero? n) (and (>= mn 0) (<= mx 0xFF)))
+          (let [b (byte-array n)]
+            (dotimes [k n] (aset-byte b k (unchecked-byte (aget d k))))
+            b)
+
+          (and (>= mn 0) (<= mx 0x7FFF))
+          (let [s (short-array n)]
+            (dotimes [k n] (aset-short s k (unchecked-short (aget d k))))
+            s)
+
+          :else d)
+        (let [v (long (aget offs i))
+              delta (- v prev)]
+          (aset-int d i (int delta))
+          (recur (inc i) v (min mn delta) (max mx delta)))))))
+
 (defn- long->8-bytes* ^bytes [^long v]
   (let [b (byte-array 8)]
     (dotimes [i 8] (aset-byte b i (unchecked-byte (bit-shift-right v (* 8 (- 7 i))))))
@@ -747,6 +799,12 @@
   `sorted` says whether that container's keys ascend -- recorded rather than
   inferred, because the encoding profile is not on the wire.
 
+  Slots go out as DELTAS, in the narrowest typed array that holds them (see
+  `delta-slot`), and a reader expands them back to absolutes once when it loads
+  the index. An int32 slot is therefore deltas too, not absolutes -- the two are
+  indistinguishable on the wire, which is why this had to land before the format
+  was published rather than after.
+
   The trailing element is a byte string of exactly 8 bytes, so it always encodes
   as `0x48` plus 8: a sealed file ends with 9 predictable bytes however large
   the index is. That is how it is found, since CBOR cannot be parsed backwards.
@@ -758,10 +816,16 @@
   how long the data is, so a reader that seeks there and does not find a tag-27
   frame named `boring/index` knows the index is stale and scans instead."
   [^Writer w ^java.io.OutputStream out index data-len]
-  (let [{:keys [stride containers counts slots sorted]} index
+  (let [{:keys [stride ^ints containers counts slots sorted]} index
+        packed (vec (map-indexed
+                     (fn [i s]
+                       ;; The sequence node's sentinel offset is -1, and a file
+                       ;; position is never negative: its deltas start from 0.
+                       (delta-slot s (max 0 (long (aget containers (int i))))))
+                     slots))
         item (data/unknown-record
               index-name
-              [(long stride) containers counts (vec slots) (vec sorted)
+              [(long stride) containers counts packed (vec sorted)
                (long->8-bytes* (long data-len))])]
     (write-to! w item out)))
 

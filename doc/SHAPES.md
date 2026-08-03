@@ -262,8 +262,9 @@ and reviewable. Ship it once the vertical is proven.
 
 A CBOR sequence (RFC 8742) has no way to reach item *n* except by skipping the
 *n-1* before it. For a log that is fine while tailing and useless while seeking:
-reaching the last of 200 000 items measured 9 896 µs by skipping and 0.43 µs
-through an index — 23 000×.
+reaching the last of 200 000 items measured 10.6 ms by skipping and 0.2 µs
+through an index — see the stride table below, and reproduce it with
+`clojure -M:bench -m nav index`.
 
 `boring/write-seq!` with `:index N` seals a sequence with one extra item:
 
@@ -274,6 +275,9 @@ d8 1b  82                             tag 27, array(2)
    86 ...                             [stride, containers, counts,
                                        slots, sorted, 48 <8 bytes>]
 ```
+
+`slots` are **deltas, not absolute offsets** — see "Slots are deltas" below
+before implementing a reader.
 
 ### Why the index is at the END
 
@@ -309,21 +313,65 @@ in range, and the target must actually carry the `boring/index` name.
 full scan, discardable at any time, and a missing or damaged one changes only
 the speed. That is deliberate, and it is what the test suite pins.
 
+### Slots are deltas, in the narrowest type that holds them
+
+Offsets inside a container ascend, so consecutive differences are small and
+nearly uniform while the absolutes are large and unbounded. Each slot therefore
+goes out as differences from the previous entry, in the narrowest of a **byte
+string**, **sint16** (tag 77) or **sint32** (tag 78), and the first difference
+is measured from the container's own offset — 0 for the sequence node, whose
+sentinel −1 is not a position.
+
+The CBOR element type *is* the width declaration, so there is no per-entry flag
+of the kind PostgreSQL needs for its `JEntry` array. Postgres reads offsets in
+place out of a TOAST'd datum and pays a prefix sum per probe; boring
+materialises the index once when it loads, expands there, and every lookup path
+then reads a plain `int[]` exactly as it did before. Delta encoding costs
+nothing at lookup time here.
+
+A reader must therefore treat an int32 slot as deltas too — absolutes and deltas
+are indistinguishable on the wire. That is why this landed before the format was
+published rather than after.
+
 ### Stride is a parameter, not a constant
 
-Each entry costs 4 bytes; a lookup scans up to *N*-1 items. On 200 000 items of
-~40 bytes:
+A lookup scans up to *N*-1 items, so stride trades size against seek. On 200 000
+items of ~36.8 bytes (7.36 MB of data) — reproduce with
+`clojure -M:bench -m nav index`:
 
-| stride | index | overhead | µs/lookup |
-|---:|---:|---:|---:|
-| 1 | 781 KB | 10.1% | 0.28 |
-| 8 | 98 KB | 1.3% | 0.46 |
-| 16 | 49 KB | 0.6% | 0.66 |
-| 64 | 12 KB | 0.2% | 2.1 |
-| 256 | 3 KB | 0.04% | 7.6 |
+| stride | anchors | slot type | index | overhead | µs/seek |
+|---:|---:|---|---:|---:|---:|
+| — | — | *no index* | — | — | **10 600** |
+| 1 | 200 000 | byte string | 195.4 KB | 2.72% | 0.2 |
+| 8 | 25 000 | sint16 | 48.9 KB | 0.68% | 0.6 |
+| 16 | 12 500 | sint16 | 24.5 KB | 0.34% | 1–2.5 |
+| 64 | 3 125 | sint16 | 6.2 KB | 0.09% | ~4.2 |
+| 256 | 781 | sint16 | 1.6 KB | 0.02% | ~4.3 |
 
-The sweet spot moves with item size — the scan cost is per item, the index cost
-per entry — so there is no default worth baking in.
+The first row is the same seek with no index: 10.6 **milliseconds**, because
+reaching item 199 999 means skipping 199 999 items. That is the number the
+whole feature exists to remove — roughly 18 000× at stride 8 — and against it
+every other row is within a rounding error of the same answer.
+
+Sizes are exact; **seek times are not**, and the last three rows are quoted
+loosely on purpose. Run to run, stride 16 moved between 1.1 and 2.4 µs and
+64/256 swapped order — the index competes for cache with the data, so a
+smaller index sometimes wins back what a longer scan costs. Read the column
+for its shape, not its digits.
+
+Seek is separated from decode because only the seek is the index's doing:
+materialising the item is a ~0.3–0.5 µs floor at any stride, which dominates at
+stride 1 and disappears into the noise by stride 64.
+
+**Narrowing breaks the proportionality.** Doubling the stride halves the anchor
+count but can double the element width, so size falls in steps rather than
+smoothly and there are bands where a denser index is nearly free. Absolute
+int32 offsets would have cost 781 KB at stride 1 (10.9% of this file); deltas
+cost 195 KB, and that 4× is what makes a stride-1 index — one with no scan
+component at all — a defensible choice rather than a curiosity.
+
+The sweet spot still moves with item size — the scan cost is per item, the index
+cost per entry — so there is no default worth baking in.
 
 ### Reaching into an item
 

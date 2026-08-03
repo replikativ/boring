@@ -106,6 +106,19 @@ including `boring.nav`, runs on JDK 9.
   (nav/value (get-in c ["customer-137" "name"])))
 ```
 
+That is the shape for a file holding **one** value. A file holding a *sequence*
+— a log — wants `mmap-items`, which returns what `nav/items` does:
+
+```clojure
+(let [[items arena] (mmap/mmap-items "log.cbor" {:stringref false})]
+  (with-open [a arena]
+    (nav/value (nth items 199999))))
+```
+
+If the sequence was sealed with `:index N`, `nth` uses it here exactly as on the
+heap — which is the pairing the two features exist for: seek into a large file
+without faulting in the pages you skipped over.
+
 Pages you never probe are never faulted in, so a lookup costs what the *item*
 costs, not what the file costs. Random selective decode over a mapping beats
 one `pread` per item by **2.3×**.
@@ -155,8 +168,24 @@ Three traps, in order of how much they cost:
    the last item.
 
 Reaching item *n* costs *n* skips, so tailing and scanning are cheap while
-seeking into the middle of a large file is not. If you need that, record
-`(offset, len)` as you append — the stream position gives it to you free.
+seeking into the middle of a large file is not. If you need that, seal the
+sequence with an index:
+
+```clojure
+(boring/write-seq! w events out {:stringref false :index 8})
+```
+
+That appends one extra CBOR item holding the offsets of every 8th item, and
+`nav/items` then jumps rather than skips — on 200 000 records, reaching the last
+one takes **10.6 ms** unindexed against **0.6 µs** indexed, for 0.68% of the
+file. The
+offsets are stored as deltas in the narrowest type that holds them, so even a
+stride of 1 — no scan at all — costs 2.7% rather than the 10.9% absolute
+offsets would. `doc/SHAPES.md` has the format and the full stride table.
+
+The index is never load-bearing: a stale, corrupt or missing one falls back to
+scanning and returns the same answer. It does **not** survive appending, though
+— re-seal rather than append to a sealed file.
 
 ## Compression
 

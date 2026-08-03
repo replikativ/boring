@@ -381,6 +381,54 @@
           (swap! p assoc ::index-name bs)
           bs))))
 
+(def ^:private shorts-class (class (short-array 0)))
+
+(defn- expand-slot
+  "A slot's deltas, back to the absolute offsets every lookup path expects.
+
+  `boring.core/delta-slot` writes each slot as differences from the previous
+  entry, in the narrowest of a byte string, sint16 or sint32 -- so the element
+  type carries the width and nothing else has to.
+
+  Expanding HERE, once per index, is what keeps this free. A prefix sum is the
+  obvious cost of delta encoding, and the obvious place to pay it is in the
+  binary search, up to a stride of additions per probe. There is no need: the
+  index is already materialised off the wire before any lookup runs, so one pass
+  at load time leaves `lookup-map`, `nth` and `node-slot` reading a plain
+  `int[]` exactly as before. Postgres pays per probe because it reads its
+  offsets in place from a TOAST'd datum and never gets a load-time pass at all.
+
+  Bytes are masked because Java's are signed; shorts are not, because the writer
+  only narrows to sint16 within the positive range."
+  ^ints [s ^long base]
+  (cond
+    (bytes? s)
+    (let [^bytes a s n (alength a) out (int-array n)]
+      (loop [k 0 acc base]
+        (if (= k n)
+          out
+          (let [v (+ acc (bit-and (aget a k) 0xFF))]
+            (aset-int out k (int v))
+            (recur (inc k) v)))))
+
+    (instance? shorts-class s)
+    (let [^shorts a s n (alength a) out (int-array n)]
+      (loop [k 0 acc base]
+        (if (= k n)
+          out
+          (let [v (+ acc (aget a k))]
+            (aset-int out k (int v))
+            (recur (inc k) v)))))
+
+    :else
+    (let [^ints a s n (alength a) out (int-array n)]
+      (loop [k 0 acc base]
+        (if (= k n)
+          out
+          (let [v (+ acc (aget a k))]
+            (aset-int out k (int v))
+            (recur (inc k) v)))))))
+
 (defn- read-index
   "The offset index sealed onto a CBOR sequence by `boring/write-seq!`, or nil.
 
@@ -427,15 +475,22 @@
                   (let [seq-slot (loop [k 0]
                                    (cond (>= k (alength containers)) nil
                                          (= -1 (aget containers k)) k
-                                         :else (recur (inc k))))]
+                                         :else (recur (inc k))))
+                        ;; Deltas to absolutes, once, against each slot's own
+                        ;; base -- its container's offset, or 0 for the
+                        ;; sequence, whose sentinel -1 is not a position.
+                        abs-slots (vec (map-indexed
+                                        (fn [i s]
+                                          (expand-slot s (max 0 (long (aget containers (int i))))))
+                                        slots))]
                     {:stride (long stride)
                      :containers containers
                      :counts counts
-                     :slots (vec slots)
+                     :slots abs-slots
                      :sorted (vec sorted)
                      :data-end ptr
                      :total (when seq-slot (long (aget counts seq-slot)))
-                     :offsets (when seq-slot (nth (vec slots) seq-slot))}))))))))))
+                     :offsets (when seq-slot (nth abs-slots seq-slot))}))))))))))
 
 (deftype Items [^Nav nav idx]
   clojure.lang.Seqable

@@ -142,6 +142,67 @@
         (is (= (items 499) (nav/value (nth (nav/items (build s) opts) 499)))
             (str "stride " s " must still reach the last item"))))))
 
+;; ----------------------------------------------------------- delta encoding
+;;
+;; Slots go on the wire as differences from the previous entry, in the narrowest
+;; of a byte string / sint16 / sint32, and are expanded once when the index
+;; loads. The element type IS the width declaration, so these tests check the
+;; type that came back rather than a flag, and check that every width still
+;; answers identically -- narrowing is a size decision and nothing else.
+
+(defn- index-slots
+  "The slot arrays as they actually sit on the wire, before expansion."
+  [^bytes bs o]
+  (let [item (last (vec (boring/decode-seq bs o)))
+        [_ _ _ slots _ _] (boring.data/frame-payload item)]
+    (vec slots)))
+
+(deftest slots-narrow-to-the-width-the-data-needs
+  (testing "small, uniform deltas take a byte string -- no tag at all"
+    (let [slots (index-slots (build 1) opts)]
+      (is (= 1 (count slots)) "one node: the sequence")
+      (is (bytes? (first slots))
+          (str "expected a byte string for ~60-byte deltas, got "
+               (.getName (class (first slots)))))))
+  (testing "wider deltas step up to sint16, and wider still to sint32"
+    (let [w (boring/writer 262144 opts)
+          mk (fn [len]
+               (let [o (ByteArrayOutputStream.)
+                     vs (vec (for [i (range 40)]
+                               {"n" i "pad" (apply str (repeat len \x))}))]
+                 (boring/write-seq! w vs o (assoc opts :index 1))
+                 (.toByteArray o)))]
+      (is (instance? (class (short-array 0)) (first (index-slots (mk 2000) opts)))
+          "~2 KB deltas exceed a byte and fit sint16")
+      (is (instance? (class (int-array 0)) (first (index-slots (mk 40000) opts)))
+          "~40 KB deltas exceed signed 16 bits and fall back to sint32"))))
+
+(deftest every-width-resolves-identically
+  (testing "the fallback to a wider element type is a size decision only"
+    (doseq [len [10 2000 40000]]
+      (let [vs (vec (for [i (range 40)] {"n" i "pad" (apply str (repeat len \x))}))
+            w (boring/writer 262144 opts)
+            o (ByteArrayOutputStream.)]
+        (boring/write-seq! w vs o (assoc opts :index 1))
+        (let [bs (.toByteArray o)]
+          (doseq [i [0 1 20 39]]
+            (is (= (vs i) (nav/value (nth (nav/items bs opts) i)))
+                (str "pad " len ", item " i))))))))
+
+(deftest deltas-cost-less-than-absolutes-would
+  (testing "the whole point: at stride 1, where a lookup needs no scan at all,
+            an index of int32 absolutes would cost 4 bytes per item. Deltas over
+            uniform records fit in one, and that is what makes a dense index
+            affordable rather than a curiosity."
+    (let [plain (alength (build nil))
+          dense (- (alength (build 1)) plain)
+          n (count items)]
+      (is (< dense (* 2 n))
+          (str "expected roughly one byte per item, got " (/ (double dense) n)))
+      (is (< (double (/ dense plain)) 0.10)
+          (str "a stride-1 index should stay well under a tenth of the file, was "
+               (format "%.1f%%" (* 100.0 (/ (double dense) plain))))))))
+
 ;; ------------------------------------------------- hierarchical descent
 ;;
 ;; The sequence index above reaches item n. These reach INTO an item: a node

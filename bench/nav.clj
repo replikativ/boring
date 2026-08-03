@@ -16,6 +16,7 @@
   Findings are written up in doc/PERFORMANCE.md."
   (:require [ab :refer [ab]]
             [boring.core :as boring]
+            [boring.data]
             [boring.mmap :as mmap]
             [boring.nav :as nav])
   (:import (java.io File FileOutputStream)
@@ -391,6 +392,58 @@
                                      (double (alength ^bytes plain))))
                          (/ (timed (lookup-sweep (nav/source bs idx-opts) ks) 20 8)
                             (count ks) 1000.0)))
+        (flush))))
+
+  (println "\nSEQUENCE STRIDE — 200 000 items; the table SHAPES.md publishes.")
+  (println "Slots are DELTA-encoded, so the element width is chosen per slot and")
+  (println "the size no longer falls in proportion to the stride: doubling the")
+  (println "stride halves the anchor count but can double the width, so there are")
+  (println "bands where a denser index is free.")
+  (println "Seek and decode are separated because only the seek is the index's")
+  (println "doing. Materialising the item is a ~0.3 us floor whatever the stride,")
+  (println "which is most of the cost at stride 1 and noise by stride 64 -- so a")
+  (println "single nth+value column would understate the stride at one end and")
+  (println "be indistinguishable from it at the other.")
+  (println (format "  %-8s %10s %12s %11s %11s %10s %12s"
+                   "stride" "anchors" "slot type" "index KB" "overhead"
+                   "us/seek" "us/nth+val"))
+  (let [seq-opts {:stringref false}
+        vs (vec (for [i (range 200000)]
+                  {"n" i "msg" (str "event " i) "lvl" "info" "ok" (even? i)}))
+        build (fn ^bytes [stride]
+                (let [w (boring/writer 65536 seq-opts)
+                      o (java.io.ByteArrayOutputStream.)]
+                  (boring/write-seq! w vs o (cond-> seq-opts
+                                              stride (assoc :index stride)))
+                  (.toByteArray o)))
+        ^bytes plain-bs (build nil)
+        plain (alength plain-bs)]
+    (println (format "  (data section %d bytes, ~%.1f per item)"
+                     plain (/ (double plain) 200000)))
+    ;; The baseline the feature exists to remove: reaching the last item means
+    ;; skipping the 199 999 before it. Few iterations -- it is milliseconds.
+    (let [unindexed (nav/items plain-bs seq-opts)]
+      (println (format "  %-8s %10s %12s %11s %11s %10.1f    (no index)"
+                       "--" "--" "--" "--" "--"
+                       (/ (timed #(nth unindexed 199999) 3 2) 1000.0))))
+    (flush)
+    (doseq [st [1 8 16 64 256]]
+      (let [bs (build st)
+            idx (- (alength bs) plain)
+            ;; the slot as it sits on the wire, BEFORE expansion -- its class is
+            ;; the width, since the CBOR element type is what declares it
+            slot (nth (nth (boring.data/frame-payload
+                            (last (vec (boring/decode-seq bs seq-opts)))) 3) 0)
+            width (condp instance? slot
+                    (Class/forName "[B") "u8 bytes"
+                    (Class/forName "[S") "sint16"
+                    "sint32")
+            items (nav/items bs seq-opts)]
+        (println (format "  %-8d %10d %12s %11.1f %10.2f%% %10.3f %12.3f"
+                         st (quot 200000 st) width (/ idx 1024.0)
+                         (* 100.0 (/ (double idx) plain))
+                         (/ (timed #(nth items 199999) 2000 8) 1000.0)
+                         (/ (timed #(nav/value (nth items 199999)) 500 8) 1000.0)))
         (flush))))
 
   (println "\nWRITE COST — building the index is a walk of the encoded bytes")
