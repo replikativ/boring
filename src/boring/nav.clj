@@ -462,8 +462,24 @@
     ;; `frame-payload`, not `record-fields`: an unregistered tag-27 frame
     ;; decodes to an UnknownRecord when its payload is a map and a
     ;; TaggedLiteral otherwise, and this payload is a vector.
-    (let [[stride ^ints containers ^ints counts slots sorted _]
-          (boring.data/frame-payload (.readFrom r ptr))]
+    (let [;; The index frame is decoded against ITS OWN depth budget, not the
+          ;; caller's. The frame is a fixed nested shape -- tag 27 around
+          ;; [name, [stride, containers, counts, slots, sorted, pointer]] -- so
+          ;; reading it costs four or five levels regardless of how shallow the
+          ;; DATA is. With `:max-depth 1`, an indexed `[1]` therefore failed to
+          ;; decode its own index, forgot it, and then walked into the frame as
+          ;; data and raised -- so a VALID index made reading fail where no
+          ;; index would have succeeded. That is the invariant inverted: the
+          ;; optimisation became load-bearing.
+          ;;
+          ;; The caller's limit is a bound on THEIR data, and it is still
+          ;; enforced on every value they realise. It was never a statement
+          ;; about boring's own footer.
+          saved (.-maxDepth r)
+          _ (set! (.-maxDepth r) (int (max saved 32)))
+          [stride ^ints containers ^ints counts slots sorted _]
+          (try (boring.data/frame-payload (.readFrom r ptr))
+               (finally (set! (.-maxDepth r) (int saved))))]
       (when (and (int? stride) (pos? (long stride)) containers
                  (instance? (Class/forName "[I") containers)
                  (instance? (Class/forName "[I") counts)

@@ -326,43 +326,44 @@ public final class Reader {
                 pos += n;
                 return;
             }
-            // DEPTH ACCOUNTING MIRRORS `read`, asymmetry and all.
+            // SKIP'S BOUND IS ABOUT STACK, NOT SEMANTICS. See enterSkip().
             //
-            // An empty definite ARRAY costs no depth, because `read` returns the
-            // shared empty vector before calling enter() -- an artifact of that
-            // allocation optimisation, but it is the behaviour callers see. An
-            // empty definite MAP does cost one, because read's map branch calls
-            // enter() unconditionally.
+            // Three attempts tried to make this agree with `read` exactly, and
+            // each broke a different value: charging for tags refused `#{}`;
+            // not charging for empty containers accepted `(sorted-map)` where
+            // decode refused; charging per container refuses a SHAPED ARRAY,
+            // whose reader consumes the outer, keys, rows and row heads inline
+            // and charges only for the tag.
             //
-            // Matching read exactly is the whole requirement: skip must reject
-            // neither more nor less. Charging for both made skip stricter, so an
-            // ordinary `#{}` -- tag 258 around an empty array -- was refused at
-            // maxDepth 1 while decode accepted it. Charging for neither made it
-            // laxer, and `(sorted-map)` (tag 27 around [name, empty map])
-            // skipped at a depth where decode refused. Only this shape agrees.
+            // That last one generalises: a tag reader that parses its payload
+            // inline charges nothing for the containers inside it, while a
+            // generic skip must recurse into them. The gap is unbounded -- three
+            // levels per nested shaped array -- so no constant slack closes it
+            // and no amount of case analysis will. Mirroring `read` is not a
+            // reachable goal for a generic walker.
             case 4: {
                 if (info == 31) {
-                    enter();
-                    try { while (!consumeBreak()) skipStructural(); } finally { exit(); }
+                    enterSkip();
+                    try { while (!consumeBreak()) skipStructural(); } finally { skipDepth--; }
                     return;
                 }
                 int n = checkCount(arg(info), 1);
                 if (n == 0) return;
-                enter();
-                try { for (int i = 0; i < n; i++) skipStructural(); } finally { exit(); }
+                enterSkip();
+                try { for (int i = 0; i < n; i++) skipStructural(); } finally { skipDepth--; }
                 return;
             }
             case 5: {
                 if (info == 31) {
-                    enter();
+                    enterSkip();
                     try { while (!consumeBreak()) { skipStructural(); skipStructural(); } }
-                    finally { exit(); }
+                    finally { skipDepth--; }
                     return;
                 }
                 int n = checkCount(arg(info), 2);
-                enter();                        // even when empty -- read does
+                enterSkip();
                 try { for (int i = 0; i < n; i++) { skipStructural(); skipStructural(); } }
-                finally { exit(); }
+                finally { skipDepth--; }
                 return;
             }
             case 6: {
@@ -391,10 +392,10 @@ public final class Reader {
                 while (true) {
                     int h2 = u8();
                     if ((h2 >>> 5) != 6) { pos--; break; }    // not a tag: put it back
-                    if (++chain > maxDepth)
+                    if (++chain > skipLimit())
                         throw Err.of("max-depth-exceeded",
-                            "boring: tag chain longer than maxDepth (" + maxDepth + ")",
-                            "max-depth", (long) maxDepth);
+                            "boring: tag chain longer than the skip bound ("
+                            + skipLimit() + ")", "max-depth", (long) skipLimit());
                     arg(h2 & 0x1F);
                 }
                 skipStructural();
@@ -452,9 +453,9 @@ public final class Reader {
      * fail too.
      */
     public long skipFrom(long p) {
-        long save = pos; int d = depth;
-        try { pos = p; skipValue(); return pos; }
-        finally { pos = save; depth = d; }
+        long save = pos; int d = depth, sd = skipDepth;
+        try { pos = p; skipDepth = 0; skipValue(); return pos; }
+        finally { pos = save; depth = d; skipDepth = sd; }
     }
 
     /** Decode the value at `p`. Does not disturb the caller's position or depth. */
@@ -629,6 +630,35 @@ public final class Reader {
     private String stringAt(long p, int n, java.nio.charset.Charset cs) {
         byte[] a = arrayFor(p, n);
         return new String(a, scratchOff, n, cs);
+    }
+
+    /** Recursion depth of the CURRENT skipStructural walk. Reset by skipFrom. */
+    private int skipDepth = 0;
+
+    /**
+     * The bound on skip recursion -- a STACK bound, deliberately not `maxDepth`.
+     *
+     * `maxDepth` is a semantic limit that `read` applies, and skip cannot
+     * reproduce read's accounting: a tag reader that consumes its payload's
+     * containers inline charges nothing for them, while a generic walker must
+     * recurse. Shaped arrays cost three such levels each, and they nest, so the
+     * discrepancy is unbounded and no constant slack closes it.
+     *
+     * Making skip stricter than read is the failure that matters -- navigation
+     * then refuses a document that decodes -- so skip is deliberately LAXER:
+     * never below 1024, and above that whatever the caller allowed read. It
+     * exists only to keep a pathological document from exhausting the stack,
+     * which is what `read` gets from maxDepth as a side effect. A document read
+     * cannot handle without overflowing its own stack is not one skip needs to
+     * accept.
+     */
+    private int skipLimit() { return Math.max(maxDepth, 1024); }
+
+    private void enterSkip() {
+        if (++skipDepth > skipLimit())
+            throw Err.of("max-depth-exceeded",
+                "boring: nesting deeper than the skip bound (" + skipLimit() + ")",
+                "max-depth", (long) skipLimit());
     }
 
     private void enter() {

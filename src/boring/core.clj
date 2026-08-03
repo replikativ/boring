@@ -691,32 +691,43 @@
   and the wire is what they describe accurately either way."
   [^Reader r p stride min-entries base ^java.util.ArrayList acc]
   (let [p (long p) stride (long stride) min-entries (long min-entries) base (long base)
+        ;; A CHAIN OF TAGS IS CONSUMED ITERATIVELY. Recursing once per tag
+        ;; overflowed the stack on `c0 c0 c0 ... 00` -- legal CBOR, and reachable
+        ;; from the public `build-index` on bytes somebody else wrote, so a
+        ;; 20 000-byte input was a StackOverflowError rather than a typed error.
+        ;; The comment this replaces claimed the recursion was bounded by the
+        ;; decoder's maxDepth; it is not, because these positional reads do not
+        ;; touch the Reader's depth at all. `Reader.skipStructural` had the same
+        ;; defect and was fixed the same way.
+        ;;
+        ;; Collapsing the chain is equivalent to recursing through it: a tag's
+        ;; extent IS its payload's extent, so the payload's end is the value's.
+        p (long (loop [q p]
+                  (if (= 6 (.majorAt r q)) (recur (long (.headEndAt r q))) q)))
         mj (.majorAt r p)]
-    (if (= mj 6)
-      (index-walk r (.headEndAt r p) stride min-entries base acc)
-      (if-not (or (= mj 4) (= mj 5))
-        (.skipFrom r p)
-        (let [n (.headArgAt r p)
-              map? (= mj 5)]
-          (if (neg? n)
-            (.skipFrom r p)                       ; indefinite length: not indexable
+    (if-not (or (= mj 4) (= mj 5))
+      (.skipFrom r p)
+      (let [n (.headArgAt r p)
+            map? (= mj 5)]
+        (if (neg? n)
+          (.skipFrom r p)                       ; indefinite length: not indexable
             ;; Only containers we will KEEP get an array, and it holds one entry
             ;; per ANCHOR rather than one per entry. The old version allocated
             ;; `(int-array n)` for every container before testing `min-entries`,
             ;; then copied every stride-th element into a second array -- so a
             ;; document of small maps allocated one throwaway array per map and
             ;; threw it away, which is why raising :index-min barely helped.
-            (let [keep? (>= n min-entries)
-                  m (if keep?
+          (let [keep? (>= n min-entries)
+                m (if keep?
                       ;; An empty container needs no anchors. The `(max n 1)`
                       ;; this replaces yielded ONE for n=0, and the loop never
                       ;; wrote it, leaving a phantom offset pointing at the
                       ;; document's start. Same defect as Writer.anchorCount.
-                      (cond (<= n 0) 0
-                            (= stride 1) n
-                            :else (inc (quot (dec n) stride)))
-                      0)
-                  kept (when keep? (int-array m))
+                    (cond (<= n 0) 0
+                          (= stride 1) n
+                          :else (inc (quot (dec n) stride)))
+                    0)
+                kept (when keep? (int-array m))
                   ;; EVERY adjacent key pair decides `sorted`, not the anchors.
                   ;; Comparing the anchor sample was unsound and returned WRONG
                   ;; ANSWERS: `sorted` licenses a binary search that then scans
@@ -724,32 +735,32 @@
                   ;; whole container is ordered. At the default stride a 20-key
                   ;; map has two anchors, so an unordered map was marked sorted
                   ;; about half the time and present keys came back nil.
-                  srt (when (and keep? map?) (doto (boolean-array 1) (aset 0 true)))
-                  end (loop [i 0 q (long (.headEndAt r p)) prev -1]
-                        (if (= i n)
-                          q
-                          (do (when (and keep? (zero? (rem i stride)))
-                                (aset ^ints kept (quot i stride) (int q)))
-                              (when (and srt (aget ^booleans srt 0) (>= (long prev) 0)
-                                         (>= (.compareItemsAt r (long prev) q) 0))
-                                (aset ^booleans srt 0 false))
-                              (recur (inc i)
-                                     (long (index-walk
-                                            r
-                                            (if map?
-                                              (long (index-walk r q stride min-entries base acc))
-                                              q)
-                                            stride min-entries base acc))
-                                     q))))]
-              (when keep?
+                srt (when (and keep? map?) (doto (boolean-array 1) (aset 0 true)))
+                end (loop [i 0 q (long (.headEndAt r p)) prev -1]
+                      (if (= i n)
+                        q
+                        (do (when (and keep? (zero? (rem i stride)))
+                              (aset ^ints kept (quot i stride) (int q)))
+                            (when (and srt (aget ^booleans srt 0) (>= (long prev) 0)
+                                       (>= (.compareItemsAt r (long prev) q) 0))
+                              (aset ^booleans srt 0 false))
+                            (recur (inc i)
+                                   (long (index-walk
+                                          r
+                                          (if map?
+                                            (long (index-walk r q stride min-entries base acc))
+                                            q)
+                                          stride min-entries base acc))
+                                   q))))]
+            (when keep?
                 ;; Decided on RAW offsets, before `base` is folded in: the
                 ;; Reader is positioned over this item's own buffer.
-                (let [sorted (boolean (and srt (aget ^booleans srt 0)))]
-                  (when (pos? base)
-                    (dotimes [k (alength ^ints kept)]
-                      (aset ^ints kept k (int (+ base (aget ^ints kept k))))))
-                  (.add acc [(int (+ base p)) (int n) kept sorted])))
-              end)))))))
+              (let [sorted (boolean (and srt (aget ^booleans srt 0)))]
+                (when (pos? base)
+                  (dotimes [k (alength ^ints kept)]
+                    (aset ^ints kept k (int (+ base (aget ^ints kept k))))))
+                (.add acc [(int (+ base p)) (int n) kept sorted])))
+            end))))))
 
 (defn- scan-into!
   "Append index nodes for [start, end) onto `acc`, and return nothing.

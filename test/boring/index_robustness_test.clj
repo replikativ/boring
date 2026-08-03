@@ -356,18 +356,30 @@
            same Reader -- `enter()` incremented before throwing, so each failure
            permanently consumed a level of the budget"))))
 
-(deftest nested-tags-are-bounded-by-max-depth
-  (testing "arrays and maps charged the depth budget; tag payloads did not, so
-            tag recursion was the one nesting maxDepth failed to bound and
-            enough of them blew the stack. `skip` must agree with `read` about
-            the limit, or the cheap path routes around the expensive path's
-            bound -- and skipping is what navigation does."
-    ;; c0 = tag 0, repeated, then a small int
-    (let [bs (byte-array (concat (repeat 40 (unchecked-byte 0xC0)) [(byte 0)]))
-          r (org.replikativ.boring.Reader. bs)]
-      (set! (.-maxDepth r) (int 4))
-      (is (thrown? clojure.lang.ExceptionInfo (.skipFrom r 0))
-          "skipping deeply nested tags must hit the depth limit"))))
+(deftest nested-tags-are-bounded
+  (testing "tag recursion was the one nesting nothing bounded, and enough of it
+            blew the stack. It is bounded now -- but by the SKIP BOUND, which is
+            max(maxDepth, 1024), not by maxDepth.
+
+            That difference is deliberate and is the fourth attempt at this. Skip
+            cannot reproduce read's depth accounting: a tag reader that consumes
+            its payload's containers inline charges nothing for them, and a
+            generic walker must recurse. Tying skip to maxDepth therefore made
+            it STRICTER than read and navigation refused decodable documents --
+            once for `#{}`, once for `(sorted-map)`, once for shaped arrays. A
+            laxer bound cannot do that, and still cannot overflow."
+    (let [chain (fn [n] (byte-array (concat (repeat n (unchecked-byte 0xC0))
+                                            [(byte 0)])))]
+      (testing "a chain well within the bound skips, even at a low :max-depth --
+                the case that used to be refused"
+        (let [^bytes bs (chain 40)
+              r (org.replikativ.boring.Reader. bs)]
+          (set! (.-maxDepth r) (int 4))
+          (is (= (alength bs) (.skipFrom r 0)))))
+      (testing "and one past the bound is a typed error"
+        (let [r (org.replikativ.boring.Reader. ^bytes (chain 2000))]
+          (set! (.-maxDepth r) (int 4))
+          (is (thrown? clojure.lang.ExceptionInfo (.skipFrom r 0))))))))
 
 (deftest canonical-maps-refuse-keys-that-encode-identically
   (testing "distinct keys can encode to the same bytes -- Long 1 and
@@ -615,8 +627,10 @@
             cost no stack at all -- and unlike charging tags to the depth
             budget, this can only make skip laxer than read, never stricter."
     (let [chain (fn [n] (byte-array (concat (repeat n (unchecked-byte 0xC0)) [(byte 0)])))]
-      (testing "a chain past the limit is refused, not crashed"
-        (let [r (org.replikativ.boring.Reader. ^bytes (chain 40))]
+      (testing "a chain past the bound is refused, not crashed. 2000 exceeds the
+                1024 floor; 40 does not, and is accepted on purpose -- see
+                `nested-tags-are-bounded`"
+        (let [r (org.replikativ.boring.Reader. ^bytes (chain 2000))]
           (set! (.-maxDepth r) (int 4))
           (is (thrown? clojure.lang.ExceptionInfo (.skipFrom r 0)))))
       (testing "and a chain far deeper than any stack is still a typed error"
@@ -691,3 +705,86 @@
               (str "stride " stride ": the index frame must be recognised, not
                     yielded as data -- otherwise the assertions above are just
                     testing the scan path")))))))
+
+;; --------------------------------------------- round four: skip's depth bound
+;;
+;; Three attempts tried to make `skip` agree with `read` about `:max-depth`, and
+;; each broke a different value. The fourth stopped trying: skip's bound is a
+;; STACK bound now, deliberately laxer than read's, because a tag reader that
+;; consumes its payload's containers inline charges nothing for them while a
+;; generic walker must recurse -- a gap that grows with nesting and that no
+;; constant slack closes.
+
+(deftest navigation-never-refuses-a-decodable-document
+  (testing "the failure mode that matters. Shaped arrays were the third value to
+            hit it: tag 39649's reader consumes the outer, keys, rows and row
+            heads inline and charges only for the tag, while skip charged for
+            each -- so a document that decoded at :max-depth 1 could not be
+            navigated. `#{}` and `(sorted-map)` were the first two."
+    (doseq [v [[{"a" 1} {"a" 2}]                    ; shaped array
+               #{} [] {} (into (sorted-map) {})
+               #{[] {}} [#{} {} []]
+               [{"a" 1 "b" 2} {"a" 3 "b" 4} {"a" 5 "b" 6}]
+               {"outer" [{"k" 1} {"k" 2}]}]
+            shapes? [true false]
+            md [1 2 3 4 1024]]
+      (let [prof {:stringref false :shapes shapes?}
+            bs (boring/encode v prof)
+            o (assoc prof :max-depth md)
+            decoded? (try (boring/decode bs o) true (catch Exception _ false))]
+        (when decoded?
+          (is (some? (try (nav/byte-span (nav/source bs o))
+                          (catch Exception _ nil)))
+              (str (pr-str v) " shapes=" shapes? " max-depth=" md
+                   ": decodes, so it must navigate")))))))
+
+(deftest a-valid-index-never-makes-reading-fail
+  (testing "the index frame is a fixed nested shape, so decoding it costs four
+            or five levels however shallow the DATA is. Read against the
+            caller's `:max-depth`, an indexed `[1]` failed to decode its own
+            index, forgot it, walked into the frame as data and raised -- a
+            VALID index making a read fail that would have succeeded with no
+            index at all. The optimisation had become load-bearing."
+    (let [out (ByteArrayOutputStream.)]
+      (boring/write-seq! (boring/writer 65536 opts) [1 2 3] out
+                         (assoc opts :index 1))
+      (let [bs (.toByteArray out)]
+        (doseq [md [1 2 3 4 1024]]
+          (is (= [1 2 3] (mapv nav/value (nav/items bs (assoc opts :max-depth md))))
+              (str "max-depth " md)))))))
+
+(deftest build-index-survives-a-long-tag-chain
+  (testing "`index-walk` recursed once per tag, so `c0 c0 ... 00` -- legal CBOR,
+            and reachable through the public `build-index` on bytes somebody
+            else wrote -- was a StackOverflowError rather than a typed error.
+            `Reader.skipStructural` had the same defect and was fixed first;
+            this is the Clojure walk catching up."
+    (let [chain (byte-array (concat (repeat 20000 (unchecked-byte 0xC0)) [(byte 0)]))]
+      (is (nil? (boring/build-index chain {:index 16}))
+          "a chain of tags contains no indexable container, and must not overflow"))))
+
+;; ------------------------------------- round four: sub-fixes with no test yet
+
+(deftest canonical-key-nesting-shares-one-depth-budget
+  (testing "`canonicalSubWriter` accumulates the parent's depthOffset. Without
+            it a scratch writer made by a scratch writer -- a canonical map
+            nested inside a canonical map KEY -- reset the budget to the inner
+            parent's local depth, so nesting through key position got a fresh
+            allowance at every hop and `:max-depth` was not a bound at all."
+    (let [deep (reduce (fn [x _] {x 0}) :leaf (range 8))]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (boring/encode deep {:profile :canonical :max-depth 2}))
+          "depth through map keys must be bounded")
+      (is (some? (boring/encode deep {:profile :canonical :max-depth 64}))
+          "and a generous budget must still encode it"))))
+
+(deftest canonical-sets-and-records-also-check-their-size
+  (testing "the size-mismatch tests covered collections and maps. The canonical
+            SET staging array and the record-field loop are sized from size()
+            the same way and had no check of their own."
+    (let [liar-set (proxy [java.util.AbstractSet] []
+                     (size [] 1)
+                     (iterator [] (.iterator (java.util.ArrayList. [1 2]))))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reported 1 entries"
+                            (boring/encode liar-set {:profile :canonical}))
+          "canonical set staging is sized by size() and must check it"))))
