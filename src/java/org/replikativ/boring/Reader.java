@@ -1677,8 +1677,16 @@ public final class Reader {
                 for (int i = 0; i < n; i++) a[i] = (short) (b[off + i] & 0xFF);
                 return a; }
             case 72: {                              // sint8
-                byte[] a = new byte[n];
-                System.arraycopy(b, off, a, 0, n);
+                // short[], though `byte` holds -128..127 exactly and is the
+                // narrower primitive. byte[] is OVERLOADED on the write side:
+                // it is how a plain CBOR byte string decodes, so it re-encodes
+                // as major type 2. A peer that sent an ARRAY OF THREE SIGNED
+                // INTEGERS got a BYTE STRING back -- the only typed array that
+                // changed the CBOR data model rather than merely widening.
+                // Widening to short[] costs a byte per element and keeps it an
+                // array (tag 77 on the way out).
+                short[] a = new short[n];
+                for (int i = 0; i < n; i++) a[i] = b[off + i];
                 return a; }
             case 65: case 69: {                     // uint16 BE / LE
                 int[] a = new int[n];

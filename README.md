@@ -173,8 +173,24 @@ why it is worth stating. `{:incl-metadata? false}` opts out.
 (boring/encode v {:profile :clojure})    ; default — compact, Clojure-native
 (boring/encode v {:profile :interop})    ; no extensions; maximally portable
 (boring/encode v {:profile :archival})   ; stable bytes AND host types — dumps
-(boring/encode v {:profile :canonical})  ; RFC 8949 §4.2; agrees with cbor2 et al
+(boring/encode v {:profile :canonical})  ; RFC 8949 §4.2 bytewise key order
 ```
+
+If you need to agree byte-for-byte with a specific peer, check *which* rule it
+implements before picking. `:canonical` is RFC 8949 §4.2.1 — bytewise
+lexicographic — which is what fxamacker's `SortCoreDeterministic` and ciborium
+produce. Python's **cbor2 `canonical=True` is the older length-first rule** (RFC
+7049 §3.9), which is boring's `:canonical-rfc7049`, not its `:canonical`:
+
+```
+{1000 "x", "a" "y"}   cbor2 canonical=True   a2 6161 6179 1903e8 6178
+                      :canonical-rfc7049     a2 6161 6179 1903e8 6178   ← same
+                      :canonical             a2 1903e8 6178 6161 6179   ← differs
+```
+
+The two coincide for keys sharing a major type, which is nearly all Clojure
+data — so this bites exactly the mixed-key-type case, and only ever at a
+signature boundary. See [COMPATIBILITY.md](doc/COMPATIBILITY.md#two-canonical-profiles).
 
 `:archival` and `:canonical` both sort map keys; they differ on floats.
 `:canonical` implements RFC 8949 §4.2.2 shortest-form, so a `Double` may come

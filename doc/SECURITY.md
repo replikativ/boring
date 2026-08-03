@@ -146,6 +146,27 @@ represent faithfully, rather than writing an approximation:
 | `:boring/incompatible-options` | an option that contradicts the profile |
 | `:boring/max-depth-exceeded` | nesting past `:max-depth`, on the write side too |
 | `:boring/unsupported-type` | a type with no encoding and no registered handler |
+| `:boring/unrepresentable-date` | a year outside 0000–9999, which RFC 3339 cannot express |
+
+## Duplicate map keys
+
+RFC 8949 §5.6 offers three approaches and requires that **"generic decoders
+need to document which of these three approaches they implement"**. boring
+implements the first: **a map with duplicate keys is rejected**, with
+`:boring/duplicate-map-key`. This holds for definite- and indefinite-length
+maps, on both platforms, and the same rule applies to tag-258 sets
+(`:boring/duplicate-set-element`) — a set that declares *n* elements of which
+fewer are distinct is refused rather than silently collapsed.
+
+Duplicate detection compares **encoded key bytes**, so byte-string keys are
+compared by content rather than identity. Keys that merely *look* alike stay
+distinct, per §5.6.1: `1` and `1.0` are different keys, and so are the text
+string `"a"` and the byte string `h'61'`.
+
+`{:check-duplicate-keys false}` turns this off, and it is the wrong default for
+anything reading untrusted input: silent last-wins is how two implementations
+end up disagreeing about what a document says, which is a parser differential
+with a signature check on the other side of it.
 
 ## Realistic harms, in order
 

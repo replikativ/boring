@@ -208,6 +208,19 @@ for their own type can take it.
 |---|---|---|---|
 | URI | 32 | `java.net.URI` | `TaggedValue` |
 | regex | 35 | `java.util.regex.Pattern` | `js/RegExp` |
+| duration | 1002 | `java.time.Duration` | `TaggedValue` |
+| full date | 1004 | `java.time.LocalDate` | `TaggedValue` |
+| decimal fraction | 4 | `java.math.BigDecimal` | `boring.data/Decimal` |
+| rational | 30 | `clojure.lang.Ratio` | `boring.data/Rational` |
+
+The bottom four rows were missing, and their absence read as a promise the
+library does not keep: the section below asserts that `Duration` and
+`LocalDate` "are carried" under tags 1002 and 1004, which is true of the wire
+format and of the JVM, but a ClojureScript peer gets an inert `TaggedValue`.
+Tags 4 and 30 do decode to a value on both platforms, just not the same one —
+JavaScript has no `BigDecimal` or `Ratio`, so boring supplies its own carriers.
+All six re-encode to identical bytes, so a round trip through ClojureScript
+never corrupts a document; it just hands back less than the JVM would.
 
 A regex is symmetric — both platforms have the type, so tag 35 has no caveat.
 
@@ -243,7 +256,9 @@ it travels as `27(["java/period", "P1Y1M1D"])` — the ISO-8601 form `java.time`
 itself parses.
 
 `java.time.Duration` and `java.time.LocalDate` **are** carried, under the
-registered RFC 9581 tag 1002 and RFC 8943 tag 1004. `java.sql.Date` is written
+registered RFC 9581 tag 1002 and RFC 8943 tag 1004 — on the JVM. ClojureScript
+has neither type and hands back a `TaggedValue` for both; see the gap table
+above. `java.sql.Date` is written
 as tag 1004 too and reads back as a `LocalDate` by default, which is what the
 value means; `{:date-type :sql-date}` gets the legacy class back, though not
 the time-of-day, which tag 1004 has no room for and which a `java.sql.Date` is
@@ -329,8 +344,22 @@ back, use `:archival` and accept that the bytes are boring's own convention.
 ## Two canonical profiles
 
 `:canonical` follows RFC 8949 §4.2: bytewise lexicographic key order.
-`:canonical-rfc7049` follows clj-cbor's older length-first-then-lexicographic
-rule (RFC 7049 §3.9).
+`:canonical-rfc7049` follows the older length-first-then-lexicographic rule
+(RFC 7049 §3.9).
+
+**Which peers implement which**, because the profile name is not enough to
+predict agreement and this only ever surfaces at a signature boundary:
+
+| rule | implementations |
+|---|---|
+| bytewise (RFC 8949 §4.2.1) = `:canonical` | fxamacker/cbor `SortCoreDeterministic`, ciborium, `draft-ietf-cbor-serialization` |
+| length-first (RFC 7049 §3.9) = `:canonical-rfc7049` | **Python cbor2 `canonical=True`**, clj-cbor |
+
+Calling `:canonical-rfc7049` "clj-cbor's older rule" understated its reach —
+cbor2 is the most widely deployed CBOR implementation there is, and its
+canonical mode is the length-first one. Verified against cbor2 6.1.4:
+`{1000 "x", "a" "y"}` gives `a2616161791903e86178` there and under
+`:canonical-rfc7049`, against `a21903e8617861616179` under `:canonical`.
 
 They are separate **profiles**, not one profile with a switch. The order used
 to be a free option, so `{:profile :canonical :canonical-order :rfc7049}`
