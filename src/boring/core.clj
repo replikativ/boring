@@ -500,7 +500,8 @@
 ;; depends on everything before it, so the chunk must be read from the start and
 ;; cannot be split. Not implemented; chunk size is the knob for that tradeoff.
 
-(declare seal-index! scan-index scan-into! nodes->index build-index)
+(declare seal-index! scan-index scan-into! nodes->index build-index
+         write-seq-resolved!)
 
 (defn encode-indexed
   "Encode `v` and seal an index onto it, returning a byte[].
@@ -550,13 +551,29 @@
   ;; `(writer n {:stringref false})` -- the setting a navigable file requires --
   ;; silently emitted stringref output through this one entry point, and
   ;; `boring.nav` then refused to read the result.
+  ;;
+  ;; RESOLVED ONCE, by whichever arity was called. Delegating the 3-arity to the
+  ;; 4-arity re-resolved options `writer-opts` had ALREADY resolved and stripped
+  ;; `:profile` from, so `resolve-opts` saw `:canonical` without the profile
+  ;; that licenses it and threw `:boring/incompatible-options` for `:archival`,
+  ;; `:canonical` and `:canonical-rfc7049` -- three of five profiles, on a
+  ;; public entry point. `encode-into!` passes `(writer-opts w)` straight to
+  ;; `write-root!` without re-resolving; this now follows that model rather than
+  ;; merely citing it.
   (^long [^Writer w values ^java.io.OutputStream out]
-   (write-seq! w values out (writer-opts w)))
+   (let [o (writer-opts w)]
+     (write-seq-resolved! w values out o
+                          (or (:index o) 0) (or (:index-min o) 16))))
   (^long [^Writer w values ^java.io.OutputStream out opts]
-   (let [o (resolve-opts opts)
-         stride (long (or (:index opts) 0))
-         indexing? (pos? stride)
-         min-entries (long (or (:index-min opts) 16))
+   (write-seq-resolved! w values out (resolve-opts opts)
+                        (or (:index opts) 0) (or (:index-min opts) 16))))
+
+(defn- write-seq-resolved!
+  "`write-seq!` with options already resolved. See the note on its 3-arity."
+  [^Writer w values ^java.io.OutputStream out o stride min-entries]
+  (let [stride (long stride)
+        min-entries (long min-entries)
+        indexing? (pos? stride)
          ;; Container nodes are captured BY THE WRITER as it encodes, not by
          ;; walking the bytes afterwards. The writer already knows the offset it
          ;; is about to write to and a container's entry count before emitting
@@ -569,37 +586,37 @@
          ;; `boring.writer-index-test` pins the two against each other.
          ;; `setIndex` starts a fresh capture; `idxBase` moves the base between
          ;; items without discarding what the earlier ones recorded.
-         _ (when indexing? (.setIndex ^Writer w (int stride) (int min-entries) 0))
-         total (try
-                 (reduce (fn [^long total v]
+        _ (when indexing? (.setIndex ^Writer w (int stride) (int min-entries) 0))
+        total (try
+                (reduce (fn [^long total v]
                            ;; `total` is this item's offset in the file. The
                            ;; writer folds it into every offset it records, so
                            ;; the nodes come out file-relative with no second
                            ;; pass, and it counts the items itself -- a volatile
                            ;; here measured slower than the boxing it replaced,
                            ;; because a volatile write is a barrier.
-                           (when indexing?
-                             (.idxBase ^Writer w total)
-                             (.idxItem ^Writer w total))
-                           (let [n (long (.position ^Writer (write-root! w v o)))]
-                             (.write out (.buffer w) 0 (int n))
-                             (+ total n)))
-                         0
-                         values)
-                 (catch Throwable t
+                          (when indexing?
+                            (.idxBase ^Writer w total)
+                            (.idxItem ^Writer w total))
+                          (let [n (long (.position ^Writer (write-root! w v o)))]
+                            (.write out (.buffer w) 0 (int n))
+                            (+ total n)))
+                        0
+                        values)
+                (catch Throwable t
                    ;; Capture off on the way out, or a writer whose encode threw
                    ;; stays in capture mode with a stale base -- and every later
                    ;; `encode-into!` or unindexed `write-seq!` on that
                    ;; (deliberately long-lived) writer keeps allocating and
                    ;; retaining a node per container, invisibly and forever.
-                   (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
-                   (throw t)))]
-     (if indexing?
-       (let [^ints cs (.idxContainers ^Writer w)
-             ^ints ns (.idxCounts ^Writer w)
-             sl (.idxSlots ^Writer w)
-             so (.idxSorted ^Writer w)
-             m (alength cs)
+                  (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
+                  (throw t)))]
+    (if indexing?
+      (let [^ints cs (.idxContainers ^Writer w)
+            ^ints ns (.idxCounts ^Writer w)
+            sl (.idxSlots ^Writer w)
+            so (.idxSorted ^Writer w)
+            m (alength cs)
              ;; The sequence itself is a node at the sentinel offset -1: it has
              ;; no container header on the wire, but it behaves like one, and a
              ;; sentinel keeps a single uniform node list rather than two. It
@@ -607,24 +624,24 @@
              ;; it claims each node's slot when it writes the container's head,
              ;; and a pre-order walk visits containers in increasing offset --
              ;; so prepending is all the ordering that is needed.
-             containers (int-array (inc m))
-             counts (int-array (inc m))]
-         (aset containers 0 (int -1))
-         (aset counts 0 (int (.idxItemTotal ^Writer w)))
-         (System/arraycopy cs 0 containers 1 m)
-         (System/arraycopy ns 0 counts 1 m)
-         (let [items (.idxItemOffsets ^Writer w)]
-           (.setIndex ^Writer w (int 0) (int 0) 0)   ; capture off again
-           (+ total
-              (long (seal-index!
-                     w out
-                     {:stride stride
-                      :containers containers
-                      :counts counts
-                      :slots (into [items] sl)
-                      :sorted (into [false] so)}
-                     total)))))
-       total))))
+            containers (int-array (inc m))
+            counts (int-array (inc m))]
+        (aset containers 0 (int -1))
+        (aset counts 0 (int (.idxItemTotal ^Writer w)))
+        (System/arraycopy cs 0 containers 1 m)
+        (System/arraycopy ns 0 counts 1 m)
+        (let [items (.idxItemOffsets ^Writer w)]
+          (.setIndex ^Writer w (int 0) (int 0) 0)   ; capture off again
+          (+ total
+             (long (seal-index!
+                    w out
+                    {:stride stride
+                     :containers containers
+                     :counts counts
+                     :slots (into [items] sl)
+                     :sorted (into [false] so)}
+                    total)))))
+      total)))
 
 (def ^:const index-name
   "Tag-27 type name for a sequence/container index. See doc/SHAPES.md.

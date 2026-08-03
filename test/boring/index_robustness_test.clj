@@ -327,14 +327,25 @@
             in a finally -- so a rejected read permanently consumed a level of
             budget on a Reader that `boring.nav` shares across every lookup. A
             later, perfectly shallow read then failed because of an earlier one."
+    ;; ONE Reader, reused -- which is the whole point. The first version of
+    ;; this test called `nav/source` inside the loop, so every attempt got a
+    ;; FRESH Reader and the leak could not show. It passed with the fix
+    ;; reverted; a per-fix revert sweep is what caught that.
     (let [deep (boring/encode (reduce (fn [acc _] [acc]) [] (range 20))
                               {:stringref false})
           shallow (boring/encode [1 2 3] {:stringref false})
-          o {:stringref false :max-depth 4}]
-      (dotimes [_ 5]
-        (is (thrown? clojure.lang.ExceptionInfo (nav/value (nav/source deep o)))))
-      (is (= [1 2 3] (nav/value (nav/source shallow o)))
-          "a shallow value must still read after repeated deep failures"))))
+          r (org.replikativ.boring.Reader. ^bytes deep)]
+      (set! (.-maxDepth r) (int 4))
+      (dotimes [_ 6]
+        (is (thrown? clojure.lang.ExceptionInfo (.readFrom r 0))
+            "the deep value must fail every time, for the same reason"))
+      ;; the SAME reader, now pointed at a shallow value
+      (.reset r ^bytes shallow)
+      (set! (.-maxDepth r) (int 4))
+      (is (= [1 2 3] (.readFrom r 0))
+          "a shallow value must still read after repeated deep failures on the
+           same Reader -- `enter()` incremented before throwing, so each failure
+           permanently consumed a level of the budget"))))
 
 (deftest nested-tags-are-bounded-by-max-depth
   (testing "arrays and maps charged the depth budget; tag payloads did not, so
@@ -384,16 +395,26 @@
             {:stringref false} -- which is exactly what a navigable file needs --
             silently emitted stringref output through this one entry point, and
             `boring.nav` then refused to read what it had just written."
-    (let [w (boring/writer 65536 {:stringref false})
-          a (ByteArrayOutputStream.)
-          b (ByteArrayOutputStream.)
-          vs (vec (for [i (range 5)] {"msg" "repeated" "n" i}))]
-      (boring/write-seq! w vs a)
-      (boring/write-seq! w vs b {:stringref false})
-      (is (= (seq (.toByteArray a)) (seq (.toByteArray b)))
-          "the 3-arity must match passing the writer's own opts explicitly")
-      (is (= vs (mapv nav/value (seq (nav/items (.toByteArray a) {:stringref false}))))
-          "and the result must be navigable"))))
+    ;; EVERY profile, not just {:stringref false}. The first version of this
+    ;; test used exactly that one -- the only setting where the round-trip
+    ;; through `writer-opts` is a no-op -- and so passed while the fix threw
+    ;; `:boring/incompatible-options` on three of the five profiles. Delegating
+    ;; the 3-arity to the 4-arity re-resolved options that `writer-opts` had
+    ;; already resolved and stripped `:profile` from, so `:canonical` arrived
+    ;; without the profile that licenses it.
+    (doseq [p [{:stringref false} {:profile :interop} {:profile :archival}
+               {:profile :canonical} {:profile :canonical-rfc7049}]]
+      (let [vs (vec (for [i (range 5)] {"msg" "repeated" "n" i}))
+            a (ByteArrayOutputStream.)
+            b (ByteArrayOutputStream.)]
+        (boring/write-seq! (boring/writer 65536 p) vs a)
+        (boring/write-seq! (boring/writer 65536 p) vs b p)
+        (is (= (seq (.toByteArray a)) (seq (.toByteArray b)))
+            (str (pr-str p) ": the 3-arity must match passing the writer's own
+                  opts explicitly, and must not throw"))
+        (is (= vs (mapv nav/value (seq (nav/items (.toByteArray a)
+                                                  (assoc p :stringref false)))))
+            (str (pr-str p) ": and the result must read back"))))))
 
 (deftest skipping-and-reading-agree-about-depth
   (testing "charging tags to the depth budget in `skipStructural` closed a hole
@@ -631,8 +652,33 @@
         (let [result (tc/quick-check
                       150
                       (prop/for-all [v g]
-                        (let [^bytes bs (boring/encode v prof)
-                              r (org.replikativ.boring.Reader. bs)]
-                          (= (long (alength bs)) (.skipFrom r 0)))))]
+                                    (let [^bytes bs (boring/encode v prof)
+                                          r (org.replikativ.boring.Reader. bs)]
+                                      (= (long (alength bs)) (.skipFrom r 0)))))]
           (is (:pass? result)
               (str (or (:profile prof) :clojure) " -- " (pr-str (:shrunk result)))))))))
+
+(deftest the-writer-capture-also-emits-no-phantom-anchor
+  (testing "the empty-container test above drives `build-index`/`encode-indexed`
+            -- the CLOJURE WALK only. `Writer.anchorCount` is the other half of
+            the same fix and is what `write-seq!` uses, which is the primary
+            index producer. Deleting its guard left the suite green, so the test
+            looked like it covered both and covered one."
+    (doseq [stride [1 4 16]]
+      (let [v {"empty-map" {} "empty-vec" [] "s" #{}
+               "real" (into {} (for [i (range 20)] [(format "k%02d" i) i]))}
+            w (boring/writer 65536 opts)
+            out (ByteArrayOutputStream.)]
+        (boring/write-seq! w [v] out (assoc opts :index stride :index-min 0))
+        (let [bs (.toByteArray out)
+              c (nth (nav/items bs opts) 0)]
+          (is (= v (nav/value c))
+              (str "stride " stride ": writer-captured index must round-trip"))
+          (is (nil? (get (get c "empty-map") "missing"))
+              (str "stride " stride ": a miss inside a captured EMPTY map must be
+                    nil, not an exception"))
+          ;; and the index must actually be USED, or this proves nothing
+          (is (= 1 (count (into [] (nav/items bs opts))))
+              (str "stride " stride ": the index frame must be recognised, not
+                    yielded as data -- otherwise the assertions above are just
+                    testing the scan path")))))))
