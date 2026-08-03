@@ -454,6 +454,13 @@ public final class Writer {
 
     /** Anchors an indexed container of `n` entries needs at the current stride. */
     private int anchorCount(int n) {
+        // An EMPTY container needs no anchors. `((0 - 1) / stride) + 1` is 1 in
+        // Java, because integer division truncates toward zero -- so an empty
+        // container claimed one anchor, the loop never wrote it, and the slot
+        // kept a phantom offset of 0 that pointed at the start of the document.
+        // Only reachable with `:index-min 0`, but it is a wrong answer waiting
+        // rather than a missing optimisation.
+        if (n <= 0) return 0;
         return idxStride == 1 ? n : ((n - 1) / idxStride) + 1;
     }
 

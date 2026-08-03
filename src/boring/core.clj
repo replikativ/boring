@@ -691,7 +691,13 @@
             ;; threw it away, which is why raising :index-min barely helped.
             (let [keep? (>= n min-entries)
                   m (if keep?
-                      (if (= stride 1) n (inc (quot (dec (max n 1)) stride)))
+                      ;; An empty container needs no anchors. The `(max n 1)`
+                      ;; this replaces yielded ONE for n=0, and the loop never
+                      ;; wrote it, leaving a phantom offset pointing at the
+                      ;; document's start. Same defect as Writer.anchorCount.
+                      (cond (<= n 0) 0
+                            (= stride 1) n
+                            :else (inc (quot (dec n) stride)))
                       0)
                   kept (when keep? (int-array m))
                   ;; EVERY adjacent key pair decides `sorted`, not the anchors.

@@ -421,3 +421,27 @@
               (str "depth " d ", max-depth " md
                    ": decode=" decoded? " skip=" skipped?
                    " -- the two paths must agree on the limit")))))))
+
+(deftest empty-containers-get-no-phantom-anchor
+  (testing "`((0 - 1) / stride) + 1` is 1 in Java, so an empty container claimed
+            one anchor that the loop never wrote -- leaving a slot whose single
+            offset was 0, pointing at the start of the document and marked
+            sorted. Only reachable with :index-min 0, which is not a sane
+            setting, but it is a wrong answer waiting rather than a missed
+            optimisation, and the payload validation would otherwise reject the
+            whole index because of it."
+    (doseq [stride [1 4 16]]
+      (let [v {"empty-map" {} "empty-vec" [] "real" (into {} (for [i (range 20)]
+                                                               [(format "k%02d" i) i]))}
+            o (assoc opts :index stride :index-min 0)
+            idx (boring/build-index (boring/encode v o) o)
+            c (nav/source (boring/encode-indexed v o) opts)]
+        (when idx
+          (doseq [[cnt slot] (map vector (seq ^ints (:counts idx)) (:slots idx))]
+            (is (= (if (zero? cnt) 0 (inc (quot (dec (long cnt)) (long stride))))
+                   (count slot))
+                (str "stride " stride ": a container of " cnt
+                     " entries must have exactly ceil(n/stride) anchors"))))
+        (is (= v (nav/value c)) (str "stride " stride ": and the value still reads back"))
+        (is (= {} (nav/value (get c "empty-map"))))
+        (is (= 5 (nav/value (get-in c ["real" "k05"]))))))))
