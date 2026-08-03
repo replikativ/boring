@@ -316,13 +316,23 @@ pointer, a truncated file, an appended-to file, a file that merely ends in the
 right 9-byte shape, and a frame that passes every detection check but holds an
 unusable payload all fall back to scanning rather than throwing.
 
-**The limit of that claim, stated rather than implied:** there is no checksum.
-A payload corrupted into something that still *parses* — plausible offsets of
-the right type — will be believed, and will seek to the wrong place. Detection
-catches malformed indexes, not subtly wrong ones. This is the same exposure the
-data section has, since CBOR carries no checksum either, so an index is no more
-fragile than the bytes it describes; if you need integrity, you need it for the
-whole file and not just for this item.
+**The limit of that claim, stated rather than implied.** It holds for a
+**missing, stale, truncated or randomly corrupt** index: each is detected, and
+costs only a scan. It does **not** hold for a *crafted* one.
+
+The reader checks that a node's parts agree — the container really is at that
+offset with the count it claims, its first anchor is that container's first
+entry, anchors ascend and stay inside the data section. What it cannot check
+without doing the very work the index exists to avoid is that **every** anchor
+is a real entry boundary (O(n) per container), or that `sorted` is truthful
+(which means reading every key). An index built to lie about either will
+misdirect a lookup to a neighbouring value, silently and without error.
+
+So the index frame is a **trust boundary**: integrity of the index is integrity
+of the document. That is the same exposure the data section already has — CBOR
+carries no checksum, and anyone able to rewrite the index can rewrite the data —
+but it is a real qualification of the sentence above, which was previously
+written without one.
 
 ### Slots are deltas, in the narrowest type that holds them
 

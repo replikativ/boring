@@ -754,7 +754,12 @@
 (defn- scan-into!
   "Append index nodes for [start, end) onto `acc`, and return nothing.
 
-  Separate from `scan-index` because `write-seq!` calls this once PER ITEM, and
+  Split out when `write-seq!` still called it once per item -- it no longer
+  walks at all, the writer captures the index while encoding, and the only
+  caller now is `scan-index` via `build-index`, always with `base` 0. The
+  reasoning below is kept because it is why the split exists.
+
+  Separate from `scan-index` because that caller invoked it once PER ITEM, and
   the result-shaping `scan-index` does -- a sort, four sequence traversals and a
   map -- is per-sequence work. Doing it per item allocated an ArrayList, two
   lazy seqs, two vectors and a four-entry map for every item in the log, almost

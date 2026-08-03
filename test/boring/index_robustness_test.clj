@@ -4,10 +4,19 @@
 
   They share a theme, and it is the claim the whole index rests on: **the index
   is an optimisation and is never load-bearing for correctness.** A missing,
-  stale, corrupt or crafted index may cost speed; it may not change an answer
-  and it may not throw at the caller. Six findings all violated that, and none
-  of them needed hostile input -- four fire on ordinary data at the shipped
-  defaults.
+  stale, truncated or randomly corrupt index may cost speed; it may not change
+  an answer and it may not throw at the caller. Six findings all violated that,
+  and none of them needed hostile input -- four fire on ordinary data at the
+  shipped defaults.
+
+  That claim is QUALIFIED, and the qualification belongs beside it: it does not
+  extend to a CRAFTED index. Checking that every anchor is a real entry boundary
+  is O(n) per container, and checking that `sorted` is truthful means reading
+  every key -- both exactly the work the index exists to avoid. A deliberately
+  lying index can therefore still misdirect a lookup, so the index frame is a
+  trust boundary: integrity of the index is integrity of the document. This
+  namespace's docstring previously asserted the unqualified version.
+  See doc/SHAPES.md.
 
   The suite missed them for reasons worth recording, because they are reasons a
   suite can miss things again:
