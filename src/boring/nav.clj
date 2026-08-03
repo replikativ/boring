@@ -63,7 +63,7 @@
 
 (set! *warn-on-reflection* true)
 
-(declare ->Cursor cursor-at read-index)
+(declare ->Cursor cursor-at read-index read-index*)
 
 (defn- fail [type msg data]
   (throw (ex-info msg (assoc data :type type))))
@@ -449,7 +449,23 @@
     ;; TaggedLiteral otherwise, and this payload is a vector.
     (let [[stride ^ints containers ^ints counts slots sorted _]
           (boring.data/frame-payload (.readFrom r ptr))]
-      (when (and (int? stride) (pos? (long stride)) containers)
+      (when (and (int? stride) (pos? (long stride)) containers
+                 (instance? (Class/forName "[I") containers)
+                 (instance? (Class/forName "[I") counts)
+                 (sequential? slots) (sequential? sorted)
+                 ;; STRUCTURE, not just decodability. Detection proves something
+                 ;; MEANT to be an index; none of it proves the payload hangs
+                 ;; together. A frame that decodes but whose parts disagree used
+                 ;; to be trusted, and produced raw IndexOutOfBoundsException at
+                 ;; the caller of `get`, or -- worse -- a wrong subtree.
+                 (= (alength containers) (alength counts)
+                    (count slots) (count sorted))
+                 ;; `node-slot` BINARY-SEARCHES containers, so they must ascend.
+                 (loop [k 1]
+                   (cond (>= k (alength containers)) true
+                         (>= (aget containers (dec k)) (aget containers k)) false
+                         :else (recur (inc k))))
+                 (every? nat-int? (seq counts)))
         ;; One uniform node list. The SEQUENCE is the node at the sentinel
         ;; offset -1: it has no container header on the wire but behaves like
         ;; one, and a sentinel avoids carrying two shapes for the same idea.
@@ -463,15 +479,41 @@
               abs-slots (vec (map-indexed
                               (fn [i s]
                                 (expand-slot s (max 0 (long (aget containers (int i))))))
-                              slots))]
-          {:stride (long stride)
-           :containers containers
-           :counts counts
-           :slots abs-slots
-           :sorted (vec sorted)
-           :data-end ptr
-           :total (when seq-slot (long (aget counts seq-slot)))
-           :offsets (when seq-slot (nth abs-slots seq-slot))})))
+                              slots))
+              st (long stride)
+              ;; Every node, checked against the file it claims to describe.
+              ;; Each of these was reachable: a slot shorter than its count made
+              ;; `nth` walk off the end, a zero-length slot made the binary
+              ;; search index -1, and an anchor pointing outside the data
+              ;; section reached `Reader.skipFrom`, which does an unchecked
+              ;; array access and throws a raw AIOOBE at the caller.
+              ok? (every?
+                   (fn [i]
+                     (let [c (long (aget containers (int i)))
+                           cnt (long (aget counts (int i)))
+                           ^ints a (nth abs-slots i)
+                           want (if (zero? cnt) 0 (inc (quot (dec cnt) st)))]
+                       (and (= (alength a) want)
+                            ;; anchors ascend, sit inside the data section, and
+                            ;; for a real container start after its own header
+                            (loop [k 0 prev -1]
+                              (if (>= k (alength a))
+                                true
+                                (let [v (long (aget a k))]
+                                  (if (and (> v prev) (<= 0 v) (< v ptr)
+                                           (or (neg? c) (> v c)))
+                                    (recur (inc k) v)
+                                    false)))))))
+                   (range (alength containers)))]
+          (when ok?
+            {:stride st
+             :containers containers
+             :counts counts
+             :slots abs-slots
+             :sorted (vec sorted)
+             :data-end ptr
+             :total (when seq-slot (long (aget counts seq-slot)))
+             :offsets (when seq-slot (nth abs-slots seq-slot))}))))
     (catch Exception _ nil)))
 
 (defn- read-index
@@ -487,6 +529,20 @@
   positive needs
   all three; a false negative just means scanning, which is always correct."
   [^Nav nav]
+  ;; The WHOLE of detection is inside the try, not just the payload.
+  ;;
+  ;; The head parser throws on reserved additional-info 28-30, and a corrupted
+  ;; back-pointer can land on such a byte -- roughly 3 in 256 of random
+  ;; corruptions, and arbitrary binary payloads contain 0xDC routinely. So
+  ;; `nav/source` itself threw `boring: reserved additional-info 28` before
+  ;; returning anything, on a file whose only fault was a damaged pointer. The
+  ;; contract is that a corrupt pointer costs speed, never correctness, and it
+  ;; has to cover the probing too.
+  (try
+    (read-index* nav)
+    (catch Exception _ nil)))
+
+(defn- read-index* [^Nav nav]
   (let [^Reader r (.rdr nav)
         n (.size r)]
     (when (>= n 9)
@@ -510,6 +566,21 @@
             (when (and (<= 0 ptr) (< ptr bp)
                        (= 6 (.majorAt r ptr))
                        (= 27 (.headArgAt r ptr))
+                       ;; The frame must END EXACTLY AT THE FILE'S END.
+                       ;;
+                       ;; Without this, concatenating two sealed sequences lost
+                       ;; half the data SILENTLY. `write-seq!` counts from 0, so
+                       ;; its back-pointer is chunk-relative; append a second
+                       ;; sealed batch of the same data length and the trailing
+                       ;; pointer lands squarely on the FIRST batch's index
+                       ;; frame -- a genuine tag-27 `boring/index`, so every
+                       ;; other check passed. `nav/items` then stopped at the
+                       ;; first chunk's data-end and reported 100 of 200 items,
+                       ;; with no error. A stale index has to be detectable, and
+                       ;; "the index is the last thing in the file" is what
+                       ;; tells the real one from an earlier one. Checked after
+                       ;; the tag probes, which are cheap and reject faster.
+                       (= n (.skipFrom r ptr))
                        (let [arr (.headEndAt r ptr)]
                          (and (= 4 (.majorAt r arr))
                               (.bytesEqualAt r (.headEndAt r arr) (name-probe nav)))))
@@ -524,14 +595,23 @@
   (nth [_ i nf]
     (let [^Reader r (.rdr nav)
           end (long (or (:data-end idx) (.size r)))]
-      (if-let [{:keys [^long stride ^ints offsets ^long total]} idx]
+      ;; `:offsets`, not `idx`. An index can exist and carry NO sequence node:
+      ;; only `write-seq!` emits the sentinel -1 node, so `encode-indexed`, and
+      ;; `build-index` + `seal-index!` over a file somebody else wrote, both
+      ;; produce one where `:offsets` and `:total` are nil. Testing `idx`
+      ;; destructured `total` as nil and compared it, so `nth` threw an NPE --
+      ;; on the 3-arity not-found form too, leaving no safe way to call it,
+      ;; while `seq` and `reduce` on the same object worked.
+      (if-let [^ints offsets (:offsets idx)]
         ;; O(1) to the anchor, then at most stride-1 skips.
-        (if (or (neg? i) (>= i total))
-          nf
-          (let [anchor (quot (long i) stride)]
-            (loop [k (* anchor stride) p (long (aget offsets anchor))]
-              (if (= k (long i)) (cursor-at nav p) (recur (inc k) (.skipFrom r p))))))
-        ;; No index: skip i times, or run out.
+        (let [stride (long (:stride idx))
+              total (long (:total idx))]
+          (if (or (neg? i) (>= i total))
+            nf
+            (let [anchor (quot (long i) stride)]
+              (loop [k (* anchor stride) p (long (aget offsets anchor))]
+                (if (= k (long i)) (cursor-at nav p) (recur (inc k) (.skipFrom r p)))))))
+        ;; No sequence index: skip i times, or run out.
         (loop [k 0 p 0]
           (cond (>= p end) nf
                 (= k (long i)) (cursor-at nav p)

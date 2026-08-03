@@ -557,22 +557,33 @@
          ;; `build-index` still exists and is still the reference implementation
          ;; -- it is the only way to index bytes somebody else wrote, and
          ;; `boring.writer-index-test` pins the two against each other.
-         _ (when indexing? (.idxReset ^Writer w))
-         total (reduce (fn [^long total v]
-                         ;; `total` is this item's offset in the file. The
-                         ;; writer folds it into every offset it records, so the
-                         ;; nodes come out file-relative with no second pass,
-                         ;; and it counts the items itself -- a volatile here
-                         ;; measured slower than the boxing it was meant to
-                         ;; replace, because a volatile write is a barrier.
-                         (when indexing?
-                           (.setIndex ^Writer w (int stride) (int min-entries) total)
-                           (.idxItem ^Writer w total))
-                         (let [n (long (.position ^Writer (write-root! w v o)))]
-                           (.write out (.buffer w) 0 (int n))
-                           (+ total n)))
-                       0
-                       values)]
+         ;; `setIndex` starts a fresh capture; `idxBase` moves the base between
+         ;; items without discarding what the earlier ones recorded.
+         _ (when indexing? (.setIndex ^Writer w (int stride) (int min-entries) 0))
+         total (try
+                 (reduce (fn [^long total v]
+                           ;; `total` is this item's offset in the file. The
+                           ;; writer folds it into every offset it records, so
+                           ;; the nodes come out file-relative with no second
+                           ;; pass, and it counts the items itself -- a volatile
+                           ;; here measured slower than the boxing it replaced,
+                           ;; because a volatile write is a barrier.
+                           (when indexing?
+                             (.idxBase ^Writer w total)
+                             (.idxItem ^Writer w total))
+                           (let [n (long (.position ^Writer (write-root! w v o)))]
+                             (.write out (.buffer w) 0 (int n))
+                             (+ total n)))
+                         0
+                         values)
+                 (catch Throwable t
+                   ;; Capture off on the way out, or a writer whose encode threw
+                   ;; stays in capture mode with a stale base -- and every later
+                   ;; `encode-into!` or unindexed `write-seq!` on that
+                   ;; (deliberately long-lived) writer keeps allocating and
+                   ;; retaining a node per container, invisibly and forever.
+                   (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
+                   (throw t)))]
      (if indexing?
        (let [^ints cs (.idxContainers ^Writer w)
              ^ints ns (.idxCounts ^Writer w)
@@ -673,28 +684,34 @@
                       (if (= stride 1) n (inc (quot (dec (max n 1)) stride)))
                       0)
                   kept (when keep? (int-array m))
-                  end (loop [i 0 q (long (.headEndAt r p))]
+                  ;; EVERY adjacent key pair decides `sorted`, not the anchors.
+                  ;; Comparing the anchor sample was unsound and returned WRONG
+                  ;; ANSWERS: `sorted` licenses a binary search that then scans
+                  ;; only the stride it lands in, which is valid only if the
+                  ;; whole container is ordered. At the default stride a 20-key
+                  ;; map has two anchors, so an unordered map was marked sorted
+                  ;; about half the time and present keys came back nil.
+                  srt (when (and keep? map?) (doto (boolean-array 1) (aset 0 true)))
+                  end (loop [i 0 q (long (.headEndAt r p)) prev -1]
                         (if (= i n)
                           q
                           (do (when (and keep? (zero? (rem i stride)))
                                 (aset ^ints kept (quot i stride) (int q)))
+                              (when (and srt (aget ^booleans srt 0) (>= (long prev) 0)
+                                         (>= (.compareItemsAt r (long prev) q) 0))
+                                (aset ^booleans srt 0 false))
                               (recur (inc i)
                                      (long (index-walk
                                             r
                                             (if map?
                                               (long (index-walk r q stride min-entries base acc))
                                               q)
-                                            stride min-entries base acc))))))]
+                                            stride min-entries base acc))
+                                     q))))]
               (when keep?
-                ;; `sorted` is decided on RAW offsets, before `base` is folded
-                ;; in: the Reader is positioned over this item's own buffer.
-                (let [sorted (boolean
-                              (and map?
-                                   (loop [k 1]
-                                     (cond (>= k (alength ^ints kept)) true
-                                           (>= (.compareItemsAt r (aget ^ints kept (dec k))
-                                                                (aget ^ints kept k)) 0) false
-                                           :else (recur (inc k))))))]
+                ;; Decided on RAW offsets, before `base` is folded in: the
+                ;; Reader is positioned over this item's own buffer.
+                (let [sorted (boolean (and srt (aget ^booleans srt 0)))]
                   (when (pos? base)
                     (dotimes [k (alength ^ints kept)]
                       (aset ^ints kept k (int (+ base (aget ^ints kept k))))))

@@ -234,10 +234,17 @@
           (doseq [v vs] (boring/write-to! w2 v o2))
           (boring/write-seq! w2 [] o2 opts)         ; no-op, keeps data-len honest
           (let [dl (.size o2)
+                ;; STRIDE 1 and three deltas, because three items need three
+                ;; anchors at stride 1 -- at stride 16 they need exactly one.
+                ;; The earlier version of this control declared three anchors at
+                ;; stride 16 and was accepted only because nothing checked that
+                ;; a slot's length matches its count. It does now, and this
+                ;; fixture was the first thing it caught.
+                ;; Each {"x" n} is 4 bytes, so the deltas are 0, 4, 4.
                 good (boring.data/unknown-record
                       boring/index-name
-                      [16 (int-array [-1]) (int-array [3])
-                       [(byte-array (map unchecked-byte [0 6 6]))] [false]
+                      [1 (int-array [-1]) (int-array [3])
+                       [(byte-array (map unchecked-byte [0 4 4]))] [false]
                        (byte-array (map unchecked-byte
                                         [0 0 0 0 0 0 (bit-shift-right dl 8) dl]))])]
             (boring/write-to! w2 good o2)

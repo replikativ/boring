@@ -368,12 +368,29 @@ public final class Writer {
     private int[][] idxSlots = new int[32][];
     private int idxN = 0;
 
-    /** Turn capture on. `stride` of 0 turns it off. */
+    /**
+     * Begin (or end) a capture session. `stride` of 0 turns capture off.
+     *
+     * Discards anything captured so far. Index state deliberately survives
+     * {@link #reset()} -- `write-seq!` resets the writer once per item while
+     * the nodes accumulate across the whole sequence -- so there has to be some
+     * other point at which a fresh start is declared, and this is it. Without
+     * that, a caller who enabled capture once and then encoded many unrelated
+     * values accumulated nodes forever, with offsets from documents that no
+     * longer exist.
+     *
+     * Use {@link #idxBase(long)} to move the base between items of one
+     * sequence; that is the operation that must NOT discard.
+     */
     public void setIndex(int stride, int minEntries, long base) {
         this.idxStride = stride;
         this.idxMinEntries = minEntries;
         this.idxBase = base;
+        idxReset();
     }
+
+    /** Move the offset base without disturbing what has been captured. */
+    public void idxBase(long base) { this.idxBase = base; }
 
     // ---- sequence offsets -------------------------------------------------
     //
@@ -405,7 +422,7 @@ public final class Writer {
         if (idxStride <= 0) return;
         if (--idxItemCountdown == 0) {
             if (idxSeqN == idxSeq.length) idxSeq = java.util.Arrays.copyOf(idxSeq, idxSeqN * 2);
-            idxSeq[idxSeqN++] = (int) off;
+            idxSeq[idxSeqN++] = checkedOffset(off);   // already file-relative
             idxItemCountdown = idxStride;
         }
         idxItems++;
@@ -418,6 +435,12 @@ public final class Writer {
     public int[] idxItemOffsets() { return java.util.Arrays.copyOf(idxSeq, idxSeqN); }
 
     public void idxReset() {
+        // Null the slot references, do not merely forget the count. Each slot
+        // is its own int[], so leaving them reachable pins one array per
+        // indexed container for the life of the writer -- and a writer is meant
+        // to be long-lived and reused. Same reasoning, and the same fix, as the
+        // stringref key table below.
+        if (idxN > 0) java.util.Arrays.fill(idxSlots, 0, idxN, null);
         idxN = 0;
         idxSeqN = 0;
         idxItems = 0;
@@ -461,8 +484,35 @@ public final class Writer {
         return idxN++;
     }
 
+    /**
+     * An index offset, checked to fit the int the format stores it in.
+     *
+     * The index carries offsets as int32 -- `containers` and every slot are
+     * int arrays on the wire. Past 2 GiB the cast silently produced NEGATIVE
+     * offsets, which is the worst of all outcomes: `node-slot` binary-searches
+     * `containers` and they stop ascending, sequence `nth` seeks to a negative
+     * position, and past 4 GiB offsets collide outright. Nothing warned. The
+     * back-pointer is 8 bytes and `nav` is long-clean throughout, so 2 GiB is a
+     * limit of the index alone -- and `write-seq!` is explicitly for
+     * long-running files, so it is reachable rather than theoretical.
+     *
+     * Refusing is right until the format carries wider offsets: an unindexed
+     * file is correct and a wrongly-indexed one is not.
+     */
+    private int checkedOffset(long v) {
+        if (v < 0 || v > Integer.MAX_VALUE)
+            throw Err.of("index-offset-overflow",
+                "boring: an index offset reached " + v + ", past the 2 GiB the index"
+                + " format stores. Write this sequence without :index, or rotate the"
+                + " file before it reaches 2 GiB.");
+        return (int) v;
+    }
+
+    /** A buffer-relative position as a checked, file-relative index offset. */
+    private int idxOffset(long off) { return checkedOffset(off + idxBase); }
+
     private void fillNode(int slot, long off, int n, int[] anchors, boolean sorted) {
-        idxOffs[slot] = (int) (off + idxBase);
+        idxOffs[slot] = idxOffset(off);
         idxCnts[slot] = n;
         idxSlots[slot] = anchors;
         idxSrt[slot] = sorted;
@@ -1000,7 +1050,7 @@ public final class Writer {
         int a = 0, countdown = 1;
         for (; s != null; s = s.next()) {
             if (anchors != null && --countdown == 0) {
-                anchors[a++] = pos + (int) idxBase; countdown = idxStride;
+                anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
             writeValue(s.first());
         }
@@ -1017,7 +1067,7 @@ public final class Writer {
         int a = 0, countdown = 1;
         for (Object o : it) {
             if (anchors != null && --countdown == 0) {
-                anchors[a++] = pos + (int) idxBase; countdown = idxStride;
+                anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
             writeValue(o);
         }
@@ -1038,13 +1088,16 @@ public final class Writer {
         boolean sorted = true;
         int prevK0 = -1, prevK1 = -1;
         int a = 0, countdown = 1;
+        // Every adjacent pair, for the reason spelled out in writeMapValue: an
+        // anchor sample does not establish that the container is ordered.
         for (clojure.lang.ISeq s = clojure.lang.RT.seq(fields); s != null; s = s.next()) {
             Map.Entry e = (Map.Entry) s.first();
-            boolean anchor = (anchors != null && --countdown == 0);
+            if (anchors != null && --countdown == 0) {
+                anchors[a++] = idxOffset(pos); countdown = idxStride;
+            }
             int k0 = pos;
-            if (anchor) { anchors[a++] = k0 + (int) idxBase; countdown = idxStride; }
             writeValue(e.getKey());
-            if (anchor) {
+            if (anchors != null) {
                 if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
                     sorted = false;
                 prevK0 = k0; prevK1 = pos;
@@ -1086,26 +1139,31 @@ public final class Writer {
 
         int[] anchors = new int[anchorCount(n)];
         int slot = reserveNode();
-        // `sorted` is not assumed here: this is the NON-canonical path, so keys
-        // arrive in whatever order the map iterates. A sorted-map or an
-        // array-map built in order is sorted in fact, and the byte-derived
-        // index would notice, so this one does too -- comparing only ANCHOR
-        // keys, which is what a reader binary-searches.
+        // EVERY adjacent key pair, not just the anchors.
+        //
+        // Comparing anchors was unsound and produced wrong answers, not merely
+        // missed optimisations. `sorted` licenses `lookup-map` to binary-search
+        // the anchors and then scan ONLY the stride it lands in; that is valid
+        // just when the whole container is ordered. Ascending anchors do not
+        // imply it -- they are a sample. With the default stride of 16 a map of
+        // 17-32 entries has two anchors, so an unordered map had a ~50% chance
+        // of being marked sorted, and then a present key returned nil.
+        // Measured: 105 of 200 random 20-entry maps had at least one such key.
+        //
+        // The cost is one comparison per entry over key bytes, and only for
+        // containers big enough to be indexed at all.
         boolean sorted = true;
         int prevK0 = -1, prevK1 = -1;
         int a = 0, countdown = 1;
 
         for (Object o : m.entrySet()) {
             Map.Entry e = (Map.Entry) o;
-            boolean anchor = (--countdown == 0);
+            if (--countdown == 0) { anchors[a++] = idxOffset(pos); countdown = idxStride; }
             int k0 = pos;
-            if (anchor) { anchors[a++] = k0 + (int) idxBase; countdown = idxStride; }
             writeValue(e.getKey());
-            if (anchor) {
-                if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
-                    sorted = false;
-                prevK0 = k0; prevK1 = pos;
-            }
+            if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
+                sorted = false;
+            prevK0 = k0; prevK1 = pos;
             writeValue(e.getValue());
         }
         fillNode(slot, start, n, anchors, sorted);
@@ -1333,7 +1391,7 @@ public final class Writer {
         int a = 0, countdown = 1;
         for (int j = 0; j < n; j++) {
             if (anchors != null && --countdown == 0) {
-                anchors[a++] = pos + (int) idxBase; countdown = idxStride;
+                anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
             writeValue(items[order[j]]);
         }
@@ -1407,23 +1465,32 @@ public final class Writer {
 
         int start = pos;
         head(MAP, n);
-        // The cheapest site of all: keys arrive already encoded, so an anchor
-        // is just `pos` before the copy, and `sorted` is TRUE by construction
-        // -- this method just sorted them -- so it costs no comparisons at all.
+        // Sorted by construction -- but only under the RFC 8949 comparator.
+        //
+        // `legacyCanonicalOrder` (:profile :canonical-rfc7049) sorts LENGTH
+        // FIRST, while every reader here compares plain bytewise, so under that
+        // profile this method's output is NOT in the order a binary search
+        // assumes. Claiming otherwise silently lost keys: measured 11 of 20 on
+        // a map mixing short text keys with large integer keys, where the two
+        // orderings genuinely diverge.
+        //
+        // No comparisons on either branch: the sort just ran, so its comparator
+        // is the whole answer.
+        boolean sorted = !legacyCanonicalOrder;
         int[] anchors = indexing(n) ? new int[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
         int a = 0, countdown = 1;
         for (int j = 0; j < n; j++) {
             int k = order[j];
             if (anchors != null && --countdown == 0) {
-                anchors[a++] = pos + (int) idxBase; countdown = idxStride;
+                anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
             ensure(encodedKeys[k].length);
             System.arraycopy(encodedKeys[k], 0, buf, pos, encodedKeys[k].length);
             pos += encodedKeys[k].length;
             writeValue(vals[k]);
         }
-        if (anchors != null) fillNode(slot, start, n, anchors, true);
+        if (anchors != null) fillNode(slot, start, n, anchors, sorted);
     }
 
     public void writeBoolean(boolean b) { u8(SIMPLE | (b ? 21 : 20)); }
@@ -1996,14 +2063,14 @@ public final class Writer {
             if (x instanceof java.util.RandomAccess) {
                 for (int i = 0; i < n; i++) {
                     if (anchors != null && --countdown == 0) {
-                        anchors[a++] = pos + (int) idxBase; countdown = idxStride;
+                        anchors[a++] = idxOffset(pos); countdown = idxStride;
                     }
                     writeValue(l.get(i));
                 }
             } else {
                 for (Object o : l) {
                     if (anchors != null && --countdown == 0) {
-                        anchors[a++] = pos + (int) idxBase; countdown = idxStride;
+                        anchors[a++] = idxOffset(pos); countdown = idxStride;
                     }
                     writeValue(o);
                 }
