@@ -679,7 +679,7 @@
   tables -- on a feature whose entire purpose is to shrink them."
   "boring/index")
 
-(declare index-walk)
+(declare index-walk index-walk*)
 
 (defn- index-walk
   "Walk the value at `p`, returning where it ENDS, and accumulating index nodes
@@ -705,6 +705,24 @@
   tag's reader is an arbitrary function -- but the offsets describe the wire,
   and the wire is what they describe accurately either way."
   [^Reader r p stride min-entries base ^java.util.ArrayList acc]
+  (index-walk* r p stride min-entries base acc 0))
+
+(defn- index-walk*
+  [^Reader r p stride min-entries base ^java.util.ArrayList acc depth]
+  ;; CONTAINER nesting is bounded too, not only the tag chain. `build-index` is
+  ;; public and documented for "a file somebody else wrote", and ~1.2 KB of
+  ;; `81 81 81 ...` was a StackOverflowError where `decode` on the same bytes
+  ;; gives :boring/max-depth-exceeded. These positional reads never touch the
+  ;; Reader's own depth, so its limit does not reach here.
+  ;; 512, not the decoder's 1024: this is a CLOJURE recursion and its frames
+  ;; are fat enough that the stack gives out between 600 and 800 on a default
+  ;; -Xss. A bound above the real limit is not a bound. So a document deeper
+  ;; than this decodes but cannot be indexed -- stated in `build-index` rather
+  ;; than discovered.
+  (when (> (long depth) 512)
+    (throw (ex-info (str "boring: nesting deeper than the index walk's bound (512)."
+                         " This document can be decoded but not indexed.")
+                    {:type :boring/max-depth-exceeded :max-depth 512})))
   (let [p (long p) stride (long stride) min-entries (long min-entries) base (long base)
         ;; A CHAIN OF TAGS IS CONSUMED ITERATIVELY. Recursing once per tag
         ;; overflowed the stack on `c0 c0 c0 ... 00` -- legal CBOR, and reachable
@@ -847,7 +865,15 @@
    (let [r (Reader. bs)
          stride (long (let [i (:index opts)] (if (and i (pos? (long i))) i 16)))
          min-entries (long (or (:index-min opts) 16))
-         idx (scan-index r 0 (alength bs) stride min-entries 0)]
+         idx (try
+               (scan-index r 0 (alength bs) stride min-entries 0)
+               (catch StackOverflowError _
+                 ;; The depth bound above is deterministic, but it is calibrated
+                 ;; against a default stack; a smaller -Xss can still reach the
+                 ;; real limit first. A public entry point that takes bytes
+                 ;; somebody else wrote may not answer with an Error.
+                 (throw (ex-info "boring: index walk ran out of stack; this document is too deeply nested to index"
+                                 {:type :boring/max-depth-exceeded}))))]
      (when (pos? (alength ^ints (:containers idx)))
        (assoc idx :stride stride)))))
 

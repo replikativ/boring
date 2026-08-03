@@ -197,6 +197,27 @@ browser.
 
 - `Writer` and `Reader` are **not** thread-safe. One per thread, or one per
   loop.
+- **`boring.nav` is not thread-safe either, and this is the one that surprises
+  people.** A source owns one `Reader`, and every cursor derived from it shares
+  that Reader's mutable position and depth. Sharing one source across threads
+  does not merely throw — it can return a **plausible but wrong document**. In
+  200 parallel passes over one `items`, 6 came back silently wrong.
+
+  Nothing about the surface warns you, which is why this is stated here rather
+  than left to be inferred: the namespace is *read-only* navigation, `Items` is
+  a reducible that invites `fold`, and `boring.mmap` picks a shared arena
+  precisely so the mapping is not pinned to one thread.
+
+  Use **`boring.nav/fork`** for a per-thread view. It shares the decoded index —
+  the expensive part, 145 µs for a 20 000-item index — and replaces only the
+  Reader, at 175 ns.
+
+  A **best-effort** detector raises `:boring/concurrent-use` when it notices
+  overlapping use of one Reader. It caught 178 of those 200 passes. It is a
+  smoke alarm, not a lock: it is deliberately non-volatile so it costs nothing
+  on the hot path, and one pass in that run still returned a wrong answer
+  without tripping it. Do not rely on it to make sharing safe — `fork` is what
+  makes sharing safe.
 - There is **no process-global registry**. `tag-registry` returns an immutable
   value and every registration returns a new one, so two libraries in one JVM
   cannot register into a shared namespace and resolve by load order. An earlier

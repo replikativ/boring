@@ -4,8 +4,10 @@
   lesson of that review was that a `.clj` test beside the JVM implementation
   does not cover a guarantee the library makes on two runtimes."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.zip]
             [boring.core :as boring]
-            [boring.data :as data]))
+            [boring.data :as data]
+            [boring.nav :as nav]))
 
 (def o {:stringref false})
 (def canonical {:profile :canonical})
@@ -212,3 +214,121 @@
               (str (.getName c) " must be overridden")))))
     (testing "a read-only registration needs no class and stays allowed"
       (is (some? (boring/register-tag (boring/tag-registry) 55555 nil nil (fn [v] v)))))))
+
+;; ---------------------------------------------------- nav collection contracts
+
+(deftest nav-honours-the-collection-interfaces-it-advertises
+  (testing "each of these threw an UNTYPED exception on undamaged data, because
+            every test happened to use the arity or operation the type does
+            implement. Same family as the `count`/AbstractMethodError gap: the
+            docstring advertises `reduce` and `get`, and the call people
+            actually write was the one that failed."
+    (let [v (boring/encode [1 2 3] o)
+          m (boring/encode {"a" 1 "b" 2} o)
+          seqbs (let [out (java.io.ByteArrayOutputStream.)]
+                  (boring/write-seq! (boring/writer 4096 o) [1 2 3] out o)
+                  (.toByteArray out))]
+      (testing "reduce WITHOUT an init -- IReduce, not only IReduceInit"
+        (is (= 3 (count (reduce (fn [a x] (conj (if (vector? a) a [a]) x))
+                                (nav/source v o)))))
+        (is (= 3 (count (reduce (fn [a x] (conj (if (vector? a) a [a]) x))
+                                (nav/items seqbs o))))))
+      (testing "contains? and find -- Associative, not only ILookup"
+        (let [c (nav/source m o)]
+          (is (true? (contains? c "a")))
+          (is (false? (contains? c "zz")))
+          (is (= 1 (nav/value (val (find c "a")))))
+          (is (nil? (find c "zz")))
+          (is (thrown? clojure.lang.ExceptionInfo (assoc c "c" 3))
+              "and assoc is refused, because a cursor is a view over bytes")))
+      (testing "nth's two arities differ, as Indexed specifies"
+        (let [c (nav/source v o)]
+          (is (= 2 (nav/value (nth c 1))))
+          (is (thrown? IndexOutOfBoundsException (nth c 99))
+              "the 2-arity throws out of range, like every other Indexed")
+          (is (= :nf (nth c 99 :nf)) "the 3-arity answers with not-found")))
+      (testing "and a not-found argument is honoured even through a tag, where
+                clojure.core/nth throws for a realised keyword or set"
+        (is (= :nf (nth (nav/source (boring/encode :foo/bar o) o) 0 :nf)))
+        (is (= :nf (nth (nav/source (boring/encode #{1 2 3} o) o) 0 :nf)))))))
+
+(deftest nav-reports-an-impossible-count-rather-than-believing-it
+  (testing "`count` was the one entry point that never checked the head against
+            the data. A head declaring 2^31 entries threw an untyped
+            ArithmeticException; below that it returned an impossible number --
+            1048576 entries from a five-byte document -- while `decode`, `seq`,
+            `reduce` and `nth` on the same bytes all said :boring/bad-count.
+            `seq` and `zipper` had the mirror bug: `(* 2 n)` overflowed to a
+            negative long on a map head."
+    (let [ba (fn [& xs] (byte-array (map unchecked-byte xs)))]
+      (doseq [[label bs op]
+              [["array 2^31 head" (ba 0x9b 0 0 0 0 0x80 0 0 0 0x01) count]
+               ["array 1M head"   (ba 0x9a 0x00 0x10 0x00 0x00) count]
+               ["map 2^62 head"   (ba 0xbb 0x40 0 0 0 0 0 0 0 0x01 0x02) #(doall (seq %))]
+               ["map 2^62 zipper" (ba 0xbb 0x40 0 0 0 0 0 0 0 0x01 0x02)
+                #(clojure.zip/next (nav/zipper %))]]]
+        (is (thrown? clojure.lang.ExceptionInfo (op (nav/source bs o)))
+            (str label " must be typed, not untyped or impossible"))))
+    (testing "and a real count still answers"
+      (is (= 3 (count (nav/source (boring/encode [1 2 3] o) o)))))))
+
+(deftest sorted-collections-refuse-incomparable-content
+  (testing "a corrupt `clojure/sorted-map` frame fed the default comparator keys
+            it cannot order, and the raw ClassCastException escaped `decode`,
+            `decode-seq` and `nav/value` alike. A SINGLE byte flip reaches it --
+            change one key's head to 0xF8 and an ordinary document becomes a
+            sorted-map of simple values. It was 8502 of 8872 untyped throwables
+            in an exhaustive single-byte sweep; random-byte fuzzing never builds
+            a tag-27 frame carrying a valid name, which is why it survived."
+    (let [ba (fn [& xs] (byte-array (map unchecked-byte (flatten xs))))
+          txt (fn [s] (let [a (.getBytes ^String s "UTF-8")]
+                        (cons (+ 0x60 (count a)) (seq a))))]
+      (doseq [[label bs]
+              [["sorted-map, simple-value key"
+                (ba 0xd8 0x1b 0x82 (txt "clojure/sorted-map") 0xa2 0xf8 0x30 0x00 0x01 0x02)]
+               ["sorted-map, mixed key types"
+                (ba 0xd8 0x1b 0x82 (txt "clojure/sorted-map") 0xa2 0x61 0x61 0x00 0x01 0x02)]
+               ["sorted-set, simple value"
+                (ba 0xd8 0x1b 0x82 (txt "clojure/sorted-set") 0x82 0xf8 0x30 0x01)]]]
+        (is (thrown? clojure.lang.ExceptionInfo (boring/decode bs))
+            (str label " must be typed"))))
+    (testing "and real sorted collections still round-trip"
+      (is (= (sorted-map "a" 1 "b" 2)
+             (boring/decode (boring/encode (sorted-map "a" 1 "b" 2) o) o)))
+      (is (= (sorted-set 1 2 3) (boring/decode (boring/encode (sorted-set 1 2 3) o) o))))))
+
+(deftest build-index-refuses-nesting-it-cannot-walk
+  (testing "`index-walk` recursed per CONTAINER without a bound -- the tag chain
+            was made iterative and this was left. ~1.2 KB of `81 81 81 ...`
+            through the public `build-index` was a StackOverflowError where
+            `decode` on the same bytes gives a typed error. Bounded at 512
+            because this is a Clojure recursion whose frames give out between
+            600 and 800, so the decoder's 1024 would not be a bound at all."
+    (let [deep (fn [n] (byte-array (concat (repeat n (unchecked-byte 0x81)) [(byte 1)])))]
+      (is (some? (boring/build-index (deep 100) {:index 4 :index-min 0}))
+          "ordinary nesting still indexes")
+      (doseq [n [1200 20000]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (boring/build-index (deep n) {:index 4 :index-min 0}))
+            (str n " nested containers must be a typed error, not an Error"))))))
+
+(deftest a-forked-source-is-safe-to-use-in-parallel
+  (testing "`boring.nav` shares one Reader across every cursor from a source, so
+            parallel use returns PLAUSIBLE BUT WRONG documents -- 6 of 200
+            passes, with no exception. `fork` shares the decoded index, which is
+            the expensive part, and replaces only the Reader."
+    (let [oi (assoc o :index 8 :index-min 4)
+          vals (mapv (fn [i] {"id" i "pad" (apply str (repeat 20 (char (+ 97 (mod i 26)))))})
+                     (range 200))
+          out (java.io.ByteArrayOutputStream.)]
+      (boring/write-seq! (boring/writer 8192 oi) vals out oi)
+      (let [bs (.toByteArray out)
+            its (nav/items bs o)
+            want (mapv nav/value its)]
+        (is (= want (mapv nav/value (nav/fork its))) "a fork sees the same data")
+        (is (every? #(= want %)
+                    (doall (pmap (fn [_] (mapv nav/value (nav/fork its))) (range 60))))
+            "and 60 parallel forked passes all agree")
+        (testing "a forked CURSOR works too, and keeps its position"
+          (let [c (nav/source (boring/encode {"a" {"b" 7}} o) o)]
+            (is (= 7 (nav/value (get-in (nav/fork c) ["a" "b"]))))))))))

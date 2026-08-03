@@ -70,7 +70,7 @@
 
 ;; ---------------------------------------------------------------- the source
 
-(deftype Nav [^Reader rdr opts probes idx])
+(deftype Nav [^Reader rdr opts probes idx src])
 
 (defn- node-slot
   "Position of the index node covering the container at `off`, or -1.
@@ -131,8 +131,20 @@
                  "with {:stringref false} to navigate it, or decode it whole "
                  "with boring/decode.")
             {}))
-    (let [nav (Nav. r opts (atom {}) nil)]
-      (Nav. r opts (atom {}) (read-index nav)))))
+    (let [nav (Nav. r opts (atom {}) nil src)]
+      (Nav. r opts (atom {}) (read-index nav) src))))
+
+(defn- fork-nav ^Nav [^Nav n]
+  (let [src (.src n)
+        ^Reader r (cond (bytes? src) (Reader. ^bytes src)
+                        :else (Reader. ^ByteSource src))]
+    (boring/configure-reader! r (.opts n))
+    ;; The decoded INDEX is shared -- it is immutable once built and it is the
+    ;; expensive part: 145 us for a 20 000-item index against 175 ns for a
+    ;; Reader. A fresh probe cache rather than a shared one, because it is the
+    ;; only other mutable field and contending an atom to save a key encode is
+    ;; the wrong trade.
+    (Nav. r (.opts n) (atom {}) (.idx n) src)))
 
 (defn source
   "A navigable view over `src` -- a byte[], or a ByteSource such as
@@ -309,6 +321,17 @@
   (let [^Reader r (.rdr nav)
         mj (major nav off)
         n (head-count nav off)
+        ;; `(* 2 n)` overflowed to a negative long on a map head declaring 2^62
+        ;; entries, so `seq` and `zipper` threw "long overflow" where `reduce`
+        ;; on the same cursor reports :boring/truncated-input. One byte flipped
+        ;; to 0xBB reaches it. Bounded by the bytes that actually follow: an
+        ;; entry is at least one byte.
+        room (- (.size r) (.headEndAt r off))
+        _ (when (or (neg? n) (> n room))
+            (fail :boring/bad-count
+                  (str "boring.nav: a container declaring " n
+                       " entries cannot fit in the " room " bytes that follow")
+                  {:offset off :declared n}))
         n (if (= mj MAJOR-MAP) (* 2 n) n)]
     (loop [i 0 p (.headEndAt r off) acc (transient [])]
       (if (= i n)
@@ -316,6 +339,21 @@
         (recur (inc i) (.skipFrom r p) (conj! acc p))))))
 
 (deftype Cursor [^Nav nav ^long off]
+  ;; Associative, not merely ILookup: `contains?` and `find` are what a caller
+  ;; reaches for after `get`, and both threw "not supported on type" -- an
+  ;; untyped IllegalArgumentException on undamaged data. `assoc` is refused,
+  ;; because a cursor is a read-only view of bytes; the zipper already refuses
+  ;; mutation the same way.
+  clojure.lang.Associative
+  (containsKey [this k] (not (identical? ::none (.valAt this k ::none))))
+  (entryAt [this k]
+    (let [v (.valAt this k ::none)]
+      (when-not (identical? v ::none) (clojure.lang.MapEntry/create k v))))
+  (assoc [_ _ _]
+    (fail :boring/read-only
+          "boring.nav: a cursor is a read-only view over bytes; assoc is not supported"
+          {:offset off}))
+
   clojure.lang.ILookup
   (valAt [this k] (.valAt this k nil))
   (valAt [_ k nf]
@@ -325,17 +363,38 @@
                            (if (neg? p) nf (cursor-at nav p)))
         ;; A tag's reader is arbitrary, so structure does not imply semantics.
         ;; Realise and let clojure.core decide -- correct for every registry.
-        (= mj MAJOR-TAG) (get (realize nav off) k nf)
+        ;; `clojure.core/get` is total EXCEPT on a sorted collection, where an
+        ;; incomparable key throws a raw ClassCastException; a lookup that was
+        ;; handed a not-found value must not throw.
+        (= mj MAJOR-TAG) (try (get (realize nav off) k nf)
+                              (catch ClassCastException _ nf))
         :else nf)))
 
   clojure.lang.Indexed
-  (nth [this i] (.nth this i nil))
+  ;; THROWS out of range, as `Indexed.nth(int)` is specified to and as every
+  ;; other Indexed does. Returning nil turned an off-by-one in caller code into
+  ;; a NullPointerException somewhere else entirely. The 3-arity is the one that
+  ;; answers with a not-found value.
+  (nth [this i]
+    (let [v (.nth this i ::none)]
+      (if (identical? v ::none)
+        (throw (IndexOutOfBoundsException. (str "boring.nav: index " i " out of bounds")))
+        v)))
   (nth [_ i nf]
     (let [mj (major nav off)]
       (cond
         (= mj MAJOR-ARRAY) (let [p (nth-item nav off i)]
                              (if (neg? p) nf (cursor-at nav p)))
-        (= mj MAJOR-TAG) (nth (realize nav off) i nf)
+        ;; A tag's reader is arbitrary, so the realised value decides -- but
+        ;; `clojure.core/nth` throws "nth not supported on this type" for a
+        ;; realised keyword or set EVEN with a not-found argument, which leaked
+        ;; an untyped error out of the arity whose whole point is not to throw.
+        (= mj MAJOR-TAG) (let [v (realize nav off)]
+                           (if (or (nil? v) (instance? clojure.lang.Indexed v)
+                                   (instance? java.util.List v) (string? v)
+                                   (and (some? v) (.isArray (class v))))
+                             (nth v i nf)
+                             nf))
         :else nf)))
 
   ;; Honest O(1): the count is in the head, and head-count refuses the
@@ -344,7 +403,24 @@
   (count [_]
     (let [mj (major nav off)]
       (if (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP))
-        (int (head-count nav off))
+        ;; CHECKED against the data, which this was the one entry point not to
+        ;; do. `(int n)` on a head declaring 2^31 entries threw an untyped
+        ;; ArithmeticException, and below that it returned an IMPOSSIBLE number
+        ;; -- 1048576 entries from a five-byte document -- while `decode`,
+        ;; `seq`, `reduce`, `nth` and `byte-span` on the same bytes all report
+        ;; :boring/bad-count. Reachable by flipping byte 0 to 0x9B or 0xBB.
+        ;;
+        ;; One entry is at least one byte, so a count larger than the bytes
+        ;; that follow cannot be honest.
+        (let [n (head-count nav off)
+              room (- (.size ^Reader (.rdr nav)) (.headEndAt ^Reader (.rdr nav) off))
+              need (if (= mj MAJOR-MAP) (* 2 n) n)]
+          (when (or (neg? n) (> need room))
+            (fail :boring/bad-count
+                  (str "boring.nav: a container declaring " n
+                       " entries cannot fit in the " room " bytes that follow")
+                  {:offset off :declared n}))
+          (int n))
         (fail :boring/not-a-container
               "boring.nav: count is only defined for arrays and maps"
               {:offset off :major mj}))))
@@ -359,6 +435,16 @@
                      (clojure.lang.MapEntry. (realize nav kp) (cursor-at nav vp)))
                    (partition 2 (child-offsets nav off))))
         :else nil)))
+
+  ;; IReduce as well as IReduceInit: `(reduce f coll)` -- the arity everyone
+  ;; actually writes -- threw a raw ClassCastException ("cannot be cast to
+  ;; clojure.lang.IReduce") on perfectly good data, because every test happened
+  ;; to pass an init. Exactly the sibling of the `Counted`/AbstractMethodError
+  ;; gap found a round earlier.
+  clojure.lang.IReduce
+  (reduce [this f]
+    (let [s (seq this)]
+      (if s (clojure.core/reduce f (first s) (rest s)) (f))))
 
   ;; The reducers path: no intermediate seq, no child cursors retained beyond
   ;; the step that uses them.
@@ -720,6 +806,16 @@
                 (= k (long i)) (cursor-at nav p)
                 :else (recur (inc k) (.skipFrom r p)))))))
 
+  ;; IReduce as well as IReduceInit: `(reduce f coll)` -- the arity everyone
+  ;; actually writes -- threw a raw ClassCastException ("cannot be cast to
+  ;; clojure.lang.IReduce") on perfectly good data, because every test happened
+  ;; to pass an init. Exactly the sibling of the `Counted`/AbstractMethodError
+  ;; gap found a round earlier.
+  clojure.lang.IReduce
+  (reduce [this f]
+    (let [s (seq this)]
+      (if s (clojure.core/reduce f (first s) (rest s)) (f))))
+
   clojure.lang.IReduceInit
   (reduce [_ f init]
     (let [^Reader r (.rdr nav)
@@ -766,6 +862,39 @@
   ([src opts]
    (let [nav (nav-of src (or opts {}))]
      (Items. nav (.idx nav)))))
+
+(defn fork
+  "A view of the same source for ANOTHER THREAD.
+
+  **`boring.nav` is not thread-safe, and sharing one source silently returns
+  WRONG ANSWERS.** A source owns one `Reader`, and a Reader carries mutable
+  position, depth and scratch state that every cursor derived from it shares.
+  Measured, 200 parallel passes over one `items` returned 10 plausible but
+  wrong documents with no exception at all, alongside a spread of typed errors.
+
+  Nothing about the surface warns you: the namespace is read-only navigation,
+  `Items` is reducible, and `boring.mmap` picks a shared arena precisely so the
+  mapping is not pinned to one thread. So this exists, and it is cheap.
+
+      (let [src (nav/items bs opts)]
+        (pmap (fn [part] (reduce f (nav/fork src))) parts))
+
+  Rebuilding with `items`/`source` instead would work, and costs far more: the
+  index has to be decoded and every delta slot expanded, measured at 145 us for
+  a 20 000-item index against 175 ns for a Reader. A fork shares that work --
+  it is immutable once built -- and replaces only the mutable part.
+
+  What is shared: the bytes, the decoded index, the options. What is fresh: the
+  Reader, and the key-probe cache."
+  [x]
+  (cond
+    (instance? Cursor x) (let [^Cursor c x] (cursor-at (fork-nav (.nav c)) (.off c)))
+    (instance? Items x)  (let [^Items i x
+                               n (fork-nav (.nav i))]
+                           (Items. n (.idx i)))
+    :else (fail :boring/unsupported-source
+                "boring.nav/fork: expected a cursor or the result of `items`"
+                {:got (class x)})))
 
 (defn zipper
   "A read-only clojure.zip zipper over the cursor. `down`, `right`, `node` and

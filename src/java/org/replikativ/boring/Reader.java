@@ -444,6 +444,35 @@ public final class Reader {
     }
 
     /**
+     * BEST-EFFORT concurrent-use detector, not a lock.
+     *
+     * A Reader is single-threaded, and `boring.nav` shares one across every
+     * cursor from a source -- so two threads navigating one source produced
+     * silently WRONG documents: 200 parallel passes gave 6 plausible-but-wrong
+     * answers and no exception at all. Every signal on nav's surface says
+     * otherwise (a "read-only" namespace, a reducible, a deliberately shared
+     * mmap arena), so the failure had to become loud.
+     *
+     * Deliberately NOT thread affinity: building a cursor on one thread and
+     * using it on another, without overlap, is a legitimate handoff that
+     * affinity would reject -- pushing callers back to rebuilding a Nav, which
+     * costs 145 us against a fork's 175 ns.
+     *
+     * Non-volatile on purpose. A volatile write on every positional read would
+     * cost more than the bug does, and this only has to catch overlap often
+     * enough to name it. A smoke alarm, not a mutex: `boring.nav/fork` is the
+     * fix and doc/SECURITY.md states the rule.
+     */
+    private boolean busy = false;
+
+    private RuntimeException concurrentUse() {
+        return Err.of("concurrent-use",
+            "boring: this Reader was used from two threads at once. A boring.nav"
+            + " source is single-threaded -- call boring.nav/fork for a per-thread"
+            + " view, which shares the decoded index.");
+    }
+
+    /**
      * Offset just past the whole value at `p`.
      *
      * Restores `depth` as well as `pos`. These positional entry points are the
@@ -453,16 +482,20 @@ public final class Reader {
      * fail too.
      */
     public long skipFrom(long p) {
+        if (busy) throw concurrentUse();
+        busy = true;
         long save = pos; int d = depth, sd = skipDepth;
         try { pos = p; skipDepth = 0; skipValue(); return pos; }
-        finally { pos = save; depth = d; skipDepth = sd; }
+        finally { pos = save; depth = d; skipDepth = sd; busy = false; }
     }
 
     /** Decode the value at `p`. Does not disturb the caller's position or depth. */
     public Object readFrom(long p) {
+        if (busy) throw concurrentUse();
+        busy = true;
         long save = pos; int d = depth;
         try { pos = p; return read(); }
-        finally { pos = save; depth = d; }
+        finally { pos = save; depth = d; busy = false; }
     }
 
     /**
@@ -1794,16 +1827,41 @@ public final class Reader {
                             // built a map whose keys were entries -- which still had
                             // the right TYPE and so passed a type check, while being
                             // unequal to the input and in the wrong order.
+                            //
+                            // Wrapped, because the default comparator throws a
+                            // raw ClassCastException on keys it cannot order --
+                            // "Default comparator requires nil, Number, or
+                            // Comparable" -- and a SINGLE BYTE FLIP reaches it:
+                            // change one key's head to 0xF8 and an ordinary
+                            // document becomes a sorted-map of simple values.
+                            // That was 8502 of 8872 untyped throwables in an
+                            // exhaustive single-byte sweep, and it escaped
+                            // `decode`, `decode-seq` and `nav/value` alike.
+                            // Random-byte fuzzing never builds a tag-27 frame
+                            // carrying a valid name, which is why it survived.
                             Object m2 = clojure.lang.PersistentTreeMap.EMPTY;
-                            for (Object o : ((java.util.Map) argument).entrySet()) {
-                                java.util.Map.Entry e2 = (java.util.Map.Entry) o;
-                                m2 = ((clojure.lang.Associative) m2).assoc(e2.getKey(), e2.getValue());
+                            try {
+                                for (Object o : ((java.util.Map) argument).entrySet()) {
+                                    java.util.Map.Entry e2 = (java.util.Map.Entry) o;
+                                    m2 = ((clojure.lang.Associative) m2).assoc(e2.getKey(), e2.getValue());
+                                }
+                            } catch (ClassCastException e) {
+                                throw Err.of("bad-tag-content",
+                                    "boring: clojure/sorted-map keys are not mutually"
+                                    + " comparable (" + e.getMessage() + ")");
                             }
                             return m2;
                         }
                         case "clojure/sorted-set":
-                            return clojure.lang.PersistentTreeSet.create(
-                                clojure.lang.RT.seq(seqableContent(argument, "clojure/sorted-set")));
+                            // Same hazard, same one-byte reach: see sorted-map.
+                            try {
+                                return clojure.lang.PersistentTreeSet.create(
+                                    clojure.lang.RT.seq(seqableContent(argument, "clojure/sorted-set")));
+                            } catch (ClassCastException e) {
+                                throw Err.of("bad-tag-content",
+                                    "boring: clojure/sorted-set elements are not mutually"
+                                    + " comparable (" + e.getMessage() + ")");
+                            }
                         case "clojure/with-meta": {
                             java.util.List l2 = listContent(argument, 27, 2);
                             Object m = l2.get(0), v2 = l2.get(1);
