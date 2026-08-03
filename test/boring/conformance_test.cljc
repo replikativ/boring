@@ -11,6 +11,7 @@
             [boring.conformance :as c]
             [boring.wg-bad :as wg]
             [boring.hostile :as hostile]
+            [boring.appendix-f :as appf]
             [boring.records :as records]))
 
 ;; ---------------------------------------------------------------- helpers
@@ -951,6 +952,29 @@
           "and the STRING survives: Instant.parse collapses :60 to :59 and
            new Date rejects it outright, so neither platform has a lossless
            native value -- preserving the text is the only honest option"))))
+
+(deftest rfc-8949-appendix-f1-is-rejected-in-full
+  (testing "every byte sequence RFC 8949 Appendix F.1 names as not well-formed
+            must raise a typed error, on both platforms.
+
+            `boring.wg-bad` is the CBOR working group's corpus and is NOT a
+            superset of Appendix F.1 -- it was missing subkind 2 and subkind 5
+            entirely, 18 of 24 reserved additional-information bytes, 8 of 10
+            chunk cases, and every large-declared-length case. The subkind-2 gap
+            is precisely why boring decoded `f8 18` as simple(24) for as long as
+            it did. See boring.appendix-f for the full accounting."
+    (doseq [[label hex] appf/cases]
+      (let [r (try {:ok (boring/decode (c/hex->bytes hex))}
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                     (if (:type (ex-data e))
+                       {:typed (:type (ex-data e))}
+                       {:untyped (str e)}))
+                   #?(:clj (catch Throwable e
+                             {:raw (.getSimpleName (class e))})))]
+        (is (contains? r :typed)
+            (str label " (" hex ") -> "
+                 (pr-str (or (:raw r) (:untyped r)
+                             (str "decoded to " (pr-str (:ok r)))))))))))
 
 (deftest every-malformed-tag-fails-typed
   (testing "a well-formed CBOR item of the WRONG SHAPE inside a tag boring

@@ -81,8 +81,17 @@ availability or integrity, not RCE.
 ### Guarantee 3 is empirical, not proven
 
 It is backed by 300 000 fuzz mutants over valid encodings with zero untyped
-failures, plus the CBOR WG's not-well-formed corpus (46/47, one documented
-exemption). That is evidence, not a proof. The fuzzer mutates *valid* encodings,
+failures, plus **RFC 8949 Appendix F.1 in full (94/94)** and the CBOR WG's
+not-well-formed corpus (46/47, one documented exemption).
+
+Those are two different corpora, and citing only the second overstated the
+first. The WG file is not a superset of Appendix F.1 — it was missing subkind 2
+and subkind 5 entirely, 18 of the 24 reserved additional-information bytes, 8 of
+the 10 indefinite-chunk cases, and every large-declared-length case. The
+subkind-2 gap is exactly why boring decoded `f8 18` as `simple(24)` for as long
+as it did: the corpus that would have caught it was the one not being run.
+
+That is evidence, not a proof. The fuzzer mutates *valid* encodings,
 so it explores near-valid space well and far-from-valid space poorly. Every
 round of fuzzing so far has found something; assume the next one would too.
 

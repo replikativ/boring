@@ -274,7 +274,7 @@ round-tripped through it ([Migrate codec](doc/MIGRATE-CODEC.md) §6).
 
 What exists today: one shared `.cljc` conformance suite run on both platforms
 (`bin/ci` prints the counts; pinning them here only means they are wrong by the
-next commit), RFC 8949 Appendix A 82/82, the CBOR
+next commit), RFC 8949 Appendix A 81/81 and Appendix F.1 94/94, the CBOR
 working group's not-well-formed corpus 46/47, coverage measured against
 nippy's `stress-data`, a frozen [golden corpus](doc/COMPATIBILITY.md) asserted
 in both directions, mutation fuzzing gated in CI on both platforms, and
