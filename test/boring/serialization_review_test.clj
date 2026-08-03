@@ -503,3 +503,35 @@
     (testing "and the real arrays still round-trip"
       (is (= [true false] (vec (boring/decode (boring/encode (boolean-array [true false]) o) o))))
       (is (= ["a" "b"] (vec (boring/decode (boring/encode (into-array String ["a" "b"]) o) o)))))))
+
+;; ---------------------------------------------------- M2 M5 M6: range checks
+
+(deftest options-and-ranges-fail-typed-rather-than-raw
+  (testing ":chunk-size 0 silently returned an EMPTY sequence for non-empty
+            input -- data loss with no error, the worst way an option can be
+            wrong -- and a negative one was a raw NegativeArraySizeException.
+            `bytesBetween` narrowed `(int)(end - start)` with no range check,
+            and `bytesEqualAt` used overflow-prone addition. All are public
+            entry points, so all must fail the way the rest of the reader does."
+    (let [bs (boring/encode [1 2 3] o)]
+      (testing ":chunk-size"
+        (doseq [bad [0 -1 1.5 "big"]]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"chunk-size"
+                                (doall (boring/decode-seq-from
+                                        (java.io.ByteArrayInputStream. bs)
+                                        (assoc o :chunk-size bad))))
+              (str (pr-str bad))))
+        (is (= 1 (count (vec (boring/decode-seq-from
+                              (java.io.ByteArrayInputStream. bs)
+                              (assoc o :chunk-size 4096)))))
+            "and a sane size still streams")
+        (is (= 1 (count (vec (boring/decode-seq-from
+                              (java.io.ByteArrayInputStream. bs) o))))
+            "as does the default"))
+      (testing "bytesBetween ranges"
+        (let [r (org.replikativ.boring.Reader. ^bytes bs)]
+          (is (= 3 (alength ^bytes (.bytesBetween r 0 3))) "a valid range works")
+          (doseq [[st e] [[3 0] [-1 3] [0 999999] [0 -1]]]
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"byte range"
+                                  (.bytesBetween r st e))
+                (str "[" st " " e ")"))))))))

@@ -1052,7 +1052,16 @@
   ([^java.io.InputStream in] (decode-seq-from in nil))
   ([^java.io.InputStream in opts]
    (let [o     (resolve-opts opts)
-         chunk (int (get opts :chunk-size 65536))
+         chunk (let [c (get opts :chunk-size 65536)]
+                 ;; VALIDATED. `:chunk-size 0` silently returned an EMPTY
+                 ;; sequence for non-empty input -- data loss with no error, the
+                 ;; worst way an option can be wrong -- and a negative value was
+                 ;; a raw NegativeArraySizeException.
+                 (when-not (and (integer? c) (pos? (long c)) (<= (long c) Integer/MAX_VALUE))
+                   (throw (ex-info (str "boring: :chunk-size must be a positive integer, got "
+                                        (pr-str c))
+                                   {:type :boring/bad-option :chunk-size c})))
+                 (int c))
          r     (Reader. (byte-array 0))
          state (volatile! {:buf (byte-array chunk) :limit 0 :last-good 0 :eof? false})]
      (configure-reader! r o)

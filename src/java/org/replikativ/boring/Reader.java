@@ -551,7 +551,7 @@ public final class Reader {
      */
     public boolean bytesEqualAt(long p, byte[] probe) {
         int n = probe.length;
-        if (p < 0 || p + n > limit) return false;
+        if (p < 0 || n > limit - p) return false;   // no overflow-prone addition
         for (int i = 0; i < n; i++) if (sb(p + i) != probe[i]) return false;
         return true;
     }
@@ -586,8 +586,32 @@ public final class Reader {
     }
 
     /** Copy the bytes in [start, end) out. Used to lift a blob or stage a span. */
+    /** Slots for `n` key/value pairs, refusing a product that cannot be an array. */
+    private static int kvSlots(int n) {
+        long slots = (long) n * 2;
+        if (slots > Integer.MAX_VALUE - 8)
+            throw Err.of("bad-count",
+                "boring: a map of " + n + " pairs needs " + slots
+                + " slots, more than one array can hold");
+        return (int) slots;
+    }
+
+    /**
+     * Bytes in [start, end). RANGE-CHECKED, because these are a public Java
+     * entry point: `(int)(end - start)` on a reversed or out-of-range pair was
+     * a raw NegativeArraySizeException or ArrayIndexOutOfBoundsException rather
+     * than the typed failure the rest of the reader promises.
+     */
     public byte[] bytesBetween(long start, long end) {
-        return freshBytes(start, (int) (end - start));
+        if (start < 0 || end < start || end > limit)
+            throw Err.of("bad-range",
+                "boring: byte range [" + start + ", " + end + ") is not within"
+                + " [0, " + limit + ")");
+        long n = end - start;
+        if (n > Integer.MAX_VALUE - 8)
+            throw Err.of("bad-range",
+                "boring: byte range of " + n + " is larger than one array can hold");
+        return freshBytes(start, (int) n);
     }
 
     /** True if this document opens a stringref namespace at its root. */
@@ -1217,7 +1241,11 @@ public final class Reader {
             case 5: {                                       // map
                 if (info == 31) { enter(); try { return readIndefiniteMap(); } finally { exit(); } }
                 int n = checkCount(arg(info), 2);
-                Object[] kvs = new Object[n * 2];
+                // CHECKED before narrowing: `checkCount(n, 2)` can pass for an
+                // n whose `n * 2` overflows signed int on a source larger than
+                // 2 GiB, which was a raw NegativeArraySizeException. Even
+                // below that, the product may exceed any usable heap.
+                Object[] kvs = new Object[kvSlots(n)];
                 enter();
                 try {
                     for (int i = 0; i < n; i++) {
@@ -1908,7 +1936,11 @@ public final class Reader {
                     // Interleave straight into the map's backing array — the
                     // keys are already decoded and interned, so there is no
                     // per-row key work at all.
-                    Object[] kvs = new Object[n * 2];
+                    // CHECKED before narrowing: `checkCount(n, 2)` can pass for an
+                // n whose `n * 2` overflows signed int on a source larger than
+                // 2 GiB, which was a raw NegativeArraySizeException. Even
+                // below that, the product may exceed any usable heap.
+                Object[] kvs = new Object[kvSlots(n)];
                     for (int i = 0; i < n; i++) {
                         kvs[i * 2] = keys[i];
                         kvs[i * 2 + 1] = read();
