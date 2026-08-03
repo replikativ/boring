@@ -496,7 +496,7 @@
 ;; depends on everything before it, so the chunk must be read from the start and
 ;; cannot be split. Not implemented; chunk size is the knob for that tradeoff.
 
-(declare seal-index! scan-index build-index)
+(declare seal-index! scan-index scan-into! nodes->index build-index)
 
 (defn encode-indexed
   "Encode `v` and seal an index onto it, returning a byte[].
@@ -563,13 +563,10 @@
                          (let [n (long (.position ^Writer (write-root! w v o)))]
                            (when indexing?
                              (.reset ^Reader scan-rdr (buffer w))
-                             (let [sub (scan-index scan-rdr 0 n stride min-entries total)]
-                               (dotimes [k (alength ^ints (:containers sub))]
-                                 (.add ^java.util.ArrayList nodes
-                                       [(aget ^ints (:containers sub) k)
-                                        (aget ^ints (:counts sub) k)
-                                        (nth (:slots sub) k)
-                                        (nth (:sorted sub) k)]))))
+                             ;; Straight into the sequence-wide accumulator.
+                             ;; Shaping a per-item result and copying out of it
+                             ;; cost more than the walk it described.
+                             (scan-into! scan-rdr 0 n stride min-entries total nodes))
                            (.write out (.buffer w) 0 (int n))
                            (+ total n)))
                        0
@@ -648,11 +645,22 @@
               map? (= mj 5)]
           (if (neg? n)
             (.skipFrom r p)                       ; indefinite length: not indexable
-            (let [starts (int-array n)
+            ;; Only containers we will KEEP get an array, and it holds one entry
+            ;; per ANCHOR rather than one per entry. The old version allocated
+            ;; `(int-array n)` for every container before testing `min-entries`,
+            ;; then copied every stride-th element into a second array -- so a
+            ;; document of small maps allocated one throwaway array per map and
+            ;; threw it away, which is why raising :index-min barely helped.
+            (let [keep? (>= n min-entries)
+                  m (if keep?
+                      (if (= stride 1) n (inc (quot (dec (max n 1)) stride)))
+                      0)
+                  kept (when keep? (int-array m))
                   end (loop [i 0 q (long (.headEndAt r p))]
                         (if (= i n)
                           q
-                          (do (aset starts i (int q))
+                          (do (when (and keep? (zero? (rem i stride)))
+                                (aset ^ints kept (quot i stride) (int q)))
                               (recur (inc i)
                                      (long (index-walk
                                             r
@@ -660,25 +668,46 @@
                                               (long (index-walk r q stride min-entries base acc))
                                               q)
                                             stride min-entries base acc))))))]
-              (when (>= n min-entries)
-                (let [kept (if (= stride 1)
-                             starts
-                             (let [m (inc (quot (dec (max n 1)) stride))
-                                   a (int-array m)]
-                               (dotimes [j m] (aset a j (aget starts (* j stride))))
-                               a))
-                      sorted (boolean
+              (when keep?
+                ;; `sorted` is decided on RAW offsets, before `base` is folded
+                ;; in: the Reader is positioned over this item's own buffer.
+                (let [sorted (boolean
                               (and map?
                                    (loop [k 1]
-                                     (cond (>= k (alength kept)) true
-                                           (>= (.compareItemsAt r (aget kept (dec k))
-                                                                (aget kept k)) 0) false
+                                     (cond (>= k (alength ^ints kept)) true
+                                           (>= (.compareItemsAt r (aget ^ints kept (dec k))
+                                                                (aget ^ints kept k)) 0) false
                                            :else (recur (inc k))))))]
                   (when (pos? base)
-                    (dotimes [k (alength kept)]
-                      (aset kept k (int (+ base (aget kept k))))))
+                    (dotimes [k (alength ^ints kept)]
+                      (aset ^ints kept k (int (+ base (aget ^ints kept k))))))
                   (.add acc [(int (+ base p)) (int n) kept sorted])))
               end)))))))
+
+(defn- scan-into!
+  "Append index nodes for [start, end) onto `acc`, and return nothing.
+
+  Separate from `scan-index` because `write-seq!` calls this once PER ITEM, and
+  the result-shaping `scan-index` does -- a sort, four sequence traversals and a
+  map -- is per-sequence work. Doing it per item allocated an ArrayList, two
+  lazy seqs, two vectors and a four-entry map for every item in the log, almost
+  always to describe zero nodes, since a typical record's containers sit below
+  `:index-min`. That scaffolding, not the byte walk, was the bulk of indexing's
+  write cost: `skipFrom` and `skipValue` together were 2% of the profile."
+  [^Reader r start end stride min-entries base ^java.util.ArrayList acc]
+  (loop [p (long start)]
+    (when (< p (long end))
+      (recur (long (index-walk r p stride min-entries base acc)))))
+  nil)
+
+(defn- nodes->index
+  "Shape accumulated nodes into the map `seal-index!` takes. Once per sequence."
+  [^java.util.ArrayList acc]
+  (let [idx (vec (sort-by first acc))]
+    {:containers (int-array (map #(nth % 0) idx))
+     :counts (int-array (map #(nth % 1) idx))
+     :slots (mapv #(nth % 2) idx)
+     :sorted (mapv #(nth % 3) idx)}))
 
 (defn- scan-index
   "Index nodes for every container of at least `min-entries` entries in
@@ -697,14 +726,8 @@
   bounds at maxDepth."
   [^Reader r start end stride min-entries base]
   (let [acc (java.util.ArrayList.)]
-    (loop [p (long start)]
-      (when (< p (long end))
-        (recur (long (index-walk r p stride min-entries base acc)))))
-    (let [idx (vec (sort-by first acc))]
-      {:containers (int-array (map #(nth % 0) idx))
-       :counts (int-array (map #(nth % 1) idx))
-       :slots (mapv #(nth % 2) idx)
-       :sorted (mapv #(nth % 3) idx)})))
+    (scan-into! r start end stride min-entries base acc)
+    (nodes->index acc)))
 
 (defn build-index
   "Index nodes for the containers inside already-encoded `bs`.
