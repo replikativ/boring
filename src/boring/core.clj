@@ -513,10 +513,24 @@
   `:index` is the stride (default 16) and `:index-min` the smallest container
   worth a node (default 16). Sorted map keys -- `:canonical` or `:archival` --
   additionally allow binary search; without them a lookup still jumps anchor to
-  anchor rather than entry to entry."
+  anchor rather than entry to entry.
+
+  `:stringref false` IS FORCED, because the sentence above would otherwise be
+  false by default. The default profile writes stringref, and `boring.nav`
+  categorically refuses a stringref document -- a stringref is an index into a
+  table built from every preceding string, which a cursor holding only an offset
+  cannot resolve. So `(nav/source (encode-indexed v))` threw
+  `:boring/stringref-not-navigable` on the very shape this function's docstring
+  recommends. Every test passed `{:stringref false}` or a sorting profile, so the
+  advertised default was the one path never exercised.
+
+  An index exists to be navigated; producing one that cannot be is not a
+  trade-off worth offering. Pass `:stringref true` explicitly and it is honoured
+  -- you simply get an index nothing can use."
   (^bytes [v] (encode-indexed v nil))
   (^bytes [v opts]
-   (let [^bytes body (encode v opts)
+   (let [opts (if (contains? opts :stringref) opts (assoc opts :stringref false))
+         ^bytes body (encode v opts)
          idx (build-index body opts)]
      (if-not idx
        body

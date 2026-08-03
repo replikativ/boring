@@ -133,14 +133,22 @@
                  ;; Called with a value that has no encoding; its result is
                  ;; written instead. nil (default) throws as before.
                  ^:mutable encodeFallback
-                 ^:mutable inFallback])
+                 ^:mutable inFallback
+                 ;; Depth already consumed by a PARENT writer, for a canonical
+                 ;; scratch. Separate from `depth` because `reset!` runs before
+                 ;; every staged key and zeroes `depth`: copying the parent's
+                 ;; depth into the scratch therefore did nothing at all, and a
+                 ;; map key got a fresh budget -- so nesting through key
+                 ;; positions could repeatedly renew a cap set as a SECURITY
+                 ;; bound. The JVM carries the same field for the same reason.
+                 ^:mutable depthOffset])
 
 (defn writer
   ([] (writer 256))
   ([size]
    (let [b (js/Uint8Array. (max 64 size))]
      (Writer. b (js/DataView. (.-buffer b)) 0 (js/Map.) 0 true true false false false nil
-              (js/Map.) true false 0 1024 false nil false))))
+              (js/Map.) true false 0 1024 false nil false 0))))
 
 (defn reset! [^Writer w]
   (set! (.-pos w) 0)
@@ -154,6 +162,8 @@
   ;; worse than an untyped one, because it looks recoverable. The JVM reset
   ;; already cleared its counter.
   (set! (.-depth w) 0)
+  ;; `depthOffset` deliberately survives: it records what a PARENT already
+  ;; spent, and a scratch writer is reset once per staged key.
   (set! (.-metaWrapped w) false)
   w)
 
@@ -474,7 +484,15 @@
     (set! (.-inclMetadata scratch) (.-inclMetadata w))
     (set! (.-permitReservedSimpleValues scratch) (.-permitReservedSimpleValues w))
     (set! (.-maxDepth scratch) (.-maxDepth w))
-    (set! (.-depth scratch) (.-depth w))
+    ;; ACCUMULATED, and into `depthOffset` rather than `depth`: `reset!` runs
+    ;; before every staged key and zeroes `depth`, so assigning it there was a
+    ;; no-op and the budget renewed itself at each hop through key position.
+    (set! (.-depthOffset scratch) (+ (.-depth w) (.-depthOffset w)))
+    ;; The fallback AND its re-entry guard. Copying the callback alone lets a
+    ;; fallback whose result still contains the unsupported value recurse
+    ;; through a fresh scratch forever.
+    (set! (.-encodeFallback scratch) (.-encodeFallback w))
+    (set! (.-inFallback scratch) (.-inFallback w))
     scratch))
 
 (defn- write-set-canonical!
@@ -520,6 +538,17 @@
                              [(to-bytes scratch) v])))
           cmp (if (.-legacyCanonicalOrder w) compare-bytes-length-first compare-bytes)
           sorted (sort-by first cmp entries)]
+      ;; Two DISTINCT host keys can encode identically under canonical
+      ;; reduction -- `1` and `(js/BigInt 1)` are both the single byte `01` --
+      ;; and a map with two identical CBOR keys is output this library's OWN
+      ;; reader rejects as :boring/duplicate-map-key. Canonical SETS have always
+      ;; checked this; maps did not, on either platform. The JVM was fixed
+      ;; first; a successful encode must never produce bytes the paired decoder
+      ;; refuses.
+      (doseq [[[a _] [b _]] (partition 2 1 sorted)]
+        (when (zero? (compare-bytes a b))
+          (throw (ex-info "boring: two map keys encode identically under :canonical"
+                          {:type :boring/canonical-duplicate}))))
       (head! w MAP (count m))
       (doseq [[kb v] sorted]
         (ensure! w (.-length kb))
@@ -582,12 +611,14 @@
 (declare write-value!*)
 
 (defn- enter! [^Writer w]
-  (set! (.-depth w) (inc (.-depth w)))
-  (when (> (.-depth w) (.-maxDepth w))
+  ;; Checked BEFORE incrementing, and against the parent's spend as well as our
+  ;; own -- see `depthOffset`.
+  (when (> (+ (inc (.-depth w)) (.-depthOffset w)) (.-maxDepth w))
     (throw (ex-info (str "boring: value nested deeper than maxDepth ("
                          (.-maxDepth w) ")")
                     {:type :boring/max-depth-exceeded
-                     :max-depth (.-maxDepth w)}))))
+                     :max-depth (.-maxDepth w)})))
+  (set! (.-depth w) (inc (.-depth w))))
 
 (defn- exit! [^Writer w] (set! (.-depth w) (dec (.-depth w))))
 
