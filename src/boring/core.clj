@@ -691,7 +691,20 @@
                    ;; retaining a node per container, invisibly and forever.
                   (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
                   (throw t)))]
-    (if indexing?
+    (if (and indexing?
+             ;; NO FRAME WHEN THERE IS NOTHING TO INDEX. `:index-min` gates
+             ;; container nodes; the sequence node is a container too (at the
+             ;; sentinel offset -1), so the same threshold decides whether it is
+             ;; worth one. Without this a three-item sequence paid ~46 bytes for
+             ;; an index that could only ever point at its own three items --
+             ;; and since `write-seq!` indexes by DEFAULT, every small sequence
+             ;; anyone wrote would have carried it.
+             ;;
+             ;; `encode-indexed` has always behaved this way: `build-index`
+             ;; returns nil when no node clears the threshold, and the body is
+             ;; returned unsealed. This makes the two agree.
+             (or (>= (long (.idxItemTotal ^Writer w)) min-entries)
+                 (pos? (alength ^ints (.idxContainers ^Writer w)))))
       (let [^ints cs (.idxContainers ^Writer w)
             ^ints ns (.idxCounts ^Writer w)
             sl (.idxSlots ^Writer w)
@@ -722,7 +735,13 @@
                      :sorted (into [false] so)}
                     total
                     o)))))
-      total)))
+      ;; Capture must go off on THIS path too. It is switched on above whenever
+      ;; `indexing?`, and the skip branch is now reachable with it on -- a
+      ;; writer left in capture mode keeps allocating and retaining a node per
+      ;; container on every later call, invisibly and forever. Same failure the
+      ;; catch clause above exists to prevent.
+      (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
+          total))))
 
 (def ^:const index-name
   "Tag-27 type name for a sequence/container index. See doc/SHAPES.md.
