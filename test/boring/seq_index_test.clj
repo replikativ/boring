@@ -203,6 +203,47 @@
           (str "a stride-1 index should stay well under a tenth of the file, was "
                (format "%.1f%%" (* 100.0 (/ (double dense) plain))))))))
 
+(deftest a-malformed-payload-degrades-to-scanning-rather-than-throwing
+  (testing "the pointer and name checks establish that something INTENDS to be
+            an index, not that its payload is usable. A frame that passes both
+            and then holds nonsense must be ignored, not thrown at the caller of
+            `nav/source` -- especially since slots are expanded eagerly, so one
+            bad slot would otherwise take down a cursor that never went near
+            that container."
+    (let [w (boring/writer 65536 opts)
+          o (ByteArrayOutputStream.)
+          vs [{"a" 1} {"b" 2} {"c" 3}]
+          _ (doseq [v vs] (boring/write-to! w v o))
+          data-len (.size o)
+          ;; tag 27 + the real name, so detection succeeds; slots are strings,
+          ;; so expansion cannot
+          bogus (boring.data/unknown-record
+                 boring/index-name
+                 [16 (int-array [-1]) (int-array [3]) ["not" "an" "array"] [false]
+                  (byte-array (map unchecked-byte
+                                   [0 0 0 0 0 0 (bit-shift-right data-len 8) data-len]))])
+          _ (boring/write-to! w bogus o)
+          bs (.toByteArray o)]
+      (is (= 4 (count (read-items bs)))
+          "scans, so the bogus frame comes back as data -- no exception")
+      (testing "and the CONTROL: the same pointer arithmetic with a usable
+                payload IS detected, so the case above fails in expansion
+                rather than never getting that far"
+        (let [w2 (boring/writer 65536 opts)
+              o2 (ByteArrayOutputStream.)]
+          (doseq [v vs] (boring/write-to! w2 v o2))
+          (boring/write-seq! w2 [] o2 opts)         ; no-op, keeps data-len honest
+          (let [dl (.size o2)
+                good (boring.data/unknown-record
+                      boring/index-name
+                      [16 (int-array [-1]) (int-array [3])
+                       [(byte-array (map unchecked-byte [0 6 6]))] [false]
+                       (byte-array (map unchecked-byte
+                                        [0 0 0 0 0 0 (bit-shift-right dl 8) dl]))])]
+            (boring/write-to! w2 good o2)
+            (is (= 3 (count (read-items (.toByteArray o2))))
+                "a well-formed payload at the same offset is used, not scanned")))))))
+
 (deftest degenerate-sequences-seal-and-read-back
   (testing "zero, one and two items. The empty case is the one that bit: its
             data section is 0 bytes long, so the back-pointer is 0 -- and a

@@ -468,6 +468,16 @@
                        (let [arr (.headEndAt r ptr)]
                          (and (= 4 (.majorAt r arr))
                               (.bytesEqualAt r (.headEndAt r arr) (name-probe nav)))))
+              ;; ANY failure past this point yields nil, which means "scan".
+              ;; The pointer and name checks establish that something INTENDS to
+              ;; be an index, not that its payload is well formed -- a truncated
+              ;; or hand-edited one can still decode to the wrong shape. Nothing
+              ;; here is load-bearing, so the honest response to a payload we
+              ;; cannot use is to ignore it and walk, never to throw at the
+              ;; caller of `nav/source`. This matters more since slots are
+              ;; expanded eagerly below: without it, one malformed slot would
+              ;; take down a cursor that never went near that container.
+              (try
               ;; `frame-payload`, not `record-fields`: an unregistered tag-27
               ;; frame decodes to an UnknownRecord when its payload is a map
               ;; and a TaggedLiteral otherwise, and this payload is a vector.
@@ -497,7 +507,8 @@
                      :sorted (vec sorted)
                      :data-end ptr
                      :total (when seq-slot (long (aget counts seq-slot)))
-                     :offsets (when seq-slot (nth abs-slots seq-slot))}))))))))))
+                     :offsets (when seq-slot (nth abs-slots seq-slot))})))
+              (catch Exception _ nil)))))))))
 
 (deftype Items [^Nav nav idx]
   clojure.lang.Seqable

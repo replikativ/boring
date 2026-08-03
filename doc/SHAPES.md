@@ -311,7 +311,18 @@ in range, and the target must actually carry the `boring/index` name.
 
 **The index is never load-bearing for correctness.** It is rebuildable by a
 full scan, discardable at any time, and a missing or damaged one changes only
-the speed. That is deliberate, and it is what the test suite pins.
+the speed. That is deliberate, and it is what the test suite pins: a corrupt
+pointer, a truncated file, an appended-to file, a file that merely ends in the
+right 9-byte shape, and a frame that passes every detection check but holds an
+unusable payload all fall back to scanning rather than throwing.
+
+**The limit of that claim, stated rather than implied:** there is no checksum.
+A payload corrupted into something that still *parses* — plausible offsets of
+the right type — will be believed, and will seek to the wrong place. Detection
+catches malformed indexes, not subtly wrong ones. This is the same exposure the
+data section has, since CBOR carries no checksum either, so an index is no more
+fragile than the bytes it describes; if you need integrity, you need it for the
+whole file and not just for this item.
 
 ### Slots are deltas, in the narrowest type that holds them
 
