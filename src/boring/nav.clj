@@ -62,14 +62,38 @@
 
 (set! *warn-on-reflection* true)
 
-(declare ->Cursor cursor-at)
+(declare ->Cursor cursor-at read-index)
 
 (defn- fail [type msg data]
   (throw (ex-info msg (assoc data :type type))))
 
 ;; ---------------------------------------------------------------- the source
 
-(deftype Nav [^Reader rdr opts probes])
+(deftype Nav [^Reader rdr opts probes idx])
+
+(defn- node-slot
+  "Position of the index node covering the container at `off`, or -1.
+
+  Returns an INT, not a map. An earlier version returned
+  `{:slot .. :count .. :sorted ..}` and allocated it on every lookup at every
+  level, which made deep paths SLOWER with an index than without: at depth 64
+  that is 64 maps per lookup, swamping the search it was meant to accelerate.
+
+  Binary search over the sorted container offsets -- O(log C) per level, which
+  is also what lets the index be sparse: an unindexed container simply is not
+  found, and the caller walks."
+  ^long [^Nav nav ^long off]
+  (if-let [idx (.idx nav)]
+    (let [^ints cs (:containers idx)]
+      (loop [lo 0 hi (dec (alength cs))]
+        (if (> lo hi)
+          -1
+          (let [mid (quot (+ lo hi) 2)
+                c (aget cs mid)]
+            (cond (= c off) mid
+                  (< c off) (recur (inc mid) hi)
+                  :else (recur lo (dec mid)))))))
+    -1))
 
 (defn- probe-for
   "The encoded bytes of `k`, cached. Key matching compares bytes rather than
@@ -97,7 +121,8 @@
                  "with {:stringref false} to navigate it, or decode it whole "
                  "with boring/decode.")
             {}))
-    (Nav. r opts (atom {}))))
+    (let [nav (Nav. r opts (atom {}) nil)]
+      (Nav. r opts (atom {}) (read-index nav)))))
 
 (defn source
   "A navigable view over `src` -- a byte[], or a ByteSource such as
@@ -141,26 +166,85 @@
 (defn- realize [^Nav nav ^long off]
   (.readFrom ^Reader (.rdr nav) off))
 
+(defn- scan-map
+  "Linear walk of a map's entries from `start`, at most `limit` of them."
+  ^long [^Reader r ^long start ^long limit ^bytes probe]
+  (loop [i 0 p start]
+    (if (>= i limit)
+      -1
+      (if (.bytesEqualAt r p probe)
+        (.skipFrom r p)
+        (recur (inc i) (.skipFrom r (.skipFrom r p)))))))
+
 (defn- lookup-map
-  "Offset of the value for `k` in the map at `off`, or -1. Decodes no keys."
+  "Offset of the value for `k` in the map at `off`, or -1. Decodes no keys.
+
+  Three paths, fastest first:
+
+    indexed + sorted   binary search the node's anchors comparing ENCODED key
+                       bytes, then walk at most `stride`-1 entries. O(log n).
+    indexed            jump anchor to anchor, walking only within one stride --
+                       still never touching a value.
+    unindexed          walk every entry, which is what this always did.
+
+  All three return the same offset. The index only decides how much is walked."
   ^long [^Nav nav ^long off k]
   (let [^Reader r (.rdr nav)
         n (head-count nav off)
-        probe (probe-for nav k)]
-    (loop [i 0 p (.headEndAt r off)]
-      (if (= i n)
-        -1
-        (if (.bytesEqualAt r p probe)
-          (.skipFrom r p)
-          (recur (inc i) (.skipFrom r (.skipFrom r p))))))))
+        ^bytes probe (probe-for nav k)
+        idx (.idx nav)
+        ns (node-slot nav off)]
+    (if (neg? ns)
+      (scan-map r (.headEndAt r off) n probe)
+      (let [^ints slot (nth (:slots idx) ns)
+            stride (long (:stride idx))
+            m (alength slot)]
+        ;; Entries after anchor a, which is NOT always `stride`: the last
+        ;; anchor covers the remainder. Walking a full stride from it ran off
+        ;; the end of the container and into whatever followed -- found by the
+        ;; missing-key case, where the search lands past the final anchor.
+        (letfn [(span [^long a] (min stride (- n (* a stride))))]
+          (if (nth (:sorted idx) ns)
+            ;; Sorted keys: binary search the anchors, then a bounded walk.
+            (loop [lo 0 hi (dec m)]
+              (if (> lo hi)
+                (let [anchor (max 0 (min (dec m) hi))]
+                  (scan-map r (aget slot anchor) (span anchor) probe))
+                (let [mid (quot (+ lo hi) 2)
+                      q (aget slot mid)
+                      c (.compareItemToBytes r q probe)]
+                  (cond (zero? c) (.skipFrom r q)
+                        (neg? c) (recur (inc mid) hi)
+                        :else (recur lo (dec mid))))))
+            ;; Unsorted: still jump anchor to anchor rather than entry to entry.
+            (loop [a 0]
+              (if (>= a m)
+                -1
+                (let [hit (scan-map r (aget slot a) (span a) probe)]
+                  (if (>= hit 0) hit (recur (inc a))))))))))))
 
-(defn- nth-item ^long [^Nav nav ^long off ^long idx]
+(defn- nth-item
+  "Offset of element `idx` of the array at `off`, or -1.
+
+  Arrays need no sorting: element i is simply the i-th recorded offset, so an
+  indexed array is O(1) to the anchor and then at most `stride`-1 skips. That
+  is why the index helps arrays under any profile, while maps need canonical
+  key order before binary search is legal."
+  ^long [^Nav nav ^long off ^long idx]
   (let [^Reader r (.rdr nav)
         n (head-count nav off)]
     (if (or (neg? idx) (>= idx n))
       -1
-      (loop [i 0 p (.headEndAt r off)]
-        (if (= i idx) p (recur (inc i) (.skipFrom r p)))))))
+      (let [ix (.idx nav)
+            ns (node-slot nav off)]
+        (if (neg? ns)
+          (loop [i 0 p (.headEndAt r off)]
+            (if (= i idx) p (recur (inc i) (.skipFrom r p))))
+          (let [^ints slot (nth (:slots ix) ns)
+                stride (long (:stride ix))
+                anchor (quot idx stride)]
+            (loop [i (* anchor stride) p (long (aget slot anchor))]
+              (if (= i idx) p (recur (inc i) (.skipFrom r p))))))))))
 
 (defn- child-offsets
   "Offsets of the children of the container at `off`, in wire order. For a map
@@ -287,7 +371,7 @@
   to value cursor (maps). Prefer `reduce` over `seq` in a hot loop."
   [^Cursor c] c)
 
-(defn- read-seq-index
+(defn- read-index
   "The offset index sealed onto a CBOR sequence by `boring/write-seq!`, or nil.
 
   CBOR cannot be parsed backwards, so the index is found through its last
@@ -312,10 +396,24 @@
                        (= 6 (.majorAt r ptr))
                        (= boring/index-tag (.headArgAt r ptr)))
               (let [tv (.readFrom r ptr)
-                    [stride total offsets _] (:value tv)]
-                (when (and (int? stride) (pos? (long stride)))
-                  {:stride (long stride) :total (long total)
-                   :offsets offsets :data-end ptr})))))))))
+                    [stride ^ints containers ^ints counts slots sorted _] (:value tv)]
+                (when (and (int? stride) (pos? (long stride)) containers)
+                  ;; One uniform node list. The SEQUENCE is the node at the
+                  ;; sentinel offset -1: it has no container header on the wire
+                  ;; but behaves like one, and a sentinel avoids carrying two
+                  ;; separate shapes for the same idea.
+                  (let [seq-slot (loop [k 0]
+                                   (cond (>= k (alength containers)) nil
+                                         (= -1 (aget containers k)) k
+                                         :else (recur (inc k))))]
+                    {:stride (long stride)
+                     :containers containers
+                     :counts counts
+                     :slots (vec slots)
+                     :sorted (vec sorted)
+                     :data-end ptr
+                     :total (when seq-slot (long (aget counts seq-slot)))
+                     :offsets (when seq-slot (nth (vec slots) seq-slot))}))))))))))
 
 (deftype Items [^Nav nav idx]
   clojure.lang.Seqable
@@ -382,7 +480,7 @@
   ([src] (items src nil))
   ([src opts]
    (let [nav (nav-of src (or opts {}))]
-     (Items. nav (read-seq-index nav)))))
+     (Items. nav (.idx nav)))))
 
 (defn zipper
   "A read-only clojure.zip zipper over the cursor. `down`, `right`, `node` and

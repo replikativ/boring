@@ -422,6 +422,35 @@ public final class Reader {
         return true;
     }
 
+    /**
+     * Lexicographic comparison of the ENCODED items at `a` and `b`.
+     *
+     * RFC 8949 §4.2.1 orders canonical map keys by their encoded bytes, so a
+     * navigator can binary-search a sorted map without decoding a single key.
+     * Bytewise, with the shorter encoding first when one is a prefix of the
+     * other.
+     */
+    public int compareItemsAt(long a, long b) {
+        long an = skipFrom(a) - a, bn = skipFrom(b) - b;
+        long n = Math.min(an, bn);
+        for (long i = 0; i < n; i++) {
+            int x = b(a + i), y = b(b + i);
+            if (x != y) return x < y ? -1 : 1;
+        }
+        return Long.compare(an, bn);
+    }
+
+    /** Same ordering, against an already-encoded probe. */
+    public int compareItemToBytes(long p, byte[] probe) {
+        long pn = skipFrom(p) - p;
+        long n = Math.min(pn, probe.length);
+        for (long i = 0; i < n; i++) {
+            int x = b(p + i), y = probe[(int) i] & 0xFF;
+            if (x != y) return x < y ? -1 : 1;
+        }
+        return Long.compare(pn, probe.length);
+    }
+
     /** Copy the bytes in [start, end) out. Used to lift a blob or stage a span. */
     public byte[] bytesBetween(long start, long end) {
         return freshBytes(start, (int) (end - start));

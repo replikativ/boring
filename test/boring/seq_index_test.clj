@@ -137,3 +137,102 @@
       (doseq [s [1 4 16 64]]
         (is (= (items 499) (nav/value (nth (nav/items (build s) opts) 499)))
             (str "stride " s " must still reach the last item"))))))
+
+;; ------------------------------------------------- hierarchical descent
+;;
+;; The sequence index above reaches item n. These reach INTO an item: a node
+;; per container, so a map lookup binary-searches and an array indexes
+;; positionally. Same guarantee as everything else here -- the index changes
+;; how much is walked, never the answer.
+
+(def sorted-opts {:profile :archival})          ; sorts map keys, drops stringref
+
+(def wide-map
+  (into {} (for [i (range 300)] [(format "k%04d" i) {"v" i "w" (str "x" i)}])))
+
+(def wide-vec (vec (for [i (range 300)] {"n" i "s" (str "s" i)})))
+
+(deftest indexed-descent-agrees-with-scanning
+  (testing "every key of a wide map resolves identically with and without an
+            index, under a sorting profile (binary search) and without one
+            (anchor-to-anchor walk)"
+    (doseq [o [sorted-opts opts]]
+      (let [plain (boring/encode wide-map o)
+            idxed (boring/encode-indexed wide-map (assoc o :index 16 :index-min 8))
+            cp (nav/source plain o)
+            ci (nav/source idxed o)]
+        (is (< (alength ^bytes plain) (alength ^bytes idxed)) "index costs something")
+        (doseq [k (keys wide-map)]
+          (is (= (nav/value (get-in cp [k "v"]))
+                 (nav/value (get-in ci [k "v"]))
+                 (get-in wide-map [k "v"]))
+              (str "key " k " under " (:profile o :clojure))))
+        (testing "and a missing key is nil on both paths"
+          (is (nil? (get cp "nope")))
+          (is (nil? (get ci "nope"))))))))
+
+(deftest indexed-arrays-need-no-sorted-keys
+  (testing "an array indexes positionally, so it works under ANY profile --
+            it is only maps that need canonical order for binary search"
+    (let [plain (boring/encode wide-vec opts)
+          idxed (boring/encode-indexed wide-vec (assoc opts :index 16 :index-min 8))
+          cp (nav/source plain opts)
+          ci (nav/source idxed opts)]
+      (doseq [i [0 1 15 16 17 150 298 299]]
+        (is (= (nav/value (nth cp i)) (nav/value (nth ci i)) (wide-vec i))
+            (str "index " i)))
+      (is (nil? (nth ci 300 nil)) "out of range still nil"))))
+
+(deftest decode-is-unaffected-by-an-index
+  (testing "encode-indexed produces a two-item sequence, so `decode` still
+            returns the value and any CBOR reader consumes both items"
+    (doseq [v [wide-map wide-vec]]
+      (let [bs (boring/encode-indexed v (assoc sorted-opts :index 16))]
+        (is (= v (boring/decode bs sorted-opts)))
+        (is (= 2 (count (boring/decode-seq bs sorted-opts))))
+        (is (= boring/index-tag (:tag (second (vec (boring/decode-seq bs sorted-opts))))))))))
+
+(deftest a-corrupt-container-index-still-answers-correctly
+  (testing "flip the back-pointer: no node is found anywhere, so every lookup
+            falls back to walking -- slower, identical answers"
+    (let [bs (boring/encode-indexed wide-map (assoc sorted-opts :index 16 :index-min 8))
+          broken (corrupt-at bs (- (alength bs) 6) 0x7F)
+          c (nav/source broken sorted-opts)]
+      (doseq [k (take 50 (keys wide-map))]
+        (is (= (get-in wide-map [k "v"]) (nav/value (get-in c [k "v"])))
+            (str "key " k))))))
+
+(deftest nodes-are-built-inside-tags
+  (testing "a set is tag 258 around an array and a record is tag 27 around a
+            map -- skipping tags would leave exactly those unindexed"
+    (let [v {"s" (into (sorted-set) (range 200))
+             "plain" (into {} (for [i (range 200)] [(format "k%03d" i) i]))}
+          idx (boring/build-index (boring/encode v sorted-opts)
+                                  (assoc sorted-opts :index 16 :index-min 8))]
+      (is (some? idx))
+      ;; TWO nodes, not three: the outer map has 2 entries and :index-min is 8,
+      ;; so it is correctly skipped. What must be present is the set's array
+      ;; and the inner map -- both of which live UNDER a tag, and neither of
+      ;; which would exist if tags were stepped over.
+      (is (= 2 (alength ^ints (:containers idx)))
+          (str "expected the set's array and the inner map, got "
+               (alength ^ints (:containers idx))))
+      (is (every? #(>= % 200) (seq ^ints (:counts idx)))
+          "both nodes should be the 200-entry containers"))))
+
+(deftest index-min-controls-size-not-correctness
+  (testing "raising the threshold shrinks the index and never changes an answer"
+    (let [sizes (vec (for [mn [2 8 64]]
+                       [mn (alength ^bytes (boring/encode-indexed
+                                            wide-map (assoc sorted-opts :index 16 :index-min mn)))]))]
+      ;; Non-increasing, not strictly decreasing: 8 and 64 both exclude the
+      ;; 2-entry inner maps and index only the outer one, so they tie. The
+      ;; claim is that raising the threshold never GROWS the index.
+      (is (apply >= (map second sizes)) (str "size must not rise with threshold: " sizes))
+      (is (> (second (first sizes)) (second (last sizes)))
+          (str "and 2 must cost more than 64: " sizes))
+      (doseq [mn [2 8 64]]
+        (let [c (nav/source (boring/encode-indexed
+                             wide-map (assoc sorted-opts :index 16 :index-min mn))
+                            sorted-opts)]
+          (is (= 42 (nav/value (get-in c ["k0042" "v"]))) (str "min " mn)))))))

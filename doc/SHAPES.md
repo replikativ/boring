@@ -334,3 +334,90 @@ scan is linear in the map's width: measured 0.35 µs at 10 keys and 276 µs at
 trailing item — would fit this mechanism unchanged. The open question there is
 not how to carry it but *what to index*, which is a schema decision rather than
 an encoding one.
+
+
+---
+
+## Tag 39651, part two: container nodes
+
+The sequence index above reaches item *n*. The same item also carries a node
+per **container**, which reaches *into* an item.
+
+A node is the byte offsets of a container's entries. With them, an array
+indexes positionally in O(1) and a map with sorted keys binary-searches in
+O(log n), comparing **encoded key bytes** — no key is ever decoded and no value
+is ever touched.
+
+```
+tag 39651 [ stride, containers, counts, slots, sorted, <8-byte data-len> ]
+```
+
+`containers` are sorted byte offsets, so a reader binary-searches them; the
+sequence itself is the node at the sentinel offset −1. `sorted` is recorded per
+node rather than inferred, because the encoding profile is not on the wire.
+
+### Sorted keys are what make it systematic
+
+Binary search needs ordering, so it requires `:canonical` or `:archival` — the
+profiles that sort map keys by encoded bytes, and which you would already be
+using for storage. Without them a lookup still jumps anchor to anchor rather
+than entry to entry, but it is O(n/stride), not O(log n).
+
+**Arrays need no profile.** Element *i* is the *i*-th recorded offset, so an
+indexed array is O(1) under any encoding.
+
+### Two knobs, and which one matters
+
+| | | |
+|---|---|---|
+| `:index` | stride | entries per recorded offset |
+| `:index-min` | threshold | smallest container worth a node |
+
+**`:index-min` dominates.** Real data is mostly small containers, and each one
+costs an offset, a count, a typed-array slot and a flag whether or not it is
+worth searching. On 2 000 records of two fields each, indexing every container
+cost **76%** of the file; indexing only containers of 8+ cost **1.3%** — and
+was *faster*, because the smaller index also fits in cache.
+
+Measured, one container, lookups spread across it:
+
+| keys | overhead | scan | indexed |
+|---:|---:|---:|---:|
+| 100 | 3.4% | 4.23 µs | 2.09 µs |
+| 1 000 | 1.4% | 26.1 µs | 0.79 µs |
+| 10 000 | 1.2% | 175.1 µs | **0.74 µs** |
+
+### Where it loses
+
+An index can be **slower**. Finding the node is itself a binary search over the
+container list, once per level. When a container is narrow *and* its entries are
+cheap to skip, walking it costs less than looking up how to jump:
+
+| nesting depth, 64-key levels | scan | indexed |
+|---:|---:|---:|
+| 4 | 0.395 µs | 0.856 µs |
+| 64 | 4.025 µs | **8.168 µs** |
+
+Raise `:index-min` above the width of such containers and they fall back to
+walking. This is the case where the default is wrong and the knob is the fix,
+which is why both are parameters and neither is implicit.
+
+### Building it
+
+The index is derived by **walking encoded bytes**, not by hooking the writer —
+so the writer's hot path is untouched and any already-encoded value can be
+indexed after the fact, including one somebody else wrote. `boring/build-index`
+does that; `boring/encode-indexed` encodes and seals in one step, producing a
+two-item sequence that `decode` still reads as the value.
+
+The walk returns each value's **end offset** rather than calling `skipFrom` per
+entry. That matters: `skipFrom` is O(subtree), so an entry-at-a-time walk
+re-walks everything beneath each level and is O(n²) in depth — measured at
+486 ns/byte against a skip's 1.3–2, and 27× slower on a 200-deep document. A
+single descent visits each byte once and the node falls out of it. Building an
+index costs 1.1–1.4× a plain encode.
+
+Tags are **descended through**, not stepped over. A set is tag 258 around an
+array, a record tag 27 around `[name, map]`, a shaped array tag 39649 around
+`[keys, rows]` — skipping tags would leave exactly those uncovered, and
+descending is free because `skipFrom` walks the same bytes anyway.

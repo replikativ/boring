@@ -321,8 +321,108 @@
     (println "you are going to touch nearly everything in a small item anyway,")
     (println "decode is the cheaper call.")))
 
+;; ------------------------------------------------------------------ index
+;;
+;; The container index across the axes that actually move the answer: how WIDE
+;; a container is, how DEEP the nesting goes, and what the workload looks like.
+;; Both knobs are shown, because they trade against each other -- `:index-min`
+;; is the size knob and `:index` (stride) the lookup knob.
+
+(def ^:private idx-opts {:profile :archival})   ; sorted keys, no stringref
+
+(defn- lookup-sweep [c ks]
+  (fn [] (doseq [k ks] (nav/value (get-in c [k "v"])))))
+
+(defn- wide-map [n]
+  (into {} (for [i (range n)] [(format "k%06d" i) {"v" i "w" (str "x" i)}])))
+
+(defn- deep-map
+  "d levels of nesting, each level a map of `w` keys whose last value descends."
+  [d w]
+  (reduce (fn [inner _]
+            (assoc (into {} (for [i (range (dec w))] [(format "k%04d" i) {"v" i}]))
+                   "zzz" inner))
+          {"v" 0} (range d)))
+
+(defn run-index []
+  (println "\nWIDTH — one container, lookups spread across it")
+  (println (format "  %-8s %10s %11s %12s %12s %10s"
+                   "keys" "plain KB" "indexed KB" "overhead" "scan us" "indexed us"))
+  (doseq [n [100 1000 10000]]
+    (let [m (wide-map n)
+          plain (boring/encode m idx-opts)
+          bs (boring/encode-indexed m (assoc idx-opts :index 16 :index-min 16))
+          ks (mapv #(format "k%06d" %) (range 0 n (max 1 (quot n 100))))
+          a (timed (lookup-sweep (nav/source plain idx-opts) ks) 5 8)
+          b (timed (lookup-sweep (nav/source bs idx-opts) ks) 20 8)]
+      (println (format "  %-8d %10.1f %11.1f %11.1f%% %12.2f %10.3f"
+                       n (/ (alength ^bytes plain) 1024.0) (/ (alength ^bytes bs) 1024.0)
+                       (* 100.0 (/ (- (alength ^bytes bs) (alength ^bytes plain))
+                                   (double (alength ^bytes plain))))
+                       (/ a (count ks) 1000.0) (/ b (count ks) 1000.0)))
+      (flush)))
+
+  (println "\nDEPTH — reaching the innermost value through d levels")
+  (println (format "  %-8s %10s %11s %12s %12s" "depth" "plain KB" "overhead" "scan us" "indexed us"))
+  (doseq [d [4 16 64]]
+    (let [m (deep-map d 64)
+          path (vec (concat (repeat d "zzz") ["v"]))
+          plain (boring/encode m idx-opts)
+          bs (boring/encode-indexed m (assoc idx-opts :index 16 :index-min 16))
+          cp (nav/source plain idx-opts) ci (nav/source bs idx-opts)
+          a (timed #(nav/value (get-in cp path)) 200 8)
+          b (timed #(nav/value (get-in ci path)) 200 8)]
+      (println (format "  %-8d %10.1f %11.1f%% %12.3f %12.3f"
+                       d (/ (alength ^bytes plain) 1024.0)
+                       (* 100.0 (/ (- (alength ^bytes bs) (alength ^bytes plain))
+                                   (double (alength ^bytes plain))))
+                       (/ a 1000.0) (/ b 1000.0)))
+      (flush)))
+
+  (println "\nKNOBS — 5 000 keys; :index-min is the size knob, stride the lookup knob")
+  (println (format "  %-12s %-8s %11s %12s" "index-min" "stride" "overhead" "us/lookup"))
+  (let [m (wide-map 5000)
+        plain (boring/encode m idx-opts)
+        ks (mapv #(format "k%06d" %) (range 0 5000 50))]
+    (doseq [mn [2 16 128] st [1 16 64]]
+      (let [bs (boring/encode-indexed m (assoc idx-opts :index st :index-min mn))]
+        (println (format "  %-12d %-8d %10.1f%% %12.3f" mn st
+                         (* 100.0 (/ (- (alength ^bytes bs) (alength ^bytes plain))
+                                     (double (alength ^bytes plain))))
+                         (/ (timed (lookup-sweep (nav/source bs idx-opts) ks) 20 8)
+                            (count ks) 1000.0)))
+        (flush))))
+
+  (println "\nWRITE COST — building the index is a walk of the encoded bytes")
+  (println (format "  %-22s %10s %12s %12s %10s" "payload" "bytes" "encode us" "+index us" "ratio"))
+  (doseq [[nm v] [["wide-map-5000" (wide-map 5000)]
+                  ["deep-64x64" (deep-map 64 64)]
+                  ["datom-maps-200" (vec (for [i (range 200)]
+                                           {"e" (+ 100 i) "a" "user/name"
+                                            "v" (str "p" i) "tx" (+ 536870912 i)}))]]]
+    (let [^bytes bs (boring/encode v idx-opts)
+          it (max 5 (quot 2000000 (alength bs)))
+          e (timed #(boring/encode v idx-opts) it 8)
+          ei (timed #(boring/encode-indexed v (assoc idx-opts :index 16 :index-min 16)) it 8)]
+      (println (format "  %-22s %10d %12.1f %12.1f %9.2fx" nm (alength bs)
+                       (/ e 1000.0) (/ ei 1000.0) (/ ei e)))
+      (flush)))
+
+  (println "\nWHERE IT LOSES, which the DEPTH table shows: an index can be SLOWER.")
+  (println "Finding the node is itself a binary search over the container list, per")
+  (println "level. When a container is narrow AND its entries are cheap to skip --")
+  (println "64 keys whose values are tiny maps -- walking it costs less than looking")
+  (println "up how to jump. Raise :index-min above the width of containers like that")
+  (println "and they fall back to walking, which is what you want.")
+  (println)
+  (println "The index is an optimisation, never load-bearing: a missing, stale or")
+  (println "corrupt one falls back to walking and returns the same answer. Sorted")
+  (println "keys (:canonical / :archival) additionally allow binary search; arrays")
+  (println "index positionally under any profile."))
+
 (defn -main [& args]
   (let [only (set args)
         run? (fn [k] (or (empty? only) (contains? only (name k))))]
     (when (run? :skip) (run-skip))
-    (when (run? :cursor) (run-cursor))))
+    (when (run? :cursor) (run-cursor))
+    (when (run? :index) (run-index))))
