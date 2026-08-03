@@ -454,6 +454,9 @@
   (set! (.-instantAsDate r) (not= :instant (get opts :instant-type :date)))
   (set! (.-fullDateAsSqlDate r) (= :sql-date (get opts :date-type :local-date)))
   (set! (.-maxDepth r) (int (get opts :max-depth 1024)))
+  ;; 0 = unlimited, which is the default. See Reader.maxItems for why the budget
+  ;; counts ITEMS rather than bytes.
+  (set! (.-maxItems r) (long (get opts :max-items 0)))
   (set! (.-validateUtf8 r) (boolean (get opts :validate-utf8 true)))
   (set! (.-autoConstructRecords r)
         (boolean (get opts :auto-construct-records? false)))
@@ -714,15 +717,27 @@
   ;; `81 81 81 ...` was a StackOverflowError where `decode` on the same bytes
   ;; gives :boring/max-depth-exceeded. These positional reads never touch the
   ;; Reader's own depth, so its limit does not reach here.
-  ;; 512, not the decoder's 1024: this is a CLOJURE recursion and its frames
-  ;; are fat enough that the stack gives out between 600 and 800 on a default
-  ;; -Xss. A bound above the real limit is not a bound. So a document deeper
-  ;; than this decodes but cannot be indexed -- stated in `build-index` rather
-  ;; than discovered.
-  (when (> (long depth) 512)
-    (throw (ex-info (str "boring: nesting deeper than the index walk's bound (512)."
+  ;; 200, well below where the stack actually gives out, and NOT the decoder's
+  ;; 1024. Two lessons are baked into that number.
+  ;;
+  ;; This is a Clojure recursion; its frames are fat enough that an isolated
+  ;; measurement put the limit between 600 and 800 on a default -Xss. A bound of
+  ;; 512 looked safe against that and was FLAKY IN THE SUITE -- roughly one run
+  ;; in three -- because the test runner and preceding tests have already spent
+  ;; stack, so the real headroom is smaller than any isolated measurement of it.
+  ;; A bound calibrated against the best case is not a bound.
+  ;;
+  ;; The StackOverflowError catch in `build-index` is a backstop, not the
+  ;; mechanism: catching one is unreliable, since the handler itself needs stack
+  ;; to construct the exception and can overflow again. The deterministic check
+  ;; has to fire first, so it is set where it comfortably does.
+  ;;
+  ;; A document nested deeper than this therefore DECODES but cannot be INDEXED.
+  ;; Said in `build-index`'s docstring rather than left to be discovered.
+  (when (> (long depth) 200)
+    (throw (ex-info (str "boring: nesting deeper than the index walk's bound (200)."
                          " This document can be decoded but not indexed.")
-                    {:type :boring/max-depth-exceeded :max-depth 512})))
+                    {:type :boring/max-depth-exceeded :max-depth 200})))
   (let [p (long p) stride (long stride) min-entries (long min-entries) base (long base)
         ;; A CHAIN OF TAGS IS CONSUMED ITERATIVELY. Recursing once per tag
         ;; overflowed the stack on `c0 c0 c0 ... 00` -- legal CBOR, and reachable
@@ -777,13 +792,22 @@
                             (when (and srt (aget ^booleans srt 0) (>= (long prev) 0)
                                        (>= (.compareItemsAt r (long prev) q) 0))
                               (aset ^booleans srt 0 false))
+                            ;; index-walk*, CARRYING THE DEPTH. Calling the
+                            ;; 6-arg wrapper here reset it to 0 at every level,
+                            ;; so the bound never fired and the only thing
+                            ;; stopping a deep document was the
+                            ;; StackOverflowError catch -- which is exactly the
+                            ;; unreliable path the bound exists to front-run,
+                            ;; and which made the test flaky rather than the
+                            ;; code safe.
                             (recur (inc i)
-                                   (long (index-walk
+                                   (long (index-walk*
                                           r
                                           (if map?
-                                            (long (index-walk r q stride min-entries base acc))
+                                            (long (index-walk* r q stride min-entries base acc
+                                                               (inc (long depth))))
                                             q)
-                                          stride min-entries base acc))
+                                          stride min-entries base acc (inc (long depth))))
                                    q))))]
             (when keep?
                 ;; Decided on RAW offsets, before `base` is folded in: the
@@ -1116,6 +1140,9 @@
      (set! (.-instantAsDate r) (not= :instant (get opts :instant-type :date)))
      (set! (.-fullDateAsSqlDate r) (= :sql-date (get opts :date-type :local-date)))
      (set! (.-maxDepth r) (int (get opts :max-depth 1024)))
+  ;; 0 = unlimited, which is the default. See Reader.maxItems for why the budget
+  ;; counts ITEMS rather than bytes.
+     (set! (.-maxItems r) (long (get opts :max-items 0)))
      (set! (.-validateUtf8 r) (boolean (get opts :validate-utf8 true)))
      (set! (.-autoConstructRecords r)
            (boolean (get opts :auto-construct-records? false)))

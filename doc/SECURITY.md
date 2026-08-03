@@ -56,7 +56,9 @@ availability or integrity, not RCE.
 1. **Termination.** Every count is validated against remaining bytes before
    allocation; nesting is capped by `:max-depth` (default 1024); no loop depends
    on wire data for its bound.
-2. **Bounded memory**, at roughly **5× the input size** — see below; not 1×.
+2. **Bounded memory**, but the multiplier depends on the decoded SHAPE and
+   reaches **23×** on documents made of many tiny containers — see below. Bulk
+   payloads are 1×. Use `:max-items` to cap it.
 3. **Typed failure.** Every rejection is an `ex-info` with a `:type` keyword.
    Nothing escapes as a raw `NullPointerException`, `ClassCastException`,
    `StackOverflowError` or `OutOfMemoryError`, so a caller's
@@ -87,19 +89,48 @@ round of fuzzing so far has found something; assume the next one would too.
 ### What "bounded memory" actually means
 
 `checkCount` requires at least one wire byte per element, but a decoded element
-costs more heap than one byte. Measured:
+costs more heap than one byte. Re-measured, wire bytes to retained heap:
 
-| input | heap |
+| input | amplification |
+|---|---:|
+| 1 MB byte string | **1.0×** |
+| `long[]` typed array (tag 79) | **1.0×** |
+| array of distinct small integers | 6.5× |
+| 100 000 short strings | 7.8× |
+| map of 50 000 entries | 11.7× |
+| 50 000 two-element vectors | **23.1×** |
+
+**This page previously said "roughly 5×", and that was wrong by a factor of
+five.** The old table's worst case was an array of *empty* arrays, which is
+cheap precisely because empty collections return shared singletons — it had been
+64× until that fix. Empty containers are the best case, not the worst.
+
+Read the shape of the table rather than any single number. **Bulk payloads do
+not amplify at all**: a megabyte byte string or typed array decodes to a
+megabyte. What amplifies is OBJECT COUNT — a one-byte container head that
+becomes a `PersistentVector` with a header, an array and slots is the worst
+per-byte case there is. So amplification tracks how many objects a document
+asks for, not how many bytes it occupies.
+
+That is also why the budget below counts items rather than bytes.
+
+### Bounding it
+
+Three limits, and they bound different things:
+
+| option | bounds |
 |---|---|
-| 2 MB array of small integers | 10 MB (**5×**) |
-| 2 MB array of empty arrays | 10 MB (**5×**) |
+| transport size limit (yours) | how many bytes arrive |
+| `:max-depth` (default 1024) | how deeply nested one value may be |
+| `:max-items` (default unlimited) | how many items a decode may produce |
 
-The second row was **121 MB (64×)** until empty collections were changed to
-return the shared singletons — every empty array had been allocating a fresh
-vector. So the multiplier is a property of the decoded shapes, and 5× is what
-the current worst known case gives, not a bound anyone has proved.
+`:max-items` is the cumulative one, and it is what actually caps heap: nothing
+else bounded the TOTAL, so a document within the size and depth limits could
+still amplify past anything documented. Set it from the table above — items are
+a good proxy for objects, and objects are what cost.
 
-**Enforce an input size limit at the transport.** boring reads what you give it.
+**Still enforce an input size limit at the transport.** boring reads what you
+give it, and `:max-items` caps the result rather than the arrival.
 
 ## Encode-side refusals
 

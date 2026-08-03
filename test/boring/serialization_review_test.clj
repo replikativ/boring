@@ -76,11 +76,18 @@
             null FIRST row threw a raw NullPointerException and the documented
             null-row fallback was unreachable for the row most likely to be
             null."
-    (testing "zero rows keep their type -- 0x0 is rectangular"
-      (is (= "[[D" (.getName (class (boring/decode
-                                     (boring/encode (make-array Double/TYPE 0 0) o) o)))))
-      (is (= "[[J" (.getName (class (boring/decode
-                                     (boring/encode (make-array Long/TYPE 0 0) o) o))))))
+    (testing "zero rows take the FALLBACK, and must not be tagged"
+      ;; I first fixed this by making a zero-row matrix rectangular so its type
+      ;; survived -- which emitted tag 40 with dimensions [0,0]. RFC 8746 3.1.1
+      ;; requires dimensions distinct from zero, and our own reader accepted it,
+      ;; so a round-trip test blessed invalid CBOR. There is no standard tag-40
+      ;; encoding of a zero extent, so the TYPE is what has to give: a 0x0
+      ;; matrix carries no values to lose.
+      (is (= [] (boring/decode (boring/encode (make-array Double/TYPE 0 0) o) o)))
+      (is (= [] (boring/decode (boring/encode (make-array Long/TYPE 0 0) o) o)))
+      (is (= "80" (apply str (map #(format "%02x" %)
+                                  (boring/encode (make-array Double/TYPE 0 0) o))))
+          "a bare empty array -- no tag 40, no dimensions"))
     (testing "a null row falls back instead of throwing, in either position"
       (doseq [[label rows] [["first" [nil (double-array [1.0])]]
                             ["later" [(double-array [1.0]) nil]]]]
@@ -301,13 +308,23 @@
   (testing "`index-walk` recursed per CONTAINER without a bound -- the tag chain
             was made iterative and this was left. ~1.2 KB of `81 81 81 ...`
             through the public `build-index` was a StackOverflowError where
-            `decode` on the same bytes gives a typed error. Bounded at 512
-            because this is a Clojure recursion whose frames give out between
-            600 and 800, so the decoder's 1024 would not be a bound at all."
+            `decode` on the same bytes gives a typed error.
+
+            Bounded at 200, not the decoder's 1024 and not the 512 I first
+            chose: an isolated measurement put the stack limit between 600 and
+            800, but the SUITE has already spent stack, so 512 was flaky about
+            one run in three. A bound calibrated against the best case is not a
+            bound, and catching StackOverflowError is only a backstop -- the
+            handler needs stack to build the exception and can overflow again."
     (let [deep (fn [n] (byte-array (concat (repeat n (unchecked-byte 0x81)) [(byte 1)])))]
-      (is (some? (boring/build-index (deep 100) {:index 4 :index-min 0}))
-          "ordinary nesting still indexes")
-      (doseq [n [1200 20000]]
+      (doseq [n [10 100 200]]
+        (is (some? (boring/build-index (deep n) {:index 4 :index-min 0}))
+            (str n " levels is ordinary nesting and must still index")))
+      ;; The exact cutoff is a safety MARGIN, not a contract -- it is set where
+      ;; the deterministic check reliably beats the stack, which depends on how
+      ;; much stack the caller has already spent. So this asserts comfortably
+      ;; past it rather than pinning an off-by-one.
+      (doseq [n [250 1200 20000]]
         (is (thrown? clojure.lang.ExceptionInfo
                      (boring/build-index (deep n) {:index 4 :index-min 0}))
             (str n " nested containers must be a typed error, not an Error"))))))
@@ -382,3 +399,36 @@
           (reduce (fn [a x] (+ (long a) (long (count x)))) 0 it)
           (doall (map (fn [i] (nav/value (nth it i))) (range 50)))
           (doall (map nav/byte-span (seq (get c "e")))))))))
+
+;; ---------------------------------------------- decode budget and amplification
+
+(deftest max-items-caps-what-a-decode-may-produce
+  (testing "`:max-depth` bounds how DEEP a document is and `checkCount` bounds
+            each container against the bytes that remain, but nothing bounded
+            the TOTAL -- so a document inside both limits could still amplify
+            past anything doc/SECURITY.md claimed. Measured, that page's
+            'roughly 5x' was wrong by a factor of five: many tiny containers
+            reach 23x, while a megabyte byte string is 1.0x.
+
+            Items rather than bytes, because heap tracks OBJECT COUNT: a
+            one-byte container head that becomes a vector is the worst per-byte
+            case there is, and bulk payloads do not amplify at all."
+    (let [bs (boring/encode (vec (repeat 5000 [1 2])) o)]
+      (is (= 5000 (count (boring/decode bs o)))
+          "unlimited by default")
+      (is (= 5000 (count (boring/decode bs (assoc o :max-items 0))))
+          "0 means unlimited, explicitly")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"more than 100 items"
+                            (boring/decode bs (assoc o :max-items 100))))
+      (is (= 5000 (count (boring/decode bs (assoc o :max-items 20000))))
+          "a generous budget still decodes"))
+    (testing "and the budget resets per decode rather than accumulating across
+              calls on a reused reader"
+      (let [bs (boring/encode (vec (repeat 500 [1 2])) o)
+            r (org.replikativ.boring.Reader. bs)]
+        (dotimes [_ 5]
+          (is (= 500 (count (boring/decode-with r bs (assoc o :max-items 5000))))))))
+    (testing "bulk payloads are what the budget must NOT punish -- one item,
+              whatever its size"
+      (is (= 100000 (alength ^bytes (boring/decode (boring/encode (byte-array 100000) o)
+                                                   (assoc o :max-items 4))))))))

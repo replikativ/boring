@@ -139,6 +139,39 @@ public final class Reader {
      */
     public int maxDepth = 1024;
 
+    /**
+     * Cumulative decoded-ITEM budget, or 0 for unlimited (the default).
+     *
+     * `maxDepth` bounds how DEEP a document goes and `checkCount` bounds each
+     * container against the bytes that remain, but nothing bounded the TOTAL --
+     * so a valid document could amplify further than doc/SECURITY.md claimed.
+     *
+     * ITEMS, not bytes, because heap tracks OBJECT COUNT rather than payload
+     * size. Measured, wire bytes to retained heap:
+     *
+     *   1 MB byte string          1.0x    one array, whatever its size
+     *   long[] typed array        1.0x
+     *   array of distinct ints    6.5x    one boxed Long per element
+     *   short strings             7.8x
+     *   map of 50 000 entries    11.7x
+     *   many 2-element vectors   23.1x    the worst shape found
+     *
+     * The pattern is the point, and it is why a byte budget would be the wrong
+     * instrument: bulk payloads do not amplify at all, while a ONE-BYTE
+     * container head that becomes an object is the worst case. Amplification
+     * tracks how many objects the document asks for, so that is what to count.
+     */
+    public long maxItems = 0;
+
+    private long items;
+
+    private void countItem() {
+        if (maxItems > 0 && ++items > maxItems)
+            throw Err.of("max-items-exceeded",
+                "boring: decoded more than " + maxItems + " items",
+                "max-items", maxItems);
+    }
+
     private int depth;
 
     private static final VarHandle SHORT_LE =
@@ -248,6 +281,7 @@ public final class Reader {
     }
 
     private void resetState() {
+        items = 0;
         this.reused = true;
         this.depth = 0;
         srActive = false;
@@ -1057,6 +1091,7 @@ public final class Reader {
      * harmless and keeps the hot path readable, not because it bought speed.
      */
     public Object read() {
+        countItem();
         int b0 = b(pos);
 
         // Repeated keyword/symbol: D8 27 D8 19 <idx>
@@ -1181,6 +1216,21 @@ public final class Reader {
                     case 21: return Boolean.TRUE;
                     case 22: return null;                   // null
                     case 23: return Data.UNDEFINED;              // NOT nil — distinct value
+                    // DELIBERATELY ACCEPTED, including `f8 00` .. `f8 1f`.
+                    //
+                    // RFC 8949 3.3 forbids an ENCODER from issuing these, and
+                    // `writeSimpleValue` enforces exactly that -- 0..23 go out
+                    // in the one-byte form and 24..31 are refused as
+                    // :boring/reserved-simple-value. The decoder is a different
+                    // duty: RFC 8949 Appendix A lists `f818` as simple(24) with
+                    // a decoded value, and test/boring/vectors.cljc carries it
+                    // as `:encode-forbidden` for that reason.
+                    //
+                    // A review asked for these to be rejected on read. Doing so
+                    // failed the Appendix A conformance vector, which is the
+                    // check that settles it: be strict in what you emit, liberal
+                    // in what you accept, and keep the asymmetry documented
+                    // where someone will find it again.
                     case 24: return Data.MAKE_SIMPLE.invoke(Long.valueOf(u8()));
                     case 25: return readHalf();
                     case 26: return Float.intBitsToFloat((int) u32());
@@ -1320,8 +1370,42 @@ public final class Reader {
         return n <= ARRAY_MAP_KW_PAIRS && allKeywordKeys(kvs, n);
     }
 
+    /**
+     * CBOR key equality for byte strings, which host equality does not give.
+     *
+     * Two byte strings with the same content are ONE key in CBOR (RFC 8949
+     * 5.6). On the JVM a `byte[]` uses identity equality, so `clojure.lang.Util`
+     * sees two distinct keys and the duplicate check below passes -- a map with
+     * two identical CBOR keys decoded happily, and the ORDINARY writer emitted
+     * one from a valid host map (`a2 42 0102 6161 42 0102 6162`).
+     *
+     * Only byte arrays need this; every other key type boring produces already
+     * has value equality.
+     */
+    private static boolean sameCborKey(Object a, Object b) {
+        if (a instanceof byte[] && b instanceof byte[])
+            return java.util.Arrays.equals((byte[]) a, (byte[]) b);
+        return clojure.lang.Util.equiv(a, b);
+    }
+
+    private static boolean anyByteArrayKey(Object[] kvs, int n) {
+        for (int i = 0; i < n; i++) if (kvs[i * 2] instanceof byte[]) return true;
+        return false;
+    }
+
     private Object buildMap(Object[] kvs, int n) {
         if (n == 0) return clojure.lang.PersistentArrayMap.EMPTY;
+        // Byte-string keys are compared by CONTENT before anything else, because
+        // neither branch below can see through host identity equality.
+        if (checkDuplicateKeys && n > 1 && anyByteArrayKey(kvs, n)) {
+            for (int i = 0; i < n; i++) {
+                for (int j = i + 1; j < n; j++) {
+                    if (kvs[i * 2] instanceof byte[] && sameCborKey(kvs[i * 2], kvs[j * 2]))
+                        throw Err.of("duplicate-map-key",
+                            "boring: duplicate byte-string map key", "key", kvs[i * 2]);
+                }
+            }
+        }
         if (checkDuplicateKeys && n > 1) {
             if (fitsArrayMap(kvs, n)) {
                 if (dupHashes.length < n) dupHashes = new int[Math.max(n, dupHashes.length * 2)];
@@ -2052,6 +2136,30 @@ public final class Reader {
                     throw Err.of("bad-tag-content",
                                  "boring: tag 1002 base value must be a number", "tag", 1002L);
                 boolean fracBase = (sec instanceof Double) || (sec instanceof Float);
+                // A BIGNUM base is checked, not narrowed. The float case was
+                // fixed and this one was not: `longValue()` on a BigInteger
+                // wraps silently, so a 20-digit second count came back as
+                // PT2157299897625622H45M19S -- a wrong Duration from valid
+                // input, which is the same defect the fractional case had.
+                // Any integral type WIDER than long, whichever class carries it:
+                // a CBOR bignum decodes to clojure.lang.BigInt here, not
+                // java.math.BigInteger, so checking one class missed the case
+                // entirely -- which is how the first attempt at this fix still
+                // returned PT2157299897625622H45M19S.
+                if (!fracBase && !(sec instanceof Long) && !(sec instanceof Integer)
+                    && !(sec instanceof Short) && !(sec instanceof Byte)) {
+                    java.math.BigInteger bi;
+                    try { bi = new java.math.BigInteger(sec.toString()); }
+                    catch (NumberFormatException e) {
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 base value is not an integer", "tag", 1002L);
+                    }
+                    if (bi.bitLength() >= 64)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 base value " + bi
+                            + " does not fit a java.time.Duration", "tag", 1002L);
+                    sec = Long.valueOf(bi.longValueExact());
+                }
                 if (nano == null) {
                     if (!fracBase)
                         return java.time.Duration.ofSeconds(((Number) sec).longValue());

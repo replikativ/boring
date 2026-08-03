@@ -1187,6 +1187,18 @@ public final class Writer {
         int start = pos;
         head(MAP, n);
 
+        // CONTENT-EQUAL BYTE-STRING KEYS are one key in CBOR (RFC 8949 5.6) and
+        // two keys on the JVM, where byte[] uses identity equality. So a
+        // perfectly valid host map -- two distinct byte[] holding the same
+        // bytes -- encoded to `a2 42 0102 6161 42 0102 6162`, a CBOR map with
+        // the same key twice, which this library's own reader now rejects.
+        //
+        // Checked only when a byte-string key is actually present, so ordinary
+        // maps pay one instanceof per key and nothing else. The canonical path
+        // catches this already, by comparing encoded keys; the ORDINARY path
+        // had no equivalent.
+        checkByteStringKeys(m, n);
+
         if (!indexing(n)) {                     // the ordinary path
             int seen = 0;
             for (Object o : m.entrySet()) {
@@ -1335,6 +1347,29 @@ public final class Writer {
                  || c == clojure.lang.Symbol.class);
     }
 
+    /**
+     * Refuse a map whose byte-string keys are content-equal. See writeMapValue.
+     * O(k^2) in the number of BYTE-STRING keys only, which is nearly always 0.
+     */
+    @SuppressWarnings("rawtypes")
+    private void checkByteStringKeys(Map m, int n) {
+        byte[][] seen = null;
+        int c = 0;
+        for (Object o : m.entrySet()) {
+            Object k = ((Map.Entry) o).getKey();
+            if (!(k instanceof byte[])) continue;
+            if (seen == null) seen = new byte[n][];
+            byte[] b = (byte[]) k;
+            for (int i = 0; i < c; i++)
+                if (java.util.Arrays.equals(seen[i], b))
+                    throw Err.of("duplicate-map-key",
+                        "boring: two map keys are byte strings with the same content,"
+                        + " which is ONE key in CBOR (RFC 8949 5.6). This map cannot"
+                        + " be encoded without producing a duplicate key.");
+            seen[c++] = b;
+        }
+    }
+
     /** Length of a primitive row, without knowing which primitive it is. */
     private static int rowLen(Object row) { return java.lang.reflect.Array.getLength(row); }
 
@@ -1347,8 +1382,8 @@ public final class Writer {
         // read before the loop's own null check, so a null FIRST row threw a raw
         // NullPointerException and the documented null-row fallback was
         // unreachable for exactly the row most likely to be null.
-        boolean rectangular = rows.length == 0 || rows[0] != null;
-        int cols = rectangular && rows.length > 0 ? rowLen(rows[0]) : 0;
+        boolean rectangular = rows.length > 0 && rows[0] != null;
+        int cols = rectangular ? rowLen(rows[0]) : 0;
         if (rectangular) {
             for (Object r : rows) {
                 // A null row is not a shape, and a differing length is not a
@@ -1356,11 +1391,20 @@ public final class Writer {
                 if (r == null || rowLen(r) != cols) { rectangular = false; break; }
             }
         }
-        // A ZERO-ROW matrix is rectangular -- 0x0 -- and `rowType` carries the
-        // element type the rows would have had, so tag 40 round-trips it as the
-        // 2-D array it is. Treating it as non-rectangular sent it down the
-        // fallback and it came back a PersistentVector, silently losing the
-        // source type on a value with no content to disagree about.
+        // A ZERO-ROW matrix takes the fallback, NOT tag 40.
+        //
+        // I had made it rectangular so its type survived -- and that emitted
+        // `d8 28 82 82 00 00 ...`, dimensions [0,0], which RFC 8746 3.1.1
+        // forbids: dimensions must be unsigned integers DISTINCT FROM ZERO.
+        // Our own reader accepted it, so a round-trip test blessed output that
+        // violates the registered tag's content rules -- the worst way to be
+        // wrong, because the suite says you are right.
+        //
+        // There is no standard tag-40 encoding of a zero extent, so the type is
+        // the thing that has to give. It is a 0x0 matrix: it carries no values
+        // to lose, and inventing a private tag to preserve its class would be a
+        // poor trade against emitting invalid CBOR.
+        if (cols == 0) rectangular = false;      // dims must be non-zero, both of them
         if (!rectangular) {
             head(ARRAY, rows.length);
             for (Object r : rows) writeValue(r);
