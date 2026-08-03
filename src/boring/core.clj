@@ -841,6 +841,84 @@
       (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
           total))))
 
+(defn- write-indexed-resolved!
+  "`write-indexed!` with options already resolved.
+
+  No `^long` return hint: Clojure only supports primitive fns up to four args
+  and this takes six."
+  [^Writer w v ^java.io.OutputStream out o stride min-entries]
+  (let [stride (long stride)
+        indexing? (pos? stride)
+        _ (when indexing? (.setIndex ^Writer w (int stride) (int min-entries) 0))
+        _ (.beginStream ^Writer w out)
+        total (try
+                (write-root! w v o)
+                (.endStream ^Writer w)
+                (catch Throwable t
+                  (.abortStream ^Writer w)
+                  (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
+                  (throw t)))]
+    (if (and indexing? (pos? (alength ^ints (.idxContainers ^Writer w))))
+      ;; NO SENTINEL NODE HERE, unlike `write-seq!`. That node stands for the
+      ;; sequence itself so `nav/items` can seek between top-level items; this
+      ;; writes ONE value, which `nav/source` navigates into. Adding a node for
+      ;; a sequence of one would claim a shape the file does not have.
+      (let [containers (.idxContainers ^Writer w)
+            counts (.idxCounts ^Writer w)
+            sl (.idxSlots ^Writer w)
+            so (.idxSorted ^Writer w)]
+        (.setIndex ^Writer w (int 0) (int 0) 0)
+        (+ total
+           (long (seal-index! w out
+                              {:stride stride :containers containers :counts counts
+                               :slots (vec sl) :sorted (vec so)}
+                              total o))))
+      (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
+          total))))
+
+(defn write-indexed!
+  "Stream ONE value to `out` and seal it with a container index, in bounded
+  memory. Returns the byte count.
+
+  The single-value counterpart of `write-seq!`, and the streaming counterpart
+  of `encode-indexed`. Where `encode-indexed` builds the whole byte array and
+  then WALKS it to derive the index -- two full copies of the document in
+  memory, plus a second pass over every byte -- this captures the index nodes
+  as the writer emits them and never holds more than one chunk.
+
+  The result is a two-item CBOR sequence: the value, then the index frame. So
+  `decode` still returns the value, `decode-seq` hides the frame, and a foreign
+  reader consumes both. Hand it to `boring.nav/source` and lookups inside large
+  containers become jumps.
+
+  Same rules as `write-seq!`: `:index` is the stride (default 16), `:index-min`
+  the smallest container worth a node (default 16), `:stringref false` is forced
+  because `boring.nav` cannot resolve a string reference from an offset, and an
+  explicit `:stringref true` alongside `:index` throws rather than one silently
+  winning. No frame is written when no container clears the threshold.
+
+  Note the size trade: on a value holding many similar records, giving up
+  stringref costs about 2x. See doc/STORAGE.md -- under a compressor it is
+  noise, but uncompressed it is not."
+  (^long [^Writer w v ^java.io.OutputStream out]
+   (let [o (writer-opts w)
+         stride (or (:index o) default-index-stride)]
+     (write-indexed-resolved! w v out
+                              (cond-> o (pos? (long stride)) (assoc :stringref false))
+                              stride (or (:index-min o) 16))))
+  (^long [^Writer w v ^java.io.OutputStream out opts]
+   (let [stride (or (:index opts) default-index-stride)]
+     (when (and (pos? (long stride)) (true? (:stringref opts)))
+       (throw (ex-info (str "boring: :stringref true cannot be combined with :index -- "
+                            "boring.nav cannot resolve string references from an offset, "
+                            "so the index would be unusable. Drop one of the two.")
+                       {:type :boring/incompatible-options
+                        :stringref true :index stride})))
+     (write-indexed-resolved! w v out
+                              (cond-> (resolve-opts opts)
+                                (pos? (long stride)) (assoc :stringref false))
+                              stride (or (:index-min opts) 16)))))
+
 (def ^:const index-name
   "Tag-27 type name for a sequence/container index. See doc/SHAPES.md.
 

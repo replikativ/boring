@@ -142,3 +142,49 @@
         (is (= [{:ok 1}] (vec (boring/decode-seq (streamed [{:ok 1}] 64 o) o))))
         (is (= 1 (boring/write-to! w 1 (ByteArrayOutputStream.) o))
             "the aborted stream left no state behind")))))
+
+;; ---------------------------------------------------------------- write-indexed!
+
+(deftest write-indexed-agrees-with-encode-indexed
+  (testing "`encode-indexed` builds the whole byte array and then WALKS it to
+            derive the index -- two copies of the document plus a second pass
+            over every byte. `write-indexed!` captures the nodes as the writer
+            emits them and holds one chunk. They must agree byte-for-byte, since
+            `boring.writer-index-test` already pins writer-capture against the
+            byte walk for sequences and this is the single-value case."
+    (doseq [[label v] [["wide map" (into {} (for [i (range 400)] [(str "k" i) {:v i}]))]
+                       ["wide vec" (mapv (fn [i] {:id i :name (str "n" i)}) (range 400))]
+                       ["nested"   {:a (vec (range 100)) :b (into {} (for [i (range 60)] [i i]))}]
+                       ["tiny"     {:a 1}]]]
+      (let [expect (boring/encode-indexed v {:index 16})
+            got (let [out (ByteArrayOutputStream.)
+                      w (boring/writer 64 o)]           ; tiny buffer: many flushes
+                  (boring/write-indexed! w v out {:index 16})
+                  (.toByteArray out))]
+        (is (= (vec expect) (vec got)) label))))
+  (testing "and the result is navigable, which is the point of having it"
+    (let [v (into {} (for [i (range 500)] [(str "key-" i) {:v i}]))
+          out (ByteArrayOutputStream.)
+          w (boring/writer 64 o)]
+      (boring/write-indexed! w v out {:index 16})
+      (let [bs (.toByteArray out)
+            c (nav/source bs o)]
+        (is (= {:v 499} (nav/value (get c "key-499"))))
+        (is (= v (nav/value c)))
+        (is (= v (boring/decode bs o)) "and `decode` still returns the value")
+        (is (= [v] (vec (boring/decode-seq bs o))) "with the frame hidden")))))
+
+(deftest write-indexed-is-bounded-and-refuses-stringref
+  (testing "bounded memory, unlike encode-indexed which holds the whole array"
+    (let [sink (proxy [OutputStream] [] (write ([_]) ([_ _ _])))
+          big (mapv (fn [i] {:id i :name (str "customer-" i)}) (range 40000))
+          w (boring/writer 65536 o)
+          n (boring/write-indexed! w big sink {:index 16})]
+      (is (> n 1000000))
+      (is (<= (alength ^bytes (boring/buffer w)) 65536))))
+  (testing "an explicit :stringref true alongside :index throws rather than one
+            silently winning -- nav cannot resolve a reference from an offset"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (boring/write-indexed! (boring/writer 4096 nil) {:a 1}
+                                        (ByteArrayOutputStream.)
+                                        {:index 16 :stringref true})))))

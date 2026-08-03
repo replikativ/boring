@@ -182,3 +182,47 @@
                        (nav/value (nth mapped i)))
                     (str "stride " stride ", item " i))))
             (finally (.close ^java.lang.AutoCloseable arena))))))))
+
+;; ---------------------------------------------------------------- write side
+
+(deftest streaming-into-a-memory-segment
+  (testing "the write-side mirror of segment-source: `boring.core/write-to!`
+            takes an OutputStream, and `segment-sink` is one, so the streaming
+            encoder reaches off-heap memory with no changes to the writer -- and
+            without dragging FFM into the JDK 9 source set, which is the whole
+            reason the sink type is an OutputStream.
+
+            hako's `encode-into!` returns a MemorySegment slice, which is
+            zero-copy OUT of a reused arena; this is the other property, bounded
+            memory ON THE WAY IN. boring has both."
+    (if-not ffm?
+      (is true "JDK < 22: skipped")
+      (let [seg-sink (requiring-resolve 'boring.mmap/segment-sink)
+            seg-source (requiring-resolve 'boring.mmap/segment-source)
+            arena-cls (Class/forName "java.lang.foreign.Arena")
+            shared (.invoke (.getMethod arena-cls "ofShared" (into-array Class []))
+                            nil (object-array 0))]
+        (with-open [^java.lang.AutoCloseable a shared]
+          (let [alloc (.getMethod (Class/forName "java.lang.foreign.SegmentAllocator")
+                                  "allocate" (into-array Class [Long/TYPE]))
+                seg (.invoke alloc shared (object-array [(long (* 4 1024 1024))]))
+                snk (seg-sink seg)
+                w (boring/writer 4096 opts)           ; tiny buffer -> many flushes
+                value (mapv (fn [i] {:id i :name (str "customer-" i) :tags #{:a :b}})
+                            (range 5000))
+                n (boring/write-to! w value snk opts)]
+            (is (pos? n))
+            (is (= n (.position snk)) "the sink saw every byte")
+            (is (<= (alength ^bytes (boring/buffer w)) 4096)
+                "and the heap buffer stayed bounded while doing it")
+            (testing "the bytes are readable in place, never staged through the heap"
+              (let [c (nav/source (seg-source (.written snk)) opts)]
+                (is (= value (nav/value c)))))
+            (testing "overflow is loud, not a silent truncation -- the index frame
+                      is at the END, so a quietly short write would look like a
+                      corrupt index rather than a full buffer"
+              (let [tiny (.invoke alloc shared (object-array [(long 32)]))
+                    snk2 (seg-sink tiny)
+                    w2 (boring/writer 16 opts)]
+                (is (thrown? IllegalStateException
+                             (boring/write-to! w2 (vec (range 1000)) snk2 opts)))))))))))
