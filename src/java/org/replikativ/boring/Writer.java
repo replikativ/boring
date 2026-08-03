@@ -983,6 +983,14 @@ public final class Writer {
         if (!(tag instanceof Number))
             throw Err.of("bad-tag", "boring: tag must be an integer, got "
                 + (tag == null ? "nil" : tag.getClass().getSimpleName()));
+        // FRACTIONAL tags were truncated, not refused: `longValue()` turned tag
+        // 1.5 into tag 1, so `(tagged-value 1.5 0)` and `(tagged-value 1 0)`
+        // both emitted `c1 00`. A tag number is an unsigned integer; anything
+        // else is a mistake the caller should hear about, not a value to round.
+        if (tag instanceof Double || tag instanceof Float
+            || tag instanceof java.math.BigDecimal || tag instanceof clojure.lang.Ratio)
+            throw Err.of("bad-tag",
+                "boring: tag must be an integer, got " + tag);
         writeTag(((Number) tag).longValue());
     }
 
@@ -1542,7 +1550,17 @@ public final class Writer {
             if (anchors != null && --countdown == 0) {
                 anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
-            writeValue(items[order[j]]);
+            // The STAGED bytes, not a second `writeValue`. Re-encoding asked a
+            // registered handler for the value twice, and a handler may be
+            // stateful or read the clock -- so the bytes that decided the sort
+            // order need not be the bytes emitted, and a canonical set could go
+            // out DESCENDING. Canonical maps already copy their staged keys;
+            // this is the same fix, and it also restores one handler call per
+            // value.
+            byte[] eb = encoded[order[j]];
+            ensure(eb.length);
+            System.arraycopy(eb, 0, buf, pos, eb.length);
+            pos += eb.length;
         }
         if (anchors != null) fillNode(slot, start, n, anchors, false);
     }

@@ -432,3 +432,74 @@
               whatever its size"
       (is (= 100000 (alength ^bytes (boring/decode (boring/encode (byte-array 100000) o)
                                                    (assoc o :max-items 4))))))))
+
+;; ------------------------------------------------- F6 F7 F8 F9: tag semantics
+
+(deftest a-canonical-set-emits-the-bytes-it-sorted-by
+  (testing "both writers pre-encoded each element to get its sort key and then
+            called `writeValue` AGAIN to emit it. A registered handler may be
+            stateful or read the clock, so the bytes that decided the order need
+            not be the bytes emitted -- a canonical set could go out DESCENDING
+            under the profile whose entire point is determinism. Canonical maps
+            already copied their staged keys."
+    (let [calls (atom 0)
+          reg (boring/register-tag (boring/tag-registry) 40001 java.io.File
+                                   (fn [_] (swap! calls inc) (if (odd? @calls) 1 2)) nil)
+          bs (boring/encode #{(java.io.File. "/a")} {:profile :canonical :registry reg})]
+      (is (= 1 @calls) "one handler call per value, not two")
+      (is (= "d9010281d99c4101" (apply str (map #(format "%02x" %) bs)))
+          "and the emitted element is the one that was sorted"))
+    (testing "ordinary canonical sets are still sorted"
+      (is (= "d9010283010203"
+             (apply str (map #(format "%02x" %)
+                             (boring/encode #{3 1 2} {:profile :canonical}))))))))
+
+(deftest a-fractional-tag-number-is-refused-not-truncated
+  (testing "`longValue()` turned tag 1.5 into tag 1, so `(tagged-value 1.5 0)`
+            and `(tagged-value 1 0)` emitted the same bytes. The registry
+            validates its own numbers, but the public `tagged-value` constructor
+            bypasses it."
+    (doseq [bad [1.5 -1 (/ 3 2) 2.0M]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"tag"
+                            (boring/encode (data/tagged-value bad 0) o))
+          (str (pr-str bad) " must be refused")))
+    (testing "and the whole unsigned 64-bit range still encodes"
+      (doseq [good [0 1 40000 (biginteger "18446744073709551615")]]
+        (is (some? (boring/encode (data/tagged-value good 0) o))
+            (str (pr-str good)))))))
+
+(deftest a-leap-second-is-preserved-rather-than-normalised
+  (testing "RFC 3339 permits `time-second = 60`. `Instant.parse` accepts the
+            spelling and silently rewrites it to :59, so two DISTINCT valid
+            tag-0 strings decoded to the same instant -- data lost with no
+            error. Neither host type can hold a leap second, so it comes back as
+            an inert TaggedValue, the same treatment f128 gets: boring does not
+            discard what it cannot represent."
+    (let [leap "2016-12-31T23:59:60Z"
+          ordinary "2016-12-31T23:59:59Z"]
+      (is (= (data/tagged-value 0 leap)
+             (boring/decode (boring/encode (data/tagged-value 0 leap) o) o))
+          "the leap second survives untouched")
+      (is (not= (boring/decode (boring/encode (data/tagged-value 0 leap) o) o)
+                (boring/decode (boring/encode (data/tagged-value 0 ordinary) o) o))
+          "and the two no longer collapse to one value")
+      (is (inst? (boring/decode (boring/encode (data/tagged-value 0 ordinary) o) o))
+          "while an ordinary timestamp is still an instant")
+      (is (inst? (boring/decode (boring/encode (java.util.Date. 0) o) o))
+          "and ordinary Date round-trips are unaffected"))))
+
+(deftest tag-27-markers-validate-their-payload
+  (testing "`seqableContent` admits nil, because nil IS seqable in Clojure --
+            right for callers that seq it, wrong for the ones that cast to List
+            and call size()/toArray(). A well-formed frame with a null payload
+            was a raw NullPointerException, against the typed-only guarantee."
+    (doseq [nm ["java/boolean-array" "java/string-array" "java/object-array"]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must wrap a list"
+                            (boring/decode (boring/encode (data/unknown-record nm nil) o) o))
+          (str nm " with nil"))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (boring/decode (boring/encode (data/unknown-record nm 7) o) o))
+          (str nm " with a scalar")))
+    (testing "and the real arrays still round-trip"
+      (is (= [true false] (vec (boring/decode (boring/encode (boolean-array [true false]) o) o))))
+      (is (= ["a" "b"] (vec (boring/decode (boring/encode (into-array String ["a" "b"]) o) o)))))))

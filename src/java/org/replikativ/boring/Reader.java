@@ -165,6 +165,15 @@ public final class Reader {
 
     private long items;
 
+    /** `:60` in the seconds field -- valid RFC 3339, unrepresentable as an Instant. */
+    private static boolean isLeapSecond(String v) {
+        int i = v.indexOf(':');
+        if (i < 0) return false;
+        int j = v.indexOf(':', i + 1);
+        return j >= 0 && j + 2 < v.length()
+               && v.charAt(j + 1) == '6' && v.charAt(j + 2) == '0';
+    }
+
     private void countItem() {
         if (maxItems > 0 && ++items > maxItems)
             throw Err.of("max-items-exceeded",
@@ -863,6 +872,23 @@ public final class Reader {
      * IllegalArgumentException -- a raw JVM exception through the typed-error
      * contract -- so the shape is checked before it is handed over.
      */
+    /**
+     * The same content, but never null -- for the markers that cast to List and
+     * call size()/toArray(). `seqableContent` admits nil because nil IS seqable
+     * in Clojure, which is right for the callers that seq it and wrong for the
+     * ones that dereference it: `27(["java/boolean-array", null])` was a raw
+     * NullPointerException out of a well-formed frame, against the typed-only
+     * guarantee doc/SECURITY.md makes.
+     */
+    private static java.util.List listMarkerContent(Object argument, String name) {
+        Object c = seqableContent(argument, name);
+        if (!(c instanceof java.util.List))
+            throw Err.of("bad-tag-content",
+                "boring: " + name + " must wrap a list, got "
+                + (c == null ? "nil" : c.getClass().getSimpleName()), "tag", 27L);
+        return (java.util.List) c;
+    }
+
     private static Object seqableContent(Object argument, String name) {
         if (argument == null
                 || argument instanceof java.util.List
@@ -1768,6 +1794,22 @@ public final class Reader {
             }
             case 0: {                                        // RFC 3339 string
                 String v = stringContent(read(), 0);
+                // A LEAP SECOND is preserved rather than normalised.
+                //
+                // RFC 3339 permits `time-second = 60`, and `Instant.parse`
+                // accepts the spelling but silently rewrites it to :59 -- so
+                // "2016-12-31T23:59:60Z" and "...:59Z" decoded to the SAME
+                // instant, losing a distinction the wire carried. ClojureScript
+                // mostly rejects the spelling outright, so the platforms
+                // disagreed too.
+                //
+                // Neither host type can hold a leap second, so the choice is
+                // reject or preserve. Preserve, as an inert TaggedValue -- the
+                // same treatment f128 gets for the same reason: boring does not
+                // discard what it cannot represent, it hands it back
+                // untouched. Silently normalising was the one option that loses
+                // data without saying so.
+                if (isLeapSecond(v)) return Data.MAKE_TAGGED.invoke(Long.valueOf(0), v);
                 java.time.Instant t;
                 try {
                     t = java.time.Instant.parse(v);
@@ -1999,7 +2041,7 @@ public final class Reader {
                                 cause instanceof Throwable ? (Throwable) cause : null);
                         }
                         case "java/boolean-array": {
-                            java.util.List l2 = (java.util.List) seqableContent(argument, "java/boolean-array");
+                            java.util.List l2 = listMarkerContent(argument, "java/boolean-array");
                             boolean[] a = new boolean[l2.size()];
                             for (int i = 0; i < a.length; i++) {
                                 Object o = l2.get(i);
@@ -2013,7 +2055,7 @@ public final class Reader {
                         case "java/char-array":
                             return stringContent(argument, 27).toCharArray();
                         case "java/string-array": {
-                            java.util.List l2 = (java.util.List) seqableContent(argument, "java/string-array");
+                            java.util.List l2 = listMarkerContent(argument, "java/string-array");
                             String[] a = new String[l2.size()];
                             for (int i = 0; i < a.length; i++) {
                                 Object o = l2.get(i);
@@ -2025,7 +2067,7 @@ public final class Reader {
                             return a;
                         }
                         case "java/object-array": {
-                            java.util.List l2 = (java.util.List) seqableContent(argument, "java/object-array");
+                            java.util.List l2 = listMarkerContent(argument, "java/object-array");
                             return l2.toArray();
                         }
                         case "java/period": {
