@@ -19,6 +19,9 @@
     - the corruption test flipped a byte to 0x7F, which lands out of range,
       rather than to a byte that parses as something dangerous."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.test.check :as tc]
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop]
             [boring.core :as boring]
             [boring.nav :as nav]
             [boring.data])
@@ -596,3 +599,40 @@
               r (org.replikativ.boring.Reader. bs)]
           (set! (.-maxDepth r) (int 8))
           (is (= (alength bs) (.skipFrom r 0))))))))
+
+(deftest skip-lands-exactly-at-the-end-of-any-value
+  (testing "the general property the tag-chain rewrite could have broken. That
+            loop reads a head to see whether the chain continues and, when it
+            does not, pushes the byte back with `pos--` -- correct only because
+            `u8()` is `b(pos++)` and advances exactly one. If it were ever
+            wrong, skipping would land mid-item and every later offset in the
+            sequence would be garbage, which no round-trip test would notice
+            because decoding never uses skip.
+
+            Generated rather than enumerated, over four profiles, because the
+            shapes that matter are tag-wrapped: sets (258), sorted maps and sets
+            (27), ratios (30), uuids (37), shaped arrays (39649)."
+    (let [g (gen/recursive-gen
+             (fn [inner]
+               (gen/one-of [(gen/map gen/string-ascii inner {:max-elements 6})
+                            (gen/vector inner 0 6)
+                            (gen/fmap set (gen/vector gen/large-integer 0 6))
+                            (gen/fmap #(into (sorted-map)
+                                             (map-indexed (fn [i v] [(str i) v]) %))
+                                      (gen/vector inner 0 5))
+                            (gen/fmap #(into (sorted-set) %)
+                                      (gen/vector gen/large-integer 0 5))
+                            (gen/fmap #(apply list %) (gen/vector inner 0 5))]))
+             (gen/one-of [gen/large-integer gen/string-ascii gen/boolean
+                          (gen/return nil) gen/keyword gen/symbol gen/ratio
+                          gen/uuid gen/double]))]
+      (doseq [prof [{:stringref false} {:profile :archival} {:profile :canonical}
+                    {:stringref false :shapes true}]]
+        (let [result (tc/quick-check
+                      150
+                      (prop/for-all [v g]
+                        (let [^bytes bs (boring/encode v prof)
+                              r (org.replikativ.boring.Reader. bs)]
+                          (= (long (alength bs)) (.skipFrom r 0)))))]
+          (is (:pass? result)
+              (str (or (:profile prof) :clojure) " -- " (pr-str (:shrunk result)))))))))
