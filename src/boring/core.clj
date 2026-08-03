@@ -543,20 +543,45 @@
          (seal-index! w out idx (alength body) (resolve-opts opts))
          (.toByteArray out))))))
 
+(def ^:const default-index-stride
+  "Stride `write-seq!` indexes at unless told otherwise. See its docstring for
+  why a sequence is indexed by default and a single `encode`d value never is."
+  16)
+
 (defn write-seq!
   "Encode each value in `values` to `out` as consecutive top-level CBOR items.
   Returns the number of bytes written. Constant memory: one value at a time,
   through the writer's own buffer, with no intermediate array per item.
 
-  `:index N` additionally seals the sequence with an offset index covering
-  every Nth item, so `boring.nav/items` can jump to an item instead of skipping
-  to it -- O(1) rather than O(n). N is the stride, and it is the size/speed
-  knob: a lookup scans up to N-1 items, while every entry costs one to four
-  bytes depending on how far apart the anchors fall, since offsets are stored as
-  deltas in the narrowest typed array that holds them. On 200k ~37-byte items,
-  stride 1 costs 2.7% of the file and stride 16 costs 0.34% for roughly 14x the
-  seek. The right N depends on item size, so it is a parameter rather than a
-  default.
+  `:index N` seals the sequence with an offset index covering every Nth item,
+  so `boring.nav/items` can jump to an item instead of skipping to it -- O(1)
+  rather than O(n). N is the stride, and it is the size/speed knob: a lookup
+  scans up to N-1 items, while every entry costs one to four bytes depending on
+  how far apart the anchors fall, since offsets are stored as deltas in the
+  narrowest typed array that holds them. On 200k ~37-byte items, stride 1 costs
+  2.7% of the file and stride 16 costs 0.34% for roughly 14x the seek.
+
+  IT DEFAULTS TO 16. `:index 0` turns it off. A sequence is the shape people
+  memory-map, and an unindexed one cannot be seeked into at all -- reaching the
+  last of 200k items costs 10.6 ms and faults in the whole file, against 1-2 us
+  at stride 16. Since offsets are only knowable after the fact, a file written
+  without an index can never gain one without a rewrite, so the default has to
+  be the useful one or the feature is unreachable for anyone who did not plan
+  ahead. It is close to free: +4.3% write time, +0.06% size on 50k ~200-byte
+  records, and -1.5% from the `:stringref false` it forces, netting SMALLER.
+
+  Unlike `encode`, this changes nothing about what the bytes ARE. A sequence is
+  already `application/cbor-seq` (RFC 8742), where extra items are expected;
+  appending a frame to a single `encode`d value would make it stop being a
+  single well-formed CBOR item, which is why that is not done and will not be.
+
+  `:index-min` (default 16) is a SEPARATE knob and gates CONTAINER nodes, not
+  the frame: a map or array with fewer than that many entries gets no node of
+  its own. Raising it to a number no container reaches gives an index over the
+  ITEMS ONLY -- the right shape for a log you seek into but do not navigate
+  within. Measured on 20 items of 40-entry maps: 6873 bytes at the default,
+  6611 with `:index-min 1000`. It does NOT suppress the frame for a short
+  sequence, which always costs ~37 bytes.
 
   `:index` FORCES `:stringref false`. `boring.nav` cannot resolve a string
   reference from an offset alone -- a stringref indexes a table built from every
@@ -606,12 +631,12 @@
   ;; is forced; that is why the 4-arity is the one that can complain.
   (^long [^Writer w values ^java.io.OutputStream out]
    (let [o (writer-opts w)
-         stride (or (:index o) 0)]
+         stride (or (:index o) default-index-stride)]
      (write-seq-resolved! w values out
                           (cond-> o (pos? (long stride)) (assoc :stringref false))
                           stride (or (:index-min o) 16))))
   (^long [^Writer w values ^java.io.OutputStream out opts]
-   (let [stride (or (:index opts) 0)]
+   (let [stride (or (:index opts) default-index-stride)]
      (when (and (pos? (long stride)) (true? (:stringref opts)))
        (throw (ex-info (str "boring: :stringref true cannot be combined with :index -- "
                             "boring.nav cannot resolve string references from an offset, "
@@ -719,6 +744,13 @@
   occurs PER ARRAY, and a name would add up to 35% on documents with many small
   tables -- on a feature whose entire purpose is to shrink them."
   "boring/index")
+
+(defn- index-frame?
+  "True for the tag-27 frame `seal-index!` appends. Both fallback shapes count:
+  the payload is an array, so it decodes to a `TaggedLiteral` rather than an
+  `UnknownRecord`, but `frame-name` reads either."
+  [v]
+  (and (data/tagged-frame? v) (= index-name (data/frame-name v))))
 
 (declare index-walk index-walk*)
 
@@ -1152,7 +1184,14 @@
                     (cond
                       (contains? v :ok)
                       (do (vswap! state assoc :last-good (.position r))
-                          (cons (:ok v) (step)))
+                          ;; See `decode-seq`: the trailing index frame is
+                          ;; metadata, not an item. Here "final" needs the
+                          ;; stream too, not just the buffer -- `.atEnd` only
+                          ;; means the current chunk is exhausted, so a refill
+                          ;; that succeeds proves the frame was not last.
+                          (if (and (index-frame? (:ok v)) (.atEnd r) (not (refill!)))
+                            nil
+                            (cons (:ok v) (step))))
                       (refill!) (step)
                       ;; Out of data and still incomplete. The retained
                       ;; exception is rethrown as-is when it is already typed,
@@ -1201,7 +1240,15 @@
             ;; per-message state must be cleared between items — but not its
             ;; ident cache, which is a pure function of bytes.
            (let [v (with-decode-errors (.readNext r))]
-             (cons v (step))))))))))
+             ;; THE INDEX FRAME IS NOT AN ITEM. `write-seq!` indexes by default,
+             ;; so without this every caller of `decode-seq` would find a
+             ;; phantom `#boring/index [...]` after their data. It is dropped
+             ;; only in the final position, which is the only place `seal-index!`
+             ;; can put it -- a frame of that name anywhere else is somebody
+             ;; else's data and stays visible.
+             (if (and (.atEnd r) (index-frame? v))
+               nil
+               (cons v (step)))))))))))
 
 ;; ## Optional hasch integration, activated if hasch is present
 ;;

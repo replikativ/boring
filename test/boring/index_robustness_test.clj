@@ -34,7 +34,17 @@
             [boring.core :as boring]
             [boring.nav :as nav]
             [boring.data])
-  (:import (java.io ByteArrayOutputStream)))
+  (:import (java.io ByteArrayOutputStream)
+           (org.replikativ.boring Reader)))
+
+(defn- foreign-items
+  "Every top-level item INCLUDING any index frame -- what a CBOR reader that
+  knows nothing about `boring/index` sees. `decode-seq` hides a trailing frame,
+  so it is no longer a stand-in for one."
+  [^bytes bs]
+  (let [r (Reader. bs)]
+    (loop [acc []]
+      (if (.atEnd r) acc (recur (conj acc (.readNext r)))))))
 
 (def opts {:stringref false})
 
@@ -137,8 +147,10 @@
       (is (= 2 (count (filter #(= 0 (get % "n")) (filter map? seen))))
           "and BOTH batches are there -- n=0 appears once per batch, which is
            what distinguishes 'both present' from 'one batch read twice'")
-      (is (= (count (vec (boring/decode-seq joined opts))) (count seen))
-          "and nav agrees with a plain CBOR sequence reader"))))
+      (is (= (count (foreign-items joined)) (count seen))
+          "and nav agrees with a plain CBOR sequence reader -- `decode-seq` is
+           NOT one any more, since it hides a trailing index frame, so this
+           reads the items off the Java reader directly"))))
 
 ;; ---------------------------------------------------------------- finding 5
 

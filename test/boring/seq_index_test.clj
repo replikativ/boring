@@ -15,9 +15,28 @@
             [boring.core :as boring]
             [boring.nav :as nav]
             [boring.data])
-  (:import (java.io ByteArrayOutputStream)))
+  (:import (java.io ByteArrayOutputStream)
+           (org.replikativ.boring Reader)))
+
+(defn- foreign-items
+  "Every top-level item INCLUDING the index frame -- what a CBOR reader that
+  knows nothing about `boring/index` sees.
+
+  `decode-seq` deliberately HIDES the trailing frame, so it can no longer stand
+  in for a foreign reader. Reading the items off the Java reader directly is
+  what these assertions meant all along; using boring's own convenience
+  function was only ever a shortcut that happened to agree."
+  [^bytes bs]
+  (let [r (Reader. bs)]
+    (loop [acc []]
+      (if (.atEnd r) acc (recur (conj acc (.readNext r)))))))
 
 (def opts {:stringref false})
+
+;; `write-seq!` INDEXES BY DEFAULT. Tests that need a plain, unsealed sequence
+;; -- the false-positive fixtures, and the ones that append their own frame --
+;; must say so, or they are testing a file that already carries a real index.
+(def unindexed {:stringref false :index 0})
 
 (def items
   (vec (for [i (range 500)]
@@ -57,12 +76,15 @@
   (testing "a reader that knows nothing about `boring/index` consumes the whole
             file: every data item, then one tag-27 frame it can ignore"
     (let [bs (build 16)
-          all (vec (boring/decode-seq bs opts))]
+          all (foreign-items bs)]
       (is (= (count items) (dec (count all))))
       (is (= items (vec (butlast all))))
       (is (= boring/index-name (boring.data/frame-name (last all)))
           "the trailing item identifies itself by NAME, under tag 27 -- so a
-           foreign reader sees `boring/index`, not an unregistered number"))))
+           foreign reader sees `boring/index`, not an unregistered number")
+      (is (= items (vec (boring/decode-seq bs opts)))
+          "while boring's OWN sequence reader hides it: the frame is metadata
+           about the file, not one of the values written to it"))))
 
 ;; ---------------------------------------------------------------- fallbacks
 
@@ -123,7 +145,7 @@
             a much narrower target than a bare tag number did."
     (let [w (boring/writer 65536 opts)
           o (ByteArrayOutputStream.)]
-      (boring/write-seq! w items o opts)
+      (boring/write-seq! w items o unindexed)
       ;; a final item that is itself an 8-byte byte string: the file now ends
       ;; with exactly 0x48 + 8 bytes, with no index anywhere
       (boring/write-to! w (byte-array 8) o)
@@ -153,7 +175,7 @@
 (defn- index-slots
   "The slot arrays as they actually sit on the wire, before expansion."
   [^bytes bs o]
-  (let [item (last (vec (boring/decode-seq bs o)))
+  (let [item (last (foreign-items bs))
         [_ _ _ slots _ _] (boring.data/frame-payload item)]
     (vec slots)))
 
@@ -232,7 +254,7 @@
         (let [w2 (boring/writer 65536 opts)
               o2 (ByteArrayOutputStream.)]
           (doseq [v vs] (boring/write-to! w2 v o2))
-          (boring/write-seq! w2 [] o2 opts)         ; no-op, keeps data-len honest
+          (boring/write-seq! w2 [] o2 unindexed)         ; no-op, keeps data-len honest
           (let [dl (.size o2)
                 ;; STRIDE 1 and three deltas, because three items need three
                 ;; anchors at stride 1 -- at stride 16 they need exactly one.
@@ -330,9 +352,12 @@
     (doseq [v [wide-map wide-vec]]
       (let [bs (boring/encode-indexed v (assoc sorted-opts :index 16))]
         (is (= v (boring/decode bs sorted-opts)))
-        (is (= 2 (count (boring/decode-seq bs sorted-opts))))
+        (is (= 2 (count (foreign-items bs)))
+            "a foreign reader consumes both items")
         (is (= boring/index-name
-               (boring.data/frame-name (second (vec (boring/decode-seq bs sorted-opts))))))))))
+               (boring.data/frame-name (second (foreign-items bs)))))
+        (is (= [v] (vec (boring/decode-seq bs sorted-opts)))
+            "boring's own reader hides the frame")))))
 
 (deftest a-corrupt-container-index-still-answers-correctly
   (testing "flip the back-pointer: no node is found anywhere, so every lookup
