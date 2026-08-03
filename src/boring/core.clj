@@ -558,6 +558,17 @@
   seek. The right N depends on item size, so it is a parameter rather than a
   default.
 
+  `:index` FORCES `:stringref false`. `boring.nav` cannot resolve a string
+  reference from an offset alone -- a stringref indexes a table built from every
+  preceding string -- so the two options describe incompatible documents, and
+  honouring both produced an index that nothing could read. Passing
+  `:stringref true` alongside `:index` throws `:boring/incompatible-options`
+  rather than silently dropping one. This costs nothing on a sequence: the
+  stringref table resets per top-level item, so on 50k ~200-byte records
+  stringref is a 1.5% size LOSS, where on the same data as one large value it is
+  a 2.1x win. Sequences are the shape that wants an index and the shape that
+  does not want stringref, which is a happier coincidence than it sounds.
+
   The index goes at the END, which is what makes it compatible with appending:
   offsets are only known after the items are written, so a leading index would
   mean buffering the whole sequence in memory. ZIP's central directory and
@@ -577,13 +588,40 @@
   ;; public entry point. `encode-into!` passes `(writer-opts w)` straight to
   ;; `write-root!` without re-resolving; this now follows that model rather than
   ;; merely citing it.
+  ;; INDEXING FORCES `:stringref false`, for the reason spelled out on
+  ;; `encode-indexed`: `boring.nav` categorically refuses a stringref document,
+  ;; because a stringref is an index into a table built from every preceding
+  ;; string and a cursor holding only an offset cannot resolve it.
+  ;;
+  ;; Without this, `(write-seq! w items out {:index 16})` under the default
+  ;; profile built the index, wrote the frame, charged for both -- and produced
+  ;; a file `nav/items` then rejected with `:boring/stringref-not-navigable`.
+  ;; The index was unreachable by construction. `encode-indexed` had already
+  ;; been fixed for exactly this; this entry point had not.
+  ;;
+  ;; An EXPLICIT `:stringref true` alongside `:index` throws rather than being
+  ;; overridden in silence -- the two options cannot both be honoured, so the
+  ;; caller has to choose. The 3-arity cannot distinguish an explicit `true`
+  ;; from the profile default (it sees already-resolved options), so there it
+  ;; is forced; that is why the 4-arity is the one that can complain.
   (^long [^Writer w values ^java.io.OutputStream out]
-   (let [o (writer-opts w)]
-     (write-seq-resolved! w values out o
-                          (or (:index o) 0) (or (:index-min o) 16))))
+   (let [o (writer-opts w)
+         stride (or (:index o) 0)]
+     (write-seq-resolved! w values out
+                          (cond-> o (pos? (long stride)) (assoc :stringref false))
+                          stride (or (:index-min o) 16))))
   (^long [^Writer w values ^java.io.OutputStream out opts]
-   (write-seq-resolved! w values out (resolve-opts opts)
-                        (or (:index opts) 0) (or (:index-min opts) 16))))
+   (let [stride (or (:index opts) 0)]
+     (when (and (pos? (long stride)) (true? (:stringref opts)))
+       (throw (ex-info (str "boring: :stringref true cannot be combined with :index -- "
+                            "boring.nav cannot resolve string references from an offset, "
+                            "so the index would be unusable. Drop one of the two.")
+                       {:type :boring/incompatible-options
+                        :stringref true :index stride})))
+     (write-seq-resolved! w values out
+                          (cond-> (resolve-opts opts)
+                            (pos? (long stride)) (assoc :stringref false))
+                          stride (or (:index-min opts) 16)))))
 
 (defn- write-seq-resolved!
   "`write-seq!` with options already resolved. See the note on its 3-arity."

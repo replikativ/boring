@@ -76,4 +76,20 @@
    ["shaped-bad-arity" "d99ae18101"]
    ["shaped-keys-not-arr" "d99ae1820180"]
    ["shaped-row-not-arr" "d99ae18281616b8101"]
-   ["shaped-row-arity" "d99ae18281616b81820102"]])
+   ["shaped-row-arity" "d99ae18281616b81820102"]
+
+   ;; RFC 8949 3.3: "An encoder MUST NOT issue two-byte sequences that start
+   ;; with 0xf8 ... and continue with a byte less than 0x20 (32 decimal). Such
+   ;; sequences are not well-formed." The final sentence binds the DECODER --
+   ;; Appendix C's pseudocode calls fail(), and these four are precisely the
+   ;; ones Appendix F.1 enumerates as not-well-formed simple values.
+   ;;
+   ;; boring accepted all of these until now, on the strength of an Appendix A
+   ;; vector that does not exist in RFC 8949 (it is RFC 7049's, removed by
+   ;; Erratum 5917). Worth pinning rather than merely fixing: the two
+   ;; implementations that accept `f814` -- ciborium and cbor-x -- decode it as
+   ;; plain `false`, turning a malformed encoding into a valid-looking value.
+   ["simple-2byte-00" "f800"]
+   ["simple-2byte-01" "f801"]
+   ["simple-2byte-14" "f814"]                 ; would alias onto `false`
+   ["simple-2byte-1f" "f81f"]])

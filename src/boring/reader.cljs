@@ -966,7 +966,19 @@
           21 true
           22 nil
           23 data/undefined
-          24 (data/simple-value (u8! r))
+          ;; `f8 00` .. `f8 1f` are not well-formed -- RFC 8949 3.3, "Such
+          ;; sequences are not well-formed", which binds the decoder and not
+          ;; just the encoder (Appendix C fails; Appendix F.1 enumerates them).
+          ;; See the long note in Reader.java for why this once read the other
+          ;; way: Appendix A's simple(24) row is RFC 7049's, removed by Erratum
+          ;; 5917.
+          24 (let [sv (u8! r)]
+               (if (< sv 32)
+                 (err :boring/malformed-simple-value
+                      (str "boring: two-byte simple value 0x" (.toString sv 16)
+                           " is not well-formed (RFC 8949 3.3 reserves f8 00..f8 1f)")
+                      {:value sv})
+                 (data/simple-value sv)))
           ;; DataView.getFloat16 is ES2025 and missing from Node 23, so decode
           ;; binary16 by hand. We never emit f16, but interop requires reading it.
           25 (do (need! r 2)

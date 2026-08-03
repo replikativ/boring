@@ -1270,22 +1270,34 @@ public final class Reader {
                     case 21: return Boolean.TRUE;
                     case 22: return null;                   // null
                     case 23: return Data.UNDEFINED;              // NOT nil — distinct value
-                    // DELIBERATELY ACCEPTED, including `f8 00` .. `f8 1f`.
+                    // `f8 00` .. `f8 1f` are REJECTED. RFC 8949 3.3: "An encoder
+                    // MUST NOT issue two-byte sequences that start with 0xf8 ...
+                    // and continue with a byte less than 0x20 (32 decimal). Such
+                    // sequences are not well-formed." That last sentence makes
+                    // this a well-formedness rule binding on the DECODER too, not
+                    // the encoder-only rule it reads as at first glance --
+                    // Appendix C's pseudocode calls fail(), and Appendix F.1
+                    // enumerates f800/f801/f818/f81f among the not-well-formed.
                     //
-                    // RFC 8949 3.3 forbids an ENCODER from issuing these, and
-                    // `writeSimpleValue` enforces exactly that -- 0..23 go out
-                    // in the one-byte form and 24..31 are refused as
-                    // :boring/reserved-simple-value. The decoder is a different
-                    // duty: RFC 8949 Appendix A lists `f818` as simple(24) with
-                    // a decoded value, and test/boring/vectors.cljc carries it
-                    // as `:encode-forbidden` for that reason.
+                    // This was once accepted here, on the grounds that Appendix A
+                    // lists `f818` as decodable simple(24). It does not: that row
+                    // is RFC 7049's, deleted from RFC 8949 by Erratum 5917. The
+                    // vector in test/boring/vectors.cljc had outlived its spec.
                     //
-                    // A review asked for these to be rejected on read. Doing so
-                    // failed the Appendix A conformance vector, which is the
-                    // check that settles it: be strict in what you emit, liberal
-                    // in what you accept, and keep the asymmetry documented
-                    // where someone will find it again.
-                    case 24: return Data.MAKE_SIMPLE.invoke(Long.valueOf(u8()));
+                    // Rejecting is also the majority behaviour -- jackson,
+                    // fxamacker, node-cbor, cbor2-JS, and cbor2-Python's 6.x
+                    // rewrite all refuse it. Of those that accept, ciborium and
+                    // cbor-x decode `f814` as plain `false`, laundering a
+                    // malformed encoding into a valid-looking value.
+                    case 24: {
+                        int sv = u8();
+                        if (sv < 32)
+                            throw Err.of("malformed-simple-value",
+                                "boring: two-byte simple value 0x" + Integer.toHexString(sv)
+                                    + " is not well-formed (RFC 8949 3.3 reserves f8 00..f8 1f)",
+                                "value", (long) sv);
+                        return Data.MAKE_SIMPLE.invoke(Long.valueOf(sv));
+                    }
                     case 25: return readHalf();
                     case 26: return Float.intBitsToFloat((int) u32());
                     case 27: return Double.longBitsToDouble(u64());
