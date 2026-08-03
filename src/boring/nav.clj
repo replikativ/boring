@@ -39,7 +39,10 @@
      resolve one -- and skipping a subtree would still have to register the
      strings inside it. Navigating a stringref document is refused, not
      silently wrong. boring writes stringref BY DEFAULT, so files meant to be
-     navigated must be written with `{:stringref false}`.
+     navigated must be written with `{:stringref false}` -- and put that on the
+     WRITER, `(boring/writer n {:stringref false})`, rather than passing it to
+     every call: resolved per call it costs ~250 heap bytes per item, resolved
+     once it costs nothing.
 
   2. Indefinite-length containers cannot be descended. Their count is not on
      the wire, so `count` could not be O(1) and `Counted` would be a lie.

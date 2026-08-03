@@ -243,6 +243,20 @@ is already lazy, so stopping at the first item decodes only that item — and fo
 one small item a cursor plus a key probe costs more than decoding it.
 Navigation wins by what it *skips*.
 
+Write such a file with the options on the **writer**, not per call:
+
+```clojure
+(let [w (boring/writer 65536 {:stringref false})]
+  (with-open [out (BufferedOutputStream. (FileOutputStream. f) 262144)]
+    (doseq [e events] (boring/write-to! w e out))))
+```
+
+`resolve-opts` merges the caller's map over the profile defaults on every
+encode, which costs ~250 heap bytes per event — and it bites hardest here,
+because a navigable file needs `:stringref false` and so cannot use the
+nil-opts fast path. Resolved once on the writer, a log event costs **301 → 15**
+bytes through `encode-buffered!` and **248 → 0** through `write-to!`.
+
 Two constraints are enforced, not documented-and-hoped: `:stringref` documents
 are refused (a cursor holding only an offset cannot resolve an index into a
 table built from preceding strings), and indefinite-length containers cannot be

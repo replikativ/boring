@@ -294,6 +294,19 @@ public final class Writer {
      * homogeneous-and-repetitive, and it is a wire feature a peer must
      * understand. datahike's chunked dumps are the case it exists for.
      */
+    /**
+     * Resolved encode options, for callers that create the writer once.
+     *
+     * Held as Object because they are a Clojure map and this class knows
+     * nothing about them -- boring.core resolves them at writer construction
+     * and reads them back on every 2-arity encode. The point is to stop
+     * resolving them PER CALL: `resolve-opts` merges the caller's map over a
+     * profile's defaults, which allocated ~230-300 B on every single encode.
+     * A navigable log pays that on every event, because navigation requires
+     * `:stringref false` and so cannot use the nil-opts fast path.
+     */
+    public Object opts;
+
     public boolean shapes = false;
 
     /**

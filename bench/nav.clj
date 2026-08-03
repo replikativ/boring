@@ -281,8 +281,11 @@
                          "msg" (str "event number " i)
                          "ctx" {"thread" "main" "ns" "app.core" "line" i}}))
           baos (java.io.ByteArrayOutputStream.)
-          w (boring/writer 8192)
-          _ (doseq [e events] (boring/write-to! w e baos opts))
+          ;; opts on the WRITER, not per call: resolving them per event costs
+          ;; ~250 B of heap each time, and a navigable log needs :stringref
+          ;; false so it cannot use the nil-opts fast path.
+          w (boring/writer 8192 opts)
+          _ (doseq [e events] (boring/write-to! w e baos))
           ^bytes log-bs (.toByteArray baos)
           xf (comp (filter #(= "error" (nav/value (get % "lvl"))))
                    (map #(nav/value (get % "n"))))]
