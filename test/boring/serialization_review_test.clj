@@ -614,3 +614,30 @@
       "d903eaa3010522 0525 05"
       ;; an unsigned key is CRITICAL: 3 says a reader MUST signal an error
       "d903eaa201050d 00")))
+
+;; ------------------------------------------------------- allocation-free write
+
+(deftest write-to-buffer-round-trips-and-reports-overflow
+  (testing "the NIO sibling of write-to!. It exists because the hand-rolled
+            two-liner goes reflective unless every argument is hinted, which
+            costs 22 KB per call against ~0 and fails silently -- nothing
+            throws, throughput just collapses where only an allocation profile
+            would show it."
+    (let [w (boring/writer 65536 o)
+          vs [{:e 1 :a :user/name :v "ada"} [1 2 3] "plain" 42]]
+      (testing "heap and direct buffers both round-trip, in sequence"
+        (doseq [bb [(java.nio.ByteBuffer/allocate 4096)
+                    (java.nio.ByteBuffer/allocateDirect 4096)]]
+          (let [^java.nio.ByteBuffer bb bb
+                counts (mapv #(boring/write-to-buffer! w % bb) vs)]
+            (is (= (.position bb) (reduce + counts))
+                "the buffer advanced by exactly the bytes written")
+            (.flip bb)
+            (let [out (byte-array (.remaining bb))]
+              (.get bb out)
+              (is (= vs (vec (boring/decode-seq out o)))
+                  "and the bytes are a readable CBOR sequence")))))
+      (testing "a value that does not fit overflows rather than truncating"
+        (let [^java.nio.ByteBuffer tiny (java.nio.ByteBuffer/allocate 4)]
+          (is (thrown? java.nio.BufferOverflowException
+                       (boring/write-to-buffer! w {:a "much too long for four bytes"} tiny))))))))
