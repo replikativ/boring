@@ -455,7 +455,14 @@
             ;; the NAME before decoding is what keeps a stray file that merely
             ;; ends in the right 9 bytes from being decoded as an index: it
             ;; would have to point at a tag-27 frame carrying this exact string.
-            (when (and (pos? ptr) (< ptr bp)
+            ;; `>= 0`, not `> 0`. A pointer of zero says the data section is
+            ;; empty and the index starts at byte 0 -- which is exactly what
+            ;; sealing an EMPTY sequence produces. Requiring it to be positive
+            ;; refused that index, and the trailing frame was then yielded as
+            ;; though it were data, so `write-seq!` of nothing read back as one
+            ;; `boring/index` item instead of none. The name check below is
+            ;; what keeps this from widening the false-positive surface.
+            (when (and (<= 0 ptr) (< ptr bp)
                        (= 6 (.majorAt r ptr))
                        (= 27 (.headArgAt r ptr))
                        (let [arr (.headEndAt r ptr)]

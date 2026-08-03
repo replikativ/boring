@@ -203,6 +203,34 @@
           (str "a stride-1 index should stay well under a tenth of the file, was "
                (format "%.1f%%" (* 100.0 (/ (double dense) plain))))))))
 
+(deftest degenerate-sequences-seal-and-read-back
+  (testing "zero, one and two items. The empty case is the one that bit: its
+            data section is 0 bytes long, so the back-pointer is 0 -- and a
+            reader that demanded a POSITIVE pointer refused its own index and
+            handed the `boring/index` frame back as though it were data. An
+            empty sealed sequence must read as empty, not as one tagged item."
+    (doseq [vs [[] [{"a" 1}] [{"a" 1} {"b" 2}]]
+            stride [1 16]]
+      (let [w (boring/writer 65536 opts)
+            o (ByteArrayOutputStream.)]
+        (boring/write-seq! w vs o (assoc opts :index stride))
+        (is (= vs (read-items (.toByteArray o)))
+            (str (count vs) " items at stride " stride))))))
+
+(deftest one-outsized-entry-does-not-break-its-neighbours
+  (testing "widths are picked per slot, so a single 50 KB value inside an
+            otherwise small container forces that whole slot to a wider type.
+            Every key must still resolve -- the narrowing is chosen by the
+            largest delta, and getting that bound wrong would corrupt only the
+            entries after the big one."
+    (let [o {:profile :archival}
+          m (into {} (for [i (range 40)]
+                       [(format "k%03d" i)
+                        (if (= i 20) (apply str (repeat 50000 \z)) i)]))
+          c (nav/source (boring/encode-indexed m (assoc o :index 4 :index-min 8)) o)]
+      (doseq [k (keys m)]
+        (is (= (get m k) (nav/value (get c k))) (str "key " k))))))
+
 ;; ------------------------------------------------- hierarchical descent
 ;;
 ;; The sequence index above reaches item n. These reach INTO an item: a node
