@@ -151,11 +151,24 @@ represent faithfully, rather than writing an approximation:
 | `:boring/invalid-utf16` | a string containing an unpaired surrogate — it has no UTF-8 encoding, and both platforms used to substitute silently |
 | `:boring/canonical-duplicate` | two set elements that encode identically under `:canonical` |
 | `:boring/bad-simple-value` | a simple value outside 0–255 |
-| `:boring/reserved-simple-value` | 24–31, which RFC 8949 §3.3 forbids emitting |
+| `:boring/reserved-simple-value` | 24–31, which RFC 8949 §3.3 forbids emitting — see below |
 | `:boring/incompatible-options` | an option that contradicts the profile |
 | `:boring/max-depth-exceeded` | nesting past `:max-depth`, on the write side too |
 | `:boring/unsupported-type` | a type with no encoding and no registered handler |
 | `:boring/unrepresentable-date` | a year outside 0000–9999, which RFC 3339 cannot express |
+
+### `:permit-reserved-simple-values` emits what boring rejects
+
+RFC 8949 §3.3 forbids *encoding* simple values 24–31, and its final sentence —
+"Such sequences are not well-formed" — binds the **decoder** too. boring
+enforces both: the writer refuses by default, and the reader raises
+`:boring/malformed-simple-value` for `f8 00`..`f8 1f`.
+
+`{:permit-reserved-simple-values true}` overrides the writer half. What comes
+out is **not well-formed CBOR, and boring will not read it back.** The option
+predates the decoder fix, when it could round-trip; it now exists only to
+generate a vector for a peer that is lenient about this. Do not enable it on a
+production encode path.
 
 ## Duplicate map keys
 

@@ -651,10 +651,21 @@
                    (str "tag " tag " should decode to a real array"))
                (is (= expected (vec v)) (str "tag " tag))))))
 
-       (testing "a uint64 above Long/MAX_VALUE has no lossless long, so it is
-                 REFUSED rather than handed back as a negative number that
-                 silently is not the value"
-         (is (:err (try-decode "d84748ffffffffffffffff" {}))))
+       (testing "a uint64 above Long/MAX_VALUE has no lossless long, so the array
+                 widens to a vector of bignums rather than being REFUSED.
+
+                 It used to be refused, which rejected conforming RFC 8746 input
+                 over a host-type limit -- and did so DATA-DEPENDENTLY, so a
+                 producer's tag 67 worked until the day a value crossed 2^63.
+                 The common case still returns a primitive long[]; only an array
+                 that needs the width pays for boxing."
+         (is (= [18446744073709551615N]
+                (:ok (try-decode "d84748ffffffffffffffff" {})))
+             "2^64-1 survives")
+         ;; tag 67 is uint64 BIG-endian; tag 71 is the little-endian one.
+         (is (= [5 18446744073709551615N]
+                (:ok (try-decode "d843500000000000000005ffffffffffffffff" {})))
+             "mixed widths in one array"))
 
        (testing "a REGISTERED reader overrides the built-in mapping. The built-in
                  typed-array types are a DEFAULT, not a ceiling: a consumer with

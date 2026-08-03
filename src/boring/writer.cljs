@@ -753,11 +753,15 @@
         (throw (ex-info (str "boring: simple value must be 0-255, got " (pr-str n))
                         {:type :boring/bad-simple-value :value n}))
         (< n 24) (u8! w (bit-or SIMPLE n))
+        ;; The escape hatch produces bytes boring itself rejects -- RFC 8949 3.3
+        ;; makes `f8 00`..`f8 1f` not well-formed, so the reader now refuses
+        ;; them. See the longer note in Writer.java for why it is kept.
         (and (< n 32) (not (.-permitReservedSimpleValues w)))
         (throw (ex-info
                 (str "boring: RFC 8949 3.3 forbids encoding simple value " n
-                     "; set :permit-reserved-simple-values to emit it anyway"
-                     " for byte-identical passthrough")
+                     ", and makes such sequences not well-formed, so boring will"
+                     " not read the result back; set :permit-reserved-simple-values"
+                     " to emit it anyway")
                 {:type :boring/reserved-simple-value :value n}))
         :else (do (u8! w (bit-or SIMPLE 24)) (u8! w n))))
 

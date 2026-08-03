@@ -1716,19 +1716,40 @@ public final class Reader {
                 for (int i = 0; i < n; i++) a[i] = (int) INT_BE.get(b, off + (i << 2));
                 return a; }
             case 67: case 71: {                     // uint64 BE / LE
-                long[] a = new long[n];
+                // Above 2^63 a uint64 has no lossless long, and handing back the
+                // negative that the bits happen to spell would be a wrong value.
+                // boring used to REFUSE the whole array for it -- conforming RFC
+                // 8746 input rejected because of a host-type limit, and rejected
+                // DATA-DEPENDENTLY, so the same producer's tag 67 worked until
+                // the day a value crossed 2^63.
+                //
+                // Scanned first so the common case still returns a primitive
+                // long[] with no boxing; only an array that actually needs the
+                // width pays for a vector of BigInt, which is what a CBOR bignum
+                // decodes to everywhere else in this reader.
+                boolean wide = false;
                 for (int i = 0; i < n; i++) {
                     long u = tag == 67 ? (long) LONG_BE.get(b, off + (i << 3))
                                        : (long) LONG_LE.get(b, off + (i << 3));
-                    // Above 2^63 a uint64 has no lossless long. Refuse rather than
-                    // hand back a negative number that silently is not the value.
-                    if (u < 0)
-                        throw Err.of("bad-tag-content",
-                            "boring: uint64 element " + i + " exceeds Long/MAX_VALUE",
-                            "tag", (long) tag);
-                    a[i] = u;
+                    if (u < 0) { wide = true; break; }
                 }
-                return a; }
+                if (!wide) {
+                    long[] a = new long[n];
+                    for (int i = 0; i < n; i++)
+                        a[i] = tag == 67 ? (long) LONG_BE.get(b, off + (i << 3))
+                                         : (long) LONG_LE.get(b, off + (i << 3));
+                    return a;
+                }
+                Object[] w = new Object[n];
+                for (int i = 0; i < n; i++) {
+                    long u = tag == 67 ? (long) LONG_BE.get(b, off + (i << 3))
+                                       : (long) LONG_LE.get(b, off + (i << 3));
+                    w[i] = u >= 0
+                        ? (Object) Long.valueOf(u)
+                        : clojure.lang.BigInt.fromBigInteger(
+                              new java.math.BigInteger(Long.toUnsignedString(u)));
+                }
+                return PersistentVector.adopt(w); }
             case 75: {                              // sint64 BE
                 long[] a = new long[n];
                 for (int i = 0; i < n; i++) a[i] = (long) LONG_BE.get(b, off + (i << 3));

@@ -937,10 +937,22 @@ public final class Writer {
             throw Err.of("bad-simple-value",
                 "boring: simple value must be 0-255, got " + n, "value", (long) n);
         if (n < 24) { u8(SIMPLE | n); return; }
+        // THE ESCAPE HATCH PRODUCES BYTES BORING ITSELF REJECTS. RFC 8949 3.3
+        // ends "Such sequences are not well-formed", which binds the decoder as
+        // well, so `f8 00`..`f8 1f` now raise :boring/malformed-simple-value on
+        // the way back in. The option's original justification -- byte-identical
+        // passthrough of something boring had decoded -- no longer exists, since
+        // there is no longer a decode path that produces one.
+        //
+        // Kept anyway, because an explicit opt-in named after the thing it
+        // permits is a reasonable way to generate a test vector for a lenient
+        // peer, and refusing outright would remove the only way to do it. The
+        // message says what you get rather than implying a round trip.
         if (n < 32 && !permitReservedSimpleValues) throw Err.of("reserved-simple-value",
             "boring: RFC 8949 3.3 forbids encoding simple value " + n
-            + " (0xf8 followed by a byte < 0x20); set :permit-reserved-simple-values "
-            + "to emit it anyway for byte-identical passthrough", "value", (long) n);
+            + " (0xf8 followed by a byte < 0x20), and makes such sequences not "
+            + "well-formed, so boring will not read the result back; set "
+            + ":permit-reserved-simple-values to emit it anyway", "value", (long) n);
         ensure(2);
         buf[pos] = (byte) (SIMPLE | 24);
         buf[pos + 1] = (byte) n;
