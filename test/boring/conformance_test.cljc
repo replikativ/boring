@@ -964,6 +964,20 @@
            new Date rejects it outright, so neither platform has a lossless
            native value -- preserving the text is the only honest option"))))
 
+(deftest a-truncated-indefinite-string-is-reported-as-truncation
+  (testing "`5f 41 00` and `7f 61 00` are indefinite-length strings that run out
+            before their break code -- Appendix F.1 lists them under 'too little
+            data'. ClojureScript reported them as :boring/bad-indefinite-chunk
+            'contains a chunk of major 0', naming a chunk that does not exist:
+            `aget` past the end of a Uint8Array is `undefined`, and
+            `undefined >> 5` is 0 in JavaScript. Both platforms now agree, and
+            agree with the RFC's own classification."
+    (doseq [hex ["5f4100" "7f6100"]]
+      (let [r (try (do (boring/decode (c/hex->bytes hex)) nil)
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                     (:type (ex-data e))))]
+        (is (= :boring/truncated-input r) hex)))))
+
 (deftest rfc-8949-appendix-f1-is-rejected-in-full
   (testing "every byte sequence RFC 8949 Appendix F.1 names as not well-formed
             must raise a typed error, on both platforms.

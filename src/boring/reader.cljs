@@ -274,6 +274,15 @@
     (read! r)))
 
 (defn- read-chunk! [^Reader r major]
+  ;; BOUNDS FIRST. `aget` past the end of a Uint8Array returns `undefined`, and
+  ;; `(bit-shift-right undefined 5)` is 0 in JavaScript -- so an indefinite
+  ;; string that simply RAN OUT before its break code was reported as
+  ;; ":boring/bad-indefinite-chunk ... contains a chunk of major 0", naming a
+  ;; chunk that does not exist. `5f 41 00` is truncated, and the JVM says so.
+  ;; Misreporting a truncation as a syntax error is the same defect class as
+  ;; the reverse, which boring.streaming-test already pins in the other
+  ;; direction.
+  (need! r 1)
   (if (at-break? r)
     (do (set! (.-pos r) (inc (.-pos r))) BREAK)
     (let [h (aget (.-buf r) (.-pos r))]
