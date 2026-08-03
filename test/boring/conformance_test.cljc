@@ -1036,6 +1036,30 @@
                         (:type (ex-data e)))))
               (str "max-items " (pr-str bad))))))))
 
+(deftest a-caller-supplied-tag-number-is-validated-on-both-platforms
+  (testing "ClojureScript's `head!` range-checked its BigInt branch but assumed
+            an unsigned integer in the Number branch, so a TaggedValue carrying
+            a bad tag reached the arithmetic unchecked. `tag 1.5` emitted `c1 00`
+            -- silently BECOMING tag 1 -- and `tag -1` emitted `ff 00`, the break
+            code followed by an item, which is not one well-formed CBOR value.
+            Neither threw. The JVM has rejected both since `writeTag` gained its
+            check; the platforms now agree."
+    (doseq [bad [-1 -40 1.5]]
+      (is (= :boring/bad-tag
+             (try (do (boring/encode (data/tagged-value bad 0) {:stringref false}) nil)
+                  (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                    (:type (ex-data e)))))
+          (str "tag " (pr-str bad) " must be refused, not emitted")))
+    ;; UNINTERPRETED tag numbers deliberately: a semantic tag validates its
+    ;; content on the way back (tag 0 wants an RFC 3339 string), which would be
+    ;; testing the tag handler rather than the number check.
+    (testing "and ordinary tags still round-trip, including large ones"
+      (doseq [good [60000 1000000 39650 4294967295]]
+        (let [v (data/tagged-value good "x")]
+          (is (= v (boring/decode (boring/encode v {:stringref false})
+                                  {:stringref false}))
+              (str "tag " good)))))))
+
 (deftest rfc-8949-appendix-f1-is-rejected-in-full
   (testing "every byte sequence RFC 8949 Appendix F.1 names as not well-formed
             must raise a typed error, on both platforms.

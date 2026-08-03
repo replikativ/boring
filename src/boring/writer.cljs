@@ -431,6 +431,27 @@
             (.set (.-srKeys w) s (.-srNext w))
             (set! (.-srNext w) (inc (.-srNext w)))))))))
 
+(defn- check-tag!
+  "A caller-supplied tag number, validated before it reaches `head!`.
+
+  `head!`'s BigInt branch range-checks, but its Number branch assumed an
+  unsigned integer and did arithmetic on whatever arrived. So `tag 1.5` emitted
+  `c1 00` -- silently becoming tag 1 -- and `tag -1` emitted `ff 00`, the BREAK
+  code followed by an item, which is not one well-formed CBOR value at all. No
+  exception either way: just output no reader can parse, or the wrong tag. The
+  JVM has rejected both since `writeTag` gained its check; this is the port."
+  [t]
+  (cond
+    ;; head! already range-checks BigInt against [0, 2^64-1].
+    (= "bigint" (goog/typeOf t)) t
+    (not (number? t))
+    (throw (ex-info (str "boring: tag must be an integer, got " (pr-str t))
+                    {:type :boring/bad-tag :tag t}))
+    (or (not (js/Number.isInteger t)) (neg? t) (> t js/Number.MAX_SAFE_INTEGER))
+    (throw (ex-info (str "boring: tag must be an unsigned integer, got " t)
+                    {:type :boring/bad-tag :tag t}))
+    :else t))
+
 (defn write-stringref-namespace! [^Writer w] (head! w TAG TAG-SR-NS))
 
 (defn- write-ident! [^Writer w s]
@@ -681,7 +702,7 @@
     ;; precisely to override what boring would do on its own.
     (get-in (.-registry w) [:writers (type x)])
     (let [h (get-in (.-registry w) [:writers (type x)])]
-      (head! w TAG (:tag h))
+      (head! w TAG (check-tag! (:tag h)))
       (write-value! w ((:fn h) x)))
 
     (instance? js/Date x)
@@ -766,7 +787,7 @@
         :else (do (u8! w (bit-or SIMPLE 24)) (u8! w n))))
 
     (data/tagged-value? x)
-    (do (head! w TAG (:tag x)) (write-value! w (:value x)))
+    (do (head! w TAG (check-tag! (:tag x))) (write-value! w (:value x)))
 
     ;; The payload is USUALLY a field map, but the reader accepts any tag-27
     ;; constructor argument, so a positional type (datahike's Datom carries a
