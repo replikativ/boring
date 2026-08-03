@@ -429,6 +429,51 @@
             (aset-int out k (int v))
             (recur (inc k) v)))))))
 
+(defn- index-payload
+  "The usable index in the tag-27 frame at `ptr`, or nil meaning \"scan\".
+
+  Split out of `read-index` because it is the half that can FAIL. Detection --
+  the tail shape, the pointer, the name -- establishes that something intends to
+  be an index; this establishes that its payload can actually be used, which is
+  a different question and the one a truncated or hand-edited file gets wrong.
+
+  ANY exception here yields nil. Nothing in the index is load-bearing, so the
+  honest response to a payload we cannot use is to ignore it and walk, never to
+  throw at the caller of `nav/source`. That matters more than it did: slots are
+  expanded eagerly below, so without this one malformed slot would take down a
+  cursor that never went near the container it belongs to."
+  [^Reader r ^long ptr]
+  (try
+    ;; `frame-payload`, not `record-fields`: an unregistered tag-27 frame
+    ;; decodes to an UnknownRecord when its payload is a map and a
+    ;; TaggedLiteral otherwise, and this payload is a vector.
+    (let [[stride ^ints containers ^ints counts slots sorted _]
+          (boring.data/frame-payload (.readFrom r ptr))]
+      (when (and (int? stride) (pos? (long stride)) containers)
+        ;; One uniform node list. The SEQUENCE is the node at the sentinel
+        ;; offset -1: it has no container header on the wire but behaves like
+        ;; one, and a sentinel avoids carrying two shapes for the same idea.
+        (let [seq-slot (loop [k 0]
+                         (cond (>= k (alength containers)) nil
+                               (= -1 (aget containers k)) k
+                               :else (recur (inc k))))
+              ;; Deltas to absolutes, once, against each slot's own base: its
+              ;; container's offset, or 0 for the sequence, whose sentinel -1
+              ;; is not a position.
+              abs-slots (vec (map-indexed
+                              (fn [i s]
+                                (expand-slot s (max 0 (long (aget containers (int i))))))
+                              slots))]
+          {:stride (long stride)
+           :containers containers
+           :counts counts
+           :slots abs-slots
+           :sorted (vec sorted)
+           :data-end ptr
+           :total (when seq-slot (long (aget counts seq-slot)))
+           :offsets (when seq-slot (nth abs-slots seq-slot))})))
+    (catch Exception _ nil)))
+
 (defn- read-index
   "The offset index sealed onto a CBOR sequence by `boring/write-seq!`, or nil.
 
@@ -468,47 +513,7 @@
                        (let [arr (.headEndAt r ptr)]
                          (and (= 4 (.majorAt r arr))
                               (.bytesEqualAt r (.headEndAt r arr) (name-probe nav)))))
-              ;; ANY failure past this point yields nil, which means "scan".
-              ;; The pointer and name checks establish that something INTENDS to
-              ;; be an index, not that its payload is well formed -- a truncated
-              ;; or hand-edited one can still decode to the wrong shape. Nothing
-              ;; here is load-bearing, so the honest response to a payload we
-              ;; cannot use is to ignore it and walk, never to throw at the
-              ;; caller of `nav/source`. This matters more since slots are
-              ;; expanded eagerly below: without it, one malformed slot would
-              ;; take down a cursor that never went near that container.
-              (try
-              ;; `frame-payload`, not `record-fields`: an unregistered tag-27
-              ;; frame decodes to an UnknownRecord when its payload is a map
-              ;; and a TaggedLiteral otherwise, and this payload is a vector.
-              (let [rec (.readFrom r ptr)
-                    [stride ^ints containers ^ints counts slots sorted _]
-                    (boring.data/frame-payload rec)]
-                (when (and (int? stride) (pos? (long stride)) containers)
-                  ;; One uniform node list. The SEQUENCE is the node at the
-                  ;; sentinel offset -1: it has no container header on the wire
-                  ;; but behaves like one, and a sentinel avoids carrying two
-                  ;; separate shapes for the same idea.
-                  (let [seq-slot (loop [k 0]
-                                   (cond (>= k (alength containers)) nil
-                                         (= -1 (aget containers k)) k
-                                         :else (recur (inc k))))
-                        ;; Deltas to absolutes, once, against each slot's own
-                        ;; base -- its container's offset, or 0 for the
-                        ;; sequence, whose sentinel -1 is not a position.
-                        abs-slots (vec (map-indexed
-                                        (fn [i s]
-                                          (expand-slot s (max 0 (long (aget containers (int i))))))
-                                        slots))]
-                    {:stride (long stride)
-                     :containers containers
-                     :counts counts
-                     :slots abs-slots
-                     :sorted (vec sorted)
-                     :data-end ptr
-                     :total (when seq-slot (long (aget counts seq-slot)))
-                     :offsets (when seq-slot (nth abs-slots seq-slot))})))
-              (catch Exception _ nil)))))))))
+              (index-payload r ptr))))))))
 
 (deftype Items [^Nav nav idx]
   clojure.lang.Seqable
