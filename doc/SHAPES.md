@@ -486,18 +486,59 @@ which is why both are parameters and neither is implicit.
 
 ### Building it
 
-The index is derived by **walking encoded bytes**, not by hooking the writer —
-so the writer's hot path is untouched and any already-encoded value can be
-indexed after the fact, including one somebody else wrote. `boring/build-index`
-does that; `boring/encode-indexed` encodes and seals in one step, producing a
-two-item sequence that `decode` still reads as the value.
+### Two builders, and why
+
+**`write-seq!` captures the index as it encodes.** The writer already knows
+`pos` — the offset it is about to write to — and knows a container's entry
+count before emitting a byte of it, so the nodes fall out of encoding. Nothing
+in the index needs a subtree's *length*, only where its entries start, so there
+is nothing to back-patch. In a length-prefixed format this would need a second
+pass; CBOR's element counts make the write side free and the read side
+expensive, and this takes the good half of that trade.
+
+On 50 000 records through a `BufferedOutputStream`, against the same write with
+no index — reproduce with `clojure -M:bench -m nav write`:
+
+| stride | walked | captured |
+|---:|---:|---:|
+| 16 | +80% | **+3%** |
+| 8 | +85% | **+5%** |
+| 1 | +113% | +30% |
+
+Stride 1's remainder is not the capture — it is delta-encoding and emitting a
+50 000-entry slot at the end, which the walk paid too.
+
+**`build-index` walks encoded bytes instead**, and stays, because it is the only
+way to index a value that is already encoded — re-indexing after a compaction,
+or indexing a file somebody else wrote. It is also the reference implementation
+the captured index is tested against, generatively, in
+`boring.writer-index-test`.
 
 The walk returns each value's **end offset** rather than calling `skipFrom` per
 entry. That matters: `skipFrom` is O(subtree), so an entry-at-a-time walk
 re-walks everything beneath each level and is O(n²) in depth — measured at
 486 ns/byte against a skip's 1.3–2, and 27× slower on a 200-deep document. A
-single descent visits each byte once and the node falls out of it. Building an
-index costs 1.1–1.4× a plain encode.
+single descent visits each byte once and the node falls out of it. Even so it
+cannot beat ~31% of encode time, because stepping over a subtree *is* walking
+it. That floor is what capturing avoids rather than optimises.
+
+### The two builders differ, deliberately
+
+The walk indexes containers **on the wire**, and boring puts several there that
+no user wrote: a sorted-map is tag 27 around a two-element `[name, map]`, a
+shaped array is `[keys, rows]`. On the wire those are indistinguishable from a
+user's own two-element vector, so the walk indexes them; the writer knows the
+difference and skips them.
+
+That is a **subset, not a disagreement**, and it is legitimate — the index is
+never load-bearing, and a node for `[name, map]` is pure overhead. The pinned
+contract:
+
+- every captured node is byte-identical to one the walk found — always;
+- the two agree completely once `:index-min` excludes frames.
+
+Every frame boring emits has **3 entries or fewer**, so 4 is the boundary and
+the default of 16 clears it comfortably.
 
 Tags are **descended through**, not stepped over. A set is tag 258 around an
 array, a record tag 27 around `[name, map]`, a shaped array tag 39649 around
