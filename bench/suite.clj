@@ -19,12 +19,10 @@
        in background load lands entirely on one side.
     3. criterium last (`bench`), for the absolute µs/op figures. Slowest, and
        the most sensitive to a noisy machine.
-    4. skip (`skip`) then navigation (`nav`) last. Both compare boring against
-       ITSELF -- a walk that builds nothing versus a full decode, and then the
-       cursor API built on that walk -- so neither depends on how the other
-       codecs happened to warm up, and both bring their own harness. `skip`
-       comes first because it measures the primitive `nav` is made of: if the
-       skip numbers move, the nav numbers move with them.
+    4. navigation (`nav`) and mmap (`mmap`) last. Both compare boring against
+       ITSELF -- a walk that builds nothing versus a full decode, a mapping
+       versus a heap array -- so neither depends on how the other codecs
+       happened to warm up, and both bring their own harness.
 
   One global warmup covers `ab` and `bench`, because per-cell warmup is not
   enough: hako's small-map encode measured 2.52 / 1.30 / 1.15 / 1.08 µs across
@@ -108,15 +106,15 @@
     ;; skip instead of an UnsupportedClassVersionError, and that this ns keeps
     ;; no load-time dependency on FFM if the hako peer ever becomes optional.
     ;; Do not read it as JDK 21 support for the suite.
-    (when (run? :skip)
-      (banner "SKIP — walking past a value vs decoding it")
-      (if-let [f (try (requiring-resolve 'skip/-main) (catch Throwable _ nil))]
+    (when (run? :nav)
+      (banner "NAVIGATION — skipping, and cursor vs decode-then-get-in")
+      (if-let [f (try (requiring-resolve 'nav/-main) (catch Throwable _ nil))]
         (f)
         (println "skipped: this section needs JDK 22+, and this JVM cannot load it")))
 
-    (when (run? :nav)
-      (banner "NAVIGATION — cursor vs decode-then-get-in")
-      (if-let [f (try (requiring-resolve 'nav/-main) (catch Throwable _ nil))]
+    (when (run? :mmap)
+      (banner "MMAP — selective read, append, and chunked compression")
+      (if-let [f (try (requiring-resolve 'mmap/-main) (catch Throwable _ nil))]
         (f)
         (println "skipped: this section needs JDK 22+, and this JVM cannot load it")))
 

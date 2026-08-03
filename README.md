@@ -87,6 +87,15 @@ Against nippy that is a win on all twelve cells. Against [hako][] — an
 experimental codec built for speed, and the fastest thing in this table — it is
 mixed.
 
+**Read that table with its tier in mind.** It calls a fresh codec per message,
+which is matched across all four libraries but is *not* how hako is meant to be
+used: `hako/encode` builds a Writer and a confined Arena per call, and its
+author's intended path is the reused `encode-into!`. Reuse both sides and hako
+gains considerably more than boring does — several of the small-payload results
+above **reverse**. `clojure -M:bench -m hako-ab` prints the tier-matched table,
+in time and allocation; quote that one for a like-for-like comparison of the
+two libraries as they are meant to be called.
+
 On nippy's *own* benchmark (`clojure -M:nippy-bench` — nippy's `stress-data`,
 nippy's filter, nippy's timing loop), round-trip µs and bytes:
 
@@ -108,7 +117,10 @@ actually writes — boring+zstd matches nippy's default round-trip time at
 
 **Where it loses.** hako is faster on deeply nested maps (and 1.4× smaller
 there), 2.4× faster decoding a plain vector of integers, and marginally ahead
-on the two small payloads' decode. fressian+zstd stays 6% smaller than
+on the two small payloads' decode. With both codecs reused it is further ahead
+still — roughly 1.3–1.8× on map-heavy encode and ~2× on map-heavy decode —
+while boring keeps the vector-heavy decode and allocates less on every payload
+measured. fressian+zstd stays 6% smaller than
 boring+zstd.
 
 On **ClojureScript** the split is sharper. transit-cljs writes JSON text, so

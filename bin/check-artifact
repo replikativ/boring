@@ -55,12 +55,13 @@ while read -r cls; do
   [ -n "$v" ] && [ "$v" -gt "$worst" ] && worst=$v
 done < <(cd "$work" && find . -name '*.class' | sed 's|^\./||; s|/|.|g')
 
-# The mmap path is a shipped feature; a jar built on an older JDK would omit it
-# silently and fail at the user's first boring.mmap call.
+# The mmap path is a shipped feature, but this script also runs in CI on JDK 21,
+# where it CANNOT be built. So: a note, not a failure. `clj -T:build deploy`
+# refuses to publish a jar without it, which is the gate that matters.
 if [ -f "$work/org/replikativ/boring/ffm/SegmentSource.class" ]; then
   note "ffm/SegmentSource present (the JDK 22+ mmap path)"
 else
-  bad "ffm/SegmentSource missing — built on a JDK older than 22, so boring.mmap cannot load"
+  note "ffm/SegmentSource ABSENT — built on JDK < 22; boring.mmap will not load. Deploy refuses this."
 fi
 
 if [ "$worst" -eq 0 ]; then

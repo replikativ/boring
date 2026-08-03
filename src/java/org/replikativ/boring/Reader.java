@@ -284,7 +284,7 @@ public final class Reader {
      * reach the fifth key of a map you step over four values you do not want.
      * Measured 3-11x cheaper than decoding structure, and 19x for a bytestring
      * -- those are length-prefixed, so skipping one is a jump rather than a
-     * walk. See `clojure -M:bench -m skip`.
+     * walk. See `clojure -M:bench -m nav skip`.
      *
      * <p><b>Why it delegates when a stringref namespace is open.</b> A string
      * inside a namespace is a table entry whether or not anybody decodes it,

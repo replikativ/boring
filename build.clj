@@ -88,25 +88,29 @@
               :javac-opts ["--release" "22" "-Xlint:-options"]})
     (println (str "  note: build JDK is " build-jdk
                   " (< 22), skipping src/java22 — this build has no "
-                  "SegmentSource, so boring.mmap will not load. Fine for "
-                  "tests; `jar` refuses to package it."))))
+                  "SegmentSource, so boring.mmap will not load. Fine for tests "
+                  "and for packaging; `deploy` refuses to publish it."))))
 
 (def ^:private segment-source-class
   "org/replikativ/boring/ffm/SegmentSource.class")
+
+(defn- has-segment-source? []
+  (.exists (java.io.File. class-dir segment-source-class)))
 
 (defn jar
   "Ships the compiled Java classes alongside the Clojure and ClojureScript
   sources, so consumers need no javac step of their own."
   [_]
   (javac nil)
-  ;; A jar without SegmentSource loads fine and then fails at the first
-  ;; boring.mmap call, on the user's machine, at runtime. Refuse here instead:
-  ;; the only way to produce one is to build on a JDK older than 22.
-  (when-not (.exists (java.io.File. class-dir segment-source-class))
-    (throw (ex-info (str "boring: refusing to package a jar without "
-                         segment-source-class " — build on JDK 22+ (this is "
-                         (str build-jdk) ")")
-                    {:build-jdk build-jdk})))
+  ;; WARN here, THROW in `deploy`. CI builds a jar on JDK 21 to check packaging
+  ;; -- that check is worth having and does not need the ffm class -- but a
+  ;; PUBLISHED jar without it loads fine and then fails at the user's first
+  ;; boring.mmap call. So the gate belongs on the release path, not on every
+  ;; `jar`, which is where it was first put and where it turned CI red.
+  (when-not (has-segment-source?)
+    (println (str "  WARNING: no " segment-source-class
+                  " in this build (JDK " build-jdk " < 22). The jar will not "
+                  "support boring.mmap. `deploy` refuses such a jar.")))
   (b/delete {:path jar-dir})
   (b/delete {:path release-dir})
   (b/write-pom {:class-dir jar-dir
@@ -157,6 +161,13 @@
   green."
   [_]
   (jar nil)
+  ;; The release gate for the mmap path. A jar built on an older JDK silently
+  ;; omits SegmentSource and fails at the consumer's first boring.mmap call.
+  (when-not (has-segment-source?)
+    (throw (ex-info (str "boring: refusing to DEPLOY a jar without "
+                         segment-source-class " — release must be built on "
+                         "JDK 22+ (this is " build-jdk ")")
+                    {:build-jdk build-jdk})))
   (let [{:keys [exit]} (clojure.java.shell/sh "bin/check-artifact")]
     (when-not (zero? exit)
       (throw (ex-info "boring: refusing to deploy, bin/check-artifact failed" {}))))

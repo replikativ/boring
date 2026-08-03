@@ -1,38 +1,197 @@
 (ns nav
-  "Does `boring.nav` deliver on the prototype numbers?
+  "Navigation, in two sections.
 
-  The prototype that motivated this layer was a hand-written scanner measuring
-  6.6x on a path lookup and ~1000x on a blob. Those were an upper bound: no
-  registry, no tag handling, no guard rails, no cursor allocation. This runs
-  the SHIPPED api, so the numbers are the ones a caller actually gets.
+    skip    how cheap it is to walk PAST a value without decoding it -- the
+            inner loop of any cursor, zipper or get-in over the wire format
+    cursor  what the shipped `boring.nav` api delivers against
+            decode-then-get-in
 
-  Three questions:
-    1. path lookup vs decode-then-get-in, on the heap
-    2. the same over an mmap'ed file
-    3. handing back a blob's bytes vs materialising it
+  Run: clojure -M:bench -m nav [skip|cursor]
 
-  Run: clojure -M:bench -m nav"
-  (:require [boring.core :as boring]
-            [boring.nav :as nav]
-            [boring.mmap :as mmap])
+  Encoded :stringref false throughout. With stringref on, skipping a subtree
+  still has to register every string inside it, because a later reference is an
+  index into that table -- a real constraint on random access, which is why
+  boring.nav refuses such documents rather than resolving them wrongly.
+
+  Findings are written up in doc/PERFORMANCE.md."
+  (:require [ab :refer [ab]]
+            [boring.core :as boring]
+            [boring.mmap :as mmap]
+            [boring.nav :as nav])
   (:import (java.io File FileOutputStream)
+           (java.lang.foreign Arena MemorySegment ValueLayout)
+           (java.nio.channels FileChannel FileChannel$MapMode)
+           (java.nio.file StandardOpenOption)
            (org.replikativ.boring Reader)))
 
 (set! *warn-on-reflection* true)
 
+(defn timed
+  "ns/op, min over rounds, `iters` calls per round.
+
+  Timing a SINGLE call is meaningless here: nanoTime's own resolution is tens
+  of ns and a cheap skip is on that order, so the first version of this fn
+  reported 14 550 ns to skip a 180-byte map. Every sample must amortise the
+  clock over many calls."
+  [f ^long iters ^long rounds]
+  (dotimes [_ (* 2 iters)] (f))
+  (loop [r 0 best Long/MAX_VALUE]
+    (if (= r rounds) (/ best (double iters))
+        (let [t0 (System/nanoTime)
+              _ (dotimes [_ iters] (f))
+              t1 (System/nanoTime)]
+          (recur (inc r) (min best (- t1 t0)))))))
+
+;; ------------------------------------------------ scanner over a segment
+
+(defn- ub ^long [^MemorySegment s ^long p]
+  (bit-and (long (.get s ValueLayout/JAVA_BYTE p)) 0xFF))
+
+(defn- head-arg
+  "The head's argument at p: a count, a length, or an immediate."
+  ^long [^MemorySegment s ^long p]
+  (let [ai (bit-and (ub s p) 31)]
+    (cond
+      (< ai 24) ai
+      (= ai 24) (ub s (+ p 1))
+      (= ai 25) (bit-or (bit-shift-left (ub s (+ p 1)) 8) (ub s (+ p 2)))
+      (= ai 26) (bit-or (bit-shift-left (ub s (+ p 1)) 24)
+                        (bit-shift-left (ub s (+ p 2)) 16)
+                        (bit-shift-left (ub s (+ p 3)) 8)
+                        (ub s (+ p 4)))
+      :else (loop [i 0 acc 0]
+              (if (= i 8) acc
+                  (recur (inc i) (bit-or (bit-shift-left acc 8) (ub s (+ p 1 i)))))))))
+
+(defn- head-end
+  "Offset past the head at p. For major type 7 this already covers the float."
+  ^long [^MemorySegment s ^long p]
+  (let [ai (bit-and (ub s p) 31)]
+    (cond (< ai 24) (+ p 1) (= ai 24) (+ p 2) (= ai 25) (+ p 3)
+          (= ai 26) (+ p 5) :else (+ p 9))))
+
+(defn skip-seg
+  "Offset just past the whole value at p. Allocates nothing."
+  ^long [^MemorySegment s ^long p]
+  (let [b (ub s p)
+        mt (bit-shift-right b 5)
+        nxt (head-end s p)]
+    (case (int mt)
+      0 nxt
+      1 nxt
+      2 (+ nxt (head-arg s p))
+      3 (+ nxt (head-arg s p))
+      4 (let [n (head-arg s p)]
+          (loop [i 0 q nxt] (if (= i n) q (recur (inc i) (skip-seg s q)))))
+      5 (let [n (head-arg s p)]
+          (loop [i 0 q nxt] (if (= i n) q (recur (inc i) (skip-seg s (skip-seg s q))))))
+      6 (skip-seg s nxt)
+      nxt)))
+
+;; ------------------------------------------------- same scanner, byte[]
+
+(defn- ubb ^long [^bytes a ^long p] (bit-and (long (aget a (int p))) 0xFF))
+
+(defn- head-arg-b ^long [^bytes a ^long p]
+  (let [ai (bit-and (ubb a p) 31)]
+    (cond
+      (< ai 24) ai
+      (= ai 24) (ubb a (+ p 1))
+      (= ai 25) (bit-or (bit-shift-left (ubb a (+ p 1)) 8) (ubb a (+ p 2)))
+      (= ai 26) (bit-or (bit-shift-left (ubb a (+ p 1)) 24)
+                        (bit-shift-left (ubb a (+ p 2)) 16)
+                        (bit-shift-left (ubb a (+ p 3)) 8)
+                        (ubb a (+ p 4)))
+      :else (loop [i 0 acc 0]
+              (if (= i 8) acc
+                  (recur (inc i) (bit-or (bit-shift-left acc 8) (ubb a (+ p 1 i)))))))))
+
+(defn- head-end-b ^long [^bytes a ^long p]
+  (let [ai (bit-and (ubb a p) 31)]
+    (cond (< ai 24) (+ p 1) (= ai 24) (+ p 2) (= ai 25) (+ p 3)
+          (= ai 26) (+ p 5) :else (+ p 9))))
+
+(defn skip-bytes ^long [^bytes a ^long p]
+  (let [b (ubb a p)
+        mt (bit-shift-right b 5)
+        nxt (head-end-b a p)]
+    (case (int mt)
+      0 nxt
+      1 nxt
+      2 (+ nxt (head-arg-b a p))
+      3 (+ nxt (head-arg-b a p))
+      4 (let [n (head-arg-b a p)]
+          (loop [i 0 q nxt] (if (= i n) q (recur (inc i) (skip-bytes a q)))))
+      5 (let [n (head-arg-b a p)]
+          (loop [i 0 q nxt] (if (= i n) q (recur (inc i) (skip-bytes a (skip-bytes a q))))))
+      6 (skip-bytes a nxt)
+      nxt)))
+
+;; ------------------------------------------------------------- harness
+
+(def shapes
+  [["small-map-8"    {"name" "Person Number 137" "email" "p137@example.com"
+                      "address" "137 Some Long Street, Some City, 12345"
+                      "notes" "padding text to make the value bigger"
+                      "id" 1000137 "active" true "score" 205.5 "tags" [0 1 2]}]
+   ["wide-map-200"   (into {} (for [i (range 200)] [(str "k" i) i]))]
+   ["long-vec-1k"    (vec (range 1000))]
+   ["text-100"       (apply str (repeat 10 "0123456789"))]
+   ["bytes-64k"      (byte-array 65536)]
+   ["nested-deep-20" (reduce (fn [acc _] {"x" acc}) {"leaf" 1} (range 20))]
+   ["datom-maps-200" (vec (for [i (range 200)]
+                            {"e" (+ 100 i) "a" "user/name" "v" (str "person-" i)
+                             "tx" (+ 536870912 i) "added" true}))]])
+
+(defn run-skip []
+  (let [arena (Arena/ofShared)]
+    (println "\n=== SKIP vs DECODE, per value ===")
+    (println "skip = walk the structure, build nothing. decode = materialise it.\n")
+    (println (format "%-16s %8s %10s %10s %9s %10s"
+                     "shape" "bytes" "skip ns" "decode ns" "ratio" "skip ns/B"))
+    (doseq [[nm v] shapes]
+      (let [^bytes bs (boring/encode v {:stringref false})
+            seg (MemorySegment/ofArray bs)
+            len (alength bs)
+            rdr (org.replikativ.boring.Reader. (byte-array 1))
+            iters (max 200 (long (/ 2000000 (max 1 len))))
+            s-ns (timed #(skip-seg seg 0) iters 40)
+            d-ns (timed #(do (.reset rdr bs) (.read rdr)) iters 40)]
+        (println (format "%-16s %8d %10.0f %10.0f %8.1fx %10.3f"
+                         nm len s-ns d-ns (/ d-ns s-ns) (/ s-ns len)))
+        (flush)))
+
+    (println "\n=== BACKING: same scanner, three sources ===")
+    (println "if these are at parity, one segment-based reader serves both.\n")
+    (let [big (vec (for [i (range 2000)]
+                     {"e" (+ 100 i) "a" "user/name" "v" (str "person-" i)
+                      "tx" (+ 536870912 i) "added" true}))
+          ^bytes bs (boring/encode big {:stringref false})
+          len (alength bs)
+          heap-seg (MemorySegment/ofArray bs)
+          f (doto (File/createTempFile "boring-skip" ".cbor") .deleteOnExit)
+          _ (with-open [out (FileOutputStream. f)] (.write out bs))
+          nat-seg (with-open [ch (FileChannel/open
+                                  (.toPath f)
+                                  (into-array StandardOpenOption [StandardOpenOption/READ]))]
+                    (.map ch FileChannel$MapMode/READ_ONLY 0 (.size ch) arena))]
+      (println (format "payload: %d bytes, 2000 maps\n" len))
+      (let [[a b] (ab #(skip-bytes bs 0) #(skip-seg heap-seg 0) 200 40)]
+        (println (format "  %-30s %9.1f µs" "byte[] + aget" (/ a 1000.0)))
+        (println (format "  %-30s %9.1f µs   (%.2fx byte[])" "heap MemorySegment" (/ b 1000.0) (/ b a))))
+      (let [[a b] (ab #(skip-bytes bs 0) #(skip-seg nat-seg 0) 200 40)]
+        (println (format "  %-30s %9.1f µs   (%.2fx byte[])" "native mmap MemorySegment" (/ b 1000.0) (/ b a))))
+      ;; correctness: all three must agree on where the value ends
+      (println (format "\n  all three agree on end offset: %s"
+                       (= (skip-bytes bs 0) (skip-seg heap-seg 0) (skip-seg nat-seg 0) len))))
+    (.close arena)))
+
 (def opts {:stringref false})
 
-(defn ab
-  "Alternating bursts, min over rounds. µs/op."
-  [fa fb ^long iters ^long rounds]
-  (dotimes [_ (* 2 iters)] (fa) (fb))
-  (loop [r 0 ba Long/MAX_VALUE bb Long/MAX_VALUE]
-    (if (= r rounds)
-      [(/ ba (double iters) 1000.0) (/ bb (double iters) 1000.0)]
-      (let [t0 (System/nanoTime) _ (dotimes [_ iters] (fa))
-            t1 (System/nanoTime) _ (dotimes [_ iters] (fb))
-            t2 (System/nanoTime)]
-        (recur (inc r) (min ba (- t1 t0)) (min bb (- t2 t1)))))))
+(defn- ab-us
+  "ab/ab in µs/op rather than ns."
+  [fa fb iters rounds]
+  (mapv #(/ % 1000.0) (ab fa fb iters rounds)))
 
 (defn- spit-bytes ^File [^bytes bs]
   (let [f (doto (File/createTempFile "boring-nav" ".cbor") .deleteOnExit)]
@@ -49,7 +208,7 @@
                "id"      (+ 1000000 i)
                "active"  true}])))
 
-(defn -main [& _]
+(defn run-cursor []
   (let [^bytes bs (boring/encode customers opts)
         c (nav/source bs opts)
         rdr (Reader. bs)
@@ -59,14 +218,14 @@
                      (/ (alength bs) 1024.0)))
     (println (format "%-44s %10s %10s %8s" "" "nav" "decode" "ratio"))
 
-    (let [[a b] (ab #(nav/value (get-in c path))
+    (let [[a b] (ab-us #(nav/value (get-in c path))
                     #(get-in (do (.reset rdr bs) (.read rdr)) path)
                     200 30)]
       (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                        "get-in one leaf (heap)" a b (/ b a))))
 
     ;; count is read from the head, so it should not depend on size at all
-    (let [[a b] (ab #(count c)
+    (let [[a b] (ab-us #(count c)
                     #(count (do (.reset rdr bs) (.read rdr)))
                     200 30)]
       (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
@@ -74,7 +233,7 @@
 
     ;; Scanning every customer's :name -- the reducers case. Still beats a full
     ;; decode because the other five fields per record are never materialised.
-    (let [[a b] (ab #(reduce (fn [acc e] (+ acc (count (nav/value (get (val e) "name")))))
+    (let [[a b] (ab-us #(reduce (fn [acc e] (+ acc (count (nav/value (get (val e) "name")))))
                              0 c)
                     #(reduce-kv (fn [acc _ v] (+ acc (count (get v "name")))) 0
                                 (do (.reset rdr bs) (.read rdr)))
@@ -86,7 +245,7 @@
     (let [f (spit-bytes bs)
           [mc arena] (mmap/mmap-source f opts)
           ^java.lang.foreign.Arena arena arena]
-      (let [[a b] (ab #(nav/value (get-in mc path))
+      (let [[a b] (ab-us #(nav/value (get-in mc path))
                       #(get-in (do (.reset rdr bs) (.read rdr)) path)
                       200 30)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
@@ -101,12 +260,12 @@
           brdr (Reader. bbs)]
       (println (format "\nblob: one 1 MiB bytestring beside a small map\n"))
       (println (format "%-44s %10s %10s %8s" "" "nav" "decode" "ratio"))
-      (let [[a b] (ab #(nav/byte-span (get bc "data"))
+      (let [[a b] (ab-us #(nav/byte-span (get bc "data"))
                       #(count ^bytes (get (do (.reset brdr bbs) (.read brdr)) "data"))
                       50 20)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.0fx"
                          "locate the blob vs materialise it" a b (/ b a))))
-      (let [[a b] (ab #(nav/value (get-in bc ["meta" "id"]))
+      (let [[a b] (ab-us #(nav/value (get-in bc ["meta" "id"]))
                       #(get-in (do (.reset brdr bbs) (.read brdr)) ["meta" "id"])
                       50 20)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.0fx"
@@ -130,14 +289,14 @@
       (println (format "\nlog: %d events, %.1f KB as a CBOR sequence\n"
                        (count events) (/ (alength log-bs) 1024.0)))
       (println (format "%-44s %10s %10s %8s" "" "nav" "decode" "ratio"))
-      (let [[a b] (ab #(into [] xf (nav/items log-bs opts))
+      (let [[a b] (ab-us #(into [] xf (nav/items log-bs opts))
                       #(into [] (comp (filter (fn [e] (= "error" (get e "lvl"))))
                                       (map (fn [e] (get e "n"))))
                              (boring/decode-seq log-bs opts))
                       5 20)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                          "scan a log for matching events" a b (/ b a))))
-      (let [[a b] (ab #(reduce (fn [_ c] (reduced (nav/value (get c "n")))) nil
+      (let [[a b] (ab-us #(reduce (fn [_ c] (reduced (nav/value (get c "n")))) nil
                                (nav/items log-bs opts))
                       #(reduce (fn [_ e] (reduced (get e "n"))) nil
                                (boring/decode-seq log-bs opts))
@@ -158,3 +317,9 @@
     (println "nav wins by what it SKIPS and what it does not materialise. When")
     (println "you are going to touch nearly everything in a small item anyway,")
     (println "decode is the cheaper call.")))
+
+(defn -main [& args]
+  (let [only (set args)
+        run? (fn [k] (or (empty? only) (contains? only (name k))))]
+    (when (run? :skip) (run-skip))
+    (when (run? :cursor) (run-cursor))))
