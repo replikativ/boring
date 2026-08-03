@@ -518,14 +518,25 @@
   divides rather than re-multiplying the remaining shape. The product was
   checked against the payload length before the first call, which is what makes
   the indexing here total."
-  [flat typed? shape dim offset cnt]
-  (let [len (nth shape dim)]
-    (if (= dim (dec (count shape)))
-      (mapv (fn [i] (if typed? (aget flat (+ offset i)) (nth flat (+ offset i))))
-            (range len))
-      (let [sub (quot cnt len)]
-        (mapv (fn [i] (nest-dims flat typed? shape (inc dim) (+ offset (* i sub)) sub))
-              (range len))))))
+  [flat typed? shape total]
+  ;; ITERATIVE, deliberately -- see the note on Reader.nestDims. This recursed
+  ;; once per DIMENSION, and dimensions are a flat array that :max-depth never
+  ;; charged for, so a shallow 20 KB item declaring 20 000 dimensions raised a
+  ;; raw RangeError under Node with no ex-data.
+  (let [k (count shape)
+        inner (nth shape (dec k))
+        base (mapv (fn [g]
+                     (mapv (fn [i] (let [x (+ (* g inner) i)]
+                                     (if typed? (aget flat x) (nth flat x))))
+                           (range inner)))
+                   (range (quot total inner)))]
+    (loop [d (- k 2) level base]
+      (if (neg? d)
+        (nth level 0)
+        (let [len (nth shape d)]
+          (recur (dec d)
+                 (mapv (fn [o] (subvec level (* o len) (* (inc o) len)))
+                       (range (quot (count level) len)))))))))
 
 (defn- cbor-integer?
   "An integer as CBOR means it: a JS number with no fractional part, or a
@@ -893,7 +904,23 @@
            (when-not (and (vector? dims) (pos? (count dims)))
              (err :boring/bad-tag-content
                   "boring: tag 40 dimensions array must not be empty" {:tag 40}))
+           ;; The decoded value nests once per dimension, so the dimension
+           ;; COUNT is nesting and belongs to the same budget.
+           (when (> (+ (.-depth r) (count dims)) (.-maxDepth r))
+             (err :boring/max-depth-exceeded
+                  (str "boring: tag 40 with " (count dims) " dimensions nests deeper than "
+                       (.-maxDepth r))
+                  {:tag 40}))
            (let [shape (mapv (fn [d]
+                               ;; A BigInt is a CBOR integer but not a usable
+                               ;; dimension: `(reduce * 1 shape)` then mixes
+                               ;; BigInt with Number and escapes as a raw
+                               ;; TypeError, straight through the typed-error
+                               ;; contract.
+                               (when (= "bigint" (goog/typeOf d))
+                                 (err :boring/bad-tag-content
+                                      "boring: tag 40 dimension exceeds the largest array this platform can build"
+                                      {:tag 40}))
                                (when-not (cbor-integer? d)
                                  (err :boring/bad-tag-content
                                       "boring: tag 40 dimensions must be integers" {:tag 40}))
@@ -933,7 +960,7 @@
                  (dotimes [i rows]
                    (aset out i (.subarray flat (* i cols) (* (inc i) cols))))
                  out)
-               (nest-dims flat typed? shape 0 0 total)))))
+               (nest-dims flat typed? shape total)))))
 
     37 (let [bs (read! r)]
          (when-not (and (instance? js/Uint8Array bs) (= 16 (.-length bs)))

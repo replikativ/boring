@@ -1541,6 +1541,29 @@ public final class Reader {
     private static final clojure.lang.Keyword KW_TAG = clojure.lang.Keyword.intern("tag");
     private static final clojure.lang.Keyword KW_VALUE = clojure.lang.Keyword.intern("value");
 
+    /**
+     * A vector from a fully-populated array, valid at ANY length.
+     *
+     * `PersistentVector.adopt(Object[])` takes its argument as the vector's
+     * TAIL, so it is only correct through 32 elements. Past that the result is
+     * a vector with a plausible `count` whose root is null: `nth` throws
+     * NullPointerException below index 32 and returns the wrong element above
+     * it. Decoding SUCCEEDS and hands back a corrupt structure, which is worse
+     * than any rejection -- a caller has no way to notice.
+     *
+     * The array reader has always had the cutoff (see case 4). Two newer paths
+     * -- wide uint64 typed arrays and tag-40 reconstruction -- called `adopt`
+     * unconditionally, so this is the shared helper all three now use rather
+     * than a rule each site has to remember.
+     */
+    private static clojure.lang.IPersistentVector vectorFromArray(Object[] items) {
+        if (items.length == 0) return PersistentVector.EMPTY;
+        if (items.length <= 32) return PersistentVector.adopt(items);
+        ITransientCollection tv = PersistentVector.EMPTY.asTransient();
+        for (Object o : items) tv = tv.conj(o);
+        return (clojure.lang.IPersistentVector) tv.persistent();
+    }
+
     /** 10^e for the small e RFC 9581's decimal scale factors use. */
     private static long pow10(int e) {
         long r = 1;
@@ -1573,17 +1596,37 @@ public final class Reader {
      *  each level divides rather than re-multiplying the remaining shape. The
      *  product was range-checked against the payload length before the first
      *  call, which is what makes the indexing here total. */
-    private static Object nestDims(Object flat, int[] shape, int dim, int offset, int count) {
-        int len = shape[dim];
-        Object[] out = new Object[len];
-        if (dim == shape.length - 1) {
-            for (int i = 0; i < len; i++) out[i] = elementAt(flat, offset + i);
-        } else {
-            int sub = count / len;
-            for (int i = 0; i < len; i++)
-                out[i] = nestDims(flat, shape, dim + 1, offset + i * sub, sub);
+    private static Object nestDims(Object flat, int[] shape, int total) {
+        // ITERATIVE, deliberately. This recursed once per DIMENSION, and the
+        // dimensions are a flat array, so :max-depth never charged for them: a
+        // structurally shallow 20 KB item declaring 20 000 dimensions of 1 blew
+        // the host stack on both platforms, with no ex-data. RFC 8746 does not
+        // bound dimensionality, so the count cannot just be capped at some
+        // arbitrary number -- it has to be built without recursion.
+        //
+        // Necessary but not sufficient: the RESULT is still nested as deeply as
+        // there are dimensions, so `=` or `hash` on it would overflow later in
+        // the CALLER. The dimension count is charged against :max-depth at the
+        // call site for that, which is what the budget is for.
+        int k = shape.length;
+        int inner = shape[k - 1];
+        Object[] level = new Object[total / inner];
+        for (int g = 0; g < level.length; g++) {
+            Object[] row = new Object[inner];
+            for (int i = 0; i < inner; i++) row[i] = elementAt(flat, g * inner + i);
+            level[g] = vectorFromArray(row);
         }
-        return PersistentVector.adopt(out);
+        for (int d = k - 2; d >= 0; d--) {
+            int len = shape[d];
+            Object[] next = new Object[level.length / len];
+            for (int o = 0; o < next.length; o++) {
+                Object[] grp = new Object[len];
+                System.arraycopy(level, o * len, grp, 0, len);
+                next[o] = vectorFromArray(grp);
+            }
+            level = next;
+        }
+        return level[0];
     }
 
     private static java.math.BigInteger integerContent(Object o, int tag) {
@@ -1749,7 +1792,7 @@ public final class Reader {
                         : clojure.lang.BigInt.fromBigInteger(
                               new java.math.BigInteger(Long.toUnsignedString(u)));
                 }
-                return PersistentVector.adopt(w); }
+                return vectorFromArray(w); }
             case 75: {                              // sint64 BE
                 long[] a = new long[n];
                 for (int i = 0; i < n; i++) a[i] = (long) LONG_BE.get(b, off + (i << 3));
@@ -2505,13 +2548,26 @@ public final class Reader {
                 // valid tag around invalid content, which is the limitation
                 // that document already names.
                 int nd = dims.size();
+                // The decoded value nests once per dimension, so the dimension
+                // COUNT is nesting and belongs to the same budget. Without this
+                // a flat dims array bought unbounded nesting for free, and a
+                // 20 KB item declaring 20 000 dimensions blew the host stack.
+                if (depth + nd > maxDepth)
+                    throw Err.of("max-depth-exceeded",
+                        "boring: tag 40 with " + nd + " dimensions nests deeper than "
+                        + maxDepth, "tag", 40L, "depth", (long) nd);
                 int[] shape = new int[nd];
                 long total = 1;
                 for (int i = 0; i < nd; i++) {
                     Object d = dims.get(i);
                     if (!(d instanceof Number) || d instanceof Double || d instanceof Float
                         || (d instanceof java.math.BigInteger
-                            && ((java.math.BigInteger) d).bitLength() > 31))
+                            && ((java.math.BigInteger) d).bitLength() > 31)
+                        // clojure.lang.BigInt, NOT just BigInteger: a CBOR
+                        // bignum decodes to the former, so checking only the
+                        // latter let longValue() narrow 2^64+1 to 1.
+                        || (d instanceof clojure.lang.BigInt
+                            && ((clojure.lang.BigInt) d).bitLength() > 31))
                         throw Err.of("bad-tag-content",
                             "boring: tag 40 dimensions must be integers", "tag", 40L);
                     long dv = ((Number) d).longValue();
@@ -2570,7 +2626,7 @@ public final class Reader {
                         System.arraycopy(flat, r * shape[1], ((Object[]) out)[r], 0, shape[1]);
                     return out;
                 }
-                return nestDims(flat, shape, 0, 0, (int) total);
+                return nestDims(flat, shape, (int) total);
             }
             case 37: {                                       // UUID
                 Object v = read();

@@ -978,6 +978,29 @@
                      (:type (ex-data e))))]
         (is (= :boring/truncated-input r) hex)))))
 
+(deftest tag-40-dimension-count-cannot-blow-the-host-stack
+  (testing "tag 40's dimensions are a FLAT array, so :max-depth never charged
+            for them -- while the decoded value nests once per dimension. A
+            structurally shallow 20 KB item declaring 20 000 dimensions of 1
+            therefore recursed 20 000 deep in the reconstructor: StackOverflowError
+            on the JVM, RangeError under Node, neither carrying ex-data, both
+            contradicting doc/SECURITY.md's typed-failure guarantee.
+
+            Rebuilt iteratively AND charged against :max-depth -- iteration alone
+            is not enough, because the result would still be 20 000 deep and
+            would overflow in the caller on `=` or `hash`."
+    ;; d8 28 82 99 4e 20 <20000 x 01> 81 07
+    (let [hex (str "d82882994e20" (apply str (repeat 20000 "01")) "8107")
+          r (try {:ok (boring/decode (c/hex->bytes hex))}
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                   (if (:type (ex-data e)) {:typed (:type (ex-data e))} {:untyped (str e)}))
+                 #?(:clj (catch Throwable e {:raw (.getSimpleName (class e))})))]
+      (is (= {:typed :boring/max-depth-exceeded} r)
+          (str "expected a typed depth error, got " (pr-str r)))))
+  (testing "and dimensionality the RFC allows still decodes"
+    (is (= [[[1 2] [3 4]] [[5 6] [7 8]]]
+           (:ok (try-decode "d8288283020202880102030405060708" interop-opts))))))
+
 (deftest rfc-8949-appendix-f1-is-rejected-in-full
   (testing "every byte sequence RFC 8949 Appendix F.1 names as not well-formed
             must raise a typed error, on both platforms.
