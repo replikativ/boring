@@ -417,10 +417,17 @@
               r (org.replikativ.boring.Reader. ^bytes bs)
               _ (set! (.-maxDepth r) (int md))
               skipped? (try (.skipFrom r 0) true (catch Exception _ false))]
-          (is (= decoded? skipped?)
+          ;; ONE-DIRECTIONAL, deliberately. Exact parity was the wrong
+          ;; specification and asserting it sent me chasing read's
+          ;; idiosyncrasies -- an empty array costs no depth but an empty map
+          ;; does, and `readTagged(258)` parses the set's array head inline
+          ;; without charging for it. What actually matters is that navigation
+          ;; never REFUSES a document that decodes: skip may be laxer, never
+          ;; stricter.
+          (is (or (not decoded?) skipped?)
               (str "depth " d ", max-depth " md
                    ": decode=" decoded? " skip=" skipped?
-                   " -- the two paths must agree on the limit")))))))
+                   " -- skip must not reject what read accepts")))))))
 
 (deftest empty-containers-get-no-phantom-anchor
   (testing "`((0 - 1) / stride) + 1` is 1 in Java, so an empty container claimed
@@ -436,12 +443,156 @@
             o (assoc opts :index stride :index-min 0)
             idx (boring/build-index (boring/encode v o) o)
             c (nav/source (boring/encode-indexed v o) opts)]
-        (when idx
-          (doseq [[cnt slot] (map vector (seq ^ints (:counts idx)) (:slots idx))]
-            (is (= (if (zero? cnt) 0 (inc (quot (dec (long cnt)) (long stride))))
-                   (count slot))
-                (str "stride " stride ": a container of " cnt
-                     " entries must have exactly ceil(n/stride) anchors"))))
+        (is (some? idx) "the index must be BUILT, not silently refused -- a
+                         `when` here made every assertion below vanish")
+        (doseq [[cnt slot] (map vector (seq ^ints (:counts idx)) (:slots idx))]
+          (is (= (if (zero? cnt) 0 (inc (quot (dec (long cnt)) (long stride))))
+                 (count slot))
+              (str "stride " stride ": a container of " cnt
+                   " entries must have exactly ceil(n/stride) anchors")))
         (is (= v (nav/value c)) (str "stride " stride ": and the value still reads back"))
         (is (= {} (nav/value (get c "empty-map"))))
+        ;; LOOKING INSIDE is the case the first version missed: it only
+        ;; realised the empty map, so it never reached the binary search, which
+        ;; assumed at least one anchor and threw straight at the caller.
+        (is (nil? (get (get c "empty-map") "missing"))
+            (str "stride " stride ": a miss inside an indexed EMPTY map must be
+                  nil, not an exception"))
+        (is (nil? (nth (get c "empty-vec") 0 nil)))
         (is (= 5 (nav/value (get-in c ["real" "k05"]))))))))
+
+;; ------------------------------------------------- closing the coverage gaps
+;;
+;; A verification review of the fixes above found that several of those tests
+;; were falsely reassuring. Each gap it named is closed here.
+
+(deftest sortedness-holds-through-the-WRITER-capture-too
+  (testing "the sortedness tests above go through `encode-indexed`/`build-index`,
+            which is the Clojure byte WALK. The Java writer capture is a second
+            implementation of the same rule and was only covered transitively.
+            `write-seq!` is the path that uses it."
+    (dotimes [_ 30]
+      (let [ks (shuffle (mapv #(format "k%03d" %) (range 20)))
+            m (reduce (fn [^java.util.LinkedHashMap a k] (doto a (.put k (subs k 1))))
+                      (java.util.LinkedHashMap.) ks)
+            w (boring/writer 65536 opts)
+            out (ByteArrayOutputStream.)]
+        (boring/write-seq! w [m] out (assoc opts :index 16 :index-min 16))
+        (let [c (nth (nav/items (.toByteArray out) opts) 0)]
+          (doseq [k ks]
+            (is (= (subs k 1) (some-> (get c k) nav/value))
+                (str "writer capture lost key " k " in order " (pr-str ks)))))))))
+
+(deftest depth-parity-covers-empty-containers
+  (testing "the depth-parity test's generator never produced an EMPTY container,
+            which is exactly where the two paths diverged: `read` returns the
+            shared empty vector BEFORE charging depth, so charging it in `skip`
+            made skipping stricter than decoding. An ordinary #{} is tag 258
+            around an empty array -- the smallest value that shows it."
+    (doseq [v [#{} [] {} #{#{}} [[]] {"a" {}} (into (sorted-map) {})
+               #{[] {}} [#{} {} []]]
+            md [1 2 3 4 1024]]
+      (let [bs (boring/encode v opts)
+            decoded? (try (boring/decode bs (assoc opts :max-depth md)) true
+                          (catch Exception _ false))
+            r (org.replikativ.boring.Reader. ^bytes bs)
+            _ (set! (.-maxDepth r) (int md))
+            skipped? (try (.skipFrom r 0) true (catch Exception _ false))]
+        (is (or (not decoded?) skipped?)
+            (str (pr-str v) " at max-depth " md
+                 ": decode=" decoded? " skip=" skipped?
+                 " -- skip must not reject what read accepts"))))))
+
+(deftest canonical-encode-fallback-applies-to-keys-and-recurses-safely
+  (testing "keys and set elements are pre-encoded in a scratch writer, which did
+            not inherit :encode-fallback -- so the option silently did not apply
+            exactly there. Inheriting it then opened a second hole: the scratch
+            did not inherit the RE-ENTRY GUARD, so a fallback whose result still
+            contains the unsupported value recursed until the stack went."
+    (let [o {:profile :canonical :encode-fallback (fn [_] "fell-back")}
+          m {(Object.) 1 "ok" 2}]
+      (is (= {"fell-back" 1 "ok" 2} (boring/decode (boring/encode m o) o))
+          "the fallback must apply to a KEY under :canonical"))
+    (testing "and a fallback that returns the unsupported value again must raise
+              the typed error, not StackOverflowError"
+      (let [bad (Object.)
+            o {:profile :canonical :encode-fallback (fn [_] {bad 1})}]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (boring/encode {bad 1} o)))))))
+
+(deftest size-mismatch-is-caught-on-every-container-path
+  (testing "the first version of this check covered AbstractCollection only. The
+            ordinary non-indexed map path, the record path, and the canonical
+            staging arrays had none -- and canonical staging threw a raw
+            ArrayIndexOutOfBoundsException from an array sized by size()."
+    (let [over (fn [] (proxy [java.util.AbstractMap] []
+                        (size [] 1)
+                        (entrySet []
+                          (java.util.LinkedHashSet.
+                           [(java.util.AbstractMap$SimpleEntry. "a" 1)
+                            (java.util.AbstractMap$SimpleEntry. "b" 2)]))))
+          under (fn [] (proxy [java.util.AbstractMap] []
+                         (size [] 2)
+                         (entrySet []
+                           (java.util.LinkedHashSet.
+                            [(java.util.AbstractMap$SimpleEntry. "a" 1)]))))]
+      (doseq [[label o] [["plain" opts]
+                         ["indexed" (assoc opts :index 1 :index-min 1)]
+                         ["canonical" {:profile :canonical}]]
+              [what mk] [["over-yield" over] ["under-yield" under]]]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reported \d+ entries"
+                              (boring/encode (mk) o))
+            (str label "/" what " must raise the typed mismatch error"))))))
+
+(deftest a-semantically-lying-index-is-refused
+  (testing "structural validation is not enough on its own: anchors can ascend,
+            sit in range and still not be entry boundaries. Three 4-byte items
+            live at 0, 4 and 8; anchors of 4, 8, 9 passed every structural check
+            and made `nth` return the NEIGHBOURING value -- a silent wrong
+            answer, which is the one outcome the index may never produce.
+
+            Closed by two O(1) reads off the container's own head: the node must
+            describe a container that is really there with the count it claims,
+            and its first anchor must be that container's first entry."
+    (let [w (boring/writer 65536 opts)
+          out (ByteArrayOutputStream.)
+          vs [{"x" 1} {"x" 2} {"x" 3}]]
+      (doseq [v vs] (boring/write-to! w v out))
+      (let [dl (.size out)]
+        (boring/write-to! w (boring.data/unknown-record
+                             boring/index-name
+                             [1 (int-array [-1]) (int-array [3])
+                              ;; deltas -> absolutes 4, 8, 9: ascending, in
+                              ;; range, and wrong
+                              [(byte-array (map unchecked-byte [4 4 1]))] [false]
+                              (byte-array (map unchecked-byte
+                                               [0 0 0 0 0 0 (bit-shift-right dl 8) dl]))])
+                          out)
+        (let [bs (.toByteArray out)
+              seen (into [] (map nav/value) (nav/items bs opts))]
+          (is (= 4 (count seen)) "refused, so it scans and the frame shows as data")
+          (is (= [1 2 3] (mapv #(get % "x") (filter map? seen)))
+              "and every item reads back as itself, not its neighbour"))))))
+
+(deftest an-unbounded-tag-chain-cannot-overflow-the-stack
+  (testing "the reason skipping needed a bound at all. `c0 c0 c0 ... 00` is
+            legal CBOR; recursing once per tag blew the stack, which is the DoS
+            maxDepth exists to prevent and the one nesting it did not cover.
+            Bounded by CHAIN LENGTH and consumed iteratively, so deep chains
+            cost no stack at all -- and unlike charging tags to the depth
+            budget, this can only make skip laxer than read, never stricter."
+    (let [chain (fn [n] (byte-array (concat (repeat n (unchecked-byte 0xC0)) [(byte 0)])))]
+      (testing "a chain past the limit is refused, not crashed"
+        (let [r (org.replikativ.boring.Reader. ^bytes (chain 40))]
+          (set! (.-maxDepth r) (int 4))
+          (is (thrown? clojure.lang.ExceptionInfo (.skipFrom r 0)))))
+      (testing "and a chain far deeper than any stack is still a typed error"
+        (let [r (org.replikativ.boring.Reader. ^bytes (chain 200000))]
+          (set! (.-maxDepth r) (int 1024))
+          (is (thrown? clojure.lang.ExceptionInfo (.skipFrom r 0))
+              "must be the depth error, never StackOverflowError")))
+      (testing "while a chain within the limit still skips correctly"
+        (let [^bytes bs (chain 3)
+              r (org.replikativ.boring.Reader. bs)]
+          (set! (.-maxDepth r) (int 8))
+          (is (= (alength bs) (.skipFrom r 0))))))))

@@ -204,7 +204,13 @@
         ^bytes probe (probe-for nav k)
         idx (.idx nav)
         ns (node-slot nav off)]
-    (if (neg? ns)
+    ;; A node with NO anchors means nothing to jump to -- walk instead. Empty
+    ;; containers legitimately produce one (`:index-min 0` will index a `{}`),
+    ;; and the sorted branch below assumes at least one anchor: with m=0 its
+    ;; `(max 0 (min (dec m) hi))` still yields 0 and `aget` threw straight at
+    ;; the caller of `get`. Cheaper to notice here than to special-case both
+    ;; branches, and it also covers any future node that turns out empty.
+    (if (or (neg? ns) (zero? (alength ^ints (nth (:slots idx) ns))))
       (scan-map r (.headEndAt r off) n probe)
       (let [^ints slot (nth (:slots idx) ns)
             stride (long (:stride idx))
@@ -503,6 +509,22 @@
                            ^ints a (nth abs-slots i)
                            want (if (zero? cnt) 0 (inc (quot (dec cnt) st)))]
                        (and (= (alength a) want)
+                            ;; The node must describe a container that IS THERE
+                            ;; and has the entry count it claims, and its first
+                            ;; anchor must be that container's first entry.
+                            ;; All O(1) -- read from the head -- and together
+                            ;; they reject an index whose offsets are internally
+                            ;; tidy but point at the wrong places, which passed
+                            ;; every earlier check and silently returned a
+                            ;; neighbouring value.
+                            (if (neg? c)
+                              ;; the sequence node: its first item is byte 0
+                              (or (zero? want) (zero? (aget a 0)))
+                              (and (< c ptr)
+                                   (#{4 5} (.majorAt r c))
+                                   (= cnt (.headArgAt r c))
+                                   (or (zero? want)
+                                       (= (long (aget a 0)) (.headEndAt r c)))))
                             ;; anchors ascend, sit inside the data section, and
                             ;; for a real container start after its own header
                             (loop [k 0 prev -1]

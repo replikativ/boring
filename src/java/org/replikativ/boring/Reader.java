@@ -326,39 +326,80 @@ public final class Reader {
                 pos += n;
                 return;
             }
+            // DEPTH ACCOUNTING MIRRORS `read`, asymmetry and all.
+            //
+            // An empty definite ARRAY costs no depth, because `read` returns the
+            // shared empty vector before calling enter() -- an artifact of that
+            // allocation optimisation, but it is the behaviour callers see. An
+            // empty definite MAP does cost one, because read's map branch calls
+            // enter() unconditionally.
+            //
+            // Matching read exactly is the whole requirement: skip must reject
+            // neither more nor less. Charging for both made skip stricter, so an
+            // ordinary `#{}` -- tag 258 around an empty array -- was refused at
+            // maxDepth 1 while decode accepted it. Charging for neither made it
+            // laxer, and `(sorted-map)` (tag 27 around [name, empty map])
+            // skipped at a depth where decode refused. Only this shape agrees.
             case 4: {
+                if (info == 31) {
+                    enter();
+                    try { while (!consumeBreak()) skipStructural(); } finally { exit(); }
+                    return;
+                }
+                int n = checkCount(arg(info), 1);
+                if (n == 0) return;
                 enter();
-                try {
-                    if (info == 31) { while (!consumeBreak()) skipStructural(); }
-                    else { int n = checkCount(arg(info), 1);
-                           for (int i = 0; i < n; i++) skipStructural(); }
-                } finally { exit(); }
+                try { for (int i = 0; i < n; i++) skipStructural(); } finally { exit(); }
                 return;
             }
             case 5: {
-                enter();
-                try {
-                    if (info == 31) {
-                        while (!consumeBreak()) { skipStructural(); skipStructural(); }
-                    } else {
-                        int n = checkCount(arg(info), 2);
-                        for (int i = 0; i < n; i++) { skipStructural(); skipStructural(); }
-                    }
-                } finally { exit(); }
+                if (info == 31) {
+                    enter();
+                    try { while (!consumeBreak()) { skipStructural(); skipStructural(); } }
+                    finally { exit(); }
+                    return;
+                }
+                int n = checkCount(arg(info), 2);
+                enter();                        // even when empty -- read does
+                try { for (int i = 0; i < n; i++) { skipStructural(); skipStructural(); } }
+                finally { exit(); }
                 return;
             }
-            case 6:
-                // A tag counts toward the depth budget. Without this, tag
-                // recursion was the one nesting that maxDepth did not bound --
-                // `c0 c0 c0 ... 00` skipped happily with maxDepth 1 and blew
-                // the stack with enough of them, turning a documented SECURITY
-                // limit into one that holds for containers only. `read()`
-                // already charges for tags; skipping has to agree, or the
-                // cheap path is the way around the expensive path's bound.
+            case 6: {
+                // A TAG CHAIN IS CONSUMED ITERATIVELY, and bounded by its
+                // length. `c0 c0 c0 ... 00` is legal CBOR, and recursing once
+                // per tag overflowed the stack -- the DoS maxDepth exists to
+                // prevent, and the one nesting it did not bound.
+                //
+                // The obvious fix, charging each tag to the depth budget like
+                // `read` does, was WRONG and the property test caught it:
+                // several tag readers parse their payload's head inline without
+                // calling enter() -- `readTagged(258)` reads the set's array
+                // that way -- so read charges for the tag but not the container
+                // under it, while a mirrored skip charged for both. `#{}` was
+                // then refused at a depth decode accepted, and navigation
+                // rejects documents that decode fine. Mirroring read's
+                // accounting case by case is not maintainable; there are as
+                // many rules as there are tag readers.
+                //
+                // Bounding the chain instead is safe by construction: it can
+                // only ever make skip LAXER than read, never stricter, so a
+                // decodable document always skips. And it removes the stack
+                // recursion outright rather than capping it.
                 arg(info);
-                enter();
-                try { skipStructural(); } finally { exit(); }
+                int chain = 1;
+                while (true) {
+                    int h2 = u8();
+                    if ((h2 >>> 5) != 6) { pos--; break; }    // not a tag: put it back
+                    if (++chain > maxDepth)
+                        throw Err.of("max-depth-exceeded",
+                            "boring: tag chain longer than maxDepth (" + maxDepth + ")",
+                            "max-depth", (long) maxDepth);
+                    arg(h2 & 0x1F);
+                }
+                skipStructural();
                 return;
+            }
             default:                       // major 7: arg() covers the width
                 if (info == 31)
                     throw Err.of("unexpected-break",

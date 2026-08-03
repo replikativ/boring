@@ -1120,8 +1120,10 @@ public final class Writer {
         int a = 0, countdown = 1;
         // Every adjacent pair, for the reason spelled out in writeMapValue: an
         // anchor sample does not establish that the container is ordered.
+        int seen = 0;
         for (clojure.lang.ISeq s = clojure.lang.RT.seq(fields); s != null; s = s.next()) {
             Map.Entry e = (Map.Entry) s.first();
+            if (++seen > n) countMismatch(n, seen);
             if (anchors != null && --countdown == 0) {
                 anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
@@ -1134,6 +1136,7 @@ public final class Writer {
             }
             writeValue(e.getValue());
         }
+        if (seen != n) countMismatch(n, seen);
         if (anchors != null) fillNode(slot, start, n, anchors, sorted);
     }
 
@@ -1158,12 +1161,15 @@ public final class Writer {
         int start = pos;
         head(MAP, n);
 
-        if (!indexing(n)) {                     // the ordinary path, untouched
+        if (!indexing(n)) {                     // the ordinary path
+            int seen = 0;
             for (Object o : m.entrySet()) {
                 Map.Entry e = (Map.Entry) o;
+                if (++seen > n) countMismatch(n, seen);
                 writeValue(e.getKey());
                 writeValue(e.getValue());
             }
+            if (seen != n) countMismatch(n, seen);
             return;
         }
 
@@ -1390,12 +1396,14 @@ public final class Writer {
         Writer scratch = canonicalSubWriter();
         int i = 0;
         for (Object o : s) {
+            if (i >= n) countMismatch(n, i + 1);    // staging arrays are size()d
             scratch.reset();
             scratch.writeValue(o);
             encoded[i] = scratch.toByteArray();
             items[i] = o;
             i++;
         }
+        if (i != n) countMismatch(n, i);
 
         Integer[] order = new Integer[n];
         for (int j = 0; j < n; j++) order[j] = j;
@@ -1455,7 +1463,11 @@ public final class Writer {
         scratch.permitReservedSimpleValues = this.permitReservedSimpleValues;
         scratch.inclMetadata = this.inclMetadata;
         scratch.maxDepth = this.maxDepth;
-        scratch.depthOffset = this.depth;
+        // ACCUMULATE the parent's own offset. A scratch writer made by a scratch
+        // writer -- a canonical map nested inside a canonical map key -- reset
+        // the budget to the inner parent's local depth, so nesting through key
+        // position got a fresh allowance each time.
+        scratch.depthOffset = this.depth + this.depthOffset;
         // The claim above is "EVERY behaviour-affecting option is inherited",
         // and this one was not: an :encode-fallback configured to rescue an
         // unsupported value worked everywhere except in a map KEY or a set
@@ -1463,6 +1475,14 @@ public final class Writer {
         // option silently did not apply exactly where the document was hardest
         // to fix by hand.
         scratch.encodeFallback = this.encodeFallback;
+        // And the RE-ENTRY GUARD with it. `inFallback` is what stops a fallback
+        // whose result still contains the unsupported value from recursing
+        // forever; copying the fallback without it meant every hop into a
+        // scratch writer handed back a fresh, un-guarded budget. A fallback
+        // returning a map keyed by the very object it was called for then
+        // overflowed the stack instead of raising the typed unsupported-value
+        // error -- a failure introduced by inheriting the fallback at all.
+        scratch.inFallback = this.inFallback;
         // The index fields are the one group DELIBERATELY not inherited, and
         // this is checked rather than commented because getting it wrong is
         // silent: the scratch writer encodes keys into its own buffer, so any
@@ -1487,6 +1507,11 @@ public final class Writer {
         int i = 0;
         for (Object o : m.entrySet()) {
             Map.Entry e = (Map.Entry) o;
+            // Checked BEFORE indexing the staging arrays, which are sized from
+            // size(): a map yielding more entries than it reported threw a raw
+            // ArrayIndexOutOfBoundsException from here rather than the typed
+            // error the other container paths give.
+            if (i >= n) countMismatch(n, i + 1);
             scratch.reset();
             scratch.writeValue(e.getKey());
             encodedKeys[i] = scratch.toByteArray();
@@ -1494,6 +1519,7 @@ public final class Writer {
             vals[i] = e.getValue();
             i++;
         }
+        if (i != n) countMismatch(n, i);
 
         Integer[] order = new Integer[n];
         for (int j = 0; j < n; j++) order[j] = j;
