@@ -391,3 +391,33 @@
           "the 3-arity must match passing the writer's own opts explicitly")
       (is (= vs (mapv nav/value (seq (nav/items (.toByteArray a) {:stringref false}))))
           "and the result must be navigable"))))
+
+(deftest skipping-and-reading-agree-about-depth
+  (testing "charging tags to the depth budget in `skipStructural` closed a hole
+            -- `read` already charged for them, so skipping was the more
+            permissive path and routed around a SECURITY bound. The risk in
+            fixing it is the mirror image: skip must not now reject anything
+            `read` accepts, because navigation skips constantly.
+
+            Tag-heavy on purpose: a set is tag 258, a sorted-map tag 27, so this
+            nests four shapes that exercise both tagged and untagged levels."
+    (let [nest (fn nest [d]
+                 (reduce (fn [acc i]
+                           (case (int (mod i 4))
+                             0 #{acc}
+                             1 (into (sorted-map) {"k" acc})
+                             2 [acc]
+                             3 {"m" acc}))
+                         :leaf (range d)))]
+      (doseq [d [1 2 4 8 16 32 64]
+              md [4 16 64 1024]]
+        (let [bs (boring/encode (nest d) opts)
+              decoded? (try (boring/decode bs (assoc opts :max-depth md)) true
+                            (catch Exception _ false))
+              r (org.replikativ.boring.Reader. ^bytes bs)
+              _ (set! (.-maxDepth r) (int md))
+              skipped? (try (.skipFrom r 0) true (catch Exception _ false))]
+          (is (= decoded? skipped?)
+              (str "depth " d ", max-depth " md
+                   ": decode=" decoded? " skip=" skipped?
+                   " -- the two paths must agree on the limit")))))))
