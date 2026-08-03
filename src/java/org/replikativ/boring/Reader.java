@@ -25,11 +25,12 @@ import java.nio.charset.StandardCharsets;
  *
  * <p>That branch is not a micro-optimisation. Reading everything through a
  * MemorySegment was implemented and measured: decode ran 14-50% slower across
- * every payload, and used ~2.5x the stack per recursive level. The
- * microbenchmark that predicted parity (bench/java/FfmProbe.java) times tight
- * loops with a constant layout, where the JIT intrinsifies everything; a
- * recursive, branchy decoder does not get that. With the branch, decode is
- * back to its byte[] numbers and the segment path still exists.
+ * every payload, and used ~2.5x the stack per recursive level. A
+ * microbenchmark of the same access pattern predicted PARITY, because it times
+ * a tight loop over a constant layout where the JIT hoists the bounds and
+ * liveness checks out; a recursive, branchy decoder does not get that. With
+ * the branch, decode is back to its byte[] numbers and the segment path still
+ * exists.
  *
  * <p><b>No FFM type is named here</b>, deliberately. Naming one would force
  * {@code --release 22} and emit a class file JDK 21 cannot load, stranding the
@@ -475,11 +476,12 @@ public final class Reader {
     //
     // Going through the segment unconditionally was measured and rejected:
     // decode ran 14-50% slower across every payload and used ~2.5x the stack
-    // per recursive level. The microbenchmark that predicted parity
-    // (bench/java/FfmProbe.java) measures tight loops with a constant layout,
-    // where the JIT intrinsifies everything; the real decoder is recursive and
-    // branchy and does not get that. `arr` is a loop-invariant null check that
-    // predicts perfectly, and it keeps the byte[] path on plain array loads.
+    // per recursive level. A microbenchmark of the same access pattern
+    // predicted parity -- it measures a tight loop over a constant layout,
+    // where the JIT hoists the per-access checks out, and the real decoder is
+    // recursive and branchy and does not get that. `arr` is a loop-invariant
+    // null check that predicts perfectly, and it keeps the byte[] path on
+    // plain array loads.
 
     /** Unsigned byte at an absolute offset. */
     private int b(long p) {

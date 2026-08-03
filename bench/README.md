@@ -33,7 +33,6 @@ Three kinds of thing live in this directory:
 | `alloc.clj` | bytes allocated per op via `ThreadMXBean` — the axis timing benchmarks miss |
 | `mmap.clj` | everything mmap, in three sections (`read`/`write`/`compress`): selective decode beats a `pread` per item 2.3x; mmap **loses** to a buffered stream for append; and the chunked-zstd curve that picks a chunk size. `clojure -M:bench -m mmap write` runs one section |
 | `nav.clj` | navigation, in two sections (`skip`/`cursor`): how cheap it is to walk past a value without decoding it — the inner loop — and then what the shipped `boring.nav` api delivers against decode-then-`get-in`. Records a NEGATIVE result too: early-exit on the first item of a log is *slower* than `decode-seq`, which is lazy already |
-| `java/FfmProbe.java` | standalone (no classpath) probe: `byte[]`+VarHandle vs heap vs native `MemorySegment`, and the big-endian intrinsification cliff. Run it on more than one JIT — the finding differs between C2 and Graal. See "Why the hot path is `byte[]`" in `doc/PERFORMANCE.md` |
 | `fuzz.clj` | mutation fuzzer over valid encodings. Found 154 untyped failures per 60k mutants on its first run. Run it after any decoder change. |
 | `prof.clj` | clj-async-profiler driver for the JVM decode loop |
 | `large.clj` | MB-scale payloads and streaming throughput, with a bounded-memory check |

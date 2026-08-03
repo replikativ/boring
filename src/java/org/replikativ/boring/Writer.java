@@ -27,8 +27,11 @@ import java.util.Set;
  * reasons other than raw scalar speed: no --enable-native-access, JDK 9+
  * rather than 22+, endian-neutrality without a manual swap, and an encode path
  * that already measures 0 bytes/op allocated. Graal additionally penalises
- * native-segment WRITES 1.6x. bench/java/FfmProbe.java reproduces all of it;
- * doc/PERFORMANCE.md has the tables and the decode-side caveat.
+ * native-segment WRITES 1.6x. doc/PERFORMANCE.md has the tables, and the
+ * caveat that matters more than any of them: those figures come from a tight
+ * loop over a constant layout, where the JIT hoists the bounds and liveness
+ * checks out. A recursive decoder does not get that, and measured 14-50%
+ * slower when it was actually built that way.
  *
  * This class comment used to end "prototype scope: bignums, ratios, instants,
  * typed arrays and the tag registry are not here yet." All of those ship. See

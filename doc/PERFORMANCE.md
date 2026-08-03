@@ -172,12 +172,14 @@ than assumed, because the first attempt got it wrong.
 
 ### The microbenchmark lied
 
-`bench/java/FfmProbe.java` times the access pattern a CBOR codec has: a header
-byte then an unaligned scalar. It reports a native segment at parity with
-`byte[]` — *provided* you never use `withOrder(BIG_ENDIAN)`, which costs 4.1×
-on stock HotSpot by declining to intrinsify. Access in native order and
+A microbenchmark of the access pattern a CBOR codec has — a header byte then an
+unaligned scalar — reports a native segment at **parity** with `byte[]`,
+provided you never use `withOrder(BIG_ENDIAN)`. That layout costs 4.1× on stock
+HotSpot by declining to intrinsify; access in native order and
 `Long.reverseBytes` (a bswap intrinsic, byte-identical output) and the penalty
-vanishes. `byteArrayViewVarHandle`, by contrast, is endian-neutral.
+vanishes. `byteArrayViewVarHandle`, by contrast, is endian-neutral. **That
+endian rule still holds and `SegmentSource` depends on it** — it is the one
+result from that probe that survived.
 
 So a segment-based reader was built. It cost **14–50% on decode** and ~2.5× the
 stack per recursive level — enough that `maxDepth`'s 1024 default rose *above*
@@ -186,9 +188,14 @@ the real stack limit and the depth cap silently stopped being a cap.
 `clj-async-profiler` said why: ~25% of samples in `checkValidStateRaw`,
 `checkIndex`, `checkSegment`, `checkBounds` — per-access bounds and liveness
 checks. A tight loop over a constant layout lets the JIT hoist all of it, which
-is exactly what `FfmProbe` measures. A recursive, branchy decoder does not.
-**A microbenchmark of an access pattern is not a benchmark of a decoder built
-on it.**
+is exactly what the microbenchmark measured. A recursive, branchy decoder does
+not. **A microbenchmark of an access pattern is not a benchmark of a decoder
+built on it.**
+
+The probe itself is not in the repo. Its headline number was withdrawn, and a
+probe that reproduces a withdrawn conclusion is worse than no probe: someone
+runs it, sees parity, and re-opens a settled question. What survived is written
+down here and in `SegmentSource`, which is where it is load-bearing.
 
 `ByteBuffer` is the JDK-9-compatible alternative and is worse: it ties `byte[]`
 on sequential scans but runs **2.29×** on the data-dependent walk a head parser
