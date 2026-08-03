@@ -1,18 +1,20 @@
 (ns boring.seq-index-test
-  "The sequence offset index (tag 39651) is an OPTIMISATION. Every test here
+  "The sequence and container index (tag 27, name `boring/index`) is an OPTIMISATION. Every test here
   exists to hold that line: whatever happens to the index, the answer must not
   change, only the speed.
 
   A sealed sequence ends with an 8-byte byte string -- always `0x48` plus 8 --
   which is where the index lives, because CBOR cannot be parsed backwards. That
   pointer doubles as the data-section length, so a reader that seeks there and
-  does not find tag 39651 knows the index is stale and scans instead.
+  does not find a tag-27 frame named `boring/index` knows the index is stale
+  and scans instead.
 
   Nothing here is outside CBOR. The trailing 9 bytes are an ordinary byte
   string, not a magic trailer, so the file stays a valid CBOR sequence."
   (:require [clojure.test :refer [deftest is testing]]
             [boring.core :as boring]
-            [boring.nav :as nav])
+            [boring.nav :as nav]
+            [boring.data])
   (:import (java.io ByteArrayOutputStream)))
 
 (def opts {:stringref false})
@@ -52,14 +54,15 @@
       (is (nil? (nth (nav/items idx16 opts) -1 nil))))))
 
 (deftest a-sealed-sequence-is-still-valid-cbor
-  (testing "a reader that knows nothing about tag 39651 consumes the whole
-            file: every data item, then one tagged value it can ignore"
+  (testing "a reader that knows nothing about `boring/index` consumes the whole
+            file: every data item, then one tag-27 frame it can ignore"
     (let [bs (build 16)
           all (vec (boring/decode-seq bs opts))]
       (is (= (count items) (dec (count all))))
       (is (= items (vec (butlast all))))
-      (is (= boring/index-tag (:tag (last all)))
-          "the trailing item identifies itself by tag"))))
+      (is (= boring/index-name (boring.data/frame-name (last all)))
+          "the trailing item identifies itself by NAME, under tag 27 -- so a
+           foreign reader sees `boring/index`, not an unregistered number"))))
 
 ;; ---------------------------------------------------------------- fallbacks
 
@@ -70,7 +73,7 @@
 
 (deftest a-corrupted-pointer-falls-back-to-scanning
   (testing "flip a byte inside the back-pointer: the offset no longer lands on
-            tag 39651, so the index is refused and the scan answers instead"
+            the tag-27 frame, so the index is refused and the scan answers"
     (let [bs (build 16)
           ;; the pointer is the last 8 bytes; byte 3 of it is high-order enough
           ;; to move the offset well out of place
@@ -110,13 +113,14 @@
           read (read-items appended)]
       (is (= (+ (count items) 2) (count read))
           "500 data items, the now-stale index item, and the appended one")
-      (is (= boring/index-tag (:tag (nth read (count items))))
+      (is (= boring/index-name (boring.data/frame-name (nth read (count items))))
           "the stale index is visible, and identifiable, rather than silent"))))
 
 (deftest a-file-that-merely-ends-in-the-right-shape-is-not-an-index
   (testing "the last 9 bytes looking like a byte string is not enough -- the
-            pointer must also land on tag 39651. This is the false-positive
-            case the three checks exist for."
+            pointer must also land on a tag-27 frame carrying the name. This is
+            the false-positive case the checks exist for, and the name makes it
+            a much narrower target than a bare tag number did."
     (let [w (boring/writer 65536 opts)
           o (ByteArrayOutputStream.)]
       (boring/write-seq! w items o opts)
@@ -190,7 +194,8 @@
       (let [bs (boring/encode-indexed v (assoc sorted-opts :index 16))]
         (is (= v (boring/decode bs sorted-opts)))
         (is (= 2 (count (boring/decode-seq bs sorted-opts))))
-        (is (= boring/index-tag (:tag (second (vec (boring/decode-seq bs sorted-opts))))))))))
+        (is (= boring/index-name
+               (boring.data/frame-name (second (vec (boring/decode-seq bs sorted-opts))))))))))
 
 (deftest a-corrupt-container-index-still-answers-correctly
   (testing "flip the back-pointer: no node is found anywhere, so every lookup

@@ -589,14 +589,26 @@
                    total))))
        total))))
 
-(def ^:const index-tag
-  "CBOR tag for a sequence offset index. See doc/SHAPES.md.
+(def ^:const index-name
+  "Tag-27 type name for a sequence/container index. See doc/SHAPES.md.
 
-  39651, not 39650: 39650 is already specified for the scattered-shape case.
-  Both sit in 38000-39999, which doc/IANA-REGISTRATION.md surveyed as empty and
-  clear of the dense `ur:` cluster at 40000-40918. Provisional, like 39649 --
-  see that document for the registration this owes."
-  39651)
+  A NAME under tag 27, not a tag number of its own. Tag 27 is CBOR's registered
+  extension point for exactly this -- \"serialised language-independent object
+  with type name and constructor arguments\" -- and boring already reserves
+  slash-bearing names under it (`clojure/sorted-map`, `java/period`; see
+  doc/INTEROP.md).
+
+  This started as tag 39651 and was moved, because the index appears exactly
+  ONCE per file: measured, a name costs 14 bytes, which is 0.05% of a 28 KB
+  file. Against that it removes a registration obligation entirely, is
+  self-describing to a foreign reader (`cbor2` sees the string, not an
+  unregistered number), and narrows false-positive detection -- a stray file
+  must now end in the right shape AND point at tag 27 AND carry this name.
+
+  Tag 39649, shaped arrays, keeps its own number for the opposite reason: it
+  occurs PER ARRAY, and a name would add up to 35% on documents with many small
+  tables -- on a feature whose entire purpose is to shrink them."
+  "boring/index")
 
 (declare index-walk)
 
@@ -727,7 +739,8 @@
   `index` comes from `build-index`; `data-len` is how many bytes precede this
   item, which is also where it begins. The item is:
 
-      tag 39651 [ stride, containers, counts, slots, sorted, <8-byte data-len> ]
+      tag 27 [ `boring/index`,
+               [ stride, containers, counts, slots, sorted, <8-byte data-len> ] ]
 
   `containers` are the byte offsets of every indexed container, sorted, so a
   reader binary-searches them. `slots` holds each container's entry offsets and
@@ -742,12 +755,12 @@
   sequence that any reader consumes -- it just sees one extra tagged item.
 
   The pointer verifies as well as locates: it is both where the index starts and
-  how long the data is, so a reader that seeks there and finds no tag 39651
-  knows the index is stale and scans instead."
+  how long the data is, so a reader that seeks there and does not find a tag-27
+  frame named `boring/index` knows the index is stale and scans instead."
   [^Writer w ^java.io.OutputStream out index data-len]
   (let [{:keys [stride containers counts slots sorted]} index
-        item (data/tagged-value
-              index-tag
+        item (data/unknown-record
+              index-name
               [(long stride) containers counts (vec slots) (vec sorted)
                (long->8-bytes* (long data-len))])]
     (write-to! w item out)))

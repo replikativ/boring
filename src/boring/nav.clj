@@ -57,6 +57,7 @@
   could disagree with decoding, silently. The slow path IS the reference
   implementation, which is what makes the fast path safe to trust."
   (:require [boring.core :as boring]
+            [boring.data]
             [clojure.zip :as zip])
   (:import (org.replikativ.boring Reader ByteSource)))
 
@@ -371,6 +372,15 @@
   to value cursor (maps). Prefer `reduce` over `seq` in a hot loop."
   [^Cursor c] c)
 
+(defn- name-probe
+  "The encoded tag-27 type name, cached on the Nav."
+  ^bytes [^Nav nav]
+  (let [p (.probes nav)]
+    (or (get @p ::index-name)
+        (let [bs (boring/encode boring/index-name {:stringref false})]
+          (swap! p assoc ::index-name bs)
+          bs))))
+
 (defn- read-index
   "The offset index sealed onto a CBOR sequence by `boring/write-seq!`, or nil.
 
@@ -380,7 +390,8 @@
 
   Three checks, because a file with no index could in principle end in those
   same bytes: the tail must have that shape, the pointer must be in range, and
-  the byte at the pointer must actually begin tag 39651. A false positive needs
+  the target must actually be a tag-27 frame carrying the name. A false
+  positive needs
   all three; a false negative just means scanning, which is always correct."
   [^Nav nav]
   (let [^Reader r (.rdr nav)
@@ -392,11 +403,22 @@
                 ptr (areduce ptr-bytes i acc 0
                              (bit-or (bit-shift-left acc 8)
                                      (bit-and (aget ptr-bytes i) 0xFF)))]
+            ;; Tag 27, then an array whose first element is the name. Checking
+            ;; the NAME before decoding is what keeps a stray file that merely
+            ;; ends in the right 9 bytes from being decoded as an index: it
+            ;; would have to point at a tag-27 frame carrying this exact string.
             (when (and (pos? ptr) (< ptr bp)
                        (= 6 (.majorAt r ptr))
-                       (= boring/index-tag (.headArgAt r ptr)))
-              (let [tv (.readFrom r ptr)
-                    [stride ^ints containers ^ints counts slots sorted _] (:value tv)]
+                       (= 27 (.headArgAt r ptr))
+                       (let [arr (.headEndAt r ptr)]
+                         (and (= 4 (.majorAt r arr))
+                              (.bytesEqualAt r (.headEndAt r arr) (name-probe nav)))))
+              ;; `frame-payload`, not `record-fields`: an unregistered tag-27
+              ;; frame decodes to an UnknownRecord when its payload is a map
+              ;; and a TaggedLiteral otherwise, and this payload is a vector.
+              (let [rec (.readFrom r ptr)
+                    [stride ^ints containers ^ints counts slots sorted _]
+                    (boring.data/frame-payload rec)]
                 (when (and (int? stride) (pos? (long stride)) containers)
                   ;; One uniform node list. The SEQUENCE is the node at the
                   ;; sentinel offset -1: it has no container header on the wire

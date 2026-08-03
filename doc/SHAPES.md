@@ -4,7 +4,7 @@ Repeated map keys are where serialization size and decode time actually go.
 This file specifies what boring does about that today, what it should do about
 the case it currently misses, and the constraints any extension must respect.
 
-**Status:** tags 39649 and 39651 are implemented. Tag 39650 is *specified here
+**Status:** tag 39649 is implemented, as is the `boring/index` tag-27 name. Tag 39650 is *specified here
 and not yet implemented* — it is a design under review, deliberately not in the
 first release. See "Why not in the first release" at the end.
 
@@ -12,7 +12,7 @@ first release. See "Why not in the first release" at the end.
 |---|---|---|
 | 39649 | shaped array — repeated map keys hoisted out | implemented |
 | 39650 | scattered shapes | specified, not implemented |
-| 39651 | sequence offset index | implemented |
+| tag 27 `boring/index` | sequence and container index | implemented — a NAME, not a number |
 
 ---
 
@@ -258,7 +258,7 @@ and reviewable. Ship it once the vertical is proven.
 
 ---
 
-## Tag 39651, sequence offset index
+## `boring/index`: the sequence offset index
 
 A CBOR sequence (RFC 8742) has no way to reach item *n* except by skipping the
 *n-1* before it. For a log that is fine while tailing and useless while seeking:
@@ -269,11 +269,10 @@ through an index — 23 000×.
 
 ```
 <item> <item> ... <item>              the data section, untouched
-d9 9ae3  84                           tag 39651, array(4)
-   <stride>                           items covered per entry
-   <total>                            item count
-   <int32 array>                      byte offset of every Nth item
-   48 <8 bytes>                       back-pointer = data-section length
+d8 1b  82                             tag 27, array(2)
+   6c 626f72696e672f696e646578        "boring/index"
+   86 ...                             [stride, containers, counts,
+                                       slots, sorted, 48 <8 bytes>]
 ```
 
 ### Why the index is at the END
@@ -299,11 +298,12 @@ they can ignore.
 ### The pointer verifies as well as locates
 
 It is both where the index begins and how long the data section is. A reader
-seeks there and checks for tag 39651; if it is not there the index is stale —
+seeks there and checks for the `boring/index` frame; if it is not there the
+index is stale —
 the file was truncated, or appended to after sealing — and the reader scans
 instead. Three checks guard against a file that merely happens to end in the
 right shape: the tail must look like an 8-byte byte string, the pointer must be
-in range, and the target must actually be tag 39651.
+in range, and the target must actually carry the `boring/index` name.
 
 **The index is never load-bearing for correctness.** It is rebuildable by a
 full scan, discardable at any time, and a missing or damaged one changes only
@@ -336,7 +336,7 @@ offset −1, so both live in one uniform list.
 
 ---
 
-## Tag 39651, part two: container nodes
+## `boring/index`, part two: container nodes
 
 The sequence index above reaches item *n*. The same item also carries a node
 per **container**, which reaches *into* an item.
@@ -347,8 +347,33 @@ O(log n), comparing **encoded key bytes** — no key is ever decoded and no valu
 is ever touched.
 
 ```
-tag 39651 [ stride, containers, counts, slots, sorted, <8-byte data-len> ]
+tag 27 [ "boring/index",
+         [ stride, containers, counts, slots, sorted, <8-byte data-len> ] ]
 ```
+
+### A name, not a number
+
+The index is a **tag-27 name**, not a tag of its own. It began as tag 39651 and
+was moved once the cost was measured: the index appears exactly **once per
+file**, so a name costs 14 bytes — 0.05% of a 28 KB file. Against that it
+removes a registration obligation entirely, is self-describing (`cbor2` sees
+the string rather than an unregistered number), and narrows false-positive
+detection, since a stray file must now end in the right shape **and** point at
+tag 27 **and** carry this exact name.
+
+**Tag 39649 keeps its own number for the opposite reason**, and this is the
+rationale that was missing from this document. Shaped arrays occur **per
+array**, not once per file, and `:shapes` exists precisely to shrink documents:
+
+| payload | shaped arrays | cost as a tag-27 name |
+|---|---:|---:|
+| datom-maps-200 | 1 | +0.4% |
+| 100 small tables | 100 | **+19.6%** |
+| nested tables ×500 | 500 | **+35.2%** |
+
+Paying up to a third of the file back would defeat the feature on exactly the
+documents it exists for. A 3-byte tag is the right trade there; a 17-byte name
+is not. One number to register, not two.
 
 `containers` are sorted byte offsets, so a reader binary-searches them; the
 sequence itself is the node at the sentinel offset −1. `sorted` is recorded per
