@@ -582,15 +582,20 @@
                        v))))
                (do (set! (.-pos r) save)
                    (let [s (read! r)]
-                     (when-not (string? s)
-                       (err :boring/bad-tag-content
-                            "boring: tag 39 must wrap a text string" {:tag 39}))
-                     (intern-ident s)))))
-           (do
-             (when (not== 3 (bit-shift-right th 5))
-               (err :boring/bad-tag-content
-                    (str "boring: tag 39 must wrap a text string, got major "
-                         (bit-shift-right th 5)) {:tag 39}))
+                     (if (string? s) (intern-ident s) (data/tagged-value 39 s))))))
+           (if (or (not== 3 (bit-shift-right th 5))
+                   (== 31 (bit-and th 0x1F)))
+             ;; NOT AN ERROR. IANA registers tag 39's data item as "multiple",
+             ;; and the defining spec says it "can be applied to multiple types
+             ;; to indicate that the tagged object has identifier semantics".
+             ;; Throwing failed the whole document over a foreign identifier
+             ;; boring has no mapping for; an inert TaggedValue is the same
+             ;; degradation every other uninterpreted tag gets. An
+             ;; indefinite-length text string lands here too -- still major 3,
+             ;; so the ai check is what catches it -- and must still intern.
+             (do (set! (.-pos r) save)
+                 (let [v (read! r)]
+                   (if (string? v) (intern-ident v) (data/tagged-value 39 v))))
              (let [n (check-count r (arg! r (bit-and th 0x1F)) 1)
                    start (.-pos r)]
                (need! r n)
@@ -678,13 +683,29 @@
                                           (recur (inc j) (assoc! m (aget ks j) (read! r)))
                                           (persistent! m)))))))))))))))
 
-    258 (let [h (u8! r)]
+    258 (let [save (.-pos r)
+              h (u8! r)]
           (when (not== 4 (bit-shift-right h 5))
             (err :boring/bad-tag-content
                  (str "boring: tag 258 must wrap an array, got major "
                       (bit-shift-right h 5)) {:tag 258}))
-          (let [n (check-count r (arg! r (bit-and h 0x1F)) 1)
-                st (if (zero? n) #{} (into #{} (repeatedly n #(read! r))))]
+          ;; INDEFINITE-LENGTH ARRAY. Tag 258 is registered against "array",
+          ;; and 3.2.2 makes the indefinite form an array; neither the
+          ;; registration nor cbor-sets-spec restricts it. Hand-rolling the
+          ;; head rejected it as :boring/reserved-info -- conforming input
+          ;; refused, under an error that was wrong too, since ai 31 is not
+          ;; reserved for major type 4.
+          (let [items (if (== 31 (bit-and h 0x1F))
+                        (do (set! (.-pos r) save)
+                            (let [c (read! r)]
+                              (when-not (vector? c)
+                                (err :boring/bad-tag-content
+                                     "boring: tag 258 must wrap an array" {:tag 258}))
+                              c))
+                        (vec (repeatedly (check-count r (arg! r (bit-and h 0x1F)) 1)
+                                         #(read! r))))
+                n (count items)
+                st (into #{} items)]
               ;; Maps reject duplicate keys; sets silently collapsed them.
             (when (and (.-checkDuplicateKeys r) (not== (count st) n))
               (err :boring/duplicate-set-element

@@ -1541,6 +1541,19 @@ public final class Reader {
     private static final clojure.lang.Keyword KW_TAG = clojure.lang.Keyword.intern("tag");
     private static final clojure.lang.Keyword KW_VALUE = clojure.lang.Keyword.intern("value");
 
+    /** A tag-258 set, with the duplicate-element check both content paths need.
+     *  Maps reject duplicate keys as an anti-differential measure; sets used to
+     *  collapse them silently. Same rule, same reason. */
+    private clojure.lang.IPersistentSet makeSet(Object[] items, int n) {
+        if (n == 0) return PersistentHashSet.EMPTY;
+        clojure.lang.IPersistentSet set = PersistentHashSet.create(items);
+        if (checkDuplicateKeys && set.count() != n)
+            throw Err.of("duplicate-set-element",
+                "boring: tag 258 declared " + n + " elements but "
+                + set.count() + " are distinct", "declared", (long) n);
+        return set;
+    }
+
     /** One element of a tag-40 payload, which may be a typed array or a CBOR array. */
     private static Object elementAt(Object flat, int i) {
         if (flat instanceof java.util.List) return ((java.util.List) flat).get(i);
@@ -1808,8 +1821,25 @@ public final class Reader {
                 // pure waste for an identifier we have already seen, and short
                 // keywords never get a stringref index to spare us.
                 int th = u8();
-                if ((th >>> 5) != 3)
-                    throw Err.of("bad-tag-content", "boring: tag 39 must wrap a text string, got major " + (th >>> 5));
+                if ((th >>> 5) != 3 || (th & 0x1F) == 31) {
+                    // NOT AN ERROR. IANA registers tag 39's data item as
+                    // "multiple", and the defining spec (lucas-clemente/
+                    // cbor-specs id.md) says it "can be applied to multiple
+                    // types to indicate that the tagged object has identifier
+                    // semantics". Throwing here failed the WHOLE DOCUMENT over
+                    // a foreign identifier boring simply has no mapping for;
+                    // carrying it as an inert TaggedValue is the same
+                    // degradation every other uninterpreted tag gets.
+                    //
+                    // An indefinite-length text string lands here too (the head
+                    // read above only recognises the definite form), and must
+                    // still become an identifier -- hence the String case
+                    // rather than a blanket TaggedValue.
+                    pos = save;
+                    Object v = read();
+                    if (v instanceof String) return internIdent((String) v);
+                    return Data.MAKE_TAGGED.invoke(Long.valueOf(39), v);
+                }
                 int n = checkCount(arg(th & 0x1F), 1);
                 long start = pos;
                 // Validated exactly as readTextRaw does. This path reads the
@@ -1833,23 +1863,34 @@ public final class Reader {
                 return ident;
             }
             case 258: {                                      // set
+                long save258 = pos;
                 int h = u8();
                 if ((h >>> 5) != 4)
                     throw Err.of("bad-tag-content",
                         "boring: tag 258 must wrap an array, got major " + (h >>> 5),
                         "tag", 258L);
+                if ((h & 0x1F) == 31) {
+                    // INDEFINITE-LENGTH ARRAY. Tag 258 is registered against
+                    // "array", and 3.2.2 makes the indefinite form an array;
+                    // neither the registration nor cbor-sets-spec restricts it.
+                    // Hand-rolling the head rejected `d9 0102 9f ... ff` with
+                    // :boring/reserved-info -- conforming input refused, under
+                    // an error that was also wrong, since ai 31 is not reserved
+                    // for major type 4. Route it through the ordinary reader,
+                    // as tags 2/3/27/30 already do.
+                    pos = save258;
+                    Object content = read();
+                    if (!(content instanceof java.util.List))
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 258 must wrap an array", "tag", 258L);
+                    java.util.List cl = (java.util.List) content;
+                    return makeSet(cl.toArray(), cl.size());
+                }
                 int n = checkCount(arg(h & 0x1F), 1);
                 if (n == 0) return PersistentHashSet.EMPTY;
                 Object[] items = new Object[n];
                 for (int i = 0; i < n; i++) items[i] = read();
-                clojure.lang.IPersistentSet set = PersistentHashSet.create(items);
-                // Maps reject duplicate keys as an anti-differential measure;
-                // sets silently collapsed them. Same rule, same reason.
-                if (checkDuplicateKeys && set.count() != n)
-                    throw Err.of("duplicate-set-element",
-                        "boring: tag 258 declared " + n + " elements but "
-                        + set.count() + " are distinct", "declared", (long) n);
-                return set;
+                return makeSet(items, n);
             }
             case 2:                                          // positive bignum
             case 3: {                                        // negative bignum

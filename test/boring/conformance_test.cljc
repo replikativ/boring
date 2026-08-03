@@ -919,6 +919,31 @@
                        ["surrounded"     (str "a💩b")]]]
       (is (= v (boring/decode (boring/encode v))) label))))
 
+(deftest conforming-tag-content-the-specs-allow-and-boring-refused
+  (testing "RFC 8746 3.1.1 admits a plain CBOR array, a typed array or a tag-41
+            Homogeneous Array as a tag-40 payload, and bounds the dimension
+            count nowhere. Tag 258 is registered against \"array\", which 3.2.2
+            makes include the indefinite-length form. Tag 39's registered data
+            item is \"multiple\", not \"text string\". boring rejected all four,
+            which is rejecting conforming input -- identically on both
+            platforms, so nothing here is a differential."
+    ;; tag 40 [[2,3], [2,4,8,4,16,256]] -- RFC 8746 Figure 2, verbatim.
+    ;; A plain CBOR array payload nests into vectors on both platforms, so
+    ;; these compare directly with no array-equality helper.
+    (is (= [[2 4 8] [4 16 256]]
+           (:ok (try-decode "d82882820203860204080410190100" interop-opts)))
+        "Figure 2 of the defining RFC")
+    ;; tag 40 [[2,2,2], [1..8]]
+    (is (= [[[1 2] [3 4]] [[5 6] [7 8]]]
+           (:ok (try-decode "d8288283020202880102030405060708" interop-opts)))
+        "three dimensions")
+    ;; tag 258 around an indefinite-length array
+    (is (= #{1 2 3} (:ok (try-decode "d901029f010203ff" interop-opts)))
+        "a set over an indefinite-length array")
+    ;; tag 39 around an integer -- degrades, does not throw
+    (is (contains? (try-decode "d82701" interop-opts) :ok)
+        "an identifier tag over non-text content stays inert")))
+
 (deftest every-malformed-tag-fails-typed
   (testing "a well-formed CBOR item of the WRONG SHAPE inside a tag boring
             handles specially must raise an ex-info with a :type, on both

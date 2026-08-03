@@ -39,7 +39,10 @@
    ["tag30-zero-denom" "d81e820100"]
    ["tag37-wrong-len" "d8254400000000"]
    ["tag37-not-bytes" "d8256178"]
-   ["tag39-not-text" "d82701"]
+   ;; `tag39-not-text` ("d82701") DELIBERATELY REMOVED. IANA registers tag 39's
+   ;; data item as "multiple", so integer content is conforming and now
+   ;; degrades to an inert TaggedValue rather than failing the document.
+
    ["tag0-not-text" "c001"]
    ["tag0-bad-date" "c06a6e6f742d612d64617465"]
    ["tag1-not-number" "c16178"]
