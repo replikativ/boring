@@ -340,21 +340,29 @@
     ;; this test called `nav/source` inside the loop, so every attempt got a
     ;; FRESH Reader and the leak could not show. It passed with the fix
     ;; reverted; a per-fix revert sweep is what caught that.
-    (let [deep (boring/encode (reduce (fn [acc _] [acc]) [] (range 20))
-                              {:stringref false})
-          shallow (boring/encode [1 2 3] {:stringref false})
-          r (org.replikativ.boring.Reader. ^bytes deep)]
+    ;; BOTH VALUES IN ONE BUFFER, and no `.reset` between them. Two earlier
+    ;; versions of this test were vacuous and the suite stayed green with the
+    ;; fix removed: the first built a fresh Reader per attempt, and the second
+    ;; called `.reset`, which sets `depth = 0` and wipes the very leak the
+    ;; assertion is meant to observe. The leak is only visible on a Reader that
+    ;; is reused WITHOUT being reset -- which is exactly how `boring.nav` uses
+    ;; one, sharing a single Reader across every lookup.
+    (let [^bytes deep (boring/encode (reduce (fn [acc _] [acc]) [] (range 20))
+                                     {:stringref false})
+          ^bytes shallow (boring/encode [1 2 3] {:stringref false})
+          both (byte-array (concat (seq deep) (seq shallow)))
+          at (alength deep)
+          r (org.replikativ.boring.Reader. ^bytes both)]
       (set! (.-maxDepth r) (int 4))
       (dotimes [_ 6]
         (is (thrown? clojure.lang.ExceptionInfo (.readFrom r 0))
             "the deep value must fail every time, for the same reason"))
-      ;; the SAME reader, now pointed at a shallow value
-      (.reset r ^bytes shallow)
-      (set! (.-maxDepth r) (int 4))
-      (is (= [1 2 3] (.readFrom r 0))
-          "a shallow value must still read after repeated deep failures on the
-           same Reader -- `enter()` incremented before throwing, so each failure
-           permanently consumed a level of the budget"))))
+      (is (= [1 2 3] (.readFrom r at))
+          "a shallow value at another offset in the SAME buffer must still read
+           after repeated deep failures -- `enter()` incremented before throwing,
+           so each failure permanently consumed a level of the budget")
+      (is (= (alength both) (.skipFrom r at))
+          "and skipping it must land at the end, not short"))))
 
 (deftest nested-tags-are-bounded
   (testing "tag recursion was the one nesting nothing bounded, and enough of it
@@ -581,13 +589,20 @@
                          (entrySet []
                            (java.util.LinkedHashSet.
                             [(java.util.AbstractMap$SimpleEntry. "a" 1)]))))]
-      (doseq [[label o] [["plain" opts]
-                         ["indexed" (assoc opts :index 1 :index-min 1)]
-                         ["canonical" {:profile :canonical}]]
+      (doseq [[label o] [["plain" opts] ["canonical" {:profile :canonical}]]
               [what mk] [["over-yield" over] ["under-yield" under]]]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reported \d+ entries"
                               (boring/encode (mk) o))
-            (str label "/" what " must raise the typed mismatch error"))))))
+            (str label "/" what " must raise the typed mismatch error")))
+      ;; The INDEXED writer path needs `write-seq!`: `encode` never calls
+      ;; setIndex, so an `:index` option there goes down the plain path and the
+      ;; row that claimed to cover indexing duplicated the plain one.
+      (doseq [[what mk] [["over-yield" over] ["under-yield" under]]]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reported \d+ entries"
+                              (boring/write-seq! (boring/writer 65536 opts) [(mk)]
+                                                 (ByteArrayOutputStream.)
+                                                 (assoc opts :index 1 :index-min 1)))
+            (str "indexed/" what " must raise it too"))))))
 
 (deftest a-semantically-lying-index-is-refused
   (testing "structural validation is not enough on its own: anchors can ascend,
@@ -788,3 +803,57 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reported 1 entries"
                             (boring/encode liar-set {:profile :canonical}))
           "canonical set staging is sized by size() and must check it"))))
+
+;; ------------------------------------------ round five: the footer's options
+
+(deftest the-index-frame-is-written-with-the-calls-options
+  (testing "`seal-index!` emitted the footer through `write-to!`'s 2-arity,
+            which resolves the WRITER's options -- so `write-seq!`'s 4-arity
+            wrote the data with the caller's opts and the frame with the
+            writer's. With the documented shape `(write-seq! (writer 4096) vs
+            out {:stringref false :index 8})` the frame went out inside a
+            stringref namespace, which `nav` refuses to recognise. The index was
+            silently dead AND the frame came back as a phantom trailing item in
+            every log.
+
+            Every test and doc example missed it by happening to build the
+            writer with the same options it passed."
+    (let [vs (vec (for [i (range 40)] {"n" i}))]
+      (doseq [wopts [nil {:stringref false} {:profile :archival}]]
+        (let [out (ByteArrayOutputStream.)
+              w (if wopts (boring/writer 4096 wopts) (boring/writer 4096))]
+          (boring/write-seq! w vs out (assoc opts :index 8))
+          (let [bs (.toByteArray out)
+                items (nav/items bs opts)]
+            (is (= 40 (count (into [] items)))
+                (str "writer opts " (pr-str wopts)
+                     ": the frame must be recognised, not yielded as data"))
+            (is (= vs (mapv nav/value (seq items))))
+            (is (= {"n" 39} (nav/value (nth items 39)))
+                "and the index must actually be usable")))))))
+
+(deftest a-mid-item-anchor-does-not-throw-at-the-caller
+  (testing "validation proves the FIRST anchor is a container's real first entry;
+            proving it of every anchor would cost the walk the index exists to
+            avoid. A middle anchor pointing mid-item therefore survives, and
+            `scan-map` used to read a garbage head from there and run off the
+            buffer -- a raw ArrayIndexOutOfBoundsException out of `get`.
+
+            The answer may be wrong -- that is the documented trust boundary --
+            but it may not be an untyped exception."
+    (let [m (into {} (for [i (range 20)] [(format "k%02d" i) i]))
+          bs (boring/encode-indexed m (assoc opts :index 4 :index-min 4))]
+      ;; mutate every single byte of the whole document, and require that no
+      ;; lookup ever throws something untyped
+      (dotimes [i (alength ^bytes bs)]
+        (doseq [v [0x00 0x7F 0xF5 0xFF]]
+          (let [c (java.util.Arrays/copyOf ^bytes bs (alength ^bytes bs))]
+            (aset-byte c i (unchecked-byte v))
+            (doseq [k ["k00" "k07" "k19" "nope"]]
+              (is (try (some-> (get (nav/source c opts) k) nav/value) true
+                       (catch clojure.lang.ExceptionInfo _ true)
+                       (catch Throwable t
+                         (println "  untyped" (.getSimpleName (class t))
+                                  "at byte" i "=" v "key" k)
+                         false))
+                  (str "byte " i " -> " v ", key " k)))))))))

@@ -468,10 +468,12 @@
   (println "up how to jump. Raise :index-min above the width of containers like that")
   (println "and they fall back to walking, which is what you want.")
   (println)
-  (println "The index is an optimisation, never load-bearing: a missing, stale or")
-  (println "corrupt one falls back to walking and returns the same answer. Sorted")
-  (println "keys (:canonical / :archival) additionally allow binary search; arrays")
-  (println "index positionally under any profile."))
+  (println "The index is an optimisation: a missing or stale one, or damage that")
+  (println "leaves it structurally inconsistent, falls back to walking and returns")
+  (println "the same answer. Damage that leaves it CONSISTENT -- bit rot included --")
+  (println "can still misdirect; see doc/SHAPES.md. Sorted keys (:canonical /")
+  (println ":archival) additionally allow binary search; arrays index positionally")
+  (println "under any profile.")
 
 ;; ------------------------------------------------------------- write cost
 ;;

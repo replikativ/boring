@@ -500,8 +500,8 @@
 ;; depends on everything before it, so the chunk must be read from the start and
 ;; cannot be split. Not implemented; chunk size is the knob for that tradeoff.
 
-(declare seal-index! scan-index scan-into! nodes->index build-index
-         write-seq-resolved!)
+(declare seal-index! seal-index-with! scan-index scan-into! nodes->index
+         build-index write-seq-resolved!)
 
 (defn encode-indexed
   "Encode `v` and seal an index onto it, returning a byte[].
@@ -523,7 +523,7 @@
        (let [w (writer (max 1024 (alength body)) opts)
              out (java.io.ByteArrayOutputStream. (+ (alength body) 256))]
          (.write out body)
-         (seal-index! w out idx (alength body))
+         (seal-index! w out idx (alength body) (resolve-opts opts))
          (.toByteArray out))))))
 
 (defn write-seq!
@@ -640,7 +640,8 @@
                      :counts counts
                      :slots (into [items] sl)
                      :sorted (into [false] so)}
-                    total)))))
+                    total
+                    o)))))
       total)))
 
 (def ^:const index-name
@@ -921,19 +922,44 @@
   The pointer verifies as well as locates: it is both where the index starts and
   how long the data is, so a reader that seeks there and does not find a tag-27
   frame named `boring/index` knows the index is stale and scans instead."
-  [^Writer w ^java.io.OutputStream out index data-len]
-  (let [{:keys [stride ^ints containers counts slots sorted]} index
-        packed (vec (map-indexed
-                     (fn [i s]
+  ([^Writer w ^java.io.OutputStream out index data-len]
+   (seal-index! w out index data-len (writer-opts w)))
+  ([^Writer w ^java.io.OutputStream out index data-len opts]
+   (seal-index-with! w out index data-len opts)))
+
+(defn- seal-index-with!
+  [^Writer w ^java.io.OutputStream out index data-len opts]
+  (letfn [(emit! [item]
+            ;; `write-root!`, not `write-to!`: `opts` here are ALREADY RESOLVED,
+            ;; and write-to!'s 3-arity resolves again -- which throws for every
+            ;; profile that locks a key, the same double-resolution trap as
+            ;; `write-seq!`'s 3-arity.
+            (let [n (long (.position ^Writer (write-root! w item opts)))]
+              (.write out (.buffer w) 0 (int n))
+              n))]
+    (let [{:keys [stride ^ints containers counts slots sorted]} index
+          packed (vec (map-indexed
+                       (fn [i s]
                        ;; The sequence node's sentinel offset is -1, and a file
                        ;; position is never negative: its deltas start from 0.
-                       (delta-slot s (max 0 (long (aget containers (int i))))))
-                     slots))
-        item (data/unknown-record
-              index-name
-              [(long stride) containers counts packed (vec sorted)
-               (long->8-bytes* (long data-len))])]
-    (write-to! w item out)))
+                         (delta-slot s (max 0 (long (aget containers (int i))))))
+                       slots))
+          item (data/unknown-record
+                index-name
+                [(long stride) containers counts packed (vec sorted)
+                 (long->8-bytes* (long data-len))])]
+    ;; The frame goes out under the SAME options as the data it describes.
+    ;; `write-to!`'s 2-arity resolves the WRITER's options instead, so
+    ;; `write-seq!`'s 4-arity wrote the data with the caller's opts and the
+    ;; footer with the writer's -- and with a plain `(writer 4096)` that meant
+    ;; the frame was emitted inside a stringref namespace, which `nav` refuses
+    ;; to recognise. The index was then silently dead (27x slower lookups) AND
+    ;; the frame came back as a phantom trailing data item in every log.
+    ;;
+    ;; Invisible to every test and doc example, because all of them happen to
+    ;; build the writer with the same options they pass.
+    ;;
+      (emit! item))))
 
 (defn- grow ^bytes [^bytes buf ^long need]
   (if (>= (alength buf) need)

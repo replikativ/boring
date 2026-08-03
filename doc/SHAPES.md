@@ -316,9 +316,14 @@ pointer, a truncated file, an appended-to file, a file that merely ends in the
 right 9-byte shape, and a frame that passes every detection check but holds an
 unusable payload all fall back to scanning rather than throwing.
 
-**The limit of that claim, stated rather than implied.** It holds for a
-**missing, stale, truncated or randomly corrupt** index: each is detected, and
-costs only a scan. It does **not** hold for a *crafted* one.
+**The limit of that claim, stated rather than implied.** It holds for an index
+that is **missing, stale, truncated, or damaged in a way that leaves it
+structurally inconsistent** — each is detected and costs only a scan. It does
+**not** hold for damage that leaves the payload structurally *consistent*, and
+that is not only a crafted-attack case: exhaustive single-byte mutation of a
+real index frame returns a **silently wrong answer 2.1% of the time**, and a
+**one-bit** flip of the `sorted` byte loses 15 of 20 keys with no error at all.
+Ordinary bit rot lands on the wrong side of this line.
 
 The reader checks that a node's parts agree — the container really is at that
 offset with the count it claims, its first anchor is that container's first

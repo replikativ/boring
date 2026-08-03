@@ -177,14 +177,43 @@
   (.readFrom ^Reader (.rdr nav) off))
 
 (defn- scan-map
-  "Linear walk of a map's entries from `start`, at most `limit` of them."
+  "Linear walk of a map's entries from `start`, at most `limit` of them.
+
+  BOUNDED BY THE SOURCE, not only by the entry count. An index anchor is where
+  this can start, and validation proves an anchor ascends, sits in range and --
+  for the first one -- is the container's real first entry. It cannot prove that
+  a MIDDLE anchor is an entry boundary without walking the container, which is
+  the work the index exists to avoid. A middle anchor pointing mid-item made
+  this read a garbage head and run off the end of the buffer, raising a raw
+  ArrayIndexOutOfBoundsException at the caller of `get`.
+
+  So the walk stops at the source's end and reports a miss. A damaged index may
+  still give a wrong ANSWER -- that is the trust boundary doc/SHAPES.md
+  describes, and it cannot be closed here -- but it may not throw an untyped
+  exception out of a lookup."
   ^long [^Reader r ^long start ^long limit ^bytes probe]
-  (loop [i 0 p start]
-    (if (>= i limit)
-      -1
-      (if (.bytesEqualAt r p probe)
-        (.skipFrom r p)
-        (recur (inc i) (.skipFrom r (.skipFrom r p)))))))
+  (let [end (.size r)]
+    ;; The walk itself is guarded, not just its starting point. A start can be
+    ;; in range while the item's DECLARED length runs past the buffer, so the
+    ;; throw happens inside `skipFrom` before any check on its result could see
+    ;; it -- `Reader.b` reads without bounds checks, which is what makes the
+    ;; decoder fast and what makes a damaged offset land here.
+    ;;
+    ;; An out-of-range walk is reported as a MISS. With a damaged index the
+    ;; answer may be wrong either way -- doc/SHAPES.md is explicit that this is
+    ;; a trust boundary -- but it may not be an untyped exception out of `get`,
+    ;; and the unsorted branch above simply tries the next anchor.
+    ;;
+    ;; try/catch costs nothing when nothing throws; this is not a hot-path tax.
+    (try
+      (loop [i 0 p start]
+        (if (or (>= i limit) (>= p end) (neg? p))
+          -1
+          (if (.bytesEqualAt r p probe)
+            (.skipFrom r p)
+            (let [q (.skipFrom r (.skipFrom r p))]
+              (if (or (<= q p) (> q end)) -1 (recur (inc i) q))))))
+      (catch IndexOutOfBoundsException _ -1))))
 
 (defn- lookup-map
   "Offset of the value for `k` in the map at `off`, or -1. Decodes no keys.
@@ -222,16 +251,27 @@
         (letfn [(span [^long a] (min stride (- n (* a stride))))]
           (if (nth (:sorted idx) ns)
             ;; Sorted keys: binary search the anchors, then a bounded walk.
-            (loop [lo 0 hi (dec m)]
-              (if (> lo hi)
-                (let [anchor (max 0 (min (dec m) hi))]
-                  (scan-map r (aget slot anchor) (span anchor) probe))
-                (let [mid (quot (+ lo hi) 2)
-                      q (aget slot mid)
-                      c (.compareItemToBytes r q probe)]
-                  (cond (zero? c) (.skipFrom r q)
-                        (neg? c) (recur (inc mid) hi)
-                        :else (recur lo (dec mid))))))
+            ;;
+            ;; The PROBE is bounds-checked as well as the walk. Validation
+            ;; proves the first anchor is a real entry; a middle one that points
+            ;; mid-item survives, and `compareItemToBytes` skips from wherever
+            ;; it is told -- reading a garbage head and running off the buffer,
+            ;; which surfaced as a raw ArrayIndexOutOfBoundsException out of
+            ;; `get`. Found by mutating every byte of a real indexed document
+            ;; and requiring that no lookup ever throws an untyped exception.
+            (let [lim (long (or (:data-end idx) (.size r)))]
+              (loop [lo 0 hi (dec m)]
+                (if (> lo hi)
+                  (let [anchor (max 0 (min (dec m) hi))]
+                    (scan-map r (aget slot anchor) (span anchor) probe))
+                  (let [mid (quot (+ lo hi) 2)
+                        q (long (aget slot mid))]
+                    (if (or (neg? q) (>= q lim))
+                      -1                       ; a damaged anchor: report a miss
+                      (let [c (.compareItemToBytes r q probe)]
+                        (cond (zero? c) (.skipFrom r q)
+                              (neg? c) (recur (inc mid) hi)
+                              :else (recur lo (dec mid)))))))))
             ;; Unsorted: still jump anchor to anchor rather than entry to entry.
             (loop [a 0]
               (if (>= a m)
@@ -697,7 +737,8 @@
   `:index N`), `nth` uses it: O(1) to the nearest anchor, then at most N-1
   skips. Without one it skips from the start. Either way the answer is the
   same -- an index is an optimisation, not load-bearing for correctness (see
-  doc/SHAPES.md for where that stops: a CRAFTED index is a trust boundary), and
+  doc/SHAPES.md for where that stops: damage leaving the payload structurally
+  CONSISTENT, bit rot included, can still misdirect), and
   a missing, truncated or stale one falls back to scanning.
 
   Detecting the index is not only about speed. The index is itself a top-level
