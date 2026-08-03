@@ -14,10 +14,38 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 
 /**
- * CBOR reader over a byte[]. Companion to Writer; same prototype scope.
+ * CBOR reader over a byte[] or a {@link ByteSource}. Companion to Writer.
+ *
+ * <p><b>One parser, two accessors.</b> This class serves heap arrays and
+ * mmap'ed files from a single head parser, because two parsers is how a
+ * decoder and its navigator drift apart -- silently, since a skip that lands
+ * one byte off does not throw, it returns a plausible wrong value. The
+ * STRUCTURE below is single-source. Only the loads branch, on whether `arr` is
+ * present.
+ *
+ * <p>That branch is not a micro-optimisation. Reading everything through a
+ * MemorySegment was implemented and measured: decode ran 14-50% slower across
+ * every payload, and used ~2.5x the stack per recursive level. A
+ * microbenchmark of the same access pattern predicted PARITY, because it times
+ * a tight loop over a constant layout where the JIT hoists the bounds and
+ * liveness checks out; a recursive, branchy decoder does not get that. With
+ * the branch, decode is back to its byte[] numbers and the segment path still
+ * exists.
+ *
+ * <p><b>No FFM type is named here</b>, deliberately. Naming one would force
+ * {@code --release 22} and emit a class file JDK 21 cannot load, stranding the
+ * incumbent LTS. The segment implementation lives in
+ * {@code org.replikativ.boring.ffm.SegmentSource}, compiled separately against
+ * JDK 22; a JDK 9 process never loads it. See {@link ByteSource}.
  */
 public final class Reader {
 
+    /**
+     * Big-endian VarHandles over a byte[]. These are NOT the segment path --
+     * the typed-array reader (RFC 8746) stages its payload into a byte[] and
+     * decodes elements from there, so it keeps the array-view handles. See
+     * the segment layouts below for everything else.
+     */
     private static final VarHandle SHORT_BE =
         MethodHandles.byteArrayViewVarHandle(short[].class, ByteOrder.BIG_ENDIAN);
     private static final VarHandle INT_BE =
@@ -25,8 +53,35 @@ public final class Reader {
     private static final VarHandle LONG_BE =
         MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.BIG_ENDIAN);
 
-    private byte[] buf;
-    private int pos;
+    /**
+     * The off-heap / mmap source, or null when decoding a plain byte[].
+     *
+     * Typed as ByteSource rather than MemorySegment on purpose: naming an FFM
+     * type here would pin the whole class to JDK 22 and emit a class file JDK
+     * 21 cannot load. See ByteSource.
+     */
+    private ByteSource src;
+    private long limit;
+    private long pos;
+
+    /**
+     * The backing array when {@code seg} wraps a whole byte[], else null.
+     *
+     * Used ONLY where the JDK demands a byte[] -- String construction, the
+     * typed-array VarHandle path, the ident cache. Scalar reads always go
+     * through the segment, so the hot path stays branch-free.
+     *
+     * Requiring the segment to cover the ENTIRE array is what makes offset 0
+     * safe to assume: heapBase() hands back the array but not the segment's
+     * offset within it, so a slice would alias the wrong bytes. ofArray always
+     * satisfies this, which is the path decode(byte[]) takes.
+     */
+    private byte[] arr;
+
+    /** Staging for bulk reads out of a native segment. Grows, never shrinks. */
+    private byte[] scratch;
+    /** Offset within the array {@link #arrayFor} returned. */
+    private int scratchOff;
 
     /**
      * Scratch for buildMap's duplicate-key hashes, reused across maps.
@@ -64,7 +119,23 @@ public final class Reader {
      *
      * QCBOR and TinyCBOR both advertise never recursing at all, which is the
      * stronger design; a depth cap is the cheap equivalent for a recursive
-     * decoder. 1024 is far beyond any legitimate Clojure value.
+     * decoder.
+     *
+     * <p><b>The cap only works while it sits BELOW the depth at which the stack
+     * actually dies.</b> Above it, the cap is decoration and the caller gets
+     * the StackOverflowError this field exists to prevent. That is not
+     * hypothetical: an interim version of this reader took every load through
+     * a MemorySegment, which inlines a deep call tree into the recursive frame
+     * and cost ~2.5x the stack per level -- the real limit fell from ~1500-2000
+     * to ~600-700 and this default became unreachable. The conformance test
+     * caught it INTERMITTENTLY, because the interpreted path survives deeper
+     * than the JIT-compiled one.
+     *
+     * <p>Keeping FFM out of this class (see {@link ByteSource}) restored it.
+     * Measured warm, the limit is now ~1400-1500 against ~1500-2000 before,
+     * so 1024 has roughly the margin it always had. If you raise it, measure
+     * -- 1024 is far beyond any legitimate Clojure value, and the headroom
+     * above it is thinner than the number suggests.
      */
     public int maxDepth = 1024;
 
@@ -131,12 +202,53 @@ public final class Reader {
      *  repeated keyword costs one array load — the same trick as hako's symref. */
     private Object[] srIdents;
 
-    public Reader(byte[] b) { this.buf = b; this.pos = 0; }
+    public Reader(byte[] b) { bindArray(b); }
+
+    public Reader(ByteSource s) { bind(s); }
+
+    /**
+     * Point at `s`. The byte[] fast path is taken when the source reports it IS
+     * an array -- see ByteSource.heapArray for why a partial view must not.
+     */
+    private void bind(ByteSource s) {
+        this.src = s;
+        this.limit = s.size();
+        this.pos = 0;
+        this.arr = s.heapArray();
+    }
+
+    /**
+     * Bind a byte[] without going through {@link #bind}.
+     *
+     * Two allocations per reset hide in the generic path, and a decode loop
+     * pays both: `MemorySegment.ofArray` wraps the array, and `heapBase()`
+     * boxes its answer in an Optional. Neither is needed here -- ofArray
+     * always covers the whole array, so `arr` is known without asking. Decode
+     * of a small map measured 1128 B/op through the generic path against 976
+     * before the segment migration; this is what closes that gap.
+     */
+    private void bindArray(byte[] b) {
+        this.src = null;
+        this.arr = b;
+        this.limit = b.length;
+        this.pos = 0;
+    }
 
     public void reset(byte[] b) {
+        // Re-binding the SAME array -- a loop over one scratch buffer, which is
+        // exactly what reading items out of a mapping does -- skips the wrapper
+        // entirely.
+        if (arr != b) bindArray(b); else pos = 0;
+        resetState();
+    }
+
+    public void reset(ByteSource s) {
+        bind(s);
+        resetState();
+    }
+
+    private void resetState() {
         this.reused = true;
-        this.buf = b;
-        this.pos = 0;
         this.depth = 0;
         srActive = false;
         if (srCount > 0) {
@@ -150,14 +262,193 @@ public final class Reader {
         // message arrives and the cache it was sized for is now too small --
         // the entries cannot simply be carried over, because the slot mask
         // changes with the size.
-        if (identKeys != null && (b.length >>> 4) > identKeys.length
+        if (identKeys != null && (limit >>> 4) > identKeys.length
                 && identKeys.length < 512) {
             identKeys = null;
         }
     }
 
-    public int position() { return pos; }
-    public boolean atEnd() { return pos >= buf.length; }
+    public long position() { return pos; }
+    public boolean atEnd() { return pos >= limit; }
+
+    /** Total addressable size. A navigator walking a CBOR sequence needs it to
+     *  know when it has run out of items. */
+    public long size() { return limit; }
+
+    /** Rewind to an absolute offset. The navigator descends with this. */
+    public void seek(long p) { this.pos = p; }
+
+    /**
+     * Advance past the value at the cursor without building it.
+     *
+     * This is the inner loop of any lazy navigation over the wire format: to
+     * reach the fifth key of a map you step over four values you do not want.
+     * Measured 3-11x cheaper than decoding structure, and 19x for a bytestring
+     * -- those are length-prefixed, so skipping one is a jump rather than a
+     * walk. See `clojure -M:bench -m nav skip`.
+     *
+     * <p><b>Why it delegates when a stringref namespace is open.</b> A string
+     * inside a namespace is a table entry whether or not anybody decodes it,
+     * and a later reference is an INDEX into that table -- so skipping past
+     * strings without registering them shifts every later index and silently
+     * resolves the wrong string. Rather than duplicate the registration rules
+     * here, where they could drift from the ones in readTextRaw, this falls
+     * back to `read()` and discards the result: slower, and correct by
+     * construction because it IS the reference implementation.
+     *
+     * <p>When no namespace is open the structural skip is safe even across a
+     * nested tag-256 subtree, because such a namespace is scoped to that
+     * subtree -- skip the whole thing and nothing outside can reference into
+     * it.
+     */
+    public void skipValue() {
+        if (srActive) { read(); return; }
+        skipStructural();
+    }
+
+    private void skipStructural() {
+        int h = u8();
+        int major = h >>> 5;
+        int info = h & 0x1F;
+        switch (major) {
+            case 0: case 1:
+                arg(info);
+                return;
+            case 2: case 3: {
+                if (info == 31) { skipIndefiniteChunks(major); return; }
+                // NOT `pos += checkCount(arg(info), 1)`. Java saves the left
+                // operand of += BEFORE evaluating the right, and arg() advances
+                // pos to read a multi-byte length -- so the compound form threw
+                // that advance away and landed one to eight bytes short. Only
+                // for lengths >= 24, which is why it survived every small
+                // fixture and was caught by the differential property test.
+                int n = checkCount(arg(info), 1);
+                pos += n;
+                return;
+            }
+            case 4: {
+                enter();
+                try {
+                    if (info == 31) { while (!consumeBreak()) skipStructural(); }
+                    else { int n = checkCount(arg(info), 1);
+                           for (int i = 0; i < n; i++) skipStructural(); }
+                } finally { exit(); }
+                return;
+            }
+            case 5: {
+                enter();
+                try {
+                    if (info == 31) {
+                        while (!consumeBreak()) { skipStructural(); skipStructural(); }
+                    } else {
+                        int n = checkCount(arg(info), 2);
+                        for (int i = 0; i < n; i++) { skipStructural(); skipStructural(); }
+                    }
+                } finally { exit(); }
+                return;
+            }
+            case 6:
+                arg(info);
+                skipStructural();
+                return;
+            default:                       // major 7: arg() covers the width
+                if (info == 31)
+                    throw Err.of("unexpected-break",
+                        "boring: break code outside an indefinite-length item");
+                arg(info);
+                return;
+        }
+    }
+
+    // ---- positional queries, for the navigator ---------------------------
+    //
+    // The cursor addresses the document by absolute offset, so these answer
+    // "what is at p" without disturbing anything a caller was doing. Each
+    // restores `pos`, because arg() advances it.
+
+    /** Major type (0-7) of the item at `p`. */
+    public int majorAt(long p) { return b(p) >>> 5; }
+
+    /** Additional-info nibble of the item at `p`. */
+    public int infoAt(long p) { return b(p) & 0x1F; }
+
+    /**
+     * The head's argument at `p`: element count for an array, pair count for a
+     * map, byte length for a string. -1 for an indefinite-length item, whose
+     * count is not on the wire.
+     */
+    public long headArgAt(long p) {
+        int info = infoAt(p);
+        if (info == 31) return -1;
+        long save = pos;
+        try { pos = p + 1; return arg(info); }
+        finally { pos = save; }
+    }
+
+    /** Offset just past the head at `p` -- where its content begins. */
+    public long headEndAt(long p) {
+        int info = infoAt(p);
+        long save = pos;
+        try { pos = p + 1; if (info >= 24 && info < 28) arg(info); return pos; }
+        finally { pos = save; }
+    }
+
+    /** Offset just past the whole value at `p`. */
+    public long skipFrom(long p) {
+        long save = pos;
+        try { pos = p; skipValue(); return pos; }
+        finally { pos = save; }
+    }
+
+    /** Decode the value at `p`. Does not disturb the caller's position. */
+    public Object readFrom(long p) {
+        long save = pos;
+        try { pos = p; return read(); }
+        finally { pos = save; }
+    }
+
+    /**
+     * Whether the `probe.length` bytes at `p` equal `probe`.
+     *
+     * This is how the navigator matches a map key: encode the sought key once,
+     * then compare bytes. Encoding is deterministic for a given profile, so
+     * byte equality is value equality -- and no key is ever decoded, which is
+     * the entire point of not materialising what you did not ask for.
+     */
+    public boolean bytesEqualAt(long p, byte[] probe) {
+        int n = probe.length;
+        if (p < 0 || p + n > limit) return false;
+        for (int i = 0; i < n; i++) if (sb(p + i) != probe[i]) return false;
+        return true;
+    }
+
+    /** Copy the bytes in [start, end) out. Used to lift a blob or stage a span. */
+    public byte[] bytesBetween(long start, long end) {
+        return freshBytes(start, (int) (end - start));
+    }
+
+    /** True if this document opens a stringref namespace at its root. */
+    public boolean hasStringrefRoot() {
+        return limit >= 3 && b(0) == 0xD9 && b(1) == 0x01 && b(2) == 0x00;
+    }
+
+    /** True if the byte at the cursor is a break, consuming it if so. */
+    private boolean consumeBreak() {
+        if (atBreak()) { pos++; return true; }
+        return false;
+    }
+
+    /** Definite-length chunks of `major` up to the break, all skipped. */
+    private void skipIndefiniteChunks(int major) {
+        while (!consumeBreak()) {
+            int h = u8();
+            if ((h >>> 5) != major)
+                throw Err.of("bad-indefinite-chunk",
+                    "boring: indefinite-length item contains a chunk of major " + (h >>> 5));
+            int n = checkCount(arg(h & 0x1F), 1);   // see skipStructural: not `pos +=`
+            pos += n;
+        }
+    }
 
     /**
      * Read the next top-level item of a CBOR sequence (RFC 8742), clearing the
@@ -176,12 +467,83 @@ public final class Reader {
         return read();
     }
 
-    private int u8()  { return buf[pos++] & 0xFF; }
-    private int u16() { int v = ((short) SHORT_BE.get(buf, pos)) & 0xFFFF; pos += 2; return v; }
-    private long u32(){ long v = ((int) INT_BE.get(buf, pos)) & 0xFFFFFFFFL; pos += 4; return v; }
-    private long u64(){ long v = (long) LONG_BE.get(buf, pos); pos += 8; return v; }
+    // ---- accessors -------------------------------------------------------
+    //
+    // ONE parser, TWO accessors. The structural logic above and below is
+    // single-source -- which is the whole point of the segment migration, since
+    // a second head parser is what drifts -- but the loads themselves branch on
+    // whether the source is a heap array.
+    //
+    // Going through the segment unconditionally was measured and rejected:
+    // decode ran 14-50% slower across every payload and used ~2.5x the stack
+    // per recursive level. A microbenchmark of the same access pattern
+    // predicted parity -- it measures a tight loop over a constant layout,
+    // where the JIT hoists the per-access checks out, and the real decoder is
+    // recursive and branchy and does not get that. `arr` is a loop-invariant
+    // null check that predicts perfectly, and it keeps the byte[] path on
+    // plain array loads.
 
-    private int remaining() { return buf.length - pos; }
+    /** Unsigned byte at an absolute offset. */
+    private int b(long p) {
+        return (arr != null ? arr[(int) p] : src.at(p)) & 0xFF;
+    }
+
+    /** Signed byte. The ident hash below folds raw bytes, so it must stay signed
+     *  to keep producing the same slots it did over a byte[]. */
+    private byte sb(long p) {
+        return arr != null ? arr[(int) p] : src.at(p);
+    }
+
+    private int s16(long p) {
+        return (arr != null ? (short) SHORT_BE.get(arr, (int) p) : src.i16(p)) & 0xFFFF;
+    }
+
+    private int s32(long p) {
+        return arr != null ? (int) INT_BE.get(arr, (int) p) : src.i32(p);
+    }
+
+    private long s64(long p) {
+        return arr != null ? (long) LONG_BE.get(arr, (int) p) : src.i64(p);
+    }
+
+    private int u8()  { return b(pos++); }
+    private int u16() { int v = s16(pos); pos += 2; return v; }
+    private long u32(){ long v = s32(pos) & 0xFFFFFFFFL; pos += 4; return v; }
+    private long u64(){ long v = s64(pos); pos += 8; return v; }
+
+    private long remaining() { return limit - pos; }
+
+    /**
+     * An array holding the `n` bytes at `p`, with the start index left in
+     * {@link #scratchOff}. Zero-copy when the source is a heap byte[]; one copy
+     * into reusable scratch otherwise.
+     *
+     * The returned array is only valid until the next call. Anything that
+     * OUTLIVES the call -- a stringref table entry, an ident cache key -- must
+     * use {@link #freshBytes} instead, or it aliases scratch and every later
+     * read rewrites it.
+     */
+    private byte[] arrayFor(long p, int n) {
+        if (arr != null) { scratchOff = (int) p; return arr; }
+        if (scratch == null || scratch.length < n)
+            scratch = new byte[Math.max(n, 256)];
+        src.copyTo(p, scratch, 0, n);
+        scratchOff = 0;
+        return scratch;
+    }
+
+    /** A private copy of the `n` bytes at `p`. Safe to retain. */
+    private byte[] freshBytes(long p, int n) {
+        byte[] out = new byte[n];
+        if (arr != null) System.arraycopy(arr, (int) p, out, 0, n);
+        else src.copyTo(p, out, 0, n);
+        return out;
+    }
+
+    private String stringAt(long p, int n, java.nio.charset.Charset cs) {
+        byte[] a = arrayFor(p, n);
+        return new String(a, scratchOff, n, cs);
+    }
 
     private void enter() {
         if (++depth > maxDepth)
@@ -356,17 +718,19 @@ public final class Reader {
      * The two produce identical Strings for ASCII input; the fast path is only
      * taken when this method has proved the input IS ASCII.
      */
-    private boolean validateUtf8(int start, int n) {
-        int i = start;
-        int end = start + n;
+    private boolean validateUtf8(long start, int n) {
+        long i = start;
+        long end = start + n;
 
         boolean ascii = true;
         while (i + 8 <= end) {                       // bulk ASCII scan
-            if ((((long) LONG_BE.get(buf, i)) & 0x8080808080808080L) != 0L) break;
+            // The mask has the same bit in every byte, so this test is
+            // endian-independent and needs no swap.
+            if ((s64(i) & 0x8080808080808080L) != 0L) break;
             i += 8;
         }
         while (i < end) {
-            int b = buf[i] & 0xFF;
+            int b = b(i);
             if (b < 0x80) { i++; continue; }
 
             int len, min, cp;
@@ -383,7 +747,7 @@ public final class Reader {
                     "offset", (long) (i - start));
 
             for (int j = 1; j < len; j++) {
-                int c = buf[i + j] & 0xFF;
+                int c = b(i + j);
                 if ((c & 0xC0) != 0x80)
                     throw Err.of("invalid-utf8",
                         "boring: invalid UTF-8 continuation byte at offset " + (i + j - start),
@@ -481,8 +845,8 @@ public final class Reader {
     private String readTextRaw(int info) {
         int n = checkCount(arg(info), 1);
         boolean ascii = validateUtf8 && validateUtf8(pos, n);
-        String s = ascii ? new String(buf, pos, n, StandardCharsets.ISO_8859_1)
-                         : new String(buf, pos, n, StandardCharsets.UTF_8);
+        String s = stringAt(pos, n,
+            ascii ? StandardCharsets.ISO_8859_1 : StandardCharsets.UTF_8);
         pos += n;
         // Only INSIDE a namespace. A string outside one is not a table entry,
         // and registering it shifted every later index by one.
@@ -512,12 +876,12 @@ public final class Reader {
      * harmless and keeps the hot path readable, not because it bought speed.
      */
     public Object read() {
-        int b0 = buf[pos] & 0xFF;
+        int b0 = b(pos);
 
         // Repeated keyword/symbol: D8 27 D8 19 <idx>
-        if (b0 == 0xD8 && pos + 4 < buf.length
-                && ((int) INT_BE.get(buf, pos)) == KW_SYMREF_PREFIX) {
-            int idx = buf[pos + 4] & 0xFF;
+        if (b0 == 0xD8 && pos + 4 < limit
+                && s32(pos) == KW_SYMREF_PREFIX) {
+            int idx = b(pos + 4);
             if (idx < 24) {                       // inline uint: byte IS the index
                 pos += 5;
                 stringrefIndex(idx);              // may not be registered yet
@@ -569,7 +933,8 @@ public final class Reader {
                 if (info == 31) return readIndefiniteBytes();
                 int n = checkCount(arg(info), 1);
                 byte[] bs = new byte[n];
-                System.arraycopy(buf, pos, bs, 0, n);
+                if (arr != null) System.arraycopy(arr, (int) pos, bs, 0, n);
+                else src.copyTo(pos, bs, 0, n);
                 pos += n;
                 // BYTE strings take stringref indices too, exactly as text
                 // strings do. Omitting them here made our table shorter than
@@ -661,7 +1026,7 @@ public final class Reader {
     private static final Object BREAK = new Object();
 
     private boolean atBreak() {
-        return pos < buf.length && (buf[pos] & 0xFF) == 0xFF;
+        return pos < limit && b(pos) == 0xFF;
     }
 
     private Object readOrBreak() {
@@ -672,7 +1037,7 @@ public final class Reader {
     /** One definite-length chunk of major type `major`, or BREAK. */
     private Object readChunk(int major) {
         if (atBreak()) { pos++; return BREAK; }
-        int header = buf[pos] & 0xFF;
+        int header = b(pos);
         if ((header >>> 5) != major)
             throw Err.of("bad-indefinite-chunk", "boring: indefinite-length item of major " + major
                 + " contains a chunk of major " + (header >>> 5));
@@ -889,12 +1254,17 @@ public final class Reader {
         final byte[] b;
         final int off;
         if (srActive && blen >= minLenForIndex(srCount)) {
-            b = java.util.Arrays.copyOfRange(buf, pos, pos + blen);
+            // Goes into the stringref table, so it must outlive this call and
+            // cannot be the shared scratch buffer.
+            b = freshBytes(pos, blen);
             off = 0;
             srPut(b);
         } else {
-            b = buf;
-            off = pos;
+            // Still zero-copy on a heap source, exactly as before; staged into
+            // scratch for a native one. The switch below consumes it before
+            // anything else can touch scratch.
+            b = arrayFor(pos, blen);
+            off = scratchOff;
         }
         pos += blen;
         int n = blen / elemSize;
@@ -1051,7 +1421,7 @@ public final class Reader {
                 return srStrings[stringrefIndex(stringrefArg())];
             case 39: {                                       // identifier
                 // Peek: a stringref here means we can reuse the interned ident.
-                int save = pos;
+                long save = pos;
                 int h = u8();
                 if ((h >>> 5) == 6) {                        // nested tag => stringref
                     int inner = (int) arg(h & 0x1F);
@@ -1079,7 +1449,7 @@ public final class Reader {
                 if ((th >>> 5) != 3)
                     throw Err.of("bad-tag-content", "boring: tag 39 must wrap a text string, got major " + (th >>> 5));
                 int n = checkCount(arg(th & 0x1F), 1);
-                int start = pos;
+                long start = pos;
                 // Validated exactly as readTextRaw does. This path reads the
                 // payload straight into the identifier cache to avoid building
                 // a String, and skipped the UTF-8 check with it -- so
@@ -1095,7 +1465,7 @@ public final class Reader {
                 // it registers every literal above the threshold, so we must too.
                 // Inside a namespace only -- see readTextRaw.
                 if (srActive && n >= minLenForIndex(srCount)) {
-                    srPut(new String(buf, start, n, StandardCharsets.UTF_8));
+                    srPut(stringAt(start, n, StandardCharsets.UTF_8));
                     srIdents[srCount - 1] = ident;
                 }
                 return ident;
@@ -1635,21 +2005,21 @@ public final class Reader {
 
     private void allocIdentCache() {
         int want = 8;
-        int target = buf.length >>> 4;
+        int target = (int) (limit >>> 4);
         while (want < target && want < 512) want <<= 1;
         identKeys = new byte[want][];
         identVals = new Object[want];
         identMask = want - 1;
     }
 
-    private static boolean bytesMatch(byte[] key, byte[] b, int start, int n) {
+    private boolean bytesMatch(byte[] key, long start, int n) {
         if (key.length != n) return false;
-        for (int i = 0; i < n; i++) if (key[i] != b[start + i]) return false;
+        for (int i = 0; i < n; i++) if (key[i] != sb(start + i)) return false;
         return true;
     }
 
     /** Intern the identifier spelled by buf[start, start+n), via the cache. */
-    private Object identFromBytes(int start, int n) {
+    private Object identFromBytes(long start, int n) {
         // Below the threshold, intern directly and allocate nothing.
         //
         // The cache pays when an identifier REPEATS -- across a reused reader,
@@ -1665,25 +2035,26 @@ public final class Reader {
         // REUSED path worse (1096 -> 1560 B), because a reader looping over
         // small messages then re-interned every identifier forever.
         if (identKeys == null) {
-            if (!reused && buf.length < IDENT_CACHE_MIN_INPUT)
+            if (!reused && limit < IDENT_CACHE_MIN_INPUT)
                 return internIdentDirect(start, n);
             allocIdentCache();
         }
         int h = n;
-        for (int i = 0; i < n; i++) h = h * 31 + buf[start + i];
+        for (int i = 0; i < n; i++) h = h * 31 + sb(start + i);
         int slot = (h ^ (h >>> 16)) & identMask;
         byte[] k = identKeys[slot];
-        if (k != null && bytesMatch(k, buf, start, n)) return identVals[slot];
-        Object ident = internIdent(new String(buf, start, n, StandardCharsets.UTF_8));
-        identKeys[slot] = java.util.Arrays.copyOfRange(buf, start, start + n);
+        if (k != null && bytesMatch(k, start, n)) return identVals[slot];
+        Object ident = internIdent(stringAt(start, n, StandardCharsets.UTF_8));
+        // A cache key outlives this call, so it cannot alias scratch.
+        identKeys[slot] = freshBytes(start, n);
         identVals[slot] = ident;
         return ident;
     }
 
     /** Intern without touching the cache -- identical result, no allocation
      *  beyond the String the interning itself needs. */
-    private Object internIdentDirect(int start, int n) {
-        return internIdent(new String(buf, start, n, StandardCharsets.UTF_8));
+    private Object internIdentDirect(long start, int n) {
+        return internIdent(stringAt(start, n, StandardCharsets.UTF_8));
     }
 
     private static Object internIdent(String s) {

@@ -1561,6 +1561,13 @@
     (let [nest (fn [n] (apply str (concat (repeat n "81") ["00"])))]
       (is (contains? (try-decode (nest 100000) {}) :err) "100k deep must be rejected")
       (is (contains? (try-decode (nest 2000) {}) :err) "2000 deep must be rejected")
+      ;; This assertion is load-bearing and has already earned it once: an
+      ;; interim reader that took every load through a MemorySegment used
+      ;; ~2.5x the stack per level, dropping the real limit below this cap so
+      ;; that the cap stopped being a cap. It failed INTERMITTENTLY -- the
+      ;; interpreted path survives deeper than the JIT-compiled one -- so a
+      ;; single green run means little here. If this flakes, the decoder's
+      ;; frames grew; do not raise the stack, lower the cap or shrink them.
       (is (contains? (try-decode (nest 1023) {}) :ok) "1023 deep is within the cap")
       (testing "and the cap is configurable"
         (is (contains? (try-decode (nest 100) {:max-depth 50}) :err))

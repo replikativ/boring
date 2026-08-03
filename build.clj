@@ -24,6 +24,11 @@
 (def version
   (or (System/getenv "BORING_VERSION")
       (format "0.1.%s" (b/git-count-revs nil))))
+
+;; The JDK running the BUILD, which is not the JDK the artifact targets. The
+;; codec targets 9; the FFM class targets 22 and can only be compiled by a
+;; javac that knows about release 22.
+(def ^:private build-jdk (.feature (Runtime/version)))
 ;; javac output ONLY. `deps.edn` puts this directory on the classpath so tests
 ;; and the REPL see the compiled Java, which means anything else that lands here
 ;; is also on the classpath. `jar` therefore stages into a SEPARATE directory:
@@ -41,28 +46,71 @@
 (defn clean [_] (b/delete {:path "target"}))
 
 (defn javac
-  "Compile the Java hot path. Targets JDK 9+ — no FFM, no --enable-native-access."
+  "Compile the Java hot path — TWO source sets at TWO release levels.
+
+  `src/java` targets JDK 9: the codec, and a `ByteSource` interface that names
+  no FFM type. `src/java22` targets JDK 22: `SegmentSource`, the MemorySegment
+  implementation of that interface, for mmap'ed and off-heap input.
+
+  One jar can hold class files of mixed versions, because the JVM rejects a
+  class only when it LOADS it. A JDK 9 process runs the codec and never
+  touches SegmentSource; ask it for a segment and you get NoClassDefFoundError
+  at that call rather than a jar that will not load at all. This is what keeps
+  JDK 21 LTS — the incumbent, since 22/23/24 are non-LTS and already EOL — a
+  supported runtime while 22+ additionally gets mmap.
+
+  --release, NOT -source/-target. -target alone still compiles against the
+  BUILD JDK's class library, so a method added after the target release links
+  fine here and throws NoSuchMethodError on the user's JVM. --release pins the
+  API too. Without it the jar carried class-file major version 69 (Java 25, the
+  build JDK) while the README promised JDK 9+, so every advertised runtime
+  except 25 failed with UnsupportedClassVersionError. Nothing caught it because
+  CI tested SOURCES and never built or loaded the jar."
   [_]
   (b/javac {:src-dirs ["src/java"]
             :class-dir class-dir
             :basis @basis
-            ;; --release, NOT -source/-target. -target alone still compiles
-            ;; against the BUILD JDK's class library, so a method added after
-            ;; the target release links fine here and throws NoSuchMethodError
-            ;; on the user's JVM. --release pins the API too.
-            ;;
-            ;; Without this the jar carried class-file major version 69
-            ;; (Java 25, the build JDK) while the README promised JDK 9+, so
-            ;; every advertised runtime except 25 failed with
-            ;; UnsupportedClassVersionError. Nothing caught it because CI
-            ;; tested SOURCES and never built or loaded the jar.
-            :javac-opts ["--release" "9" "-Xlint:-options"]}))
+            :javac-opts ["--release" "9" "-Xlint:-options"]})
+  ;; Second, against JDK 22, with the release-9 output on the classpath so
+  ;; SegmentSource can see the ByteSource interface it implements.
+  ;;
+  ;; SKIPPED when the BUILD jdk is older than 22, because `--release 22` is not
+  ;; a thing javac 21 can do -- it fails with "release version 22 not
+  ;; supported" and takes every downstream job with it. CI runs JDK 21 (the
+  ;; CLJS toolchain pins it), and that is worth keeping: a green JDK 21 run is
+  ;; exactly the evidence that the codec still works without FFM. What it must
+  ;; NOT do is silently produce a release jar with no mmap support, which is
+  ;; what `jar` checks for below.
+  (if (>= build-jdk 22)
+    (b/javac {:src-dirs ["src/java22"]
+              :class-dir class-dir
+              :basis (update @basis :classpath assoc class-dir {:path-key :none})
+              :javac-opts ["--release" "22" "-Xlint:-options"]})
+    (println (str "  note: build JDK is " build-jdk
+                  " (< 22), skipping src/java22 — this build has no "
+                  "SegmentSource, so boring.mmap will not load. Fine for tests "
+                  "and for packaging; `deploy` refuses to publish it."))))
+
+(def ^:private segment-source-class
+  "org/replikativ/boring/ffm/SegmentSource.class")
+
+(defn- has-segment-source? []
+  (.exists (java.io.File. class-dir segment-source-class)))
 
 (defn jar
   "Ships the compiled Java classes alongside the Clojure and ClojureScript
   sources, so consumers need no javac step of their own."
   [_]
   (javac nil)
+  ;; WARN here, THROW in `deploy`. CI builds a jar on JDK 21 to check packaging
+  ;; -- that check is worth having and does not need the ffm class -- but a
+  ;; PUBLISHED jar without it loads fine and then fails at the user's first
+  ;; boring.mmap call. So the gate belongs on the release path, not on every
+  ;; `jar`, which is where it was first put and where it turned CI red.
+  (when-not (has-segment-source?)
+    (println (str "  WARNING: no " segment-source-class
+                  " in this build (JDK " build-jdk " < 22). The jar will not "
+                  "support boring.mmap. `deploy` refuses such a jar.")))
   (b/delete {:path jar-dir})
   (b/delete {:path release-dir})
   (b/write-pom {:class-dir jar-dir
@@ -113,6 +161,13 @@
   green."
   [_]
   (jar nil)
+  ;; The release gate for the mmap path. A jar built on an older JDK silently
+  ;; omits SegmentSource and fails at the consumer's first boring.mmap call.
+  (when-not (has-segment-source?)
+    (throw (ex-info (str "boring: refusing to DEPLOY a jar without "
+                         segment-source-class " — release must be built on "
+                         "JDK 22+ (this is " build-jdk ")")
+                    {:build-jdk build-jdk})))
   (let [{:keys [exit]} (clojure.java.shell/sh "bin/check-artifact")]
     (when-not (zero? exit)
       (throw (ex-info "boring: refusing to deploy, bin/check-artifact failed" {}))))

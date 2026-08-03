@@ -170,9 +170,28 @@
     merged))
 
 (defn writer
-  "Create a reusable Writer. Not thread-safe; one per thread or per loop."
+  "Create a reusable Writer. Not thread-safe; one per thread or per loop.
+
+  With `opts`, they are resolved ONCE here and used by every 2-arity
+  `encode-into!` / `encode-buffered!` / `write-to!` on this writer. Prefer this
+  to passing the same map on every call: `resolve-opts` merges the caller's map
+  over the profile defaults, which allocates ~230-300 B per call. On a log
+  event that is the difference between 452 and 220 heap bytes, and it bites
+  hardest exactly where it is least wanted -- a navigable file needs
+  `:stringref false`, so it cannot use the nil-opts fast path.
+
+  Passing opts explicitly to a 3-arity call still wins, and REPLACES these
+  rather than merging with them -- one place to look for what a call used."
   (^Writer [] (writer 256))
-  (^Writer [^long initial-size] (Writer. initial-size)))
+  (^Writer [^long initial-size] (Writer. initial-size))
+  (^Writer [^long initial-size opts]
+   (doto (Writer. initial-size)
+     (-> .-opts (set! (resolve-opts opts))))))
+
+(defn- writer-opts
+  "The writer's pre-resolved options, or the default set."
+  [^Writer w]
+  (or (.-opts w) default-opts))
 
 (declare configure-reader!)
 
@@ -367,7 +386,7 @@
 
   Still allocates the returned array. For a fully allocation-free loop use
   `encode-buffered!` with `buffer`/`write-to!`."
-  (^bytes [^Writer w v] (encode-into! w v nil))
+  (^bytes [^Writer w v] (.toByteArray ^Writer (write-root! w v (writer-opts w))))
   (^bytes [^Writer w v opts]
    (.toByteArray ^Writer (write-root! w v (resolve-opts opts)))))
 
@@ -381,7 +400,7 @@
   nobody insists on a freshly-allocated byte[] per message.
 
   The buffer is overwritten by the next encode. Do not retain it."
-  (^long [^Writer w v] (encode-buffered! w v nil))
+  (^long [^Writer w v] (.position ^Writer (write-root! w v (writer-opts w))))
   (^long [^Writer w v opts]
    (.position ^Writer (write-root! w v (resolve-opts opts)))))
 
@@ -404,7 +423,10 @@
 (defn write-to!
   "Encode `v` into `w` and write its bytes straight to `out`, with no
   intermediate array."
-  ([^Writer w v ^java.io.OutputStream out] (write-to! w v out nil))
+  ([^Writer w v ^java.io.OutputStream out]
+   (let [n (encode-buffered! w v)]
+     (.write out (.buffer w) 0 (int n))
+     n))
   ([^Writer w v ^java.io.OutputStream out opts]
    (let [n (encode-buffered! w v opts)]
      (.write out (.buffer w) 0 (int n))

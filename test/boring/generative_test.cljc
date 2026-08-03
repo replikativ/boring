@@ -14,7 +14,8 @@
             [clojure.test.check.properties :as prop]
             [boring.core :as boring]
             [boring.conformance :as c]
-            [boring.data :as data]))
+            [boring.data :as data]
+            #?(:clj [boring.nav])))
 
 ;; ---------------------------------------------------------------- generators
 
@@ -303,3 +304,197 @@
 
 (deftest generative-summary
   (is true "specs above carry the assertions"))
+
+;; ------------------------------------------------- skipValue vs the decoder
+;;
+;; `skipValue` is the inner loop of lazy navigation: it walks past a value
+;; without building it. That makes it a SECOND implementation of CBOR's
+;; structure, and the failure mode of a second implementation is silent -- a
+;; skip that lands one byte off does not throw, it returns a plausible wrong
+;; value from the wrong offset.
+;;
+;; So the decoder is the oracle. Whatever `read()` consumes, `skipValue()` must
+;; consume exactly, over every shape the generators can produce and under both
+;; stringref settings -- stringref being the case where skipping cannot ignore
+;; string contents, because a later reference is an index into a table that
+;; skipped strings still have to populate.
+
+#?(:clj
+   (defn- skip-end
+     "Byte offset `skipValue` leaves the cursor at, from a fresh reader."
+     [^bytes bs]
+     (let [r (org.replikativ.boring.Reader. bs)]
+       (.skipValue r)
+       (.position r))))
+
+#?(:clj
+   (defn- read-end
+     "Byte offset `read` leaves the cursor at -- the oracle."
+     [^bytes bs]
+     (let [r (org.replikativ.boring.Reader. bs)]
+       (.read r)
+       (.position r))))
+
+#?(:clj
+   (defspec skip-consumes-exactly-what-decode-consumes 500
+     (prop/for-all [v gen-value]
+                   (let [bs (boring/encode v)]
+                     (= (skip-end bs) (read-end bs) (alength bs))))))
+
+#?(:clj
+   (defspec skip-consumes-exactly-what-decode-consumes-without-stringref 500
+     (prop/for-all [v gen-value]
+                   (let [bs (boring/encode v {:stringref false})]
+                     (= (skip-end bs) (read-end bs) (alength bs))))))
+
+#?(:clj
+   (defspec skip-agrees-on-tag-types 500
+     (prop/for-all [v gen-tagged-nested]
+                   (let [bs (boring/encode v)]
+                     (= (skip-end bs) (read-end bs) (alength bs))))))
+
+#?(:clj
+   (defspec skip-agrees-on-shaped-encodings 300
+     (prop/for-all [v gen-value]
+                   (let [bs (boring/encode v {:shapes true})]
+                     (= (skip-end bs) (read-end bs) (alength bs))))))
+
+;; Skipping the FIRST of two concatenated items must land exactly on the
+;; second, which is the property navigation actually depends on -- landing on
+;; the wrong offset is how a wrong-but-plausible value gets returned.
+#?(:clj
+   (defspec skip-lands-on-the-next-item 300
+     (prop/for-all [a gen-value b gen-value]
+                   (let [^bytes ba (boring/encode a)
+                         ^bytes bb (boring/encode b)
+                         both (byte-array (+ (alength ba) (alength bb)))]
+                     (System/arraycopy ba 0 both 0 (alength ba))
+                     (System/arraycopy bb 0 both (alength ba) (alength bb))
+                     (let [r (org.replikativ.boring.Reader. both)]
+                       (.skipValue r)
+           ;; `c/equiv?`, not `=` -- gen-value produces byte[] and other Java
+           ;; arrays, which compare by IDENTITY under `=`, so this property
+           ;; failed on a correct skip.
+                       (and (= (.position r) (alength ba))
+                            (c/equiv? b (.readNext r))))))))
+
+;; ------------------------------------------------- navigation vs the decoder
+;;
+;; A cursor is a second reading of the wire format, and its failure mode is the
+;; same silent one `skipValue` has: land on the wrong offset and you get a
+;; plausible value from the wrong place rather than an error. So the decoder is
+;; the oracle again -- navigating to a path must equal decoding the whole
+;; document and calling `get-in` on it, for every shape the generators reach.
+
+;; Paths are derived from the CURSOR, not from the decoded value. Clojure's
+;; `map?` is true for RECORDS, but a record is tag 27 on the wire, not a map --
+;; so walking the decoded structure would ask the navigator to descend into
+;; things that are not containers. Asking the wire what it holds is both the
+;; correct test and the one that documents the distinction.
+#?(:clj
+   (defn- nav-paths
+     "Paths into `v` that are genuinely containers on the wire, one and two deep."
+     [c v]
+     (when (= :map (boring.nav/value-type c))
+       (concat (for [k (keys v)] [k])
+               (for [k (keys v)
+                     :let [inner (get c k)]
+                     :when (and (some? inner) (= :map (boring.nav/value-type inner)))
+                     ik (keys (get v k))]
+                 [k ik])))))
+
+#?(:clj
+   (defspec navigation-agrees-with-decode-then-get-in 300
+     (prop/for-all [v (gen/map (gen/one-of [gen/string-ascii gen/large-integer])
+                               gen-value {:max-elements 6})]
+                   (let [opts {:stringref false}
+                         bs (boring/encode v opts)
+                         c (boring.nav/source bs opts)
+                         decoded (boring/decode bs opts)]
+                     (every? (fn [path]
+                               (let [cur (get-in c path)]
+                                 (and (some? cur)
+                                      (c/equiv? (boring.nav/value cur) (get-in decoded path)))))
+                             (nav-paths c v))))))
+
+;; `raw-bytes` must be an independently decodable slice -- that is what makes it
+;; safe to hand a subtree somewhere else without materialising it.
+#?(:clj
+   (defspec raw-bytes-of-a-subtree-decodes-alone 300
+     (prop/for-all [v (gen/map gen/string-ascii gen-value {:max-elements 5})]
+                   (let [opts {:stringref false}
+                         bs (boring/encode v opts)
+                         c (boring.nav/source bs opts)]
+                     (every? (fn [k]
+                               (let [cur (get c k)]
+                                 (c/equiv? (boring/decode (boring.nav/raw-bytes cur) opts)
+                                           (get v k))))
+                             (keys v))))))
+
+;; count must agree with the decoded container, since it is read from the head
+;; rather than counted.
+#?(:clj
+   (defspec cursor-count-agrees 300
+     (prop/for-all [v (gen/map gen/string-ascii gen-value {:max-elements 6})]
+                   (let [opts {:stringref false}
+                         c (boring.nav/source (boring/encode v opts) opts)]
+                     (and (= (count c) (count v))
+              ;; Only where the WIRE says container -- see nav-paths.
+                          (every? (fn [k]
+                                    (let [cur (get c k)]
+                                      (if (contains? #{:map :array} (boring.nav/value-type cur))
+                                        (= (count cur) (count (get v k)))
+                                        true)))
+                                  (keys v)))))))
+
+;; reduce over a cursor must see the same entries as the decoded map, and must
+;; honour `reduced` -- the early-exit is what makes it usable as a source for
+;; transducers over a file you do not want to read all of.
+#?(:clj
+   (defspec cursor-reduce-agrees-and-short-circuits 200
+     (prop/for-all [v (gen/map gen/string-ascii gen/large-integer {:max-elements 6})]
+                   (let [opts {:stringref false}
+                         c (boring.nav/source (boring/encode v opts) opts)
+                         via-nav (reduce (fn [acc e] (assoc acc (key e) (boring.nav/value (val e))))
+                                         {} c)
+                         first-key (reduce (fn [_ e] (reduced (key e))) nil c)]
+                     (and (= via-nav v)
+                          (or (empty? v) (contains? v first-key)))))))
+
+;; ------------------------------------------------------- CBOR sequences
+;;
+;; A log is a CBOR sequence (RFC 8742): top-level items concatenated, which is
+;; what `write-to!` in a loop produces. `nav/source` addresses only the FIRST
+;; of them -- deliberately, since a caller may be navigating a value inside an
+;; oversized scratch buffer -- so `nav/items` is what a log needs, and it must
+;; agree item-for-item with `decode-seq`.
+
+#?(:clj
+   (defspec nav-items-agrees-with-decode-seq 200
+     (prop/for-all [vs (gen/vector gen-value 0 8)]
+                   (let [opts {:stringref false}
+                         baos (java.io.ByteArrayOutputStream.)
+                         w (boring/writer 4096)]
+                     (doseq [v vs] (boring/write-to! w v baos opts))
+                     (let [bs (.toByteArray baos)]
+                       (and (= (count vs)
+                               (reduce (fn [n _] (inc n)) 0 (boring.nav/items bs opts)))
+                            (c/equiv? (vec vs)
+                                      (mapv boring.nav/value (seq (boring.nav/items bs opts))))
+                            (c/equiv? (vec (boring/decode-seq bs opts))
+                                      (mapv boring.nav/value (seq (boring.nav/items bs opts))))))))))
+
+;; `reduced` must stop the walk, which is what makes a transducer over a large
+;; log affordable -- otherwise every early-exit query still pays for the tail.
+#?(:clj
+   (defspec nav-items-short-circuits 200
+     (prop/for-all [vs (gen/vector gen/large-integer 1 10)]
+                   (let [opts {:stringref false}
+                         baos (java.io.ByteArrayOutputStream.)
+                         w (boring/writer 4096)]
+                     (doseq [v vs] (boring/write-to! w v baos opts))
+                     (let [bs (.toByteArray baos)
+                           seen (atom 0)]
+                       (reduce (fn [_ c] (swap! seen inc) (reduced (boring.nav/value c)))
+                               nil (boring.nav/items bs opts))
+                       (= 1 @seen))))))

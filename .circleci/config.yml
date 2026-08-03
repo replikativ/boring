@@ -28,6 +28,23 @@ executors:
       - image: cimg/clojure:1.12-openjdk-21.0-node
     working_directory: ~/repo
 
+  # JDK 25 for the FFM half. `src/java22` compiles at --release 22 and holds
+  # SegmentSource, the MemorySegment implementation behind boring.mmap; javac
+  # 21 cannot target release 22 at all, so on the executor above that source
+  # set is skipped and boring.mmap simply is not built.
+  #
+  # That is deliberate -- a green JDK 21 run is the evidence that the codec
+  # works without FFM, which is a claim this project makes -- but it left the
+  # entire off-heap path untested: the mmap tests SKIP there, and the artifact
+  # job only ever inspected a jar with no SegmentSource in it.
+  #
+  # 25 and not 22: 22, 23 and 24 are non-LTS and already end-of-life, so "JDK
+  # 22+" means 25 LTS in practice, and that is what users will actually run.
+  clj-node-25:
+    docker:
+      - image: cimg/clojure:1.12-openjdk-25.0-node
+    working_directory: ~/repo
+
 commands:
   restore-deps:
     steps:
@@ -118,6 +135,28 @@ jobs:
             - interop/rust/target
       - store-logs
 
+  # The half the JDK 21 jobs cannot reach. Same suite, but here it compiles
+  # src/java22 and the mmap tests RUN rather than skip -- they probe
+  # SegmentSource specifically, not the preview java.lang.foreign that JDK 21
+  # also ships, so on 21 they correctly decide FFM is unavailable and stand
+  # down. Without this job that decision is never once exercised the other way.
+  #
+  # `bin/ci artifact` matters here too: it is the only place a jar containing
+  # SegmentSource is ever built and checked, and `clj -T:build deploy` refuses
+  # to publish one without it.
+  ffm:
+    executor: clj-node-25
+    steps:
+      - checkout
+      - restore-deps
+      - run:
+          name: JVM suite on JDK 25 — mmap and the segment reader
+          command: bin/ci jvm
+      - run:
+          name: Built artifact WITH the FFM class
+          command: bin/ci artifact
+      - store-logs
+
   cljs:
     executor: clj-node
     steps:
@@ -161,6 +200,7 @@ workflows:
           context: docker-deploy
           setup_cljs: false
       - jvm
+      - ffm
       - cljs
       - interop
       - fuzz
@@ -172,6 +212,15 @@ workflows:
       # the GitHub release. `clj -T:build deploy` runs bin/check-artifact first
       # and refuses to publish a jar that fails it, so the gate is on the
       # publish path and not merely on the test path.
+      #
+      # CHECK BEFORE THE NEXT RELEASE: `tools/deploy` runs on the ORB's
+      # executor, not on one declared here, and `clj -T:build deploy` now
+      # refuses to publish a jar without SegmentSource -- which a JDK older
+      # than 22 cannot build. If the orb's image is JDK 21, the release will
+      # fail this gate. That is the correct failure (better than silently
+      # shipping a jar whose boring.mmap cannot load) but it needs the orb's
+      # JDK confirmed, or the orb call pinned to a 22+ image, before merging to
+      # main. It was not verifiable from the machine this was written on.
       - tools/deploy:
           context:
             - clojars-deploy
@@ -182,6 +231,7 @@ workflows:
           requires:
             - tools/setup
             - jvm
+            - ffm
             - cljs
             - interop
             - fuzz

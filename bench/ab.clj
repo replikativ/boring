@@ -8,7 +8,12 @@
 
   Instead: alternate A and B in short bursts inside one loop, so both see the
   same conditions, and take the min over many rounds — the round that lands in a
-  quiet moment gives a clean reading for both."
+  quiet moment gives a clean reading for both.
+
+  This ns compares boring's reused writer against hako's `encode`, which builds
+  a fresh Writer and Arena per call — not a matched pair. `hako-ab` runs the
+  same interleaved harness over properly matched tiers and is the one to quote;
+  this one is kept for the nippy columns and for the historical numbers."
   (:require [boring.core :as boring]
             [s-exp.hako :as hako]
             [taoensso.nippy :as nippy])

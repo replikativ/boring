@@ -16,6 +16,23 @@ import java.util.Set;
  * MemorySegment. Requires JDK 9+, and no flags -- an FFM path would need
  * --enable-native-access on current JDKs.
  *
+ * Re-measured since against a NATIVE segment, which that first round never
+ * covered. Naively, big-endian access to an off-heap segment costs 5.63 ns
+ * against 1.37 for byte[] on stock HotSpot 25 -- but that 4.1x is the JIT
+ * declining to intrinsify a non-native ValueLayout, not a cost of off-heap
+ * memory, and it vanishes if you access in native order and call
+ * Long.reverseBytes (a bswap intrinsic): 1.38 ns, byte-identical output.
+ *
+ * So FFM is available at parity on stock HotSpot, and byte[] is kept for
+ * reasons other than raw scalar speed: no --enable-native-access, JDK 9+
+ * rather than 22+, endian-neutrality without a manual swap, and an encode path
+ * that already measures 0 bytes/op allocated. Graal additionally penalises
+ * native-segment WRITES 1.6x. doc/PERFORMANCE.md has the tables, and the
+ * caveat that matters more than any of them: those figures come from a tight
+ * loop over a constant layout, where the JIT hoists the bounds and liveness
+ * checks out. A recursive decoder does not get that, and measured 14-50%
+ * slower when it was actually built that way.
+ *
  * This class comment used to end "prototype scope: bignums, ratios, instants,
  * typed arrays and the tag registry are not here yet." All of those ship. See
  * doc/COMPATIBILITY.md for the complete list of what is emitted.
@@ -280,6 +297,19 @@ public final class Writer {
      * homogeneous-and-repetitive, and it is a wire feature a peer must
      * understand. datahike's chunked dumps are the case it exists for.
      */
+    /**
+     * Resolved encode options, for callers that create the writer once.
+     *
+     * Held as Object because they are a Clojure map and this class knows
+     * nothing about them -- boring.core resolves them at writer construction
+     * and reads them back on every 2-arity encode. The point is to stop
+     * resolving them PER CALL: `resolve-opts` merges the caller's map over a
+     * profile's defaults, which allocated ~230-300 B on every single encode.
+     * A navigable log pays that on every event, because navigation requires
+     * `:stringref false` and so cannot use the nil-opts fast path.
+     */
+    public Object opts;
+
     public boolean shapes = false;
 
     /**

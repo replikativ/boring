@@ -19,10 +19,16 @@
        in background load lands entirely on one side.
     3. criterium last (`bench`), for the absolute µs/op figures. Slowest, and
        the most sensitive to a noisy machine.
+    4. navigation (`nav`) and mmap (`mmap`) last. Both compare boring against
+       ITSELF -- a walk that builds nothing versus a full decode, a mapping
+       versus a heap array -- so neither depends on how the other codecs
+       happened to warm up, and both bring their own harness.
 
-  A single global warmup covers all three, because per-cell warmup is not
+  One global warmup covers `ab` and `bench`, because per-cell warmup is not
   enough: hako's small-map encode measured 2.52 / 1.30 / 1.15 / 1.08 µs across
-  four consecutive runs of the same cell."
+  four consecutive runs of the same cell. `skip` and `nav` warm themselves --
+  they compare boring against boring, so they do not need every codec exercised
+  first."
   (:require [ab]
             [bench]
             [published]
@@ -87,6 +93,30 @@
     (when (run? :criterium)
       (banner "TIMING, criterium — absolute µs/op, slowest and noisiest")
       (bench/-main))
+
+    ;; The last two sections are resolved LAZILY rather than required at the top
+    ;; of this ns. Both touch java.lang.foreign and so need JDK 22+: skip.clj
+    ;; compares its scanner across byte[], a heap segment and an mmap'ed one,
+    ;; and nav.clj pulls in boring.mmap.
+    ;;
+    ;; Honest note on what that does and does not buy. It does NOT make this
+    ;; suite runnable on an older JVM -- the :bench alias already pins JDK 25,
+    ;; because hako's classes are class-file version 69 and nothing here loads
+    ;; without them. What it buys is that these sections degrade to a printed
+    ;; skip instead of an UnsupportedClassVersionError, and that this ns keeps
+    ;; no load-time dependency on FFM if the hako peer ever becomes optional.
+    ;; Do not read it as JDK 21 support for the suite.
+    (when (run? :nav)
+      (banner "NAVIGATION — skipping, and cursor vs decode-then-get-in")
+      (if-let [f (try (requiring-resolve 'nav/-main) (catch Throwable _ nil))]
+        (f)
+        (println "skipped: this section needs JDK 22+, and this JVM cannot load it")))
+
+    (when (run? :mmap)
+      (banner "MMAP — selective read, append, and chunked compression")
+      (if-let [f (try (requiring-resolve 'mmap/-main) (catch Throwable _ nil))]
+        (f)
+        (println "skipped: this section needs JDK 22+, and this JVM cannot load it")))
 
     (println)
     (println "done.")

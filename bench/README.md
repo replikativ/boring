@@ -29,7 +29,10 @@ Three kinds of thing live in this directory:
 | `suite.clj` | the entry point above — runs the others in the right order, with one global warmup |
 | `ab.clj` | A/B harness that interleaves two codecs in short bursts. Use this, not criterium, whenever the machine is not quiet — criterium measures A for ~7s then B for ~7s and background load drift makes that comparison meaningless. Includes a global warmup, because per-cell warmup was not enough (hako's small-map encode measured 2.52 / 1.30 / 1.15 / 1.08 µs across four consecutive runs). |
 | `bench.clj` | main JVM competitive benchmark vs nippy, hako, clj-cbor |
+| `hako_ab.clj` | **the tier-matched boring-vs-hako table**, time and allocation. Quote this one, not `bench.clj`'s hako column: `hako/encode` builds a fresh Writer and Arena per call and is not the path hako is meant to be used through, so pairing it against boring's reused writer measured our fast path against their slow one. Also carries the heap-only caveat on the allocation columns |
 | `alloc.clj` | bytes allocated per op via `ThreadMXBean` — the axis timing benchmarks miss |
+| `mmap.clj` | everything mmap, in three sections (`read`/`write`/`compress`): selective decode beats a `pread` per item 2.3x; mmap **loses** to a buffered stream for append; and the chunked-zstd curve that picks a chunk size. `clojure -M:bench -m mmap write` runs one section |
+| `nav.clj` | navigation, in two sections (`skip`/`cursor`): how cheap it is to walk past a value without decoding it — the inner loop — and then what the shipped `boring.nav` api delivers against decode-then-`get-in`. Records a NEGATIVE result too: early-exit on the first item of a log is *slower* than `decode-seq`, which is lazy already |
 | `fuzz.clj` | mutation fuzzer over valid encodings. Found 154 untyped failures per 60k mutants on its first run. Run it after any decoder change. |
 | `prof.clj` | clj-async-profiler driver for the JVM decode loop |
 | `large.clj` | MB-scale payloads and streaming throughput, with a bounded-memory check |

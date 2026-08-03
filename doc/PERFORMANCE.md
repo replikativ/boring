@@ -84,9 +84,20 @@ Wire size, bytes:
 
 boring beats nippy on all twelve timing cells, and on size for the two payloads
 where the shape machinery applies. Against hako — an experimental codec built
-for speed — it wins the small-payload encodes outright, ties `datom-maps-200`,
-wins `str-maps-200` decode by 1.7× at **2.1× smaller on the wire**, and loses
-the nested-map and integer-vector rows (see below).
+for speed — it wins the small-payload encodes, ties `datom-maps-200`, wins
+`str-maps-200` decode by 1.7× at **2.1× smaller on the wire**, and loses the
+nested-map and integer-vector rows (see below).
+
+**The tier this table uses matters, and it flatters boring on the small rows.**
+Every codec here allocates fresh per call, which is matched — but `hako/encode`
+builds a Writer and a confined Arena each time, and hako's intended path is the
+reused `encode-into!`. Reuse both sides and the small-payload encode wins
+*reverse*: `small-map` goes from boring 0.50 / hako 1.08 µs to boring 0.86 /
+hako 0.59. `clojure -M:bench -m hako-ab` is the tier-matched table — time and
+allocation, T1/T2/T3 — and it is the one to quote when comparing the two
+libraries as each is meant to be called. Summarised: hako wins map-heavy encode
+(1.1–1.8×) and map-heavy decode (~2×); boring wins vector-heavy decode (~1.3×)
+and allocates less on every payload measured.
 
 The four small cells are close enough that the ordering is not stable across
 machines; treat 0.13 vs 0.18 µs as "the same". The gaps worth reading are the
@@ -152,6 +163,147 @@ against boring's raw 15 326. Put both behind a compressor and **boring+zstd
 lands at 4 900 bytes in the same 1 102 µs nippy takes for 8 518** — 1.7×
 smaller at equal time. nippy/lzma2 is smaller still at 3 888, for 8× the
 round-trip. fressian+zstd is 6% smaller than boring+zstd and 2.8× slower.
+
+## Reading: `byte[]`, FFM, and navigation
+
+hako builds on `java.lang.foreign` — a confined `Arena` owning a native
+`MemorySegment`. boring's reader does not, and the reason is measured rather
+than assumed, because the first attempt got it wrong.
+
+### The microbenchmark lied
+
+A microbenchmark of the access pattern a CBOR codec has — a header byte then an
+unaligned scalar — reports a native segment at **parity** with `byte[]`,
+provided you never use `withOrder(BIG_ENDIAN)`. That layout costs 4.1× on stock
+HotSpot by declining to intrinsify; access in native order and
+`Long.reverseBytes` (a bswap intrinsic, byte-identical output) and the penalty
+vanishes. `byteArrayViewVarHandle`, by contrast, is endian-neutral. **That
+endian rule still holds and `SegmentSource` depends on it** — it is the one
+result from that probe that survived.
+
+So a segment-based reader was built. It cost **14–50% on decode** and ~2.5× the
+stack per recursive level — enough that `maxDepth`'s 1024 default rose *above*
+the real stack limit and the depth cap silently stopped being a cap.
+
+`clj-async-profiler` said why: ~25% of samples in `checkValidStateRaw`,
+`checkIndex`, `checkSegment`, `checkBounds` — per-access bounds and liveness
+checks. A tight loop over a constant layout lets the JIT hoist all of it, which
+is exactly what the microbenchmark measured. A recursive, branchy decoder does
+not. **A microbenchmark of an access pattern is not a benchmark of a decoder
+built on it.**
+
+The probe itself is not in the repo. Its headline number was withdrawn, and a
+probe that reproduces a withdrawn conclusion is worse than no probe: someone
+runs it, sees parity, and re-opens a settled question. What survived is written
+down here and in `SegmentSource`, which is where it is load-bearing.
+
+`ByteBuffer` is the JDK-9-compatible alternative and is worse: it ties `byte[]`
+on sequential scans but runs **2.29×** on the data-dependent walk a head parser
+actually performs, against `MemorySegment`'s 1.22×.
+
+### What shipped: one parser, two accessors
+
+The structural logic is single-source — a second head parser is what drifts,
+silently — but the loads branch on whether the source is a heap array. That
+recovers the loss in full (`datom-maps-200` decode: 53.39 µs before, 72.06
+all-segment, **53.06** with the branch; allocation identical).
+
+Because the `byte[]` path then touches no FFM, the FFM types moved out of
+`Reader` behind a JDK-9-named `ByteSource`. `src/java` compiles at
+`--release 9`, `src/java22` holds the one `MemorySegment` implementation, and
+one jar carries both since the JVM rejects a class only when it *loads* it. The
+full suite passes on **JDK 21**, which cannot load FFM at all; 22+ adds mmap.
+
+Off-heap decode costs **1.35×** heap decode, and only that path pays it
+(shared/global arena 1.35×, confined 1.46×). It also means: to realise a whole
+subtree from a mapping, stage its byte span into a scratch array and decode
+through the array path (67.5 µs) rather than in place (75.4 µs).
+
+### Navigation
+
+`boring.nav` is a read-only cursor — `ILookup` (so `clojure.core/get-in`
+works), `Indexed`, `Counted`, `Seqable`, `IReduceInit`, and a `clojure.zip`
+zipper. `clojure -M:bench -m nav`:
+
+| 68 KB, 200 records | nav | decode + `get-in` | ratio |
+|---|---:|---:|---:|
+| `get-in` one leaf (heap) | 5.9 µs | 124 µs | **21×** |
+| `count` the top-level map | 0.08 µs | 121 µs | **1400×** |
+| reduce over all 200, one field each | 57 µs | 125 µs | 2.2× |
+| `get-in` one leaf (mmap'ed) | 6.2 µs | 131 µs | **21×** |
+| locate a 1 MiB blob vs materialise it | 0.6 µs | 185 µs | **290×** |
+
+`count` is O(1) — the element count is in the head. The reduce row is only 2.2×
+because it visits every record. Skipping is 3–11× cheaper than decoding for
+structure and **18×** for a bytestring, which is length-prefixed, so ignoring
+one is a jump whose cost does not scale with its size.
+
+A log is a CBOR sequence, walked by `nav/items`:
+
+| 5 000 events, 360 KB | nav | decode-seq | ratio |
+|---|---:|---:|---:|
+| scan for matching events | 1 542 µs | 5 330 µs | **3.5×** |
+| first event only (early exit) | 3.9 µs | 2.2 µs | **0.6×** |
+
+**That second row is where nav loses, and it is the useful one.** `decode-seq`
+is already lazy, so stopping at the first item decodes only that item — and for
+one small item a cursor plus a key probe costs more than decoding it.
+Navigation wins by what it *skips*.
+
+Write such a file with the options on the **writer**, not per call:
+
+```clojure
+(let [w (boring/writer 65536 {:stringref false})]
+  (with-open [out (BufferedOutputStream. (FileOutputStream. f) 262144)]
+    (doseq [e events] (boring/write-to! w e out))))
+```
+
+`resolve-opts` merges the caller's map over the profile defaults on every
+encode, which costs ~250 heap bytes per event — and it bites hardest here,
+because a navigable file needs `:stringref false` and so cannot use the
+nil-opts fast path. Resolved once on the writer, a log event costs **301 → 15**
+bytes through `encode-buffered!` and **248 → 0** through `write-to!`.
+
+Two constraints are enforced, not documented-and-hoped: `:stringref` documents
+are refused (a cursor holding only an offset cannot resolve an index into a
+table built from preceding strings), and indefinite-length containers cannot be
+descended (their count is not on the wire, so `Counted` would lie — boring
+never writes them). Tags are opaque: `get` realises through the ordinary reader
+and delegates, because a tag's reader is an arbitrary function and structure
+does not imply semantics.
+
+### mmap: good for reading, not for writing
+
+`clojure -M:bench -m mmap`. Selective decode over a mapping beats a `pread` per
+item **2.3×**, and costs 3–17% over a no-copy floor.
+
+Writing is the opposite. Appending 200 000 items: `BufferedOutputStream`
+**130 ms**, mmap 171 ms, encode-only floor **105 ms**. A mapping faults per
+4 KiB page while `write(2)` hands the kernel one prepared buffer. The floor
+matters more than the ranking — **I/O is 19% of the job** — so a writer that
+encoded straight into a mapping would compete for that 19% against an overhead
+larger than the copy it removes. The actionable finding is that an unbuffered
+`FileOutputStream` is **2.9× slower** than wrapping it.
+
+### Compression: chunk at page size
+
+Compression and mmap'ed selective access pull against each other: mmap pages at
+4 KiB, a compressed block only decodes whole. zstd level 3, random lookups:
+
+| chunk | compressed | ratio | ns/lookup | vs raw |
+|---|---:|---:|---:|---:|
+| uncompressed | 15.4 MB | 1.00× | 1 498 | 1.0× |
+| **4 KB** | **1.59 MB** | **9.7×** | **5 400** | **3.6×** |
+| 64 KB | 1.22 MB | 12.7× | 55 987 | 37× |
+| 256 KB | 1.21 MB | 12.8× | 201 755 | 135× |
+
+Lookup cost scales with chunk size; ratio saturates almost immediately. 4 KB
+reaches 77% of whole-file ratio and aligns with the page granularity mmap gives
+you anyway. This is the argument *against* filesystem compression here: btrfs
+compresses 128 KiB extents and ZFS a 128 KiB recordsize, landing at the bottom
+of that table with no knob. Compression also forecloses zero-copy — a chunk
+must be decompressed to the heap — so it and the blob win are alternatives for
+the same bytes.
 
 ## Where boring loses
 
