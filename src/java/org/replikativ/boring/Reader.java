@@ -1541,6 +1541,13 @@ public final class Reader {
     private static final clojure.lang.Keyword KW_TAG = clojure.lang.Keyword.intern("tag");
     private static final clojure.lang.Keyword KW_VALUE = clojure.lang.Keyword.intern("value");
 
+    /** 10^e for the small e RFC 9581's decimal scale factors use. */
+    private static long pow10(int e) {
+        long r = 1;
+        while (e-- > 0) r *= 10;
+        return r;
+    }
+
     /** A tag-258 set, with the duplicate-element check both content paths need.
      *  Maps reject duplicate keys as an anti-differential measure; sets used to
      *  collapse them silently. Same rule, same reason. */
@@ -2272,8 +2279,12 @@ public final class Reader {
                 // typed error naming the key, rather than reported as "no base
                 // value" or ignored. Refusing a conforming form we cannot carry
                 // losslessly is honest; truncating it is not.
-                Object sec = m.get(1L), nano = m.get(-9L);
+                Object sec = m.get(1L);
+                Object nano = null;
+                int fracScale = 0;                  // 3, 6, 9, 12, 15 or 18
                 for (Object k : m.keySet()) {
+                    // A TEXT KEY IS ELECTIVE and skipped -- see the negative-key
+                    // note below; RFC 9581 3 groups the two together.
                     if (!(k instanceof Number)) continue;
                     long kk = ((Number) k).longValue();
                     if (kk == 4 || kk == 5)
@@ -2285,12 +2296,29 @@ public final class Reader {
                     if (kk >= 0 && kk != 1)
                         throw Err.of("bad-tag-content",
                             "boring: tag 1002 has unknown critical key " + kk, "tag", 1002L);
-                    // Only one scaled fraction may appear, and only -9 is one
-                    // boring can carry exactly.
-                    if (kk < 0 && kk != -9)
-                        throw Err.of("bad-tag-content",
-                            "boring: tag 1002 scaled-fraction key " + kk
-                            + " is not a form boring represents", "tag", 1002L);
+                    if (kk == -3 || kk == -6 || kk == -9
+                        || kk == -12 || kk == -15 || kk == -18) {
+                        // RFC 9581 3.3: "Each extended time data item MUST NOT
+                        // contain more than one of these keys."
+                        if (nano != null)
+                            throw Err.of("bad-tag-content",
+                                "boring: tag 1002 has more than one decimally scaled"
+                                + " fraction key", "tag", 1002L);
+                        fracScale = (int) -kk;
+                        nano = m.get(k);
+                    }
+                    // EVERY OTHER NEGATIVE KEY IS IGNORED, which RFC 9581 3
+                    // requires: "For negative integer keys and text string values
+                    // of the key, implementations MUST ignore key/value pairs they
+                    // do not understand; these keys are 'elective', as the
+                    // extended time as a whole is still usable without the
+                    // information they carry".
+                    //
+                    // boring threw on all of them. That refused conforming
+                    // durations outright -- `{1: 5, -1: 0}` (timescale UTC, the
+                    // DEFAULT) and `{1: 5, -13: ...}` among them -- and inverted
+                    // a MUST while the comment above claimed "the rules below are
+                    // the RFC's". The unsigned half was right and stays.
                 }
                 if (sec == null)
                     throw Err.of("bad-tag-content",
@@ -2352,11 +2380,38 @@ public final class Reader {
                 if (!(nano instanceof Number) || nano instanceof Double || nano instanceof Float)
                     throw Err.of("bad-tag-content",
                                  "boring: tag 1002 fraction must be an integer", "tag", 1002L);
-                long nn = ((Number) nano).longValue();
-                if (nn < 0 || nn > 999999999L)
+                long fv = ((Number) nano).longValue();
+                if (fv < 0)
                     throw Err.of("bad-tag-content",
-                        "boring: tag 1002 fraction " + nn
-                        + " is outside 0..999999999", "tag", 1002L);
+                        "boring: tag 1002 fraction " + fv + " must be unsigned", "tag", 1002L);
+                // SCALED TO NANOSECONDS. -3 is milliseconds (Java time), -6
+                // microseconds (old UNIX), -9 nanoseconds (new UNIX) -- all three
+                // exact in a Duration, and boring used to refuse two of them.
+                long nn;
+                if (fracScale <= 9) {
+                    long mul = pow10(9 - fracScale);
+                    if (fv > 999999999L / mul)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 fraction " + fv + "e-" + fracScale
+                            + " is a second or more", "tag", 1002L);
+                    nn = fv * mul;
+                } else {
+                    // -12/-15/-18 are picoseconds and finer. Accepted when they
+                    // land on a whole nanosecond, refused otherwise: a Duration
+                    // has no room below 1 ns, and silently dropping the remainder
+                    // would be the truncation this tag handler exists to prevent.
+                    long div = pow10(fracScale - 9);
+                    if (fv % div != 0)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 fraction " + fv + "e-" + fracScale
+                            + " is finer than the nanosecond a java.time.Duration holds",
+                            "tag", 1002L);
+                    nn = fv / div;
+                    if (nn > 999999999L)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 fraction " + fv + "e-" + fracScale
+                            + " is a second or more", "tag", 1002L);
+                }
                 return java.time.Duration.ofSeconds(((Number) sec).longValue(), nn);
             }
             case 1004: {                                     // full-date, RFC 8943

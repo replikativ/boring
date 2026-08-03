@@ -198,7 +198,13 @@
                            ["decimal-fraction base"    {4 [-1 15]}]
                            ["bigfloat base"            {5 [-1 15]}]
                            ["unknown critical key"     {1 2 99 "x"}]
-                           ["other scaled fraction"    {1 2 -3 5}]
+                           ;; `{1 2, -3 5}` USED TO BE HERE. It is a conforming
+                           ;; duration -- -3 is milliseconds -- and RFC 9581 3
+                           ;; makes negative keys elective, so refusing it
+                           ;; inverted a MUST. See
+                           ;; `tag-1002-ignores-elective-keys-and-scales-every-fraction`.
+                           ["sub-nanosecond fraction"  {1 2 -12 1}]
+                           ["two scaled fractions"     {1 2 -3 5 -6 5}]
                            ["no base"                  {-9 5}]]]
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"tag 1002"
                                 (dur m))
@@ -573,3 +579,38 @@
       (java.time.Instant/parse "2013-03-21T20:04:00Z")
       (java.time.Instant/parse "0001-01-01T00:00:00Z")
       (java.time.Instant/parse "9999-12-31T23:59:59Z"))))
+
+;; ------------------------------------------------------- RFC 9581 tag 1002
+
+(defn- unhex ^bytes [s]
+  (byte-array (map #(unchecked-byte (Integer/parseInt (apply str %) 16))
+                   (partition 2 (clojure.string/replace s #"\s" "")))))
+
+(deftest tag-1002-ignores-elective-keys-and-scales-every-fraction
+  (testing "RFC 9581 3: \"For negative integer keys and text string values of the
+            key, implementations MUST ignore key/value pairs they do not
+            understand; these keys are 'elective'.\" boring threw on every
+            negative key but -9, which inverted a MUST and refused conforming
+            durations -- including `{1: 5, -1: 0}`, whose elective key names the
+            DEFAULT timescale."
+    (are [hex expected] (= expected (str (boring/decode (unhex hex) o)))
+      ;; -3 milliseconds (Java time) and -6 microseconds (old UNIX time) are
+      ;; exactly representable and were both refused outright.
+      "d903eaa2010522 1901f4"     "PT5.5S"
+      "d903eaa2010525 1a0007a120" "PT5.5S"
+      "d903eaa2010528 01"         "PT5.000000001S"
+      ;; -12 picoseconds, landing on a whole nanosecond
+      "d903eaa201052b 1903e8"     "PT5.000000001S"
+      ;; elective keys boring does not implement are IGNORED, not fatal
+      "d903eaa2010520 00"         "PT5S"          ; -1  timescale
+      "d903eaa201052c 01"         "PT5S"          ; -13 timescale
+      "d903eaa1 0105"             "PT5S"))
+  (testing "what still fails, and why"
+    (are [hex] (thrown-with-msg? clojure.lang.ExceptionInfo #"tag 1002"
+                                 (boring/decode (unhex hex) o))
+      ;; finer than a Duration's nanosecond -- refused rather than truncated
+      "d903eaa201052b 01"
+      ;; RFC 9581 3.3: "MUST NOT contain more than one of these keys"
+      "d903eaa3010522 0525 05"
+      ;; an unsigned key is CRITICAL: 3 says a reader MUST signal an error
+      "d903eaa201050d 00")))
