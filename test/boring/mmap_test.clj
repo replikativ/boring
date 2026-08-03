@@ -75,23 +75,23 @@
           (tc/quick-check
            150
            (prop/for-all [v gen-doc]
-             (let [^bytes bs (boring/encode v opts)
-                   f (spit-bytes bs)
-                   heap (nav/source bs opts)
-                   decoded (boring/decode bs opts)
-                   [mm arena] (mmap-source* f)]
-               (try
-                 (every?
-                  (fn [path]
-                    (let [via-mm (get-in mm path)
-                          via-heap (get-in heap path)]
-                      (and (some? via-mm)
-                           (some? via-heap)
+                         (let [^bytes bs (boring/encode v opts)
+                               f (spit-bytes bs)
+                               heap (nav/source bs opts)
+                               decoded (boring/decode bs opts)
+                               [mm arena] (mmap-source* f)]
+                           (try
+                             (every?
+                              (fn [path]
+                                (let [via-mm (get-in mm path)
+                                      via-heap (get-in heap path)]
+                                  (and (some? via-mm)
+                                       (some? via-heap)
                            ;; mmap == heap == decode, all three
-                           (c/equiv? (nav/value via-mm) (nav/value via-heap))
-                           (c/equiv? (nav/value via-mm) (get-in decoded path)))))
-                  (paths-of heap v))
-                 (finally (.close ^java.lang.AutoCloseable arena))))))]
+                                       (c/equiv? (nav/value via-mm) (nav/value via-heap))
+                                       (c/equiv? (nav/value via-mm) (get-in decoded path)))))
+                              (paths-of heap v))
+                             (finally (.close ^java.lang.AutoCloseable arena))))))]
       (is (:pass? result) (pr-str result)))))
 
 (deftest mmap-raw-bytes-and-count-agree
@@ -101,18 +101,18 @@
           (tc/quick-check
            150
            (prop/for-all [v gen-doc]
-             (let [^bytes bs (boring/encode v opts)
-                   f (spit-bytes bs)
-                   [mm arena] (mmap-source* f)]
-               (try
-                 (and (= (count mm) (count v))
+                         (let [^bytes bs (boring/encode v opts)
+                               f (spit-bytes bs)
+                               [mm arena] (mmap-source* f)]
+                           (try
+                             (and (= (count mm) (count v))
                       ;; a subtree lifted out of the MAPPING must decode alone
-                      (every? (fn [k]
-                                (let [cur (get mm k)]
-                                  (c/equiv? (boring/decode (nav/raw-bytes cur) opts)
-                                            (get v k))))
-                              (keys v)))
-                 (finally (.close ^java.lang.AutoCloseable arena))))))]
+                                  (every? (fn [k]
+                                            (let [cur (get mm k)]
+                                              (c/equiv? (boring/decode (nav/raw-bytes cur) opts)
+                                                        (get v k))))
+                                          (keys v)))
+                             (finally (.close ^java.lang.AutoCloseable arena))))))]
       (is (:pass? result) (pr-str result)))))
 
 (deftest closing-the-arena-invalidates-cursors

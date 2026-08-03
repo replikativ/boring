@@ -115,8 +115,6 @@
 
 ;; ------------------------------------------------------------- wire queries
 
-(def ^:private ^:const MAJOR-BYTES 2)
-(def ^:private ^:const MAJOR-TEXT 3)
 (def ^:private ^:const MAJOR-ARRAY 4)
 (def ^:private ^:const MAJOR-MAP 5)
 (def ^:private ^:const MAJOR-TAG 6)

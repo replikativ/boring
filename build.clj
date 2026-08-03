@@ -24,6 +24,11 @@
 (def version
   (or (System/getenv "BORING_VERSION")
       (format "0.1.%s" (b/git-count-revs nil))))
+
+;; The JDK running the BUILD, which is not the JDK the artifact targets. The
+;; codec targets 9; the FFM class targets 22 and can only be compiled by a
+;; javac that knows about release 22.
+(def ^:private build-jdk (.feature (Runtime/version)))
 ;; javac output ONLY. `deps.edn` puts this directory on the classpath so tests
 ;; and the REPL see the compiled Java, which means anything else that lands here
 ;; is also on the classpath. `jar` therefore stages into a SEPARATE directory:
@@ -68,16 +73,40 @@
             :javac-opts ["--release" "9" "-Xlint:-options"]})
   ;; Second, against JDK 22, with the release-9 output on the classpath so
   ;; SegmentSource can see the ByteSource interface it implements.
-  (b/javac {:src-dirs ["src/java22"]
-            :class-dir class-dir
-            :basis (update @basis :classpath assoc class-dir {:path-key :none})
-            :javac-opts ["--release" "22" "-Xlint:-options"]}))
+  ;;
+  ;; SKIPPED when the BUILD jdk is older than 22, because `--release 22` is not
+  ;; a thing javac 21 can do -- it fails with "release version 22 not
+  ;; supported" and takes every downstream job with it. CI runs JDK 21 (the
+  ;; CLJS toolchain pins it), and that is worth keeping: a green JDK 21 run is
+  ;; exactly the evidence that the codec still works without FFM. What it must
+  ;; NOT do is silently produce a release jar with no mmap support, which is
+  ;; what `jar` checks for below.
+  (if (>= build-jdk 22)
+    (b/javac {:src-dirs ["src/java22"]
+              :class-dir class-dir
+              :basis (update @basis :classpath assoc class-dir {:path-key :none})
+              :javac-opts ["--release" "22" "-Xlint:-options"]})
+    (println (str "  note: build JDK is " build-jdk
+                  " (< 22), skipping src/java22 — this build has no "
+                  "SegmentSource, so boring.mmap will not load. Fine for "
+                  "tests; `jar` refuses to package it."))))
+
+(def ^:private segment-source-class
+  "org/replikativ/boring/ffm/SegmentSource.class")
 
 (defn jar
   "Ships the compiled Java classes alongside the Clojure and ClojureScript
   sources, so consumers need no javac step of their own."
   [_]
   (javac nil)
+  ;; A jar without SegmentSource loads fine and then fails at the first
+  ;; boring.mmap call, on the user's machine, at runtime. Refuse here instead:
+  ;; the only way to produce one is to build on a JDK older than 22.
+  (when-not (.exists (java.io.File. class-dir segment-source-class))
+    (throw (ex-info (str "boring: refusing to package a jar without "
+                         segment-source-class " — build on JDK 22+ (this is "
+                         (str build-jdk) ")")
+                    {:build-jdk build-jdk})))
   (b/delete {:path jar-dir})
   (b/delete {:path release-dir})
   (b/write-pom {:class-dir jar-dir
