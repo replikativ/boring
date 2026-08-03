@@ -1,4 +1,4 @@
-# IANA registration for tag 39649
+# IANA registration for tags 39649 and 39651
 
 Tag 39649 (shaped array) is **provisional**: boring emits it today under
 `:shapes true`, but it is not in the IANA CBOR tag registry, so the number is
@@ -24,6 +24,17 @@ still entirely unassigned.
 
 Re-verified against <https://www.iana.org/assignments/cbor-tags/tags.csv> on
 2026-07-31: 39649 unassigned, nothing assigned in 38000–39999.
+
+**39651, sequence offset index**, is the second provisional tag, taken from the
+same surveyed gap and for the same reasons. 39650 was skipped because
+`doc/SHAPES.md` already specifies it for the scattered-shape case.
+
+This doubles the obligation below rather than adding a footnote to it: two
+numbers now have to be registered or removed before the first release, not one.
+Both degrade safely if a collision happens — an unrecognised tag surfaces as a
+`TaggedValue`, and for 39651 the reader simply falls back to scanning — but
+"degrades safely" is not the same as "is ours", and the point of this document
+is to not confuse the two.
 
 ## Procedure
 

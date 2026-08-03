@@ -496,19 +496,95 @@
 ;; depends on everything before it, so the chunk must be read from the start and
 ;; cannot be split. Not implemented; chunk size is the knob for that tradeoff.
 
+(declare seal-index!)
+
 (defn write-seq!
   "Encode each value in `values` to `out` as consecutive top-level CBOR items.
   Returns the number of bytes written. Constant memory: one value at a time,
-  through the writer's own buffer, with no intermediate array per item."
+  through the writer's own buffer, with no intermediate array per item.
+
+  `:index N` additionally seals the sequence with an offset index covering
+  every Nth item, so `boring.nav/items` can jump to an item instead of skipping
+  to it -- O(1) rather than O(n). N is the stride, and it is the size/speed
+  knob: every entry costs 4 bytes, while a lookup scans up to N-1 items. On
+  200k ~40-byte items, stride 1 cost 10% of the file and stride 16 cost 0.6%
+  for roughly 2.5x the lookup. The right N depends on item size, so it is a
+  parameter rather than a default.
+
+  The index goes at the END, which is what makes it compatible with appending:
+  offsets are only known after the items are written, so a leading index would
+  mean buffering the whole sequence in memory. ZIP's central directory and
+  Parquet's footer are at the end for the same reason. See `seal-index!` if you
+  are writing items incrementally rather than from a seq."
   (^long [^Writer w values ^java.io.OutputStream out] (write-seq! w values out nil))
   (^long [^Writer w values ^java.io.OutputStream out opts]
-   (let [o (resolve-opts opts)]
-     (reduce (fn [^long total v]
-               (let [n (long (.position ^Writer (write-root! w v o)))]
-                 (.write out (.buffer w) 0 (int n))
-                 (+ total n)))
-             0
-             values))))
+   (let [o (resolve-opts opts)
+         stride (long (or (:index opts) 0))
+         indexing? (pos? stride)
+         offs (when indexing? (java.util.ArrayList.))
+         n-items (volatile! 0)
+         total (reduce (fn [^long total v]
+                         (when (and indexing? (zero? (rem (long @n-items) stride)))
+                           (.add ^java.util.ArrayList offs (int total)))
+                         (vswap! n-items inc)
+                         (let [n (long (.position ^Writer (write-root! w v o)))]
+                           (.write out (.buffer w) 0 (int n))
+                           (+ total n)))
+                       0
+                       values)]
+     (if indexing?
+       (+ total (long (seal-index! w out (vec offs) stride @n-items total)))
+       total))))
+
+(def ^:const index-tag
+  "CBOR tag for a sequence offset index. See doc/SHAPES.md.
+
+  39651, not 39650: 39650 is already specified for the scattered-shape case.
+  Both sit in 38000-39999, which doc/IANA-REGISTRATION.md surveyed as empty and
+  clear of the dense `ur:` cluster at 40000-40918. Provisional, like 39649 --
+  see that document for the registration this owes."
+  39651)
+
+(defn- long->8-bytes ^bytes [^long v]
+  (let [b (byte-array 8)]
+    (dotimes [i 8] (aset-byte b i (unchecked-byte (bit-shift-right v (* 8 (- 7 i))))))
+    b))
+
+(defn seal-index!
+  "Write a sequence offset index to `out`, sealing a CBOR sequence written by
+  `write-seq!` or by a loop over `write-to!`.
+
+  `offsets` are byte offsets of indexed items from the START of the sequence,
+  `stride` is how many items each entry covers (1 = every item), and `total` is
+  how many items there are. `data-len` is the length in bytes of everything
+  written so far -- which is also where this item begins.
+
+  The item is:
+
+      tag 39651 [stride, total, offsets, <8-byte data-len>]
+
+  The trailing element is a byte string of exactly 8 bytes, so it always
+  encodes as `0x48` plus 8 -- the file therefore ends with 9 predictable bytes
+  no matter how large the offsets array is. That is what makes the index
+  findable: CBOR cannot be parsed backwards, so a reader takes the last 9
+  bytes, reads the pointer, and seeks to it.
+
+  Nothing here is outside CBOR. Those 9 bytes are the encoding of an ordinary
+  byte string, not a magic trailer, so the file stays a valid CBOR sequence
+  that any reader can consume -- it just sees one extra tagged item at the end.
+
+  The pointer doubles as the verification: it is both where the index starts
+  and how long the data section is, so a reader that seeks there and does not
+  find tag 39651 knows the index is stale (truncated file, appended-to file)
+  and falls back to scanning."
+  ;; No primitive hints: Clojure allows them only on fns of four args or fewer,
+  ;; and this takes six. The values are coerced here instead.
+  [^Writer w ^java.io.OutputStream out offsets stride total data-len]
+  (let [idx (int-array offsets)
+        item (data/tagged-value index-tag
+                                [(long stride) (long total) idx
+                                 (long->8-bytes (long data-len))])]
+    (write-to! w item out)))
 
 (defn- grow ^bytes [^bytes buf ^long need]
   (if (>= (alength buf) need)
