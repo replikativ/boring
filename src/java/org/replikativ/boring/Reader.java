@@ -536,9 +536,14 @@ public final class Reader {
     public Object readFrom(long p) {
         if (busy) throw concurrentUse();
         busy = true;
-        long save = pos; int d = depth;
-        try { pos = p; return read(); }
-        finally { pos = save; depth = d; busy = false; }
+        // `items` is saved and CLEARED, like depth. A positional read is an
+        // independent lookup -- `boring.nav` shares one Reader across every
+        // one of them -- so without this two navigations consumed each other's
+        // budget and the tenth `get` on a large document failed because of the
+        // nine before it.
+        long save = pos; int d = depth; long it = items;
+        try { pos = p; items = 0; return read(); }
+        finally { pos = save; depth = d; items = it; busy = false; }
     }
 
     /**
@@ -645,6 +650,16 @@ public final class Reader {
     public Object readNext() {
         this.reused = true;
         depth = 0;
+        // A FRESH ITEM BUDGET PER TOP-LEVEL ITEM. `items` used to carry across
+        // them, so a CBOR sequence spent one cumulative budget for the whole
+        // file -- and because `reset()` on a streaming refill DOES clear it,
+        // acceptance depended on the chunk size: the same five items decoded at
+        // :chunk-size 2 and failed at 65536. A limit whose meaning changes with
+        // an unrelated buffering knob cannot be the right one.
+        //
+        // Per-item matches what the streaming API already promises: retained
+        // memory is bounded by the largest single item, not by the file.
+        items = 0;
         srActive = false;
         if (srCount > 0) {
             java.util.Arrays.fill(srStrings, 0, srCount, null);

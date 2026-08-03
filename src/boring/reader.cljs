@@ -51,18 +51,26 @@
                  ^:mutable tolerateUnknownTags
                  ^:mutable validateUtf8
                  ^:mutable checkDuplicateKeys
+                 ;; The cumulative item budget, absent here entirely until now:
+                 ;; `:max-items` was accepted by the CLJS API and silently
+                 ;; ignored, so the only heap-amplification control
+                 ;; doc/SECURITY.md names did not exist in a browser or under
+                 ;; Node. 0 means unlimited, which is the default.
+                 ^:mutable maxItems
+                 ^:mutable items
                  ^:mutable registry])
 
 (defn reader
   [^js/Uint8Array bs]
   (Reader. bs (js/DataView. (.-buffer bs) (.-byteOffset bs) (.-byteLength bs))
-           0 #js [] #js [] false (js/Map.) 0 1024 true true true nil))
+           0 #js [] #js [] false (js/Map.) 0 1024 true true true 0 0 nil))
 
 (defn reset! [^Reader r ^js/Uint8Array bs]
   (set! (.-buf r) bs)
   (set! (.-dv r) (js/DataView. (.-buffer bs) (.-byteOffset bs) (.-byteLength bs)))
   (set! (.-pos r) 0)
   (set! (.-depth r) 0)
+  (set! (.-items r) 0)
   (set! (.-srStrings r) #js [])
   (set! (.-srIdents r) #js [])
   (set! (.-srActive r) false)
@@ -83,6 +91,17 @@
          {:max-depth (.-maxDepth r)})))
 
 (defn- exit! [^Reader r] (set! (.-depth r) (dec (.-depth r))))
+
+(defn- count-item! [^Reader r]
+  ;; Counts ITEMS, not bytes: a one-byte container head that becomes an object
+  ;; is the worst amplification case, so what matters is how many objects the
+  ;; document asks for. Mirrors Reader.countItem on the JVM.
+  (when (pos? (.-maxItems r))
+    (set! (.-items r) (inc (.-items r)))
+    (when (> (.-items r) (.-maxItems r))
+      (err :boring/max-items-exceeded
+           (str "boring: decoded more than " (.-maxItems r) " items")
+           {:max-items (.-maxItems r)}))))
 
 (defn- need! [^Reader r n]
   (when (> n (remaining r))
@@ -1066,6 +1085,7 @@
     v))
 
 (defn read! [^Reader r]
+  (count-item! r)
   (let [header (u8! r)
         major (bit-shift-right header 5)
         info (bit-and header 0x1F)]
@@ -1146,6 +1166,10 @@
   namespace but keeping the ident cache."
   [^Reader r]
   (set! (.-depth r) 0)
+  ;; A FRESH ITEM BUDGET PER TOP-LEVEL ITEM, matching the JVM. Carrying it
+  ;; across items made a sequence spend one cumulative budget for the whole
+  ;; file, and on the JVM made acceptance depend on the streaming chunk size.
+  (set! (.-items r) 0)
   (set! (.-srStrings r) #js [])
   (set! (.-srIdents r) #js [])
   (set! (.-srActive r) false)

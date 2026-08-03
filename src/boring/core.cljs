@@ -183,6 +183,16 @@
   ;; The field existed and defaulted to true, but nothing set it, so
   ;; `:check-duplicate-keys false` was silently ignored. See the JVM core.
   (set! (.-checkDuplicateKeys r) (boolean (get opts :check-duplicate-keys true)))
+  ;; `:max-items` was accepted and silently ignored here -- the only
+  ;; heap-amplification control doc/SECURITY.md names did not exist on this
+  ;; platform at all. Validated rather than coerced: `-1` used to disable the
+  ;; bound on the JVM and a non-integer raised a raw host exception.
+  (let [mi (get opts :max-items 0)]
+    (when-not (and (integer? mi) (not (neg? mi)))
+      (throw (ex-info (str "boring: :max-items must be a non-negative integer "
+                           "(0 means unlimited), got " (pr-str mi))
+                      {:type :boring/bad-option :option :max-items :value mi})))
+    (set! (.-maxItems r) mi))
   ;; ALWAYS set, never `when-let` -- a reusable reader kept the previous
   ;; call's registry. See the JVM core for the reproduction.
   (set! (.-registry r) (:registry opts))

@@ -533,6 +533,22 @@
        (throw (ex-info "boring: input ended mid-value (truncated or malformed)"
                        {:type :boring/truncated-input} e#)))))
 
+(defn- max-items-opt
+  "`:max-items`, validated. 0 means unlimited, which is the default.
+
+  It used to go straight through `long`, so `-1` silently DISABLED the bound
+  (the reader tests `maxItems > 0`), `1.5` truncated to 1, a bignum raised a raw
+  IllegalArgumentException and a string a raw ClassCastException -- two untyped
+  failures out of the option parser for the only heap-amplification control
+  doc/SECURITY.md names."
+  ^long [opts]
+  (let [v (get opts :max-items 0)]
+    (when-not (and (integer? v) (not (neg? v)) (<= v Long/MAX_VALUE))
+      (throw (ex-info (str "boring: :max-items must be a non-negative integer "
+                           "(0 means unlimited), got " (pr-str v))
+                      {:type :boring/bad-option :option :max-items :value v})))
+    (long v)))
+
 (defn ^:no-doc configure-reader!
   "Apply decode options to a Reader. Public only so `boring.nav` can apply the
   SAME options its docstrings promise -- it realises values through this reader,
@@ -545,7 +561,7 @@
   (set! (.-maxDepth r) (int (get opts :max-depth 1024)))
   ;; 0 = unlimited, which is the default. See Reader.maxItems for why the budget
   ;; counts ITEMS rather than bytes.
-  (set! (.-maxItems r) (long (get opts :max-items 0)))
+  (set! (.-maxItems r) (max-items-opt opts))
   (set! (.-validateUtf8 r) (boolean (get opts :validate-utf8 true)))
   ;; WIRED, having been documented and then never applied. doc/SECURITY.md
   ;; describes `:check-duplicate-keys false` as the way to turn duplicate
@@ -1458,7 +1474,7 @@
      (set! (.-maxDepth r) (int (get opts :max-depth 1024)))
   ;; 0 = unlimited, which is the default. See Reader.maxItems for why the budget
   ;; counts ITEMS rather than bytes.
-     (set! (.-maxItems r) (long (get opts :max-items 0)))
+     (set! (.-maxItems r) (max-items-opt opts))
      (set! (.-validateUtf8 r) (boolean (get opts :validate-utf8 true)))
   ;; WIRED, having been documented and then never applied. doc/SECURITY.md
   ;; describes `:check-duplicate-keys false` as the way to turn duplicate

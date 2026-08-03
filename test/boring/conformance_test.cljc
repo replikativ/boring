@@ -1001,6 +1001,41 @@
     (is (= [[[1 2] [3 4]] [[5 6] [7 8]]]
            (:ok (try-decode "d8288283020202880102030405060708" interop-opts))))))
 
+(deftest max-items-is-enforced-on-both-platforms-and-per-item
+  (testing ":max-items is the only heap-amplification control doc/SECURITY.md
+            names, and ClojureScript did not implement it at all -- the option
+            was accepted and silently ignored, so a browser or Node reader had
+            no bound whatsoever. On the JVM the counter existed but carried
+            across top-level items, which made acceptance depend on the
+            streaming chunk size: the same five items decoded at `:chunk-size 2`
+            and failed at 65536. A limit whose meaning changes with an unrelated
+            buffering knob cannot be the right one.
+
+            The budget is now PER TOP-LEVEL ITEM on both platforms, which is
+            what the streaming API already promises: retained memory is bounded
+            by the largest single item, not by the file."
+    (let [o {:stringref false}]
+      (testing "one oversized item is refused"
+        (is (= :boring/max-items-exceeded
+               (try (do (boring/decode (c/hex->bytes "8a0102030405060708090a")
+                                       (assoc o :max-items 3)) nil)
+                    (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                      (:type (ex-data e)))))))
+      (testing "an item within budget decodes"
+        (is (= [1 2] (boring/decode (c/hex->bytes "820102") (assoc o :max-items 5)))))
+      (testing "and the budget does NOT accumulate across a sequence"
+        ;; five [1] items: each costs 2, so a budget of 3 admits every one
+        (is (= [[1] [1] [1] [1] [1]]
+               (vec (boring/decode-seq (c/hex->bytes "81018101810181018101")
+                                       (assoc o :max-items 3))))))
+      (testing "the option is validated rather than coerced"
+        (doseq [bad [-1 1.5 "x"]]
+          (is (= :boring/bad-option
+                 (try (do (boring/decode (c/hex->bytes "8101") (assoc o :max-items bad)) nil)
+                      (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                        (:type (ex-data e)))))
+              (str "max-items " (pr-str bad))))))))
+
 (deftest rfc-8949-appendix-f1-is-rejected-in-full
   (testing "every byte sequence RFC 8949 Appendix F.1 names as not well-formed
             must raise a typed error, on both platforms.

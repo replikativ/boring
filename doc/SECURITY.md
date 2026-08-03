@@ -138,6 +138,22 @@ else bounded the TOTAL, so a document within the size and depth limits could
 still amplify past anything documented. Set it from the table above — items are
 a good proxy for objects, and objects are what cost.
 
+**The budget is PER TOP-LEVEL ITEM**, and per positional read in `boring.nav`.
+It is not a budget for a whole file. That is deliberate and matches what the
+streaming API promises — retained memory is bounded by the largest single item,
+not by the sequence — but it means a sequence of a million items within budget
+is a million times the budget in total, so an input size limit at the transport
+is doing real work here rather than being belt-and-braces.
+
+It used to accumulate across items, which sounds stricter and was in fact
+incoherent: `reset()` on a streaming refill cleared the counter while an
+in-memory decode did not, so the same five items decoded at `:chunk-size 2` and
+were refused at `65536`. Acceptance cannot depend on a buffering knob.
+
+Both platforms enforce it. ClojureScript accepted the option and ignored it
+until recently, so a browser or Node reader had no bound at all — if you are
+relying on this in a CLJS deployment, check the version.
+
 **Still enforce an input size limit at the transport.** boring reads what you
 give it, and `:max-items` caps the result rather than the arrival.
 
