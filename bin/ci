@@ -184,7 +184,14 @@ stage_interop () {
 stage_interop_rust () {
   if command -v cargo >/dev/null 2>&1; then
     run interop-rust cargo run --quiet --manifest-path interop/rust/Cargo.toml \
-        -- interop/fixture.cbor
+        --bin read-boring -- interop/fixture.cbor
+    # A THIRD independent encoder over the canonical corpus. Two encoders
+    # agreeing cannot see a mistake they share, and boring and cbor2 do share
+    # one: both flatten every NaN to f97e00, which the Python gate is
+    # structurally unable to notice. ciborium does not, and says so.
+    run interop-canonical-rust cargo run --quiet \
+        --manifest-path interop/rust/Cargo.toml \
+        --bin canonical-bytes -- interop/canonical_fixture.cbor
   elif [ -n "${CI:-}" ]; then
     echo "──▶ interop-rust"
     echo "   FAILED — cargo missing, and CI must not skip a required reader"

@@ -407,8 +407,14 @@ predict agreement and this only ever surfaces at a signature boundary:
 
 | rule | implementations |
 |---|---|
-| bytewise (RFC 8949 §4.2.1) = `:canonical` | fxamacker/cbor `SortCoreDeterministic`, ciborium, `draft-ietf-cbor-serialization` |
-| length-first (RFC 7049 §3.9) = `:canonical-rfc7049` | **Python cbor2 `canonical=True`**, clj-cbor |
+| bytewise (RFC 8949 §4.2.1) = `:canonical` | fxamacker/cbor `SortCoreDeterministic`, `draft-ietf-cbor-serialization` |
+| length-first (RFC 7049 §3.9) = `:canonical-rfc7049` | **Python cbor2 `canonical=True`**, clj-cbor, Rust ciborium |
+
+`ciborium` was listed under the bytewise rule here and that was wrong: its only
+ordering helper, `CanonicalValue`, is length-first. Corrected after
+`interop/rust/src/canonical.rs` compared its output against ours over 989
+values — which is the point of the encode-side gates, and is the kind of claim
+that cannot be checked by reading a README.
 
 Calling `:canonical-rfc7049` "clj-cbor's older rule" understated its reach —
 cbor2 is the most widely deployed CBOR implementation there is, and its
@@ -505,6 +511,15 @@ working group's live determinism work and is in WG Last Call. It is *not*
 targeting `draft-ietf-cbor-cde`, which is a parked WG document.
 
 Two consequences worth stating plainly, because both surprise people:
+
+- **Every NaN encodes as `f9 7e00`**, whatever bits went in. A NaN carries a
+  sign bit and a 51-bit payload, and boring keeps neither: `-NaN` and a
+  signalling NaN both come back as the one quiet NaN. RFC 8949 §4.2.2 permits
+  picking a single representation and §4.1's zero-padding rule would preserve
+  the sign, so this is a choice rather than a requirement — Python cbor2 makes
+  the same one, and Rust ciborium does not (`-NaN` → `f9 fe00`). It surfaced
+  only once a THIRD independent encoder was compared, because the second shared
+  our choice.
 
 - **`-0.0` has no ClojureScript counterpart, and that is visible in the
   bytes.** JavaScript has one number type, and in it `-0` is a `Number` that

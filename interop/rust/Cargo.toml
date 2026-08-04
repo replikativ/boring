@@ -13,3 +13,12 @@ ciborium = "0.2"
 [[bin]]
 name = "read-boring"
 path = "src/main.rs"
+
+# The ENCODE-side gate. `read-boring` proves ciborium can read what boring
+# writes; this proves ciborium and boring emit the same octets for the same
+# value under a deterministic profile. ciborium can do that job -- it has
+# shortest-float on bit equality and a public `CanonicalValue` ordering -- so
+# the corpus gets a third independent encoder rather than a second.
+[[bin]]
+name = "canonical-bytes"
+path = "src/canonical.rs"
