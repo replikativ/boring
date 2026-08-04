@@ -857,9 +857,10 @@ public final class Writer {
                 flushChunk();
                 need = n;
             }
-            // A single primitive larger than the whole buffer -- a long string,
-            // a big byte array -- still has to fit, so growth remains the
-            // fallback. It is the leaf case nippy also buffers whole.
+            // A span that cannot be handed directly to the sink (for example a
+            // pinned key or a typed-array staging span) still has to fit, so
+            // growth remains the fallback. Contiguous byte payloads bypass the
+            // chunk through writePayload instead.
             if (need > buf.length) grow(need);
         }
     }
@@ -995,9 +996,7 @@ public final class Writer {
         // zero sign byte; CBOR wants the unsigned magnitude only.
         int off = (mag.length > 1 && mag[0] == 0) ? 1 : 0;
         head(BYTES, mag.length - off);
-        ensure(mag.length - off);
-        System.arraycopy(mag, off, buf, pos, mag.length - off);
-        pos += mag.length - off;
+        writePayload(mag, off, mag.length - off);
     }
 
     private static final int TAG_DECIMAL = 4;
@@ -2033,7 +2032,7 @@ public final class Writer {
      * keeps `buffer()`/`encode-buffered!` working exactly as before.
      */
     private void writePayload(byte[] src, int off, int len) {
-        if (sink != null && pinDepth == 0 && len > buf.length) {
+        if (sink != null && pinDepth == 0 && len >= buf.length) {
             if (pos > 0) flushChunk();
             try {
                 sink.write(src, off, len);
@@ -2351,7 +2350,7 @@ public final class Writer {
         //
         // An explicit registration is an instruction, so it wins. Nobody can be
         // broken by this who was not already being ignored.
-        TagRegistry.TagWriter handler = registry.writerFor(c);
+        TagRegistry.TagWriter handler = registry.hasWriters() ? registry.writerFor(c) : null;
         if (handler != null) {
             writeTag(handler.tag);                        // validated, not raw head
             writeValue(handler.fn.invoke(x));

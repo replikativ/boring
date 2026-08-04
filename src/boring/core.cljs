@@ -44,6 +44,10 @@
    :canonical-rfc7049 {:stringref false :float-policy :shortest :canonical true
                        :shapes false :canonical-order :rfc7049}})
 
+;; The nil-options path is every default encode. Keeping this shared avoids a
+;; merge/dissoc allocation per item in a reused-writer loop.
+(def ^:private default-opts (:clojure profile-defaults))
+
 ;; Keys a profile DEFINES. Passing a conflicting value asks for two
 ;; incompatible things at once, and the previous behaviour was to silently
 ;; honour the user's -- so `{:profile :canonical :stringref true}` emitted the
@@ -82,17 +86,28 @@
                        :profile-values (select-keys base conflicts)})))))
 
 (defn- resolve-opts [opts]
-  (let [profile (get opts :profile :clojure)
-        base (or (profile-defaults profile)
-                 (throw (ex-info "boring: unknown profile"
-                                 {:type :boring/unknown-profile :profile profile})))
-        _ (check-profile-conflicts! profile base opts)
-        merged (merge base (dissoc opts :profile))]
-    merged))
+  (if (nil? opts)
+    default-opts
+    (let [profile (get opts :profile :clojure)
+          base (or (profile-defaults profile)
+                   (throw (ex-info "boring: unknown profile"
+                                   {:type :boring/unknown-profile :profile profile})))
+          _ (check-profile-conflicts! profile base opts)]
+      (merge base (dissoc opts :profile)))))
 
 (defn writer
+  "Create a reusable writer. When supplied, `opts` are resolved once and used
+  by the no-options arities of `encode-into!`, `encode-buffered!`, and
+  `write-seq!`; an explicit options argument overrides them for that call."
   ([] (wr/writer 256))
-  ([size] (wr/writer size)))
+  ([size] (wr/writer size))
+  ([size opts]
+   (let [w (wr/writer size)]
+     (set! (.-opts ^wr/Writer w) (resolve-opts opts))
+     w)))
+
+(defn- writer-opts [^wr/Writer w]
+  (or (.-opts w) default-opts))
 
 (declare configure-reader!)
 
@@ -145,13 +160,13 @@
   ([v opts] (wr/to-bytes (write-root! (wr/writer 256) v (resolve-opts opts)))))
 
 (defn encode-into!
-  ([w v] (encode-into! w v nil))
+  ([w v] (wr/to-bytes (write-root! w v (writer-opts w))))
   ([w v opts] (wr/to-bytes (write-root! w v (resolve-opts opts)))))
 
 (defn encode-buffered!
   "Encode into `w` and return the byte count, copying nothing out. Reach the
   bytes with `buffer`; they are overwritten by the next encode."
-  ([w v] (encode-buffered! w v nil))
+  ([w v] (wr/position (write-root! w v (writer-opts w))))
   ([w v opts] (wr/position (write-root! w v (resolve-opts opts)))))
 
 (defn buffer [w] (wr/buffer w))
@@ -414,7 +429,13 @@
 
   Use `encode-buffered!` with `buffer` if you want the borrowed view and will
   consume it synchronously."
-  ([w values sink] (write-seq! w values sink nil))
+  ([w values sink]
+   (let [o (writer-opts w)]
+     (reduce (fn [total v]
+               (let [n (wr/position (write-root! w v o))]
+                 (sink (.slice (wr/buffer w) 0 n))
+                 (+ total n)))
+             0 values)))
   ([w values sink opts]
    (let [o (resolve-opts opts)]
      (reduce (fn [total v]

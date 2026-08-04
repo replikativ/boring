@@ -3,6 +3,7 @@
   in .cljc. Anything the JVM asserts, CLJS must assert too."
   (:require [cljs.test :as t]
             [boring.canonical-parity-test]
+            [boring.cljs-writer-opts-test]
             [boring.conformance-test]
             [boring.generative-test]
             [boring.golden-test]
@@ -21,6 +22,7 @@
   ;; can silently cover one platform. That is the same gap this file's
   ;; docstring promises against, one level up.
   (t/run-tests 'boring.canonical-parity-test
+               'boring.cljs-writer-opts-test
                'boring.conformance-test 'boring.generative-test 'boring.golden-test
                'boring.streaming-test))
 
