@@ -251,7 +251,7 @@
     (and (ifn? fb)
          (not (or (keyword? fb) (symbol? fb) (map? fb) (set? fb) (vector? fb)))) fb
     :else (throw (ex-info (str "boring: :encode-fallback must be nil, :placeholder, or a function, got "
-                          (pr-str fb))
+                               (pr-str fb))
                           {:type :boring/bad-option :value fb}))))
 
 (def ^:private ^:const max-safe-depth 2048)

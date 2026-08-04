@@ -176,7 +176,7 @@
     (and (ifn? fb)
          (not (or (keyword? fb) (symbol? fb) (map? fb) (set? fb) (vector? fb)))) fb
     :else (throw (ex-info (str "boring: :encode-fallback must be nil, :placeholder, or a function, got "
-                          (pr-str fb))
+                               (pr-str fb))
                           {:type :boring/bad-option :value fb}))))
 
 (defn- configure-writer! [^wr/Writer w opts]
@@ -489,9 +489,38 @@
        (refill!)
        (step)))))
 
+(defn- reject-index-opts!
+  "ClojureScript cannot WRITE an index; refuse to be asked rather than ignore it.
+
+  `:index` and `:index-min` were read by neither this arity nor anything it
+  calls, so portable `.cljc` code asking for an index got a sealed, navigable
+  file on the JVM and a silently unindexed one here -- the same byte count for
+  `{:index 16}`, `{:index 0}` and no options at all. A file without an index
+  cannot gain one without a rewrite, so the loss is discovered much later, by
+  whoever tries to `nav` into it.
+
+  Only an EXPLICIT request throws. The JVM's `write-seq!` indexes by default, so
+  a portable call with no options must keep working on both platforms; it just
+  produces a plain RFC 8742 sequence here, which every reader including
+  `boring.nav` still consumes."
+  [opts]
+  (doseq [k [:index :index-min]]
+    (when (contains? opts k)
+      (throw (ex-info (str "boring: " k " is not supported on ClojureScript -- writing "
+                           "an index is JVM-only. Omit it for a plain CBOR sequence, "
+                           "or write the indexed file on the JVM.")
+                      {:type :boring/unsupported-option :option k :value (get opts k)})))))
+
 (defn write-seq!
   "Encode each value as a consecutive top-level item, appending to `sink`, a
   function of one Uint8Array. Returns the total byte count.
+
+  **Writing an index is JVM-only.** The JVM arity takes an OutputStream and
+  seals an offset index by default; this one takes a sink function and writes a
+  plain RFC 8742 sequence. Passing `:index` or `:index-min` here throws
+  `:boring/unsupported-option` rather than quietly producing a file that cannot
+  be navigated. READING past an index written elsewhere works on both platforms
+  -- see `decode-seq`.
 
   `sink` receives bytes it OWNS. This used to pass `.subarray` of the writer's
   reusable buffer, which is a view rather than a copy: a sink that retained the
@@ -511,6 +540,7 @@
                  (+ total n)))
              0 values)))
   ([w values sink opts]
+   (reject-index-opts! opts)
    (let [o (resolve-opts opts)]
      (reduce (fn [total v]
                (let [n (wr/position (write-root! w v o))]

@@ -26,7 +26,7 @@ deliberate, and the golden corpus makes them visible (see below).
 
 Not by intention — by a test that fails.
 
-`test/boring/golden_v1.cljc` holds frozen bytes for 59 portable and 19 JVM-only
+`test/boring/golden_v1.cljc` holds frozen bytes for 60 portable and 30 JVM-only
 values. `boring.golden-test` asserts both directions on every CI run:
 
 - the frozen bytes still **decode** to the original value — this is promise 1,

@@ -69,7 +69,12 @@
 
 #?(:clj
    (def jvm-only
-     {"bigint-huge"          "d90100c249010000000000000000"
+     {"typed-short-array"    "d90100d84d460100feff0300"
+      "typed-int-array"      "d90100d84e4c01000000feffffff03000000"
+      "typed-long-array"     "d90100d84f58180100000000000000feffffffffffffff0300000000000000"
+      "typed-float-array"    "d90100d855480000c03f000020c0"
+      "typed-double-array"   "d90100d85650000000000000f83f00000000000004c0"
+      "bigint-huge"          "d90100c249010000000000000000"
       "bigint-neg"           "d90100c349010000000000000000"
       "bigdec-1.50M"         "d90100c482211896"
       "bigdec-1.5M"          "d90100c482200f"

@@ -80,7 +80,7 @@ then.
 (require '[boring.core :as boring])
 
 (boring/encode {:user/name "Ada" :scores [99 100] :tags #{:x :y}})
-;; => #object["[B" ...]  49 bytes
+;; => #object["[B" ...]  58 bytes
 
 (boring/decode *1)
 ;; => {:user/name "Ada", :scores [99 100], :tags #{:x :y}}
