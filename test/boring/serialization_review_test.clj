@@ -679,3 +679,41 @@
             (is (= 8 (count m)) "nine pairs, key 0 repeated -> eight distinct")
             (is (= 9 (get m 0)) "and the LAST value for the repeated key wins")
             (is (= m (into {} m)))))))))
+
+;; ---------------------------------------------- content-aware duplicates (F5)
+
+(deftest duplicate-detection-sees-through-host-array-identity
+  (testing "doc/SECURITY.md says duplicate detection compares encoded key bytes.
+            It compared HOST equality, which is identity for arrays -- so two
+            content-equal `short[]` keys were two distinct keys and a document
+            with duplicate CBOR keys decoded to a map with more entries than the
+            wire described. Only byte[] had a special case, and that one was an
+            O(n^2) pair scan, unbounded above the array-map threshold and so
+            attacker-controlled work on read. One content-aware pass now."
+    (let [dup (fn [mk] (-> {} (assoc (mk) :a) (assoc (mk) :b)))]
+      (doseq [[label mk] [["short[]"  #(short-array [1 2])]
+                          ["int[]"    #(int-array [1 2])]
+                          ["long[]"   #(long-array [1 2])]
+                          ["double[]" #(double-array [1.0 2.0])]
+                          ["byte[]"   #(byte-array [1 2])]]]
+        (let [m (dup mk)]
+          (is (= 2 (count m)) (str label ": the host map really does hold two keys"))
+          ;; The TYPE, not the message: byte[] keys are additionally caught on
+          ;; the ENCODE side by the writer's own check, which words it
+          ;; differently. Either end refusing is the point.
+          (is (= :boring/duplicate-map-key
+                 (try (do (boring/decode (boring/encode m o) o) nil)
+                      (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+              (str label " keys encode identically and must be refused"))))))
+  (testing "tag 258 elements get the same treatment"
+    ;; d9 0102 82 41 01 41 01 -- 258([h'01', h'01'])
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"duplicate"
+                          (boring/decode (unhex "d901028241014101") o))))
+  (testing "and distinct content is still distinct, at both map sizes"
+    (doseq [n [2 20]]
+      (let [m (into {} (for [i (range n)] [(int-array [i]) i]))]
+        (is (= n (count (boring/decode (boring/encode m o) o)))
+            (str n " distinct array keys must all survive")))))
+  (testing "non-array keys keep RFC 8949 5.6.1 semantics"
+    ;; a2 01 01 fb3ff0000000000000 02 -- keys 1 and 1.0 are DISTINCT
+    (is (= 2 (count (boring/decode (unhex "a20101fb3ff000000000000002") o))))))

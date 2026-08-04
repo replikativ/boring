@@ -1485,33 +1485,91 @@ public final class Reader {
         return false;
     }
 
+    /**
+     * A map key or set element wrapped so that ARRAYS compare by CONTENT.
+     *
+     * Host array equality is identity on the JVM, so two content-equal
+     * `short[]` keys -- or `byte[]`, or a tag-40 payload -- were two distinct
+     * keys, and a document with duplicate CBOR keys decoded to a map with more
+     * entries than the wire described. doc/SECURITY.md says duplicate detection
+     * compares encoded key bytes; for everything but byte strings it did not.
+     *
+     * Wrapping also replaces the two O(n^2) pair scans this used to do -- one
+     * of them specifically for byte-string keys, and unbounded above the
+     * array-map threshold, which made it attacker-controlled work on read. A
+     * HashSet of these is one pass.
+     *
+     * Non-array keys delegate to Clojure's own hasheq/equiv, so `1` and `1.0`
+     * stay distinct per RFC 8949 5.6.1 and a stringref-resolved string still
+     * collides with its literal spelling -- which comparing raw encoded bytes
+     * would have missed.
+     */
+    private static final class KeyProbe {
+        final Object k;
+        private final int hash;
+        KeyProbe(Object k) { this.k = k; this.hash = hashOf(k); }
+
+        private static int hashOf(Object o) {
+            if (o instanceof byte[])    return java.util.Arrays.hashCode((byte[]) o);
+            if (o instanceof short[])   return java.util.Arrays.hashCode((short[]) o);
+            if (o instanceof int[])     return java.util.Arrays.hashCode((int[]) o);
+            if (o instanceof long[])    return java.util.Arrays.hashCode((long[]) o);
+            if (o instanceof double[])  return java.util.Arrays.hashCode((double[]) o);
+            if (o instanceof float[])   return java.util.Arrays.hashCode((float[]) o);
+            if (o instanceof char[])    return java.util.Arrays.hashCode((char[]) o);
+            if (o instanceof boolean[]) return java.util.Arrays.hashCode((boolean[]) o);
+            if (o instanceof Object[])  return java.util.Arrays.deepHashCode((Object[]) o);
+            return clojure.lang.Util.hasheq(o);
+        }
+
+        private static boolean eq(Object a, Object b) {
+            if (a instanceof byte[] && b instanceof byte[])
+                return java.util.Arrays.equals((byte[]) a, (byte[]) b);
+            if (a instanceof short[] && b instanceof short[])
+                return java.util.Arrays.equals((short[]) a, (short[]) b);
+            if (a instanceof int[] && b instanceof int[])
+                return java.util.Arrays.equals((int[]) a, (int[]) b);
+            if (a instanceof long[] && b instanceof long[])
+                return java.util.Arrays.equals((long[]) a, (long[]) b);
+            if (a instanceof double[] && b instanceof double[])
+                return java.util.Arrays.equals((double[]) a, (double[]) b);
+            if (a instanceof float[] && b instanceof float[])
+                return java.util.Arrays.equals((float[]) a, (float[]) b);
+            if (a instanceof char[] && b instanceof char[])
+                return java.util.Arrays.equals((char[]) a, (char[]) b);
+            if (a instanceof boolean[] && b instanceof boolean[])
+                return java.util.Arrays.equals((boolean[]) a, (boolean[]) b);
+            if (a instanceof Object[] && b instanceof Object[])
+                return java.util.Arrays.deepEquals((Object[]) a, (Object[]) b);
+            return clojure.lang.Util.equiv(a, b);
+        }
+
+        @Override public int hashCode() { return hash; }
+        @Override public boolean equals(Object o) {
+            return o instanceof KeyProbe && eq(k, ((KeyProbe) o).k);
+        }
+    }
+
+    /** One pass, content-aware. Throws on the first duplicate. */
+    private void checkDistinct(Object[] kvs, int n, int stride, String what, String errType) {
+        java.util.HashSet<KeyProbe> seen = new java.util.HashSet<>(Math.max(4, n * 2));
+        for (int i = 0; i < n; i++) {
+            Object k = kvs[i * stride];
+            if (!seen.add(new KeyProbe(k)))
+                throw Err.of(errType, "boring: duplicate " + what + ": " + k, "key", k);
+        }
+    }
+
     private Object buildMap(Object[] kvs, int n) {
         if (n == 0) return clojure.lang.PersistentArrayMap.EMPTY;
-        // Byte-string keys are compared by CONTENT before anything else, because
-        // neither branch below can see through host identity equality.
-        if (checkDuplicateKeys && n > 1 && anyByteArrayKey(kvs, n)) {
-            for (int i = 0; i < n; i++) {
-                for (int j = i + 1; j < n; j++) {
-                    if (kvs[i * 2] instanceof byte[] && sameCborKey(kvs[i * 2], kvs[j * 2]))
-                        throw Err.of("duplicate-map-key",
-                            "boring: duplicate byte-string map key", "key", kvs[i * 2]);
-                }
-            }
-        }
+        // ONE content-aware pass. Two O(n^2) pair scans used to live here -- one
+        // specifically for byte-string keys, unbounded above the array-map
+        // threshold and therefore attacker-controlled work on read -- and
+        // neither could see through host identity equality for any OTHER array
+        // type. See KeyProbe.
         if (checkDuplicateKeys && n > 1) {
-            if (fitsArrayMap(kvs, n)) {
-                if (dupHashes.length < n) dupHashes = new int[Math.max(n, dupHashes.length * 2)];
-                final int[] hashes = dupHashes;
-                for (int i = 0; i < n; i++) hashes[i] = clojure.lang.Util.hasheq(kvs[i * 2]);
-                for (int i = 0; i < n; i++) {
-                    for (int j = i + 1; j < n; j++) {
-                        if (hashes[i] == hashes[j]
-                                && clojure.lang.Util.equiv(kvs[i * 2], kvs[j * 2])) {
-                            throw Err.of("duplicate-map-key", "boring: duplicate map key: " + kvs[i * 2], "key", kvs[i * 2]);
-                        }
-                    }
-                }
-            } else {
+            checkDistinct(kvs, n, 2, "map key", "duplicate-map-key");
+            if (!fitsArrayMap(kvs, n)) {
                 // Above the array-map threshold the hash map's own build does
                 // an O(n) check already — but it raises Clojure's
                 // IllegalArgumentException, which is untyped as far as our
@@ -1628,6 +1686,12 @@ public final class Reader {
      *  collapse them silently. Same rule, same reason. */
     private clojure.lang.IPersistentSet makeSet(Object[] items, int n) {
         if (n == 0) return PersistentHashSet.EMPTY;
+        // CONTENT-AWARE, like map keys. `PersistentHashSet.create` compares
+        // arrays by identity, so tag 258 holding two content-equal byte strings
+        // came back as a two-element set -- more elements than the wire
+        // describes, and the same defect the map path had.
+        if (checkDuplicateKeys && n > 1)
+            checkDistinct(items, n, 1, "tag 258 element", "duplicate-set-element");
         clojure.lang.IPersistentSet set = PersistentHashSet.create(items);
         if (checkDuplicateKeys && set.count() != n)
             throw Err.of("duplicate-set-element",
