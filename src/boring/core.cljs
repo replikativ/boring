@@ -253,7 +253,8 @@
    (let [o (opt/check-opts opts)
          block (get opts :chunk-size 65536)
          r (configure-reader! (rd/reader (js/Uint8Array. 0)) o)
-         state (atom {:buf (js/Uint8Array. block) :limit 0 :last-good 0 :eof? false})]
+         state (atom {:buf (js/Uint8Array. block) :limit 0 :last-good 0 :base 0
+                      :eof? false})]
      ;; `last-good` is the offset just past the last COMPLETE item, NOT the
      ;; reader's current position. A failed read leaves the position somewhere
      ;; mid-item — and past the end of the valid bytes, since the byte reader
@@ -285,7 +286,7 @@
                              {:type :boring/stalled-source}))))))
              (refill!
                []
-               (let [{:keys [buf limit last-good eof?]} @state
+               (let [{:keys [buf limit last-good eof? base]} @state
                      rest-len (- limit last-good)
                      _ (when (pos? last-good)
                          (.set buf (.subarray buf last-good limit) 0))
@@ -300,14 +301,26 @@
                      buf (grow buf (+ rest-len (max n block)))
                      _ (when (pos? n) (.set buf chunk rest-len))
                      new-limit (+ rest-len n)]
+                 ;; `base` is what earlier compactions discarded, so
+                 ;; `base + last-good` is a position in the FILE. Without it
+                 ;; this passed -1 to `index-frame?`, which by construction
+                 ;; skips the back-pointer test -- the only check that tells
+                 ;; a frame describing THIS file from one carried in from
+                 ;; another. The JVM sibling was fixed; this was not.
                  (swap! state assoc :buf buf :limit new-limit :last-good 0
+                        :base (+ base last-good)
                         :eof? (or eof? (nil? chunk)))
                  (rd/reset! r (.subarray buf 0 new-limit))
                  (pos? n)))
              (step []
                (lazy-seq
                 (if-not (rd/at-end? r)
-                  (let [v (try
+                  (let [;; Captured BEFORE the read: `last-good` is advanced past
+                        ;; the item in the `:ok` branch below, and the frame test
+                        ;; runs after that, so reading it there gives the frame's
+                        ;; END. Same trap the JVM sibling fell into first.
+                        item-start (+ (:base @state) (:last-good @state))
+                        v (try
                             {:ok (rd/read-next! r)}
                             (catch :default e
                               ;; From INSIDE the reader, "the buffer ends
@@ -374,7 +387,7 @@
                                ;; default 64 KiB chunk. `index-frame?`'s own
                                ;; docstring says the streaming decoder passes
                                ;; -1; this did not.
-                               (frame/index-frame? (:ok v) -1)
+                               (frame/index-frame? (:ok v) item-start)
                                (not (refill!)))
                         nil
                         (do (swap! state assoc :last-good (rd/position r))
@@ -587,7 +600,13 @@
      (loop [p 0] (when (< p end) (recur (index-walk* r p stride min-entries 0 acc 0))))
      (when (pos? (.-length acc))
        (let [idx (vec (sort-by first (vec acc)))]
-         {:containers (mapv #(nth % 0) idx)
+         ;; `:stride` INCLUDED. The JVM's `build-index` returns it and
+         ;; `seal-index!` reads it from the index; here it was omitted and
+         ;; `seal-index!` took it from its own options map instead, so the
+         ;; documented public pair sealed a stride-16 frame over stride-4
+         ;; slots whenever the two calls were given different options.
+         {:stride stride
+          :containers (mapv #(nth % 0) idx)
           :counts (mapv #(nth % 1) idx)
           :slots (mapv #(nth % 2) idx)
           :sorted (mapv #(nth % 3) idx)})))))

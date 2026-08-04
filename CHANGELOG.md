@@ -11,6 +11,52 @@ here.
 
 ### Added
 
+- **Random access into encoded CBOR**, and the sealed offset index that makes it
+  fast. `boring.nav` walks the wire format and materialises only what you ask
+  for; `write-seq!` seals an index by default and `boring.nav/items` uses it to
+  reach item *n* without stepping over the *n-1* before it — 9.8 ms to 1.6 µs on
+  a 200 000-item log, at 0.34% file overhead. The frame is ordinary CBOR (tag 27,
+  `boring/index`), so a file carrying one stays readable by any CBOR
+  implementation; see [doc/SHAPES.md](doc/SHAPES.md) for the format.
+- `encode-indexed`, `build-index` and `seal-index!` — index an already-encoded
+  blob rather than capturing while writing. **Available on both platforms**, and
+  byte-identical between them, so a browser and a server produce the same file.
+  Writing an index *while streaming* (`write-seq!` with `:index`) remains
+  JVM-only; reading one works everywhere.
+- `write-indexed!` — a single value, streamed to an `OutputStream` with an index
+  sealed after it.
+- `write-to-buffer!` — encode into a caller-supplied `ByteBuffer`, allocation-free.
+- `trim!` — give a reused writer back what one exceptional job grew. Every growth
+  in a writer is otherwise one-way, which is what makes reuse allocation-free.
+- `boring.mmap` — navigate a memory-mapped file without reading it into the heap.
+- `:profile :archival` — sorted map keys AND fixed-width floats. That combination
+  was previously unreachable: `:canonical` locks the float width and `:interop`
+  locks the key order, so the one thing a portable database dump needs could not
+  be asked for.
+- `:profile :canonical-rfc7049` — clj-cbor's and Python cbor2's length-first key
+  ordering, named rather than left as a knob on `:canonical`. Verified against
+  cbor2 and Rust ciborium over 989 values, byte for byte.
+- [doc/STORAGE.md](doc/STORAGE.md).
+
+### Changed
+
+- `write-seq!` **indexes by default** (stride 16). Files it wrote before this
+  release remain readable; files it writes now carry a trailing index item that
+  older boring versions will surface as an extra `boring/index` value at the end
+  of the sequence rather than as an error. Pass `{:index 0}` for the old output.
+
+### Fixed
+
+- Cross-platform: `encode-indexed` produced different bytes on ClojureScript
+  than on the JVM, because the index's `sorted` flag was hardcoded rather than
+  computed. Content-addressed stores would have seen two hashes for one value.
+- ClojureScript: 27 bytes could hang `decode-seq` indefinitely — the structural
+  skip validated neither bounds nor declared counts.
+- A declared count could size an index array before being checked against the
+  bytes present, so six bytes were an `OutOfMemoryError`.
+- Every read path now reports a typed error for a `nil` input, a stack overflow,
+  and a damaged index frame, on both platforms.
+
 - First public release. `boring.core` — `encode`, `decode`, `write-to!`,
   `write-seq!`, `decode-seq`, `decode-seq-from`, `writer`, `tag-registry`,
   `register-tag`, `register-record`.

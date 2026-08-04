@@ -57,7 +57,7 @@ availability or integrity, not RCE.
    allocation; nesting is capped by `:max-depth` (default 1024); no loop depends
    on wire data for its bound.
 2. **Bounded memory**, but the multiplier depends on the decoded SHAPE and
-   reaches **23×** on documents made of many tiny containers — see below. Bulk
+   reaches **37×** on documents made of many tiny containers — see below. Bulk
    payloads are 1×. Use `:max-items` to cap it.
 3. **Typed failure.** Every rejection is an `ex-info` with a `:type` keyword.
    Nothing escapes as a raw `NullPointerException`, `ClassCastException` or
@@ -118,8 +118,9 @@ costs more heap than one byte. Re-measured, wire bytes to retained heap:
 | `long[]` typed array (tag 79) | **1.0×** |
 | array of distinct small integers | 6.5× |
 | 100 000 short strings | 7.8× |
-| map of 50 000 entries | 11.7× |
-| 50 000 two-element vectors | **23.1×** |
+| map of 50 000 entries | 15.1× |
+| 50 000 two-element vectors | 16.9× |
+| 50 000 × `[[[i]]]` | **37×** |
 | tag 40, dimensions `[500000, 1, 1]` | **149×** |
 
 **This page previously said "roughly 5×", and that was wrong by a factor of
@@ -257,6 +258,17 @@ with two entries.
 
 Keys that merely *look* alike stay distinct, per §5.6.1: `1` and `1.0` are
 different keys, and so are the text string `"a"` and the byte string `h'61'`.
+
+**On ClojureScript `1` and `1.0` are the same key, and such a map is REFUSED.**
+JavaScript has one number type, so the platform cannot hold both — `a2 01 61 61
+f9 3c00 61 62` decodes to a two-entry map on the JVM and raises
+`:boring/duplicate-map-key` in a browser. Tag-258 sets behave the same way.
+This is a real parser differential across a JVM↔browser boundary and it cannot
+be removed: the alternative is collapsing two distinct keys into one silently,
+which is worse in the direction that matters. A reader that refuses is a
+reader you can reason about; a reader that quietly agrees to a different
+document is not. If you exchange CBOR with browsers, do not write maps whose
+keys differ only by numeric type — nothing boring encodes produces them.
 Comparison deliberately does **not** run on raw encoded bytes: that would miss a
 key written once as a literal string and once as a stringref, which is the same
 key.
