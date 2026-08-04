@@ -73,9 +73,25 @@
   \"asserted byte-for-byte identical to cbor2's own\" offers a reader, so the
   committed artifact is published evidence even though it is not the gate.
 
-  The output is deterministic -- two runs against the same library produce
-  byte-identical files -- so a non-empty `git status --short interop/` after
-  running this means the encoding moved, not that the generator is noisy."
+  THE OUTPUT IS NOT BYTE-STABLE, and it is worth knowing exactly how far the
+  instability reaches before reading anything into a diff. `byte[]` hashes by
+  IDENTITY, several cases use one as a map key or a set element
+  (`order-mixed-majors`, `order-prefix-bytes`, much of `gen-*`), and a
+  `PersistentHashMap` orders by hash -- so two identical map literals in ONE
+  process already enumerate their keys differently. The transport column is
+  `:interop`, which does not sort, so that shuffle reaches the bytes. Measured
+  over three consecutive runs: two agreed exactly and the third differed in 165
+  of 989 rows.
+
+  All of it is in COLUMN 1, the transport encoding, which each checker decodes
+  with its own decoder before comparing anything. Columns 2 and 3 -- the
+  canonical expectations, the actual subject -- were identical across all three
+  runs, as they have to be, since a canonical profile sorts. So the fixture's
+  MEANING is stable and only its packaging moves.
+
+  The practical consequence: a diff in this file after running the generator
+  proves nothing on its own. Run the two checkers. They are what decides
+  whether the committed copy is stale."
   (:require [boring.core :as boring])
   (:import (java.util Arrays)))
 
