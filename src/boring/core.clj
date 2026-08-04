@@ -1210,7 +1210,20 @@
                                    (bit-and (aget bs (+ (- n 8) i)) 0xff)))))]
         ;; The pointer is also the length of the data section, so it must land
         ;; inside the file and leave room for the frame it points at.
-        (if (and (>= p 0) (< p (- n 9)) (frame-prefix-at? bs p)) p -1)))))
+        ;; AND THE FRAME MUST END AT THE FILE'S END. Checking the prefix and
+        ;; the pointer is not enough: concatenate two sealed batches of equal
+        ;; length and the second file's pointer names an offset inside the
+        ;; FIRST batch that also carries the prefix, so `decode-seq` stopped
+        ;; there and returned 40 of 82 items with no error, while every other
+        ;; reader -- `decode-seq-from`, `nav/items`, a bare Reader loop, and
+        ;; ClojureScript -- returned 82. Silent data loss, and mine.
+        ;;
+        ;; `nav/read-index*` has always enforced this. The sequence decoder got
+        ;; a weaker approximation of it for the fourth time; this is the check
+        ;; itself rather than another proxy for it.
+        (if (and (>= p 0) (< p (- n 9)) (frame-prefix-at? bs p)
+                 (= n (.skipFrom (Reader. bs) p)))
+          p -1)))))
 
 (defn- index-walk
   "Walk the value at `p`, returning where it ENDS, and accumulating index nodes

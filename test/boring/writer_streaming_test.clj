@@ -261,6 +261,13 @@
                  (.write o ^bytes (hx "d81b826c626f72696e672f696e64657886"))
                  (dotimes [_ 300000] (.write o 0x81))
                  (.write o 0x00)
+                 ;; 0x48 -- the 8-byte byte-string header `footer-start` looks
+                 ;; for. The first version of this test omitted it, so the gate
+                 ;; never opened and both assertions passed on unfixed code.
+                 ;; That is TWICE this test has been vacuous; the assertion
+                 ;; below on `:boring/max-items-exceeded` is what makes the
+                 ;; omission impossible to miss a third time.
+                 (.write o 0x48)
                  (dotimes [i 8]
                    (.write o (unchecked-byte (bit-and (bit-shift-right (alength data) (* 8 (- 7 i)))
                                                       0xff))))
@@ -272,9 +279,11 @@
               assertions passed however broken the gate was -- which is exactly
               why the defect it was written to catch survived another round.
               This one allocates 102 MB against the unfixed code"
-      (is (= :boring/max-items-exceeded
-             (t! #(doall (boring/decode-seq attack {:max-items 100}))))
-          "the payload is a real bomb, not a malformed item")
+      (is (#{:boring/max-items-exceeded :boring/max-depth-exceeded}
+           (t! #(doall (boring/decode-seq attack {:max-items 100}))))
+          "the payload must reach a BUDGET -- either one proves the bomb is a
+           real value and not a malformed item that dies in validation, which
+           is how this assertion passed vacuously twice")
       (is (< (alloc-mb #(doall (boring/decode-seq attack {:max-items 100}))) 20)
           "and the footer is skipped, not decoded under lifted budgets"))
 
@@ -288,3 +297,30 @@
         (is (= 300 (count (boring/decode-seq sealed {:max-depth 3}))))
         (is (= 300 (count (boring/decode-seq-from
                            (java.io.ByteArrayInputStream. sealed) {:max-depth 3}))))))))
+
+(deftest appending-a-second-sealed-batch-loses-nothing-in-decode-seq
+  (testing "`footer-start` checked the seventeen prefix bytes and the pointer's
+            range, but never that the frame ENDS at the file's end. Concatenate
+            two sealed batches of equal length and the second file's pointer
+            names an offset inside the FIRST that also carries the prefix -- so
+            decode-seq stopped there and returned 40 of 82 items with no error,
+            while decode-seq-from, nav/items, a bare Reader loop and
+            ClojureScript all returned 82. `nav/read-index*` has always enforced
+            the end-at-EOF rule; the sequence decoder had a weaker proxy for it"
+    (let [mk (fn [n] (let [o (ByteArrayOutputStream.)]
+                       (boring/write-seq! (boring/writer 4096)
+                                          (vec (for [i (range n)] {:e i :v (str "v" i)})) o)
+                       (.toByteArray o)))
+          cat (fn [& bss] (let [o (ByteArrayOutputStream.)]
+                            (doseq [^bytes b bss] (.write o b))
+                            (.toByteArray o)))
+          a (mk 40)]
+      (testing "two batches of the SAME length -- the case that broke"
+        (is (= 82 (count (boring/decode-seq (cat a a)))))
+        (is (= (count (nav/items (cat a a))) (count (boring/decode-seq (cat a a))))
+            "and every reader agrees"))
+      (testing "different lengths, and a single batch, are unaffected"
+        (is (= 84 (count (boring/decode-seq (cat a (mk 42))))))
+        (is (= 40 (count (boring/decode-seq a))))
+        (is (= 40 (count (boring/decode-seq a {:max-depth 3})))
+            "including under a budget too small for the footer")))))
