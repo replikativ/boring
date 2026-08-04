@@ -254,6 +254,8 @@
                           (pr-str fb))
                           {:type :boring/bad-option :value fb}))))
 
+(def ^:private ^:const max-safe-depth 2048)
+
 (defn- max-depth-opt
   "`:max-depth`, validated, exactly as its sibling `:max-items` is.
 
@@ -264,9 +266,17 @@
   was correct."
   ^long [opts]
   (let [v (get opts :max-depth 1024)]
-    (when-not (and (integer? v) (pos? v) (<= v Integer/MAX_VALUE))
+    ;; CAPPED AT WHAT THE HOST STACK SURVIVES. The decoder recurses per level,
+    ;; so a limit the JVM cannot honour is not a limit -- `:max-depth 4000`
+    ;; accepted a 2000-deep document by raising a raw StackOverflowError,
+    ;; which is the one failure doc/SECURITY.md promises cannot escape. The
+    ;; default 1024 is well inside; 2048 is the most that has been measured to
+    ;; hold on a default stack.
+    (when-not (and (integer? v) (pos? v) (<= v max-safe-depth))
       (throw (ex-info (str "boring: :max-depth must be a positive integer no greater "
-                           "than " Integer/MAX_VALUE ", got " (pr-str v))
+                           "than " max-safe-depth " (the decoder recurses per level, and "
+                           "a limit the host stack cannot honour is not a limit), got "
+                           (pr-str v))
                       {:type :boring/bad-option :option :max-depth :value v})))
     (long v)))
 
@@ -1182,49 +1192,6 @@
         ;; inside the file and leave room for the frame it points at.
         (if (and (>= p 0) (< p (- n 9)) (frame-prefix-at? bs p)) p -1)))))
 
-(defn- read-item-or-frame
-  "Read the next top-level item at `start`, giving boring's OWN footer its own
-  budgets -- and ONLY at the offset the file says the footer begins.
-
-  `boring.nav` isolates the frame's depth budget, with a comment explaining that
-  the caller's limit bounds THEIR data and was never a statement about boring's
-  footer; the sequence decoders needed the same, because `write-seq!` appends a
-  frame four to five levels deep and a file whose data is depth 1 could not be
-  read back under `:max-depth 4`.
-
-  THE OFFSET GATE IS THE WHOLE SAFETY ARGUMENT, and its absence was a defect of
-  its own: a first version retried at any offset and accepted whatever came
-  back if it merely LOOKED like a frame. Two concatenated sealed files then
-  ended at the first file's footer -- 352 records decoded as 200 under
-  `:max-depth 4`, silently, with no error. And because the retry also lifted
-  `:max-items`, a document that had nothing to do with the index could be
-  re-read with no budget at all: a 3 MB tag-40 item under `{:max-items 100}`
-  allocated 473 MB before reporting the same error it would have reported for
-  free. Both are reachable by anyone who follows doc/SECURITY.md's advice to set
-  a budget.
-
-  With the gate, the retry happens at exactly one offset in a file, and only
-  when the file's own trailing back-pointer names it."
-  [^Reader r ^long start ^long frame-at]
-  (try
-    (.readNext r)
-    (catch clojure.lang.ExceptionInfo e
-      (if-not (and (= start frame-at)
-                   (#{:boring/max-depth-exceeded :boring/max-items-exceeded}
-                    (:type (ex-data e))))
-        (throw e)
-        (let [saved-d (.-maxDepth r) saved-m (.-maxItems r) saved-n (.-items r)]
-          (set! (.-maxDepth r) (int (max saved-d 32)))
-          (set! (.-maxItems r) 0)
-          (let [v (try (.readFrom r start)
-                       ;; ExceptionInfo only. `catch Throwable` here relabelled a
-                       ;; genuine OutOfMemoryError as :boring/max-items-exceeded.
-                       (catch clojure.lang.ExceptionInfo _ (throw e))
-                       (finally (set! (.-maxDepth r) (int saved-d))
-                                (set! (.-maxItems r) saved-m)
-                                (set! (.-items r) saved-n)))]
-            (if (index-frame? v start) ::index-frame (throw e))))))))
-
 (defn- index-walk
   "Walk the value at `p`, returning where it ENDS, and accumulating index nodes
   into `acc` on the way back up.
@@ -1428,7 +1395,25 @@
   ([^bytes bs] (build-index bs nil))
   ([^bytes bs opts]
    (let [r (Reader. bs)
-         stride (long (let [i (:index opts)] (if (and i (pos? (long i))) i 16)))
+         ;; VALIDATED, like every other entry point. This read its own way --
+         ;; `(if (and i (pos? (long i))) i 16)` -- so all four defects
+         ;; `index-opt`'s docstring says it closed were still live here:
+         ;; `:index 0`, the documented off switch, silently became stride 16;
+         ;; `:index 1.5` became stride 1; `:index -1` became 16; and
+         ;; `:index "x"` was a raw ClassCastException. `encode-indexed` reaches
+         ;; this, so the API's flagship indexed entry point was the one place
+         ;; the option meant something different.
+         stride (let [i (index-opt opts :index default-index-stride)]
+                  ;; 0 means "no index" everywhere else, and building an index
+                  ;; with no index is not a thing this function can do -- it
+                  ;; used to silently substitute 16, so the documented off
+                  ;; switch produced a LARGER file than omitting the option.
+                  ;; Naming `encode` is more use than a stride nobody asked for.
+                  (when (zero? i)
+                    (throw (ex-info (str "boring: :index 0 turns indexing off, which "
+                                         "build-index cannot do; use `encode` instead")
+                                    {:type :boring/bad-option :option :index :value 0})))
+                  i)
          min-entries (long (index-opt opts :index-min 16))
          idx (try
                (scan-index r 0 (alength bs) stride min-entries 0)
@@ -1692,30 +1677,19 @@
                                 ;; sound where retrying a truncation is not.
                                 (#{:boring/max-depth-exceeded
                                    :boring/max-items-exceeded} (:type (ex-data e)))
-                                (let [at (long (:last-good @state))
-                                      st @state]
-                                  (if-not (frame-prefix-at? (:buf st) at)
-                                    ;; NOT the footer, so the caller's budget
-                                    ;; stands. Without this the retry cleared
-                                    ;; `maxItems` before testing anything, and
-                                    ;; an ordinary document -- no forgery
-                                    ;; needed -- allocated 488 MB under
-                                    ;; `{:max-items 100}` on the reader
-                                    ;; documented for input larger than the
-                                    ;; heap.
-                                    (throw e)
-                                    (let [sd (.-maxDepth r) sm (.-maxItems r) sn (.-items r)]
-                                  (set! (.-maxDepth r) (int (max sd 32)))
-                                  (set! (.-maxItems r) 0)
-                                  (let [fv (try (.readFrom r at)
-                                                (catch clojure.lang.ExceptionInfo _ nil)
-                                                (finally
-                                                  (set! (.-maxDepth r) (int sd))
-                                                  (set! (.-maxItems r) sm)
-                                                  (set! (.-items r) sn)))]
-                                    (if (and (some? fv) (index-frame? fv -1) (not (refill!)))
-                                      {:frame true}
-                                      (throw e))))))
+                                ;; SKIPPED, NOT DECODED -- see `decode-seq`.
+                                ;; Reading the footer under lifted budgets is
+                                ;; what let a forged frame allocate 102 MB
+                                ;; there; the streaming arity had the same
+                                ;; shape. If the seventeen frame bytes are at
+                                ;; this item's start and nothing follows, the
+                                ;; rest of the input is the footer and the
+                                ;; sequence is over. Nothing is materialised.
+                                (if (and (frame-prefix-at? (:buf @state)
+                                                           (long (:last-good @state)))
+                                         (not (refill!)))
+                                  {:frame true}
+                                  (throw e))
                                 :else (throw e)))
                             (catch IndexOutOfBoundsException e
                               {:need-more e}))]

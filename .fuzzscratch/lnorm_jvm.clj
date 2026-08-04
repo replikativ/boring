@@ -55,8 +55,16 @@
     (record? v) (str "REC:" (pr-str v))
     :else (str "?" (.getSimpleName (class v)) ":" (pr-str v))))
 
+(defn rt [v opts]
+  (try (let [e (b/encode v opts)] (str " | E" (hex e) " | " (lnorm (b/decode e opts))))
+       (catch clojure.lang.ExceptionInfo e
+         (if (= "boring" (some-> (ex-data e) :type namespace))
+           (str " | EERR " (name (:type (ex-data e))))
+           (str " | EUNTYPED " (.getMessage e))))
+       (catch Throwable e (str " | EUNTYPED " (.getName (class e)) " " (.getMessage e)))))
+
 (defn outcome [^bytes bs opts]
-  (try (str "OK " (lnorm (b/decode bs opts)))
+  (try (let [v (b/decode bs opts)] (str "OK " (lnorm v) (rt v opts)))
        (catch clojure.lang.ExceptionInfo e
          (if (= "boring" (some-> (ex-data e) :type namespace))
            (str "ERR " (name (:type (ex-data e))))

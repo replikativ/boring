@@ -1,0 +1,38 @@
+(require '[clojure.string] '[boring.core :as b])
+(defn h [s] (let [s (clojure.string/replace s " " "")]
+              (byte-array (map #(unchecked-byte (Integer/parseInt (apply str %) 16)) (partition 2 s)))))
+(defn hx [^bytes bs] (apply str (map #(format "%02x" (bit-and % 0xff)) bs)))
+(defn t [label s]
+  (let [v (try (b/decode (h s)) (catch Exception e ::err))]
+    (if (= ::err v) (println (format "%-26s %-34s ERR" label s))
+      (let [e (b/encode v)
+            v2 (b/decode e)]
+        (println (format "%-26s %-34s vals=%-42s reenc=%s roundtrip-vals=%s"
+                         label s
+                         (pr-str (vec (if (instance? (Class/forName "[J") v) (seq ^longs v)
+                                        (if (instance? (Class/forName "[S") v) (seq ^shorts v)
+                                          (if (instance? (Class/forName "[I") v) (seq ^ints v)
+                                            (if (instance? (Class/forName "[D") v) (seq ^doubles v)
+                                              (if (instance? (Class/forName "[F") v) (seq ^floats v) v)))))))
+                         (hx e)
+                         (pr-str (vec (if (instance? (Class/forName "[J") v2) (seq ^longs v2)
+                                        (if (instance? (Class/forName "[S") v2) (seq ^shorts v2)
+                                          (if (instance? (Class/forName "[I") v2) (seq ^ints v2)
+                                            (if (instance? (Class/forName "[D") v2) (seq ^doubles v2)
+                                              (if (instance? (Class/forName "[F") v2) (seq ^floats v2) v2)))))))))))))
+(println ";; BIG-ENDIAN source tags, non-palindromic payloads")
+(t "67 uint64BE"   "d843 48 0102030405060708")
+(t "75 sint64BE"   "d84b 48 0102030405060708")
+(t "66 uint32BE"   "d842 48 0102030405060708")
+(t "74 sint32BE"   "d84a 48 0102030405060708")
+(t "65 uint16BE"   "d841 48 0102030405060708")
+(t "73 sint16BE"   "d849 48 0102030405060708")
+(t "82 f64BE"      "d852 48 3ff0000000000000")
+(t "81 f32BE"      "d851 48 3f80000040000000")
+(t "80 f16BE"      "d850 48 3c00400042004400")
+(println ";; LITTLE-ENDIAN source tags (the 5 boring writes)")
+(t "79 sint64LE"   "d84f 48 0102030405060708")
+(t "78 sint32LE"   "d84e 48 0102030405060708")
+(t "77 sint16LE"   "d84d 48 0102030405060708")
+(t "86 f64LE"      "d856 48 000000000000f03f")
+(t "85 f32LE"      "d855 48 0000803f00000040")

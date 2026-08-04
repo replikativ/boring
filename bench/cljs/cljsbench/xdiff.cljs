@@ -68,9 +68,17 @@
     (record? v) (str "REC:" (pr-str v))
     :else (str "?" (goog/typeOf v) ":" (pr-str v))))
 
+(defn rt [v opts]
+  (try (let [e (boring/encode v opts)] (str " | E" (hexb e) " | " (lnorm (boring/decode e opts))))
+       (catch ExceptionInfo e
+         (if (= "boring" (some-> (ex-data e) :type namespace))
+           (str " | EERR " (name (:type (ex-data e))))
+           (str " | EUNTYPED " (.-message e))))
+       (catch :default e (str " | EUNTYPED " (.-name e) " " (.-message e)))))
+
 (defn outcome [bs opts]
   (try
-    (str "OK " (lnorm (boring/decode bs opts)))
+    (let [v (boring/decode bs opts)] (str "OK " (lnorm v) (rt v opts)))
     (catch ExceptionInfo e
       (if (= "boring" (some-> (ex-data e) :type namespace))
         (str "ERR " (name (:type (ex-data e))))

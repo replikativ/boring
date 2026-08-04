@@ -126,6 +126,25 @@
   (data/unknown-record "boring/unencodable"
                        {:type (str (type x)) :repr (pr-str x)}))
 
+(defn- max-depth-opt
+  "`:max-depth`, validated. Mirrors the JVM's `max-depth-opt`.
+
+  This read `(get opts :max-depth 1024)` and set it unchecked, so a non-numeric
+  value made every later `(> depth maxDepth)` compare against NaN -- which is
+  ALWAYS false in JavaScript. `{:max-depth :kw}` therefore removed the nesting
+  bound entirely and a 2000-deep document that the default correctly refuses
+  decoded fine, while the same option raised `:boring/bad-option` on the JVM.
+  doc/SECURITY.md names a browser as an attacker source and this as one of
+  three bounds."
+  [opts]
+  (let [v (get opts :max-depth 1024)]
+    ;; Capped at what the host stack survives -- see the JVM's max-depth-opt.
+    (when-not (and (number? v) (js/Number.isInteger v) (pos? v) (<= v 2048))
+      (throw (ex-info (str "boring: :max-depth must be a positive integer no greater "
+                           "than 2048, got " (pr-str v))
+                      {:type :boring/bad-option :option :max-depth :value v})))
+    v))
+
 (defn- float-policy!
   "`:float-policy`, validated rather than compared.
 
@@ -168,7 +187,7 @@
   (set! (.-legacyCanonicalOrder w) (= :rfc7049 (:canonical-order opts)))
   (set! (.-shapes w) (boolean (:shapes opts)))
   (set! (.-registry w) (:registry opts))
-  (set! (.-maxDepth w) (get opts :max-depth 1024))
+  (set! (.-maxDepth w) (max-depth-opt opts))
   (set! (.-permitReservedSimpleValues w)
         (boolean (:permit-reserved-simple-values opts)))
   (set! (.-encodeFallback w) (encode-fallback-fn (:encode-fallback opts)))
@@ -218,7 +237,7 @@
                          "is portable.")
                     {:type :boring/unsupported-option
                      :option :auto-construct-records?})))
-  (set! (.-maxDepth r) (get opts :max-depth 1024))
+  (set! (.-maxDepth r) (max-depth-opt opts))
   (set! (.-validateUtf8 r) (boolean (get opts :validate-utf8 true)))
   ;; WIRED, having been documented and then never applied on either platform.
   ;; The field existed and defaulted to true, but nothing set it, so

@@ -2626,3 +2626,41 @@
        (let [v (vec (repeat 20 {:a 1 :b 2 :c 3}))]
          (is (< (alength (boring/encode v {:shapes true}))
                 (alength (boring/encode v {:shapes false}))))))))
+
+(deftest max-depth-is-bounded-on-both-platforms
+  (testing "ClojureScript set maxDepth unchecked, so a non-numeric value made
+            every `(> depth maxDepth)` compare against NaN -- ALWAYS false in
+            JavaScript -- and removed the nesting bound entirely. The same
+            option raised :boring/bad-option on the JVM, and doc/SECURITY.md
+            names a browser as an attacker source and this as one of its three
+            bounds"
+    (doseq [v [:kw [1] "x" -1 0 1.5 nil]]
+      (is (= :boring/bad-option
+             (err-type #(boring/decode (c/hex->bytes "01") {:max-depth v})))
+          (pr-str v))))
+  (testing "a document deeper than the default is still refused, and raising
+            the limit within what the stack survives still accepts it"
+    (let [deep (c/hex->bytes (str (apply str (repeat 1500 "81")) "00"))]
+      (is (= :boring/max-depth-exceeded (err-type #(boring/decode deep))))
+      (is (not= :boring/max-depth-exceeded
+                (err-type #(boring/decode deep {:max-depth 2000}))))))
+  (testing "and a limit the host stack cannot honour is refused as an option
+            rather than accepted and then raising a raw StackOverflowError,
+            which doc/SECURITY.md promises cannot escape"
+    (is (= :boring/bad-option
+           (err-type #(boring/decode (c/hex->bytes "01") {:max-depth 100000}))))))
+
+#?(:clj
+   (deftest build-index-validates-its-stride-like-everything-else
+     (testing "`build-index` read `:index` its own way, so all four defects
+               `index-opt` closed were live in the API's flagship indexed entry
+               point: 1.5 became stride 1, -1 became 16, a string was a raw
+               ClassCastException, and 0 -- the documented off switch --
+               silently produced a LARGER file than omitting the option"
+       (doseq [v [1.5 -1 "x" 0]]
+         (is (= :boring/bad-option
+                (err-type #(boring/encode-indexed (vec (range 40)) {:index v})))
+             (pr-str v))))
+     (testing "and a legal stride still seals"
+       (is (not= :boring/bad-option
+                 (err-type #(boring/encode-indexed (vec (range 40)) {:index 16})))))))
