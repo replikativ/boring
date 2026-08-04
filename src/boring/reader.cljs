@@ -63,6 +63,7 @@
                  ^:mutable depth
                  ^:mutable maxDepth
                  ^:mutable tolerateUnknownTags
+                 ^:mutable instantFn
                  ^:mutable validateUtf8
                  ^:mutable checkDuplicateKeys
                  ;; The cumulative item budget, absent here entirely until now:
@@ -77,7 +78,7 @@
 (defn reader
   [^js/Uint8Array bs]
   (Reader. bs (js/DataView. (.-buffer bs) (.-byteOffset bs) (.-byteLength bs))
-           0 #js [] #js [] false (js/Map.) 0 1024 true true true 0 0 nil))
+           0 #js [] #js [] false (js/Map.) 0 1024 true nil true true 0 0 nil))
 
 (defn reset! [^Reader r ^js/Uint8Array bs]
   (set! (.-buf r) bs)
@@ -1355,7 +1356,10 @@
               (err :boring/bad-tag-content
                    (str "boring: tag 0 content is not a valid RFC 3339 instant: " s)
                    {:tag 0 :value s}))
-            d)))
+            ;; `:instant-type` applies to BOTH time tags. A `Date` encodes as
+            ;; tag 0 by default -- RFC 3339 text -- so patching only tag 1 left
+            ;; the option doing nothing on the shape boring actually writes.
+            (if-let [f (.-instantFn r)] (f (.getTime d)) d))))
     1 (let [v0 (read! r)
             ;; A BIGNUM IS A NUMBER for tag 1. RFC 8949 3.4.2 says the content
             ;; is "a numerical value ... represented as an integer or a
@@ -1374,7 +1378,14 @@
           (when (js/isNaN (.getTime d))
             (err :boring/bad-tag-content
                  (str "boring: tag 1 epoch out of range: " v) {:tag 1 :value v}))
-          d))
+          ;; `:instant-type` as a FUNCTION of epoch-millis. JavaScript has one
+          ;; time type, so the JVM's `:date`/`:instant` keywords have no
+          ;; counterpart -- but a caller using a cross-platform time library
+          ;; (`cljc.java-time`, `tick`, both js-joda underneath) has a type they
+          ;; would rather have back, and boring should not have to depend on
+          ;; one to allow it. The option was accepted and silently ignored,
+          ;; which is the behaviour this file's own policy says it does not do.
+          (if-let [f (.-instantFn r)] (f (.getTime d)) d)))
     4 (let [l (read! r)]                            ; decimal fraction
         (when-not (and (vector? l) (== 2 (count l)))
           (err :boring/bad-tag-content

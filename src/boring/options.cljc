@@ -226,8 +226,11 @@
                     :want ":preserve-width or :shortest"}
    :canonical-order {:pred #{:rfc8949 :rfc7049}
                      :want ":rfc8949 or :rfc7049"}
-   :instant-type   {:pred #{:date :instant}
-                    :want ":date or :instant"}
+   ;; A function is legal on both platforms: ClojureScript has one time type,
+   ;; so a caller wanting `cljc.java-time`/`tick` values supplies the
+   ;; constructor rather than boring depending on js-joda. `(fn [epoch-millis])`.
+   :instant-type   {:pred #(or (#{:date :instant} %) (fn? %))
+                    :want ":date, :instant, or a function of epoch millis"}
    :date-type      {:pred #{:local-date :sql-date}
                     :want ":local-date or :sql-date"}
    :encode-fallback {:pred #(or (nil? %) (= :placeholder %) (callable? %))

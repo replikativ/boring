@@ -155,9 +155,19 @@
 
 (defn- configure-reader! [^rd/Reader r opts]
   (set! (.-tolerateUnknownTags r) (boolean (get opts :tolerate-unknown-tags true)))
-  ;; No :instant-type here — CLJS has only js/Date, so the JVM's Date/Instant
-  ;; choice has no counterpart. Silently accepting the option and ignoring it
-  ;; would be worse than not offering it.
+  ;; `:instant-type` is a FUNCTION here, not the JVM's `:date`/`:instant`
+  ;; keyword. JavaScript has one time type, so the keyword choice has no
+  ;; counterpart -- but a caller using a cross-platform time library
+  ;; (`cljc.java-time`, `tick`; js-joda underneath) has a type they would
+  ;; rather have back, and boring should not have to depend on one to make that
+  ;; possible. Given `(fn [epoch-millis] ...)`, tag 0 and tag 1 build with it;
+  ;; omitted, they build a `js/Date` as before.
+  ;;
+  ;; It used to be accepted and silently IGNORED, which this file's own policy
+  ;; says it does not do -- `:auto-construct-records?` is refused loudly for
+  ;; exactly that reason. Refusing was the other option and would have broken
+  ;; the portable `.cljc` caller who passes one options map to both platforms,
+  ;; which is konserve's shape.
   ;;
   ;; :auto-construct-records? is refused for the same reason, LOUDLY. It cannot
   ;; work here: advanced compilation minifies constructor names and there is no
@@ -174,6 +184,7 @@
                          "is portable.")
                     {:type :boring/unsupported-option
                      :option :auto-construct-records?})))
+  (let [it (:instant-type opts)] (set! (.-instantFn r) (when (fn? it) it)))
   (set! (.-maxDepth r) (get opts :max-depth 1024))
   (set! (.-validateUtf8 r) (boolean (get opts :validate-utf8 true)))
   ;; WIRED, having been documented and then never applied on either platform.

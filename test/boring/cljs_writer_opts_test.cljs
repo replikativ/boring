@@ -23,3 +23,23 @@
       (let [chunks (atom [])]
         (boring/write-seq! w [v v] #(swap! chunks conj %))
         (is (every? #(bytes= (boring/encode v {:stringref false}) %) @chunks))))))
+
+(deftest instant-type-can-be-a-constructor
+  (testing "JavaScript has one time type, so the JVM's `:date`/`:instant`
+            keyword choice has no counterpart -- and the option was accepted
+            and silently ignored, which this platform's own policy says it does
+            not do. A caller using a cross-platform time library
+            (`cljc.java-time`, `tick`) has a type they would rather have back,
+            and boring should not depend on js-joda to allow it. So the option
+            takes a function of epoch milliseconds."
+    (let [bs (boring/encode (js/Date. 1234567890123))]
+      (testing "the control: without it, a js/Date comes back as always"
+        (is (instance? js/Date (boring/decode bs))))
+      (testing "with a constructor, the caller's value comes back"
+        (is (= {:epoch 1234567890123}
+               (boring/decode bs {:instant-type (fn [ms] {:epoch ms})}))))
+      (testing "and a value that is neither a known keyword nor a function is
+                still refused, rather than ignored as it used to be"
+        (is (= :boring/bad-option
+               (try (do (boring/decode bs {:instant-type "nope"}) nil)
+                    (catch :default e (:type (ex-data e))))))))))
