@@ -298,8 +298,14 @@
   ;; the caller named, silently. `TagRegistry.checkTag` never saw the 1.5,
   ;; because by then it was a long. Found by a test written for the
   ;; ClojureScript half of the same defect.
-  (when-not (integer? tag)
-    (throw (ex-info (str "boring: tag numbers are integers; got " (pr-str tag))
+  ;; RANGE TOO, not only integrality. `(long tag)` on a bignum past
+  ;; Long/MAX_VALUE raises a raw IllegalArgumentException -- untyped, out of the
+  ;; registration API, for the one tag number a caller is most likely to reach
+  ;; for when testing the boundary. CBOR's tag domain is [0, 2^64-1]; this API
+  ;; takes a long and says so rather than truncating.
+  (when-not (and (integer? tag) (<= (bigint tag) (bigint Long/MAX_VALUE)))
+    (throw (ex-info (str "boring: tag numbers are integers no greater than "
+                         Long/MAX_VALUE "; got " (pr-str tag))
                     {:type :boring/bad-tag-number :tag tag})))
   ;; Explicit lets rather than cond->: the threaded intermediate would lose its
   ;; type hint and each .with* call would reflect.

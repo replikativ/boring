@@ -2437,3 +2437,48 @@
      (testing "and a legal one still applies"
        (is (= :boring/max-depth-exceeded
               (err-type #(boring/decode (c/hex->bytes "81818101") {:max-depth 2})))))))
+
+(deftest tag-32-accepts-what-the-other-platform-accepts
+  (testing "the character check added for the ASCII cases was RFC 3986 exactly,
+            which is ASCII-only -- but java.net.URI takes the IRI-ish superset
+            every JVM peer already writes, so a URI with a non-ASCII path became
+            a FALSE REJECTION on ClojureScript. A stricter grammar only one side
+            enforces is the same defect as a looser one"
+    (doseq [u ["http://a.b/café" "é" "http://a.b/中" "http://ok" "/rel"]]
+      (is (not= :boring/bad-tag-content (err-type #(dec-hex (tag32-hex u)))) u)))
+  (testing "while the characters RFC 3986 has no production for stay refused"
+    (doseq [u ["a b" "a|b" "%zz"]]
+      (is (= :boring/bad-tag-content (err-type #(dec-hex (tag32-hex u)))) u))))
+
+(deftest tag-1002-base-precision-and-bounds-match
+  (testing "a base finer than a nanosecond cannot round-trip a Duration, so the
+            JVM refuses it -- ClojureScript had no exactness rule at all"
+    (doseq [h ["d903eaa101fb3e01203af9ee7561" "d903eaa101fb3ddb7cdfd9d7bdbb"]]
+      (is (= :boring/bad-tag-content (err-type #(dec-hex h))) h)))
+  (testing "and the negative bound was `<` where the positive one was `>=`, so
+            -2^63 as a double was accepted here and refused there"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d903eaa101fbc3e0000000000000")))))
+  (testing "bases a Duration does hold are unaffected"
+    (doseq [h ["d903eaa101fb3ff8000000000000" "d903eaa101fb3fb999999999999a" "d903eaa10105"]]
+      (is (not= :boring/bad-tag-content (err-type #(dec-hex h))) h))))
+
+(deftest a-decoded-value-can-always-be-re-encoded
+  (testing "ClojureScript built a 2-D typed tag-40 array with `make-array`,
+            which is a raw JS Array, and its own writer has no case for one --
+            so this document decoded to a value boring could not re-encode. The
+            rows are still zero-copy subarray views"
+    (let [v (dec-hex "d82882820202d84e5001020304050607080910111213141516")]
+      (is (not= :boring/unencodable-class (err-type #(boring/encode v)))))))
+
+#?(:clj
+   (deftest register-tag-rejects-an-out-of-range-tag-typed
+     (testing "`(long tag)` on a bignum past Long/MAX_VALUE raised a raw
+               IllegalArgumentException -- untyped, out of the registration API,
+               at exactly the boundary someone testing limits would reach for"
+       (is (= :boring/bad-tag-number
+              (err-type #(boring/register-tag (boring/tag-registry)
+                                              18446744073709551615N nil nil identity)))))
+     (testing "and Long/MAX_VALUE itself still registers"
+       (is (not= :boring/bad-tag-number
+                 (err-type #(boring/register-tag (boring/tag-registry)
+                                                 Long/MAX_VALUE nil nil identity)))))))

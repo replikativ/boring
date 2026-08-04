@@ -271,7 +271,7 @@ Residuals, all of them platform limits rather than decisions:
 - **Tag 1's accepted epoch range differs**, and this is the one known place the
   two platforms disagree about legality. A `js/Date` spans ±8.64e12 seconds; a
   `java.time.Instant` spans ±3.1e16. An epoch second between those bounds — say
-  `1(1e13)` — decodes to a year-318205 instant on the JVM and is refused on
+  `1(1e13)` — decodes to a year-318857 instant on the JVM and is refused on
   ClojureScript. Neither is wrong about CBOR; the hosts simply differ.
 - Tag 40 accepts a payload written under any of the 21 typed-array tags the JVM
   reads, and only the 5 ClojureScript reads. The same asymmetry as the row

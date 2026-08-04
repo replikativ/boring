@@ -759,6 +759,23 @@
 (defn- pow10n [^number n]
   (loop [i n acc (js/BigInt 1)] (if (zero? i) acc (recur (dec i) (* acc (js/BigInt 10))))))
 
+(defn- decimal-scale
+  "Digits after the decimal point in the shortest decimal that round-trips `x`.
+
+  The JVM's rule is `BigDecimal.valueOf(d)`, which is defined as
+  `Double.toString(d)` -- the shortest round-tripping decimal. JavaScript's
+  `toString` is the same shortest form, so reading the scale off it agrees with
+  the JVM digit for digit. Doing this arithmetically instead does not work:
+  `0.1 * 1e9` is 100000000.00000001, which would reject a base the JVM accepts."
+  [x]
+  (let [s (.toString (js/Math.abs x))
+        parts (.split s "e")
+        mant (aget parts 0)
+        e (if (> (.-length parts) 1) (js/parseInt (aget parts 1) 10) 0)
+        dot (.indexOf mant ".")
+        frac (if (== -1 dot) 0 (- (.-length mant) dot 1))]
+    (- frac e)))
+
 (defn- as-bigint
   "`x` as a BigInt when it is a CBOR integer, else nil."
   [x]
@@ -869,10 +886,27 @@
       ;; second count that a double can actually hold.
       (when (if (= "bigint" (goog/typeOf b))
               (or (< b MIN-I64) (> b MAX-I64))
+              ;; `<=` on the negative side, not `<`. A JS number this large can
+              ;; only have arrived as a FLOAT -- a CBOR integer past 2^53
+              ;; decodes to BigInt here -- and the JVM refuses a double base of
+              ;; -2^63 for the same reason it refuses +2^63: it is the bound,
+              ;; not a value inside it. The two sides of the check were not
+              ;; symmetric, so one of them let a document through.
               (or (not (js/isFinite b))
-                  (< b -9223372036854775808) (>= b 9223372036854775808)))
+                  (<= b -9223372036854775808) (>= b 9223372036854775808)))
         (err :boring/bad-tag-content
              (str "boring: tag 1002 base value " b " does not fit a 64-bit second count")
+             {:tag 1002}))
+      ;; NANOSECOND EXACTNESS, which the JVM enforces via
+      ;; `BigDecimal.valueOf(d).movePointRight(9)` and this side did not
+      ;; implement at all: `1002({1: 1e-10})` was accepted here and refused
+      ;; there. A base finer than a nanosecond cannot round-trip through a
+      ;; java.time.Duration, so preserving it would hand a JVM peer a document
+      ;; it must reject.
+      (when (and (number? b) (> (decimal-scale b) 9))
+        (err :boring/bad-tag-content
+             (str "boring: tag 1002 base value " b
+                  " is not representable to nanosecond precision")
              {:tag 1002})))
     (when-let [[scale fv] @frac]
       ;; With a scaled fraction present, RFC 9581 requires an INTEGER base and
@@ -1312,7 +1346,14 @@
          ;; RFC 3986 Appendix A: a URI reference is built from unreserved,
          ;; reserved and pct-encoded characters, and a `%` must introduce two
          ;; hex digits.
-         (when-not (re-matches #"(?:[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=]|%[0-9A-Fa-f]{2})*" v)
+         ;; NON-ASCII IS ALLOWED. RFC 3986's own grammar is ASCII-only, but
+         ;; `java.net.URI` accepts other characters -- it is the IRI-ish
+         ;; superset every JVM peer already writes -- so restricting to RFC 3986
+         ;; exactly turned `32("http://a.b/café")` into a false rejection here
+         ;; while the JVM decoded it. Matching the other platform is the point;
+         ;; a stricter grammar that only one side enforces is the defect this
+         ;; check was added to remove.
+         (when-not (re-matches #"(?:[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=-￿]|%[0-9A-Fa-f]{2})*" v)
            (err :boring/bad-tag-content
                 (str "boring: tag 32 content is not a valid URI: " v)
                 {:tag 32 :value v}))
@@ -1430,10 +1471,15 @@
              (if (and (= 2 (count shape)) typed?)
                ;; A 2-D typed array keeps the zero-copy array-of-subarrays it
                ;; has always produced; everything else becomes nested vectors.
-               (let [rows (nth shape 0) cols (nth shape 1) out (make-array rows)]
-                 (dotimes [i rows]
-                   (aset out i (.subarray flat (* i cols) (* (inc i) cols))))
-                 out)
+               ;; A VECTOR of subarrays, not a raw JS Array. `make-array`
+               ;; returns a JS Array, and `writer.cljs` has no case for one --
+               ;; so this path decoded a document into a value boring itself
+               ;; could not re-encode, which is the one shape a codec must never
+               ;; produce. The rows are still `.subarray` views, so the
+               ;; zero-copy property this branch exists for is unchanged.
+               (let [rows (nth shape 0) cols (nth shape 1)]
+                 (into [] (map (fn [i] (.subarray flat (* i cols) (* (inc i) cols))))
+                       (range rows)))
                (nest-dims flat typed? shape total)))))
 
     37 (let [bs (read! r)]
