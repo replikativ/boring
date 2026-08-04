@@ -61,6 +61,9 @@
 
 (def decode-side
   [["decode"          (fn [o] (boring/decode (encoded) o))]
+   ;; `reader` is here because it was the ONE decode entry point the option
+   ;; unification missed on ClojureScript, and the matrix could not see it.
+   ["reader"          (fn [o] (boring/decode-with (boring/reader (encoded) o) (encoded)))]
    ["decode-with"     (fn [o] (boring/decode-with (boring/reader #?(:clj (byte-array 0)
                                                                     :cljs (js/Uint8Array. 0))
                                                                 o)
@@ -71,7 +74,22 @@
 (def encode-side
   [["encode"          (fn [o] (len (boring/encode specimen o)))]
    ["encode-buffered" (fn [o] (boring/encode-buffered! (boring/writer 256) specimen o))]
-   ["encode-indexed"  (fn [o] (len (boring/encode-indexed specimen o)))]])
+   ["encode-indexed"  (fn [o] (len (boring/encode-indexed specimen o)))]
+   ;; JVM-only, and both were missed: `write-seq!` read and COERCED `:index`
+   ;; off the raw map before resolution ran, and `seal-index!`'s opts arity was
+   ;; behind no gate at all. Marked rather than omitted -- a row that silently
+   ;; is not there on one platform is how a gap hides.
+   #?@(:clj [["write-seq!"      (fn [o] (let [out (java.io.ByteArrayOutputStream.)]
+                                          (boring/write-seq! (boring/writer 4096)
+                                                             [specimen] out o)))]
+             ["write-indexed!"  (fn [o] (let [out (java.io.ByteArrayOutputStream.)]
+                                          (boring/write-indexed! (boring/writer 4096)
+                                                                 specimen out o)))]
+             ["seal-index!"     (fn [o] (let [out (java.io.ByteArrayOutputStream.)
+                                              bs (boring/encode specimen {:stringref false})
+                                              ix (boring/build-index bs {:index 2 :index-min 2})]
+                                          (boring/seal-index! (boring/writer 4096) out ix
+                                                              (len bs) o)))]])])
 
 ;; `build-index` takes the same `:index`/`:index-min` knobs but no encode
 ;; options, so it is its own side rather than a row in `encode-side`.

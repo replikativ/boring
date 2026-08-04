@@ -672,7 +672,17 @@
                           (cond-> o (pos? (long stride)) (assoc :stringref false))
                           stride (long (get o :index-min 16)))))
   (^long [^Writer w values ^java.io.OutputStream out opts]
-   (let [stride (long (get opts :index default-index-stride))]
+   ;; RESOLVED FIRST, because resolution is what validates. `:index` was read
+   ;; and coerced with `long` off the RAW map here, so `{:index "x"}` was a raw
+   ;; ClassCastException out of this line -- the exact defect the option
+   ;; validator says it closed, reintroduced by reading the option before the
+   ;; gate rather than after it.
+   ;;
+   ;; The `:stringref` test below still reads the raw map, and must: a resolved
+   ;; map carries the profile's `:stringref true`, so testing the resolved one
+   ;; would refuse every default indexed write.
+   (let [o (resolve-opts opts)
+         stride (long (get o :index default-index-stride))]
      (when (and (pos? (long stride)) (true? (:stringref opts)))
        (throw (ex-info (str "boring: :stringref true cannot be combined with :index -- "
                             "boring.nav cannot resolve string references from an offset, "
@@ -680,9 +690,9 @@
                        {:type :boring/incompatible-options
                         :stringref true :index stride})))
      (write-seq-resolved! w values out
-                          (cond-> (resolve-opts opts)
+                          (cond-> o
                             (pos? (long stride)) (assoc :stringref false))
-                          stride (long (get opts :index-min 16))))))
+                          stride (long (get o :index-min 16))))))
 
 (defn- write-seq-resolved!
   "`write-seq!` with options already resolved. See the note on its 3-arity."
@@ -864,7 +874,17 @@
                               (cond-> o (pos? (long stride)) (assoc :stringref false))
                               stride (long (get o :index-min 16)))))
   (^long [^Writer w v ^java.io.OutputStream out opts]
-   (let [stride (long (get opts :index default-index-stride))]
+   ;; RESOLVED FIRST, because resolution is what validates. `:index` was read
+   ;; and coerced with `long` off the RAW map here, so `{:index "x"}` was a raw
+   ;; ClassCastException out of this line -- the exact defect the option
+   ;; validator says it closed, reintroduced by reading the option before the
+   ;; gate rather than after it.
+   ;;
+   ;; The `:stringref` test below still reads the raw map, and must: a resolved
+   ;; map carries the profile's `:stringref true`, so testing the resolved one
+   ;; would refuse every default indexed write.
+   (let [o (resolve-opts opts)
+         stride (long (get o :index default-index-stride))]
      (when (and (pos? (long stride)) (true? (:stringref opts)))
        (throw (ex-info (str "boring: :stringref true cannot be combined with :index -- "
                             "boring.nav cannot resolve string references from an offset, "
@@ -872,9 +892,9 @@
                        {:type :boring/incompatible-options
                         :stringref true :index stride})))
      (write-indexed-resolved! w v out
-                              (cond-> (resolve-opts opts)
+                              (cond-> o
                                 (pos? (long stride)) (assoc :stringref false))
-                              stride (long (get opts :index-min 16))))))
+                              stride (long (get o :index-min 16))))))
 
 (def ^:const index-name
   "Tag-27 type name for a sequence/container index. See doc/SHAPES.md.
@@ -1224,9 +1244,20 @@
   how long the data is, so a reader that seeks there and does not find a tag-27
   frame named `boring/index` knows the index is stale and scans instead."
   ([^Writer w ^java.io.OutputStream out index data-len]
-   (seal-index! w out index data-len (writer-opts w)))
+   ;; The writer's options were resolved when the writer was built, so this
+   ;; arity is already past the gate.
+   (seal-index-with! w out index data-len (writer-opts w)))
   ([^Writer w ^java.io.OutputStream out index data-len opts]
-   (seal-index-with! w out index data-len opts)))
+   ;; RESOLVED, like every other public entry point. This was the one that was
+   ;; not: every option reached `configure!` unchecked, so `{:float-policy
+   ;; :nope}` silently selected :shortest, `{:encode-fallback :placehodler}`
+   ;; installed the keyword as the fallback function, and `{:max-depth "5"}`
+   ;; left as a raw ClassCastException. The frame itself carries no floats and
+   ;; no maps, so no wire corruption was reachable through it -- but a public
+   ;; entry point that accepts garbage and fails untyped is exactly what the
+   ;; option gate exists to make impossible, and `boring.options` claims in its
+   ;; own docstring that resolution is the one thing every entry point does.
+   (seal-index-with! w out index data-len (resolve-opts opts))))
 
 (defn- seal-index-with!
   [^Writer w ^java.io.OutputStream out index data-len opts]

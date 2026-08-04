@@ -2756,3 +2756,42 @@
                          {:max-depth 3})))))
       (testing "and the frame is still not an item"
         (is (= 1 (count (boring/decode-seq idx {:max-depth 3}))))))))
+
+(deftest the-skip-walk-terminates-on-hostile-bytes
+  (testing "`skip-from` walks heads without building values, which is what
+            makes indexing and frame recognition cheap -- and it must refuse
+            what the decoder refuses. The ClojureScript twin validated nothing:
+            `aget` past a Uint8Array yields `undefined`, which is never the
+            0xff break byte, so a truncated indefinite container spun forever.
+            Twenty-seven bytes -- a real index-frame prefix followed by an
+            unclosed `9f` -- HUNG `decode-seq` in the browser where the JVM
+            answered `:boring/truncated-input`. A hang is worse than a wrong
+            answer: nothing above it can recover, and this runs on bytes
+            somebody else wrote.
+
+            A declared count is now checked against the bytes that remain, so
+            the walk is linear in the input rather than in what the input
+            claims -- `9b ffffffffffffffff` owed 2^64 items and simply did not
+            finish."
+    (doseq [[label hex] [["frame prefix, unclosed indefinite array"
+                          "d81b826c626f72696e672f696e646578869f480000000000000000"]
+                         ["array of 3 with 1 element"        "8301"]
+                         ["map of 2 with 1 pair"             "a20101"]
+                         ["array declaring 2^64 elements"    "9bffffffffffffffff"]
+                         ["byte string declaring 2^64 bytes" "5bffffffffffffffff"]
+                         ["bare indefinite array head"       "9f"]
+                         ["indefinite map, no break"         "bf01"]]]
+      (testing label
+        (is (contains? #{:boring/truncated-input :boring/bad-count}
+                       (err-type #(count (boring/decode-seq (c/hex->bytes hex)))))
+            "decode-seq refuses it, typed")
+        (is (contains? #{:boring/truncated-input :boring/bad-count}
+                       (err-type #(boring/build-index (c/hex->bytes hex)
+                                                      {:index 1 :index-min 1})))
+            "and so does the walk that never decodes")))
+    (testing "the control: well-formed input of the SAME shapes still walks, so
+              the assertions above are about the damage and not about the
+              shapes being rejected wholesale"
+      (doseq [hex ["83010203" "a201020304"]]
+        (is (= 1 (count (boring/decode-seq (c/hex->bytes hex)))) hex)
+        (is (some? (boring/build-index (c/hex->bytes hex) {:index 1 :index-min 1})) hex)))))

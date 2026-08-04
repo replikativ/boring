@@ -90,9 +90,30 @@
    :canonical         #{:canonical :canonical-order :stringref :shapes :float-policy}
    :canonical-rfc7049 #{:canonical :canonical-order :stringref :shapes :float-policy}})
 
+;; RESOLUTION IS IDEMPOTENT, and it is marked rather than inferred.
+;;
+;; It was not, and that cost two separate breakages in one afternoon -- 415
+;; test errors from `nav/source` and 6 more from `seal-index!`, both from the
+;; same cause. A resolved map carries the profile's own `:canonical`, so
+;; re-resolving reads that as the caller trying to override what the profile
+;; locks, and the second resolve throws `:boring/incompatible-options` on a map
+;; the first resolve produced.
+;;
+;; That is a trap for every caller that passes options down: whether you may
+;; resolve depends on whether somebody above you already did, which is not
+;; knowable locally. The marker makes it knowable. Metadata because it is
+;; inert -- nothing reads the options map except by keyword, and it is never
+;; encoded.
+(def ^:private resolved-meta {::resolved true})
+
+(defn resolved?
+  "Whether `opts` has already been through `resolve-opts`."
+  [opts]
+  (boolean (::resolved (meta opts))))
+
 ;; The resolved options for `(encode v)` / `(decode bs)`, computed once.
 ;; nil opts is the dominant call shape and always resolves to the same map.
-(def default-opts (:clojure profile-defaults))
+(def default-opts (with-meta (:clojure profile-defaults) resolved-meta))
 
 ;; ------------------------------------------------------------- the placeholder
 
@@ -309,9 +330,13 @@
   frozen default map without touching any of it, which is the dominant call
   shape and the reason the validation above is affordable."
   [opts]
-  (if (nil? opts)
-    default-opts
-    (let [base (profile-of opts)]
-      (validate! opts)
-      (check-profile-conflicts! (get opts :profile :clojure) base opts)
-      (merge base (dissoc opts :profile)))))
+  (cond
+    (nil? opts) default-opts
+    ;; Already through the gate -- see `resolved?`. Returning it unchanged is
+    ;; what lets a function resolve its own argument without having to know
+    ;; whether its caller did.
+    (resolved? opts) opts
+    :else (let [base (profile-of opts)]
+            (validate! opts)
+            (check-profile-conflicts! (get opts :profile :clojure) base opts)
+            (with-meta (merge base (dissoc opts :profile)) resolved-meta))))

@@ -49,7 +49,12 @@
 (defn reader
   "A reusable Reader. `opts` are the same map `decode` takes."
   ([bs] (rd/reader bs))
-  ([bs opts] (configure-reader! (rd/reader bs) (resolve-opts opts))))
+  ;; `check-opts`, not `resolve-opts`, matching the JVM twin and the three
+  ;; other decode entry points here. Left on `resolve-opts` when the others
+  ;; were converted, it produced a fresh divergence out of the change that was
+  ;; meant to end them: `{:canonical true}` decoded fine through `decode` and
+  ;; raised `:boring/incompatible-options` through `reader`.
+  ([bs opts] (configure-reader! (rd/reader bs) (opt/check-opts opts))))
 
 ;; The `^wr/Writer` / `^rd/Reader` hints are not decoration: without them the
 ;; compiler cannot infer the target of these `set!`s, and every downstream
@@ -385,7 +390,11 @@
   `boring.nav` still consumes."
   [opts]
   (doseq [k [:index :index-min]]
-    (when (contains? opts k)
+    ;; `:index 0` is the documented OFF switch, and off is what this platform
+    ;; does anyway -- the JVM accepts it and writes no index. Refusing it here
+    ;; on `contains?` made the one spelling that means "do not index" the one
+    ;; spelling that failed, and only on one platform.
+    (when (and (contains? opts k) (not (zero? (get opts k))))
       (throw (ex-info (str "boring: " k " is not supported on ClojureScript -- writing "
                            "an index is JVM-only. Omit it for a plain CBOR sequence, "
                            "or write the indexed file on the JVM.")

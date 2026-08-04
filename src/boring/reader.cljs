@@ -293,6 +293,17 @@
                 (if (zero? n)
                   (.-pos r)
                   (let [q (.-pos r)
+                        ;; EVERY head is bounds-checked before it is read.
+                        ;; Without this, `aget` past the end of a Uint8Array
+                        ;; yields `undefined` -- which is never the 0xff break
+                        ;; byte and never equal to anything -- so the break
+                        ;; scan below ran forever. Twenty-seven bytes, a real
+                        ;; frame prefix followed by an unclosed `9f`, HUNG
+                        ;; `decode-seq` on this platform where the JVM answered
+                        ;; `:boring/truncated-input`. A hang is worse than a
+                        ;; wrong answer: nothing above it can recover, and this
+                        ;; runs on bytes somebody else wrote.
+                        _ (need! r (- (inc q) (.-pos r)))
                         mj (major-at r q)
                         info (info-at r q)]
                     (if (== info 31)
@@ -300,6 +311,7 @@
                       ;; item each time round rather than a known count.
                       (do (set! (.-pos r) (inc q))
                           (recur (+ (dec n) (loop [k 0]
+                                              (need! r 1)
                                               (if (== 0xff (aget (.-buf r) (.-pos r)))
                                                 (do (set! (.-pos r) (inc (.-pos r))) k)
                                                 (do (set! (.-pos r) (skip-from r (.-pos r)))
@@ -307,10 +319,26 @@
                       (let [he (head-end-at r q)
                             a (head-arg-at r q)]
                         (set! (.-pos r) he)
+                        ;; DECLARED COUNTS ARE VALIDATED AGAINST THE BYTES THAT
+                        ;; REMAIN, as `Reader.skipStructural` has always done
+                        ;; with `checkCount`. Unchecked, `9b ffffffffffffffff`
+                        ;; owed 2^64 items and the loop below simply did not
+                        ;; finish; and a declared byte-string length past the
+                        ;; end walked `pos` outside the buffer, after which
+                        ;; every read was `undefined`. It also made this
+                        ;; platform BUILD AN INDEX over truncated input -- `8301`
+                        ;; and `a20101` -- that the JVM refuses.
+                        ;;
+                        ;; Bounding the count also bounds the total work: `n`
+                        ;; can never exceed the bytes left, so the walk is
+                        ;; linear in the input rather than in what the input
+                        ;; claims.
                         (case mj
-                          (2 3) (do (set! (.-pos r) (+ he a)) (recur (dec n)))
-                          4 (recur (+ (dec n) a))
-                          5 (recur (+ (dec n) (* 2 a)))
+                          (2 3) (let [len (check-count r a 1)]
+                                  (set! (.-pos r) (+ he len))
+                                  (recur (dec n)))
+                          4 (recur (+ (dec n) (check-count r a 1)))
+                          5 (recur (+ (dec n) (* 2 (check-count r a 2))))
                           6 (recur n)            ; a tag owes its payload
                           (recur (dec n))))))))]
       (set! (.-pos r) save)
