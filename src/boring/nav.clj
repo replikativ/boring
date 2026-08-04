@@ -851,7 +851,13 @@
              :sorted (vec sorted)
              :data-end ptr
              :total (when seq-slot (long (aget counts seq-slot)))
-             :offsets (when seq-slot (nth abs-slots seq-slot))}))))
+             :offsets (when seq-slot (nth abs-slots seq-slot))
+             ;; The per-anchor verdict cache -- see `anchor-sound?`. Allocated
+             ;; once with the index, so a lookup allocates nothing.
+             :anchor-checked (when seq-slot
+                               (boolean-array (alength ^longs (nth abs-slots seq-slot))))
+             :anchor-ok (when seq-slot
+                          (boolean-array (alength ^longs (nth abs-slots seq-slot))))}))))
     (catch Exception _ nil)))
 
 (defn- read-index
@@ -945,6 +951,58 @@
               ;; in the right place.
               (merge {:data-end ptr} (index-payload r ptr)))))))))
 
+(defn- anchor-sound?
+  "Whether sequence anchor `k` is where it claims to be. Cached per anchor.
+
+  VALIDATED LOCALLY, against the PREVIOUS anchor rather than against the start
+  of the file: stepping `stride` items from anchor k-1 must land exactly on
+  anchor k. That is O(stride) --
+  the same order as the walk `nth` already does from the anchor it lands on --
+  and it needs no earlier anchor to be trusted, so it costs no more for anchor
+  5000 than for anchor 1.
+
+  Cached because the alternative is paying it per lookup: a full scan through
+  `nth` then verifies each anchor once rather than once per item, which is one
+  extra pass over the data across the whole scan. The cache is a plain
+  boolean pair per anchor; two threads racing to compute the same verdict
+  write the same value.
+
+  This is the last of the three levels. `footer-start` pins the frame,
+  `anchor[0] = 0` and the end-of-node check pin the two ends, and this pins the
+  middle -- but only for the anchors actually used, which is what keeps it
+  affordable."
+  ;; No primitive hints: five args with three of them primitive is one past
+  ;; what Clojure allows, and the boxing here is once per anchor, not per item.
+  [^Nav nav ^longs offsets stride total k]
+  (let [^booleans done (:anchor-checked (.idx nav))
+        ^booleans okv (:anchor-ok (.idx nav))]
+    (if (or (nil? done) (>= (long k) (alength done)))
+      true                                    ; no cache: nothing to verify against
+      (if (aget done (int k))
+        (aget okv (int k))
+        (let [^Reader r (.rdr nav)
+              ;; Against the PREDECESSOR, not the successor. Checking forward
+              ;; leaves the LAST anchor with only the data section's end to
+              ;; compare against -- which is what the end-of-node check already
+              ;; does, and shares its blind spot: a uniform shift moves the last
+              ;; anchor and the walk from its new position can still land
+              ;; exactly on the end. Measured, that left `nth 48` wrong and
+              ;; every other item right. Checking backward gives every anchor
+              ;; but the zeroth a reference that damage has to fake separately,
+              ;; and the zeroth is pinned to offset 0 at load.
+              ok (if (zero? (long k))
+                   (zero? (aget offsets 0))
+                   (let [prev (aget offsets (int (dec (long k))))
+                         span (long stride)]
+                     (try
+                       (= (aget offsets (int k))
+                          (loop [j 0 p prev]
+                            (if (= j span) p (recur (inc j) (skip r p)))))
+                       (catch clojure.lang.ExceptionInfo _ false))))]
+          (aset done (int k) true)
+          (aset okv (int k) (boolean ok))
+          ok)))))
+
 (deftype Items [^Nav nav idx]
   clojure.lang.Seqable
   (seq [this] (seq (into [] this)))
@@ -984,8 +1042,24 @@
           (if (or (neg? i) (>= i total))
             nf
             (let [anchor (quot (long i) stride)]
-              (loop [k (* anchor stride) p (long (aget offsets anchor))]
-                (if (= k (long i)) (cursor-at nav p) (recur (inc k) (skip r p)))))))
+              (if-not (anchor-sound? nav offsets stride total anchor)
+                ;; A middle anchor cannot be validated at load without walking
+                ;; to it, which is the work the index exists to avoid -- so it
+                ;; is validated HERE, against its neighbour, the first time
+                ;; anybody jumps to it, and the verdict is cached.
+                ;;
+                ;; Without it, one changed delta byte inside the frame moved
+                ;; anchors 2 and 3 of a 60-item file and `nth 32` returned
+                ;; -1768167461 where `decode-seq` returned the record. The
+                ;; end-of-node check does not see it: the last anchor moved
+                ;; too, and the walk from its new position still landed
+                ;; exactly on the data section's end.
+                (loop [k 0 p 0]                     ; fall back to the walk
+                  (cond (>= p end) nf
+                        (= k (long i)) (cursor-at nav p)
+                        :else (recur (inc k) (skip r p))))
+                (loop [k (* anchor stride) p (long (aget offsets anchor))]
+                  (if (= k (long i)) (cursor-at nav p) (recur (inc k) (skip r p))))))))
         ;; No sequence index: skip i times, or run out.
         (loop [k 0 p 0]
           (cond (>= p end) nf

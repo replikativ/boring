@@ -34,6 +34,7 @@
             [boring.core :as boring]
             [boring.nav :as nav]
             [boring.frame]
+            [boring.conformance :as c]
             [boring.data])
   (:import (java.io ByteArrayOutputStream)
            (org.replikativ.boring Reader)))
@@ -1107,3 +1108,135 @@
                 (format "k%02d" i)))))
       (testing "and an absent key is still absent"
         (is (nil? (get (nav/source damaged o) "nope")))))))
+
+;; ------------------------------------------ the property, not another case
+;;
+;; Three rounds of audits found the same defect three times: the index
+;; misdirects, `nav` returns a plausible wrong value, `decode-seq` over the
+;; same bytes returns the truth, and nothing raises. Each fix was correct and
+;; each time a level underneath was still unguarded -- an anchor that ascends
+;; but is not an entry boundary, a total nobody compared with the data, a
+;; footer from another generation.
+;;
+;; So this asserts the INVARIANT rather than the cases:
+;;
+;;   the index is an optimisation, so for every byte string whatsoever, the
+;;   indexed reader and the unindexed reader must agree about every item they
+;;   can both produce.
+;;
+;; Deliberately not "damage is rejected". Rejecting damage is one way to
+;; satisfy this and scanning is another, and which one applies is an
+;; implementation choice this property has no business pinning. What it forbids
+;; is the third outcome: two readers, one file, two different answers.
+
+(defn- reader-loop
+  "Every top-level item, read with no index at all -- the reference."
+  [^bytes bs]
+  (let [r (Reader. bs)]
+    (loop [acc []]
+      (if (.atEnd r) acc (recur (conj acc (.readNext r)))))))
+
+(defn- re-encode
+  "A decoded value as bytes, or a marker. Re-encoding is the comparison -- see
+  the property below for why nothing weaker survives damaged input."
+  [v]
+  (try (vec (boring/encode v opts))
+       (catch Throwable _ ::unencodable)))
+
+(defn- nav-items-or-error
+  "Read through `count` and `nth` -- the two paths the index actually drives.
+
+  The first version of this used `mapv` over the seq, and the seq WALKS: it
+  never consults the item total and never jumps to an anchor. So the property
+  built on it passed with the end-anchor check disabled, which is the whole
+  class it was written to catch. `count` returns the frame's total verbatim and
+  `nth` bounds against it and jumps from an anchor; those are what a lying
+  index lies to."
+  [^bytes bs]
+  (try (let [items (nav/items bs opts)
+             n (count items)]
+         {:ok (mapv #(nav/value (nth items %)) (range n))})
+       (catch clojure.lang.ExceptionInfo e {:typed (:type (ex-data e))})
+       (catch Throwable t {:untyped (class t)})))
+
+(defn- seq-items-or-error [^bytes bs]
+  (try {:ok (vec (boring/decode-seq bs opts))}
+       (catch clojure.lang.ExceptionInfo e {:typed (:type (ex-data e))})
+       (catch Throwable t {:untyped (class t)})))
+
+(deftest damage-never-makes-the-two-readers-disagree
+  (testing "mutate arbitrary bytes of a sealed file and require that `nav` --
+            which consults the index -- and `decode-seq` -- which does not --
+            never both succeed with different answers. That is exactly the
+            shape of every index defect found so far, and none of them would
+            have survived this."
+    (let [vs (vec (for [i (range 60)] {:id i :name (str "rec-" i) :tags [i (inc i)]}))
+          ^bytes clean (seal vs opts)
+          n (alength clean)
+          ;; DAMAGE INSIDE THE FRAME, and the boundary is the point.
+          ;;
+          ;; The index is a claim ABOUT the data section. Validating that claim
+          ;; against the data it describes is cheap and complete only at the
+          ;; ends: `footer-start` pins the frame, `anchor[0] = 0` pins the
+          ;; start, and the end check pins the last stride. Proving a MIDDLE
+          ;; anchor is an item boundary means walking to it, which is the work
+          ;; the index exists to avoid -- so damage to the DATA that shifts item
+          ;; boundaries can leave every anchor after it stale, and measurably
+          ;; does: zeroing byte 0 of this fixture makes `nth` disagree with
+          ;; `decode-seq` on 44 of 60 items, from anchor 1 onward.
+          ;;
+          ;; That is the trust boundary doc/SHAPES.md already states, and
+          ;; closing it costs a validating walk on every lookup. What must
+          ;; hold, and what this asserts, is the half that is affordable: when
+          ;; the INDEX is what is damaged, the reader that consults it and the
+          ;; reader that ignores it never disagree.
+          frame-at (long (#'boring.frame/footer-start clean))
+          gen-site (gen/choose frame-at (dec n))
+          gen-damage (gen/vector (gen/tuple gen-site (gen/choose 0 255)) 1 4)
+          result
+          (tc/quick-check
+           400
+           (prop/for-all
+            [damage gen-damage]
+            (let [c (java.util.Arrays/copyOf clean n)]
+              (doseq [[i v] damage] (aset-byte c (int i) (unchecked-byte (int v))))
+              (let [a (nav-items-or-error c)
+                    b (seq-items-or-error c)]
+                (and
+                 ;; Neither reader may fail untyped, whatever the bytes say.
+                 (nil? (:untyped a)) (nil? (:untyped b))
+                 ;; And where both produce values, the values must match, item
+                 ;; for item, for as far as both got.
+                 ;; COMPARED BY RE-ENCODING, which is the only oracle strong
+                 ;; enough here. Three earlier versions of this property
+                 ;; reported disagreements that were not: `=` treats the Java
+                 ;; arrays inside a decoded frame as identities;
+                 ;; `conformance/equiv?` reaches into maps and sequences but
+                 ;; not into a tagged literal; and its map branch uses
+                 ;; `contains?`, which cannot match a `byte[]` KEY -- which
+                 ;; damaged bytes readily produce. Each failure was in the
+                 ;; comparison, not the library.
+                 ;;
+                 ;; The wire is the ground truth this is about anyway: two
+                 ;; values that re-encode to the same bytes are the same value
+                 ;; for every purpose boring has.
+                 (or (not (and (contains? a :ok) (contains? b :ok)))
+                     (let [xs (:ok a) ys (:ok b)]
+                       (and (= (count xs) (count ys))
+                            (= (mapv re-encode xs) (mapv re-encode ys))))))))))]
+      (is (:pass? result)
+          (str "a damaged file where the two readers disagree: "
+               (pr-str (:shrunk result))))))
+
+  (testing "the control: undamaged, both readers agree AND the index is really
+            in use -- without this the property could pass on a corpus where
+            nav never consults an index at all"
+    (let [vs (vec (for [i (range 60)] {:id i :name (str "rec-" i) :tags [i (inc i)]}))
+          ^bytes clean (seal vs opts)]
+      (is (some? (:offsets (#'boring.nav/read-index (#'boring.nav/nav-of clean opts))))
+          "the sequence node is present, so `nth` goes through the index")
+      (is (= vs (mapv nav/value (nav/items clean opts))))
+      (is (= vs (vec (boring/decode-seq clean opts))))
+      (is (= (inc (count vs)) (count (reader-loop clean)))
+          "and a bare Reader sees one MORE item -- the frame -- which is what
+           makes `decode-seq` a real second opinion rather than the same code"))))
