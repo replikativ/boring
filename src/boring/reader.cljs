@@ -316,6 +316,26 @@
       (set! (.-pos r) save)
       end)))
 
+(defn compare-items-at
+  "Lexicographic comparison of the ENCODED items at `a` and `b`.
+
+  RFC 8949 §4.2.1 orders canonical map keys by their encoded bytes, so a
+  navigator can binary-search a sorted map without decoding a single key.
+  Bytewise, with the shorter encoding first when one is a prefix of the other.
+  Mirrors `Reader.compareItemsAt`, and must agree with it byte for byte: the
+  `sorted` flag it decides is written into the index frame, and a frame written
+  here is read by `boring.nav` on the JVM."
+  [^Reader r a b]
+  (let [buf (.-buf r)
+        an (- (skip-from r a) a)
+        bn (- (skip-from r b) b)
+        n (min an bn)]
+    (loop [i 0]
+      (if (== i n)
+        (cond (< an bn) -1 (> an bn) 1 :else 0)
+        (let [x (aget buf (+ a i)) y (aget buf (+ b i))]
+          (if (== x y) (recur (inc i)) (if (< x y) -1 1)))))))
+
 (defn- read-text! [^Reader r info]
   (let [n (check-count r (arg! r info) 1)
         start (.-pos r)]

@@ -649,11 +649,19 @@
                           :else (inc (quot (dec n) stride)))
                     0)
                 kept (when keep? (js/Array. m))
-                end (loop [i 0 q (rd/head-end-at r p)]
+                ;; EVERY adjacent key pair decides `sorted`, not the anchors --
+                ;; see the JVM `index-walk` for why sampling the anchors returns
+                ;; wrong answers. Arrays are never marked sorted: the flag is
+                ;; about map key order, and `boring.nav` only consults it there.
+                srt (when (and keep? map?) #js [true])
+                end (loop [i 0 q (rd/head-end-at r p) prev -1]
                       (if (== i n)
                         q
                         (do (when (and keep? (zero? (rem i stride)))
                               (aset kept (quot i stride) q))
+                            (when (and srt (aget srt 0) (>= prev 0)
+                                       (>= (rd/compare-items-at r prev q) 0))
+                              (aset srt 0 false))
                             (recur (inc i)
                                    (if map?
                                      ;; A map entry is a key AND a value, and
@@ -662,14 +670,10 @@
                                                                  base acc (inc depth))
                                                   stride min-entries base acc (inc depth))
                                      (index-walk* r q stride min-entries base acc
-                                                  (inc depth)))))))]
+                                                  (inc depth)))
+                                   q))))]
             (when keep?
-              ;; `sorted` is false throughout. The flag only LICENSES a binary
-              ;; search; false means nav scans the container, which is correct
-              ;; and merely slower. Emitting it honestly keeps `compareItemsAt`
-              ;; -- comparing two encoded items in canonical order without
-              ;; decoding them -- out of the first version of this.
-              (.push acc [(+ p base) n (vec kept) false]))
+              (.push acc [(+ p base) n (vec kept) (boolean (and srt (aget srt 0)))]))
             end))))))
 
 (defn build-index

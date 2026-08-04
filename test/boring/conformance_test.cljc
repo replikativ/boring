@@ -2696,3 +2696,36 @@
       (is (= :boring/bad-option
              (err-type #(boring/encode-indexed (vec (range 40)) {:index bad})))
           (pr-str bad)))))
+
+(deftest indexed-bytes-are-identical-on-both-platforms
+  (testing "The `sorted` flag in the index frame is COMPUTED, not assumed.
+            ClojureScript emitted `false` for every container while the JVM
+            emitted the real flag, so the two platforms wrote different bytes
+            for the same value -- silently, because nav treats `false` as
+            'scan instead of binary-search' and still returns right answers.
+            konserve is portable and content-addressed: two platforms must not
+            disagree about the bytes.
+
+            These two cases differ in ONE byte -- f5 vs f4, the flag itself --
+            which is what makes them a discriminator rather than a smoke test.
+            Without the fix the ascending case fails on ClojureScript and
+            passes on the JVM."
+    (let [opts {:index 1 :index-min 3 :shapes false :stringref false}
+          asc  (array-map "a" 1 "b" 2 "c" 3)
+          desc (array-map "c" 1 "b" 2 "a" 3)]
+      (is (= (str "81a3616101616202616303d81b826c626f72696e672f696e646578"
+                  "8601d84e4401000000d84e4403000000814301030381f5"
+                  "48000000000000000b")
+             (c/bytes->hex (boring/encode-indexed [asc] opts)))
+          "ascending keys -> sorted true (f5)")
+      (is (= (str "81a3616301616202616103d81b826c626f72696e672f696e646578"
+                  "8601d84e4401000000d84e4403000000814301030381f4"
+                  "48000000000000000b")
+             (c/bytes->hex (boring/encode-indexed [desc] opts)))
+          "descending keys -> sorted false (f4)")
+      (testing "the flag is what separates them: same keys, same values, same
+                length, and the frame differs"
+        (let [a (c/bytes->hex (boring/encode-indexed [asc] opts))
+              d (c/bytes->hex (boring/encode-indexed [desc] opts))]
+          (is (= (count a) (count d)))
+          (is (not= a d)))))))
