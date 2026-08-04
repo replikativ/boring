@@ -247,6 +247,75 @@
 (defn- min-len-for-index [idx]
   (cond (< idx 24) 3 (< idx 256) 4 (< idx 65536) 5 :else 7))
 
+;; ## Positional primitives, for indexing already-encoded bytes
+;;
+;; `boring.core/build-index` walks a blob it did not write, so it needs to ask
+;; where an item's head ends and where the item ends WITHOUT decoding it. These
+;; mirror `Reader.majorAt`/`headArgAt`/`headEndAt`/`skipFrom` on the JVM, and
+;; they must agree with the decoder byte for byte: a skip that lands one byte
+;; off produces an index pointing into the middle of an item, which reads back
+;; as a plausible wrong value rather than an error. The property test that
+;; guards them compares `skip-from` against where `read!` actually stops.
+
+(defn major-at [^Reader r p] (bit-shift-right (aget (.-buf r) p) 5))
+(defn- info-at [^Reader r p] (bit-and (aget (.-buf r) p) 0x1F))
+
+(defn head-arg-at
+  "The head's argument at `p` -- element count, pair count, or byte length.
+  -1 for an indefinite item, whose count is not on the wire."
+  [^Reader r p]
+  (let [info (info-at r p)]
+    (if (== info 31)
+      -1
+      (let [save (.-pos r)]
+        (set! (.-pos r) (inc p))
+        (let [v (arg! r info)] (set! (.-pos r) save) v)))))
+
+(defn head-end-at
+  "Offset just past the head at `p` -- where its content begins."
+  [^Reader r p]
+  (let [info (info-at r p)
+        save (.-pos r)]
+    (set! (.-pos r) (inc p))
+    (when (and (>= info 24) (< info 28)) (arg! r info))
+    (let [v (.-pos r)] (set! (.-pos r) save) v)))
+
+(defn skip-from
+  "Where the item at `p` ENDS, without building its value.
+
+  Decoding and discarding would be simpler and is what a first attempt should
+  reach for -- but it allocates the whole structure to learn one integer, which
+  is the cost `build-index` exists to avoid. This walks heads only."
+  [^Reader r p]
+  (let [save (.-pos r)]
+    (set! (.-pos r) p)
+    (let [end (loop [n 1]                      ; items still owed
+                (if (zero? n)
+                  (.-pos r)
+                  (let [q (.-pos r)
+                        mj (major-at r q)
+                        info (info-at r q)]
+                    (if (== info 31)
+                      ;; Indefinite: consume until the break, which owes one more
+                      ;; item each time round rather than a known count.
+                      (do (set! (.-pos r) (inc q))
+                          (recur (+ (dec n) (loop [k 0]
+                                              (if (== 0xff (aget (.-buf r) (.-pos r)))
+                                                (do (set! (.-pos r) (inc (.-pos r))) k)
+                                                (do (set! (.-pos r) (skip-from r (.-pos r)))
+                                                    (recur k)))))))
+                      (let [he (head-end-at r q)
+                            a (head-arg-at r q)]
+                        (set! (.-pos r) he)
+                        (case mj
+                          (2 3) (do (set! (.-pos r) (+ he a)) (recur (dec n)))
+                          4 (recur (+ (dec n) a))
+                          5 (recur (+ (dec n) (* 2 a)))
+                          6 (recur n)            ; a tag owes its payload
+                          (recur (dec n))))))))]
+      (set! (.-pos r) save)
+      end)))
+
 (defn- read-text! [^Reader r info]
   (let [n (check-count r (arg! r info) 1)
         start (.-pos r)]
