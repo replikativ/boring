@@ -1100,6 +1100,36 @@
 
 (declare index-walk index-walk*)
 
+(def ^:private frame-prefix
+  "The exact bytes every sealed frame starts with: tag 27, a two-element array,
+  the text string `boring/index`, and the six-element payload array.
+
+  A CONSTANT, checked before anything is decoded, because the weaker gates that
+  preceded it were forgeable with nine appended bytes. `footer-start` used to
+  accept any file whose byte at n-9 was 0x48 and whose trailing pointer was in
+  range -- so appending `48 0000000000000000` to an ordinary document pointed
+  the gate at offset 0, and whatever item lived there was re-read with the
+  budgets lifted. A 3 MB tag-40 item then allocated 473 MB under
+  `{:max-items 100}`, and a sealed file with four items appended lost them
+  silently.
+
+  Forging THIS means writing a real frame header at the offset the file names,
+  which is the thing the retry exists to handle."
+  (byte-array (map unchecked-byte
+                   [0xd8 0x1b 0x82 0x6c 0x62 0x6f 0x72 0x69 0x6e 0x67
+                    0x2f 0x69 0x6e 0x64 0x65 0x78 0x86])))
+
+(defn- frame-prefix-at?
+  "Whether `bs` carries `frame-prefix` at `off`."
+  [^bytes bs ^long off]
+  (let [fp ^bytes frame-prefix
+        n (alength fp)]
+    (and (some? bs) (>= off 0) (<= (+ off n) (alength bs))
+         (loop [i 0]
+           (cond (= i n) true
+                 (= (aget bs (+ off i)) (aget fp i)) (recur (inc i))
+                 :else false)))))
+
 (defn- footer-start
   "Where a genuine index footer begins in `bs`, or -1.
 
@@ -1124,7 +1154,7 @@
                                    (bit-and (aget bs (+ (- n 8) i)) 0xff)))))]
         ;; The pointer is also the length of the data section, so it must land
         ;; inside the file and leave room for the frame it points at.
-        (if (and (>= p 0) (< p (- n 9))) p -1)))))
+        (if (and (>= p 0) (< p (- n 9)) (frame-prefix-at? bs p)) p -1)))))
 
 (defn- read-item-or-frame
   "Read the next top-level item at `start`, giving boring's OWN footer its own
@@ -1637,7 +1667,18 @@
                                 (#{:boring/max-depth-exceeded
                                    :boring/max-items-exceeded} (:type (ex-data e)))
                                 (let [at (long (:last-good @state))
-                                      sd (.-maxDepth r) sm (.-maxItems r) sn (.-items r)]
+                                      st @state]
+                                  (if-not (frame-prefix-at? (:buf st) at)
+                                    ;; NOT the footer, so the caller's budget
+                                    ;; stands. Without this the retry cleared
+                                    ;; `maxItems` before testing anything, and
+                                    ;; an ordinary document -- no forgery
+                                    ;; needed -- allocated 488 MB under
+                                    ;; `{:max-items 100}` on the reader
+                                    ;; documented for input larger than the
+                                    ;; heap.
+                                    (throw e)
+                                    (let [sd (.-maxDepth r) sm (.-maxItems r) sn (.-items r)]
                                   (set! (.-maxDepth r) (int (max sd 32)))
                                   (set! (.-maxItems r) 0)
                                   (let [fv (try (.readFrom r at)
@@ -1648,7 +1689,7 @@
                                                   (set! (.-items r) sn)))]
                                     (if (and (some? fv) (index-frame? fv -1) (not (refill!)))
                                       {:frame true}
-                                      (throw e))))
+                                      (throw e))))))
                                 :else (throw e)))
                             (catch IndexOutOfBoundsException e
                               {:need-more e}))]

@@ -240,3 +240,55 @@
       (is (= :boring/bad-argument
              (try (boring/trim! w) (catch clojure.lang.ExceptionInfo e
                                      (:type (ex-data e)))))))))
+
+(deftest a-forged-footer-tail-opens-no-gate
+  (let [t! (fn [f] (try (f) (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+        tmx (java.lang.management.ManagementFactory/getThreadMXBean)
+        alloc-mb (fn [f] (let [tid (.getId (Thread/currentThread))
+                               a (.getThreadAllocatedBytes tmx tid)]
+                           (t! f)
+                           (long (/ (- (.getThreadAllocatedBytes tmx tid) a) 1048576.0))))
+        tag40 (let [o (ByteArrayOutputStream.)]
+                (.write o ^bytes (byte-array (map unchecked-byte
+                                                  [0xd8 0x28 0x82 0x83 0x1a 0x00 0x07 0xa1 0x20
+                                                   0x01 0x01 0xd8 0x4e 0x5a 0x00 0x07 0xa1 0x20])))
+                (dotimes [_ 500000] (.write o 1))
+                (.toByteArray o))
+        forge (fn [^bytes bs] (let [o (ByteArrayOutputStream.)]
+                                (.write o bs)
+                                (.write o ^bytes (byte-array (map unchecked-byte
+                                                                  (cons 0x48 (repeat 8 0)))))
+                                (.toByteArray o)))]
+
+    (testing "the footer gate checked only that byte n-9 was 0x48 and the
+              trailing pointer was in range, so nine appended bytes aimed it at
+              offset 0 and whatever item lived there was re-read with the
+              budgets lifted -- 473 MB from a 3 MB document under
+              {:max-items 100}. The gate is the frame's own byte prefix now"
+      (is (< (alloc-mb #(doall (boring/decode-seq (forge tag40) {:max-items 100}))) 50)
+          "a forged tail must not lift the budget"))
+
+    (testing "and the streaming arity had no gate at all -- it cleared
+              :max-items BEFORE testing whether the item was a frame, so an
+              ordinary document needed no forgery: 488 MB on the reader
+              documented for input larger than the heap"
+      (is (< (alloc-mb #(doall (boring/decode-seq-from
+                                (java.io.ByteArrayInputStream. tag40) {:max-items 100})))
+             50)))
+
+    (testing "the same nine bytes also caused silent data loss: a sealed file
+              with four items appended returned 300 instead of 305 under
+              :max-depth 4, with no error"
+      (let [sealed (let [o (ByteArrayOutputStream.)]
+                     (boring/write-seq! (boring/writer 4096)
+                                        (vec (for [i (range 300)] {:e i :v (str "v" i)})) o)
+                     (.toByteArray o))
+            extra (let [o (ByteArrayOutputStream.)]
+                    (.write o ^bytes sealed)
+                    (doseq [i (range 4)] (.write o ^bytes (boring/encode {:x i})))
+                    (.toByteArray o))]
+        (is (not= 300 (t! #(count (boring/decode-seq (forge extra) {:max-depth 4}))))
+            "truncation is never the right answer to a budget that is too small")
+        (is (= 300 (count (boring/decode-seq sealed))) "an honest file still reads")
+        (is (= 300 (count (boring/decode-seq-from (java.io.ByteArrayInputStream. sealed))))
+            "and both readers agree on it")))))
