@@ -2664,3 +2664,35 @@
      (testing "and a legal stride still seals"
        (is (not= :boring/bad-option
                  (err-type #(boring/encode-indexed (vec (range 40)) {:index 16})))))))
+
+(defn- count-bytes [bs]
+  #?(:clj (alength ^bytes bs) :cljs (.-length bs)))
+
+(deftest encode-indexed-works-on-both-platforms
+  (testing "ClojureScript can index an already-encoded blob. konserve is
+            portable and wants indexed access into stored blobs from either
+            side, so this could not stay JVM-only. It walks bytes rather than
+            hooking the writer, which is why it ports at all -- the streaming
+            capture path (`write-seq! {:index N}`) is a different and larger
+            thing that is still JVM-only"
+    (let [v (vec (for [i (range 40)] {:e i :a :n/x :v (str "value-" i)}))
+          plain (boring/encode v {:stringref false})
+          idx (boring/encode-indexed v {:index 4 :index-min 4})]
+      (testing "the result is still a CBOR sequence whose first item is the value"
+        (is (= v (first (boring/decode-seq idx)))))
+      (testing "and the frame is metadata, not an item"
+        (is (= 1 (count (boring/decode-seq idx)))))
+      (testing "the index costs something but not much"
+        (is (> (count-bytes idx) (count-bytes plain)))
+        (is (< (count-bytes idx) (* 1.1 (count-bytes plain)))))
+      (testing "nothing worth indexing means no frame, so the result still decodes"
+        (is (= [1 2] (first (boring/decode-seq
+                             (boring/encode-indexed [1 2] {:index-min 16}))))))))
+
+  (testing "the stride is validated here too -- `build-index` read `:index` its
+            own way on both platforms and let a fractional, negative or
+            non-numeric stride through"
+    (doseq [bad [1.5 -1 "x" 0]]
+      (is (= :boring/bad-option
+             (err-type #(boring/encode-indexed (vec (range 40)) {:index bad})))
+          (pr-str bad)))))

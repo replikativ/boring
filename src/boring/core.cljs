@@ -554,6 +554,202 @@
 ;; constructor is enough. Security is the same: reading looks the name up, it
 ;; never resolves a symbol or evaluates anything from the wire.
 
+
+(def ^:const default-index-stride
+  "Stride used when `:index` is not given. Matches the JVM's."
+  16)
+
+(defn- index-opt
+  "`:index` / `:index-min`, validated. Mirrors the JVM's `index-opt`.
+
+  Read its own way once on each platform, and both times the same four defects
+  followed: a fractional stride truncated, a negative one silently turned
+  indexing off although only 0 is documented for that, an oversized one escaped
+  as a host arithmetic error, and a non-numeric one escaped from coercion."
+  [opts k default]
+  (let [v (get opts k default)]
+    (when-not (and (number? v) (js/Number.isInteger v) (not (neg? v))
+                   (<= v js/Number.MAX_SAFE_INTEGER))
+      (throw (ex-info (str "boring: " k " must be a non-negative integer"
+                           (when (= k :index) " (0 turns indexing off)")
+                           ", got " (pr-str v))
+                      {:type :boring/bad-option :option k :value v})))
+    v))
+
+;; ## Indexing an already-encoded blob
+;;
+;; `encode-indexed` on ClojureScript. konserve is portable and wants to offer
+;; indexed access into stored blobs from either platform, so this had to stop
+;; being JVM-only.
+;;
+;; It walks bytes rather than hooking the writer, which is why it ports at all:
+;; the JVM's `build-index` does the same, and the streaming capture path
+;; (`write-seq! {:index N}`, offsets recorded while encoding) is a separate and
+;; much larger thing that stays JVM-only for now.
+;;
+;; THE WIRE FORMAT IS THE JVM'S, byte for byte -- a blob indexed here is read by
+;; `boring.nav` there, which is the shape konserve needs and the acceptance test
+;; that guards this code.
+
+(def ^:private INDEX-WALK-MAX-DEPTH 200)
+
+(defn- delta-slot
+  "Entry offsets as deltas, in the narrowest CBOR form that holds them.
+
+  Mirrors the JVM's `delta-slot` exactly, including the tier boundaries: a byte
+  string for 0..255, tag 77 (sint16) to 0x7FFF, tag 78 (sint32) beyond. The tag
+  IS the width declaration, so this adds no format surface -- and a reader
+  cannot tell which platform produced the slot, which is the point.
+
+  `base` is what the first delta is measured from: the container's own offset,
+  or 0 for the sequence node."
+  [offs base]
+  (let [n (count offs)
+        d (js/Array. n)]
+    (loop [i 0 prev base mn js/Number.MAX_SAFE_INTEGER mx js/Number.MIN_SAFE_INTEGER]
+      (if (== i n)
+        (cond
+          (or (zero? n) (and (>= mn 0) (<= mx 0xFF)))
+          (js/Uint8Array.from d)
+          (and (>= mn 0) (<= mx 0x7FFF)) (js/Int16Array.from d)
+          :else (js/Int32Array.from d))
+        (let [v (nth offs i) delta (- v prev)]
+          (aset d i delta)
+          (recur (inc i) v (min mn delta) (max mx delta)))))))
+
+(defn- index-walk*
+  "Walk the value at `p`, returning where it ends, accumulating nodes into `acc`.
+
+  Returning the end offset is the trick the JVM version explains at length:
+  calling a skip per entry would re-walk every subtree and make the scan
+  quadratic in nesting depth. Here each byte is visited once.
+
+  Tag chains are collapsed iteratively -- a tag's extent IS its payload's -- so
+  a chain of them is not a stack hazard. Container nesting carries an explicit
+  bound for the same reason the JVM does: this is public and runs on bytes
+  somebody else wrote."
+  [r p stride min-entries base acc depth]
+  (when (> depth INDEX-WALK-MAX-DEPTH)
+    (throw (ex-info (str "boring: nesting deeper than the index walk's bound ("
+                         INDEX-WALK-MAX-DEPTH "). This document can be decoded "
+                         "but not indexed.")
+                    {:type :boring/max-depth-exceeded :max-depth INDEX-WALK-MAX-DEPTH})))
+  (let [p (loop [q p] (if (== 6 (rd/major-at r q)) (recur (rd/head-end-at r q)) q))
+        mj (rd/major-at r p)]
+    (if-not (or (== mj 4) (== mj 5))
+      (rd/skip-from r p)
+      (let [n (rd/head-arg-at r p)
+            map? (== mj 5)]
+        (if (neg? n)
+          (rd/skip-from r p)                    ; indefinite: not indexable
+          (let [keep? (>= n min-entries)
+                m (if keep?
+                    (cond (<= n 0) 0
+                          (== stride 1) n
+                          :else (inc (quot (dec n) stride)))
+                    0)
+                kept (when keep? (js/Array. m))
+                end (loop [i 0 q (rd/head-end-at r p)]
+                      (if (== i n)
+                        q
+                        (do (when (and keep? (zero? (rem i stride)))
+                              (aset kept (quot i stride) q))
+                            (recur (inc i)
+                                   (if map?
+                                     ;; A map entry is a key AND a value, and
+                                     ;; the anchor points at the key.
+                                     (index-walk* r (index-walk* r q stride min-entries
+                                                                 base acc (inc depth))
+                                                  stride min-entries base acc (inc depth))
+                                     (index-walk* r q stride min-entries base acc
+                                                  (inc depth)))))))]
+            (when keep?
+              ;; `sorted` is false throughout. The flag only LICENSES a binary
+              ;; search; false means nav scans the container, which is correct
+              ;; and merely slower. Emitting it honestly keeps `compareItemsAt`
+              ;; -- comparing two encoded items in canonical order without
+              ;; decoding them -- out of the first version of this.
+              (.push acc [(+ p base) n (vec kept) false]))
+            end))))))
+
+(defn build-index
+  "Index nodes for the containers inside already-encoded `bs`, or nil.
+
+  `:index` is the stride (default 16) and `:index-min` the smallest container
+  worth a node (default 16). `:index-min` is the dominant size knob -- see the
+  JVM docstring for the measurements."
+  ([bs] (build-index bs nil))
+  ([bs opts]
+   (let [stride (index-opt opts :index default-index-stride)
+         _ (when (zero? stride)
+             (throw (ex-info (str "boring: :index 0 turns indexing off, which build-index "
+                                  "cannot do; use `encode` instead")
+                             {:type :boring/bad-option :option :index :value 0})))
+         min-entries (index-opt opts :index-min 16)
+         r (rd/reader bs)
+         acc (array)
+         end (.-length bs)]
+     (loop [p 0] (when (< p end) (recur (index-walk* r p stride min-entries 0 acc 0))))
+     (when (pos? (.-length acc))
+       (let [idx (vec (sort-by first (vec acc)))]
+         {:containers (mapv #(nth % 0) idx)
+          :counts (mapv #(nth % 1) idx)
+          :slots (mapv #(nth % 2) idx)
+          :sorted (mapv #(nth % 3) idx)})))))
+
+(defn- long->8-bytes [v]
+  (let [b (js/Uint8Array. 8)]
+    (loop [i 0 x v]
+      (when (< i 8)
+        (aset b (- 7 i) (bit-and x 0xff))
+        (recur (inc i) (js/Math.floor (/ x 256)))))
+    b))
+
+(defn seal-index!
+  "Append the tag-27 index frame describing `index` over `data-len` bytes.
+
+  The frame is tag 27 wrapping [name, [stride, containers, counts, slots,
+  sorted, <8-byte data-len>]] -- the same item `boring.nav` reads on the JVM. The
+  trailing byte string is always exactly 8 bytes, so a sealed file ends with 9
+  predictable bytes, which is how the frame is found without parsing backwards."
+  [index data-len opts]
+  (let [{:keys [containers counts slots sorted]} index
+        stride (index-opt opts :index default-index-stride)
+        packed (vec (map-indexed (fn [i s] (delta-slot s (max 0 (nth containers i))))
+                                 slots))]
+    (encode (data/unknown-record index-name
+                                 [stride (vec containers) (vec counts) packed (vec sorted)
+                                  (long->8-bytes data-len)])
+            (assoc (or opts {}) :stringref false))))
+
+(defn encode-indexed
+  "Encode `v` and seal an index onto it, returning a Uint8Array.
+
+  The result is a two-item CBOR sequence -- the value, then the index -- so
+  `decode` still returns the value and any CBOR reader consumes both. A JVM peer
+  passes it to `boring.nav/source` and lookups inside large containers become
+  jumps.
+
+  `:stringref false` IS FORCED, exactly as on the JVM: an index records byte
+  offsets, and a string reference resolves against a table built from every
+  preceding string, so an offset alone cannot be decoded inside a stringref
+  namespace.
+
+  Returns the plain encoding when nothing clears `:index-min`, which is what the
+  JVM does and why the result is always decodable either way."
+  ([v] (encode-indexed v nil))
+  ([v opts]
+   (let [o (assoc (or opts {}) :stringref false)
+         body (encode v o)
+         idx (build-index body o)]
+     (if-not idx
+       body
+       (let [frame (seal-index! idx (.-length body) o)
+             out (js/Uint8Array. (+ (.-length body) (.-length frame)))]
+         (.set out body 0)
+         (.set out frame (.-length body))
+         out)))))
+
 (defn tag-registry
   "An empty registry. Shape:
 
