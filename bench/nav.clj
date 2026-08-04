@@ -473,7 +473,7 @@
   (println "the same answer. Damage that leaves it CONSISTENT -- bit rot included --")
   (println "can still misdirect; see doc/SHAPES.md. Sorted keys (:canonical /")
   (println ":archival) additionally allow binary search; arrays index positionally")
-  (println "under any profile.")
+  (println "under any profile."))
 
 ;; ------------------------------------------------------------- write cost
 ;;

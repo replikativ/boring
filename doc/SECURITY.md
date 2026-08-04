@@ -60,9 +60,21 @@ availability or integrity, not RCE.
    reaches **23×** on documents made of many tiny containers — see below. Bulk
    payloads are 1×. Use `:max-items` to cap it.
 3. **Typed failure.** Every rejection is an `ex-info` with a `:type` keyword.
-   Nothing escapes as a raw `NullPointerException`, `ClassCastException`,
-   `StackOverflowError` or `OutOfMemoryError`, so a caller's
-   `catch ExceptionInfo` is sufficient.
+   Nothing escapes as a raw `NullPointerException`, `ClassCastException` or
+   `StackOverflowError`, so a caller's `catch ExceptionInfo` is sufficient.
+
+   **`OutOfMemoryError` is the exception, and is deliberately not caught.** A
+   heap exhausted by one decode is not a condition that decode can report and
+   the caller can shrug off — the JVM is in trouble process-wide, and
+   converting it would invite exactly that shrug. The bound that keeps a
+   document from getting there is `:max-items`, not a catch.
+
+   The `StackOverflowError` half is enforced at one boundary shared by every
+   read path (`boring.errors/with-decode-errors`), because it was previously
+   applied to four of six: `decode-seq-from` and `boring.nav` both leaked the
+   raw error on deeply nested input. The original is attached as the cause, so
+   a document that nests too deep stays distinguishable from a caller's own
+   recursion overflowing inside a `nav` traversal.
 
    This is a **checked** claim, not an aspiration: `boring.hostile` feeds
    malformed content to every built-in tag and asserts a typed failure on both

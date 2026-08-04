@@ -58,6 +58,7 @@
   implementation, which is what makes the fast path safe to trust."
   (:require [boring.core :as boring]
             [boring.data]
+            [boring.errors :as err]
             [clojure.zip :as zip])
   (:import (org.replikativ.boring Reader ByteSource)))
 
@@ -171,6 +172,32 @@
 
 (defn- major ^long [^Nav nav ^long off] (.majorAt ^Reader (.rdr nav) off))
 
+(defmacro ^:private skip
+  "`Reader.skipFrom` behind the decode error boundary.
+
+  The SECOND choke point, and the one `realize` does not cover. `skipStructural`
+  recurses per container level, so stepping over a deeply nested sibling
+  overflows the stack without ever building a value -- `nav/children` on a
+  1000-deep array chain raised a bare `java.lang.StackOverflowError` on a
+  256 KiB stack while `nav/value` on the same bytes, wrapped, gave
+  `:boring/max-depth-exceeded`.
+
+  Wrapped HERE rather than around the loops that call it, so that a deliberate
+  `IndexOutOfBoundsException` -- `nth`'s two-arity out-of-range contract -- is
+  raised outside the boundary and stays what `Indexed` promises.
+
+  A macro, not a function: this sits in the inner loop of every walk, and a
+  `try` block costs nothing when nothing is thrown while a var call does. As a
+  function it cost ~40 ns on the 300 ns `locate the blob` row -- measurable on
+  exactly the operation doc/PERFORMANCE.md leads with."
+  [r p]
+  ;; The `long` is load-bearing: a `try` expression is typed Object, so without
+  ;; it every `(recur (skip ...))` boxes and the loop locals stop being
+  ;; primitive -- which the compiler reports and which is a real cost in the
+  ;; walks this sits inside.
+  `(let [^Reader r# ~r]
+     (long (err/with-decode-errors (.skipFrom r# ~p)))))
+
 (defn- head-count
   "Element count for an array, pair count for a map. Refuses indefinite."
   ^long [^Nav nav ^long off]
@@ -186,7 +213,13 @@
 ;; ------------------------------------------------------------------ cursor
 
 (defn- realize [^Nav nav ^long off]
-  (.readFrom ^Reader (.rdr nav) off))
+  ;; THE choke point: `value`, `Items.nth`, `Items.reduce`, `children`, `get`
+  ;; and `zipper` all reach bytes through here. Unwrapped, `nav/value` on a
+  ;; 3000-deep tag chain raised a bare `java.lang.StackOverflowError` while
+  ;; `decode` on the same bytes gave `:boring/max-depth-exceeded` -- the one
+  ;; documented-as-impossible escape in doc/SECURITY.md, on the API whose whole
+  ;; premise is reading documents somebody else wrote.
+  (err/with-decode-errors (.readFrom ^Reader (.rdr nav) off)))
 
 (defn- scan-map
   "Linear walk of a map's entries from `start`, at most `limit` of them.
@@ -222,8 +255,8 @@
         (if (or (>= i limit) (>= p end) (neg? p))
           -1
           (if (.bytesEqualAt r p probe)
-            (.skipFrom r p)
-            (let [q (.skipFrom r (.skipFrom r p))]
+            (skip r p)
+            (let [q (skip r (skip r p))]
               (if (or (<= q p) (> q end)) -1 (recur (inc i) q))))))
       (catch IndexOutOfBoundsException _ -1))))
 
@@ -281,7 +314,7 @@
                     (if (or (neg? q) (>= q lim))
                       -1                       ; a damaged anchor: report a miss
                       (let [c (.compareItemToBytes r q probe)]
-                        (cond (zero? c) (.skipFrom r q)
+                        (cond (zero? c) (skip r q)
                               (neg? c) (recur (inc mid) hi)
                               :else (recur lo (dec mid)))))))))
             ;; Unsorted: still jump anchor to anchor rather than entry to entry.
@@ -307,12 +340,12 @@
             ns (node-slot nav off)]
         (if (neg? ns)
           (loop [i 0 p (.headEndAt r off)]
-            (if (= i idx) p (recur (inc i) (.skipFrom r p))))
+            (if (= i idx) p (recur (inc i) (skip r p))))
           (let [^longs slot (nth (:slots ix) ns)
                 stride (long (:stride ix))
                 anchor (quot idx stride)]
             (loop [i (* anchor stride) p (long (aget slot anchor))]
-              (if (= i idx) p (recur (inc i) (.skipFrom r p))))))))))
+              (if (= i idx) p (recur (inc i) (skip r p))))))))))
 
 (defn- child-offsets
   "Offsets of the children of the container at `off`, in wire order. For a map
@@ -336,7 +369,7 @@
     (loop [i 0 p (.headEndAt r off) acc (transient [])]
       (if (= i n)
         (persistent! acc)
-        (recur (inc i) (.skipFrom r p) (conj! acc p))))))
+        (recur (inc i) (skip r p) (conj! acc p))))))
 
 (deftype Cursor [^Nav nav ^long off]
   ;; Associative, not merely ILookup: `contains?` and `find` are what a caller
@@ -458,13 +491,13 @@
         (loop [i 0 p (.headEndAt r off) acc init]
           (if (or (= i n) (reduced? acc))
             (unreduced acc)
-            (recur (inc i) (.skipFrom r p) (f acc (cursor-at nav p)))))
+            (recur (inc i) (skip r p) (f acc (cursor-at nav p)))))
         (= mj MAJOR-MAP)
         (loop [i 0 p (.headEndAt r off) acc init]
           (if (or (= i n) (reduced? acc))
             (unreduced acc)
-            (let [vp (.skipFrom r p)]
-              (recur (inc i) (.skipFrom r vp)
+            (let [vp (skip r p)]
+              (recur (inc i) (skip r vp)
                      (f acc (clojure.lang.MapEntry. (realize nav p)
                                                     (cursor-at nav vp)))))))
         :else (fail :boring/not-a-container
@@ -509,7 +542,7 @@
   lets a caller hand a subtree somewhere else without decoding it."
   [^Cursor c]
   (let [^Nav nav (.nav c) off (.off c)]
-    [off (.skipFrom ^Reader (.rdr nav) off)]))
+    [off (skip ^Reader (.rdr nav) off)]))
 
 (defn raw-bytes
   "The encoded bytes of the subtree at the cursor, copied out. A re-encodable
@@ -807,7 +840,7 @@
                        ;; "the index is the last thing in the file" is what
                        ;; tells the real one from an earlier one. Checked after
                        ;; the tag probes, which are cheap and reject faster.
-                       (= n (.skipFrom r ptr))
+                       (= n (skip r ptr))
                        (let [arr (.headEndAt r ptr)]
                          (and (= 4 (.majorAt r arr))
                               (.bytesEqualAt r (.headEndAt r arr) (name-probe nav)))))
@@ -853,12 +886,12 @@
             nf
             (let [anchor (quot (long i) stride)]
               (loop [k (* anchor stride) p (long (aget offsets anchor))]
-                (if (= k (long i)) (cursor-at nav p) (recur (inc k) (.skipFrom r p)))))))
+                (if (= k (long i)) (cursor-at nav p) (recur (inc k) (skip r p)))))))
         ;; No sequence index: skip i times, or run out.
         (loop [k 0 p 0]
           (cond (>= p end) nf
                 (= k (long i)) (cursor-at nav p)
-                :else (recur (inc k) (.skipFrom r p)))))))
+                :else (recur (inc k) (skip r p)))))))
 
   ;; IReduce as well as IReduceInit: `(reduce f coll)` -- the arity everyone
   ;; actually writes -- threw a raw ClassCastException ("cannot be cast to
@@ -879,7 +912,7 @@
       (loop [p 0 acc init]
         (if (or (>= p end) (reduced? acc))
           (unreduced acc)
-          (recur (.skipFrom r p) (f acc (cursor-at nav p)))))))
+          (recur (skip r p) (f acc (cursor-at nav p)))))))
 
   Object
   (toString [_] "#boring.nav/items"))
