@@ -83,18 +83,6 @@ public final class Reader {
     /** Offset within the array {@link #arrayFor} returned. */
     private int scratchOff;
 
-    /**
-     * Scratch for buildMap's duplicate-key hashes, reused across maps.
-     *
-     * A fresh int[n] per map is invisible in a timing benchmark and obvious in
-     * an allocation one: decoding 200 five-key maps allocated 200 arrays.
-     *
-     * Safe as a field despite nested maps: buildMap runs only after every value
-     * of its map has been read, so an inner map's check completes before the
-     * outer map's begins, and nothing in it calls back into read().
-     */
-    private int[] dupHashes = new int[16];
-
     /** Unknown tags surface as TaggedValue rather than throwing. DATAHIKE-
      *  REQUIREMENTS.md §7 wants strict-by-default; set false for that. */
     public boolean tolerateUnknownTags = true;
@@ -1406,13 +1394,11 @@ public final class Reader {
     /**
      * Build a map from an interleaved k/v array, rejecting duplicate keys.
      *
-     * `RT.map` does this via `createWithCheck`, whose O(n^2) loop calls
-     * `Util.equiv` on every pair. For boxed numbers that lands in
-     * `Numbers.equal`'s category dispatch, measured at 96 ns for a 5-pair map
-     * (34 ns keyword keys, 118 ns string keys) — 10-37% of decode time.
-     *
-     * Prefiltering on hash makes the comparison nearly free: distinct keys
-     * almost never collide, so `equiv` runs only for genuine candidates.
+     * Small maps are built once through createAsIfByAssoc and rejected when
+     * the resulting count is smaller than the declared pair count. Array keys
+     * get a bounded content scan because host maps compare them by identity.
+     * Large maps use the content-aware HashSet path below. This avoids a
+     * HashSet plus one wrapper per key on every five-key datom map.
      *
      * The check is kept rather than dropped because differing duplicate-key
      * behaviour between implementations is a parser-differential attack
@@ -1454,35 +1440,6 @@ public final class Reader {
             if (!(kvs[i * 2] instanceof clojure.lang.Keyword)) return false;
         }
         return true;
-    }
-
-    /** Would the runtime itself represent this map as a PersistentArrayMap? */
-    private static boolean fitsArrayMap(Object[] kvs, int n) {
-        if (n <= ARRAY_MAP_PAIRS) return true;
-        return n <= ARRAY_MAP_KW_PAIRS && allKeywordKeys(kvs, n);
-    }
-
-    /**
-     * CBOR key equality for byte strings, which host equality does not give.
-     *
-     * Two byte strings with the same content are ONE key in CBOR (RFC 8949
-     * 5.6). On the JVM a `byte[]` uses identity equality, so `clojure.lang.Util`
-     * sees two distinct keys and the duplicate check below passes -- a map with
-     * two identical CBOR keys decoded happily, and the ORDINARY writer emitted
-     * one from a valid host map (`a2 42 0102 6161 42 0102 6162`).
-     *
-     * Only byte arrays need this; every other key type boring produces already
-     * has value equality.
-     */
-    private static boolean sameCborKey(Object a, Object b) {
-        if (a instanceof byte[] && b instanceof byte[])
-            return java.util.Arrays.equals((byte[]) a, (byte[]) b);
-        return clojure.lang.Util.equiv(a, b);
-    }
-
-    private static boolean anyByteArrayKey(Object[] kvs, int n) {
-        for (int i = 0; i < n; i++) if (kvs[i * 2] instanceof byte[]) return true;
-        return false;
     }
 
     /**
@@ -1585,27 +1542,52 @@ public final class Reader {
         }
     }
 
-    private Object buildMap(Object[] kvs, int n) {
-        if (n == 0) return clojure.lang.PersistentArrayMap.EMPTY;
-        // ONE content-aware pass. Two O(n^2) pair scans used to live here -- one
-        // specifically for byte-string keys, unbounded above the array-map
-        // threshold and therefore attacker-controlled work on read -- and
-        // neither could see through host identity equality for any OTHER array
-        // type. See KeyProbe.
-        if (checkDuplicateKeys && n > 1) {
-            checkDistinct(kvs, n, 2, "map key", "duplicate-map-key");
-            if (!fitsArrayMap(kvs, n)) {
-                // Above the array-map threshold the hash map's own build does
-                // an O(n) check already — but it raises Clojure's
-                // IllegalArgumentException, which is untyped as far as our
-                // callers are concerned. Fuzzing surfaced it.
-                try {
-                    return clojure.lang.PersistentHashMap.createWithCheck(kvs);
-                } catch (IllegalArgumentException e) {
+    private static boolean anyArrayKey(Object[] kvs, int n) {
+        for (int i = 0; i < n; i++) {
+            Object k = kvs[i * 2];
+            if (k != null && k.getClass().isArray()) return true;
+        }
+        return false;
+    }
+
+    /** Allocation-free content check for maps whose size is bounded by the
+     * array-map threshold. Called only when at least one key is an array; for
+     * ordinary keys createAsIfByAssoc already performs the needed equality. */
+    private static void checkDistinctSmall(Object[] kvs, int n) {
+        for (int i = 0; i < n; i++) {
+            for (int j = i + 1; j < n; j++) {
+                if (KeyProbe.eq(kvs[i * 2], kvs[j * 2])) {
+                    Object k = kvs[i * 2];
                     throw Err.of("duplicate-map-key",
-                        "boring: " + e.getMessage());
+                        "boring: duplicate map key: " + k, "key", k);
                 }
             }
+        }
+    }
+
+    private Object buildMap(Object[] kvs, int n) {
+        if (n == 0) return clojure.lang.PersistentArrayMap.EMPTY;
+        final boolean fits = n <= ARRAY_MAP_PAIRS
+            || (n <= ARRAY_MAP_KW_PAIRS && allKeywordKeys(kvs, n));
+        if (fits) {
+            // Build once. For ordinary keys the resulting count is the
+            // duplicate check, avoiding a HashSet and one KeyProbe allocation
+            // per key on every small map. Array identity is the one exception,
+            // handled by a bounded, allocation-free content scan.
+            if (checkDuplicateKeys && n > 1 && anyArrayKey(kvs, n))
+                checkDistinctSmall(kvs, n);
+            clojure.lang.IPersistentMap m =
+                clojure.lang.PersistentArrayMap.createAsIfByAssoc(kvs);
+            if (checkDuplicateKeys && m.count() != n) {
+                checkDistinctSmall(kvs, n); // finds the key for typed ex-data
+                throw Err.of("duplicate-map-key", "boring: duplicate map key");
+            }
+            return m;
+        }
+        if (checkDuplicateKeys) {
+            // The large path stays one-pass and content-aware; unlike the old
+            // pair scan, its work is not attacker-controlled O(n^2).
+            checkDistinct(kvs, n, 2, "map key", "duplicate-map-key");
         }
         // WITH THE CHECK OFF, LAST-WINS -- never a corrupt map.
         //
@@ -1619,9 +1601,6 @@ public final class Reader {
         // `createAsIfByAssoc` is last-wins, matching what the hash-map branch
         // below has always done, so the two sizes now agree instead of
         // differing at the array-map threshold.
-        if (fitsArrayMap(kvs, n)) {
-            return clojure.lang.PersistentArrayMap.createAsIfByAssoc(kvs);
-        }
         return clojure.lang.PersistentHashMap.create(kvs);
     }
 

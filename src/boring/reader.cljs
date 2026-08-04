@@ -385,11 +385,12 @@
   "Host equality first, content equality only for array-likes.
 
   `identical?` leads because boring's ident cache returns the SAME keyword
-  object for a repeated key, so the overwhelmingly common case is a pointer
-  comparison and never reaches the rest."
+  object for a repeated key. After a failed identity comparison, distinct
+  keywords and symbols cannot be equal within one read and skip the general
+  equality path."
   [a b]
   (or (identical? a b)
-      (= a b)
+      (and (not (or (keyword? a) (symbol? a))) (= a b))
       (and (array-key? a) (array-key? b)
            (= (array-content-key a) (array-content-key b)))))
 

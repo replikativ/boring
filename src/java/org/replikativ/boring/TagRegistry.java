@@ -171,6 +171,8 @@ public final class TagRegistry {
     }
 
     public TagWriter writerFor(Class<?> cls) { return writers.get(cls); }
+    /** True when encode dispatch can possibly find a user handler. */
+    public boolean hasWriters() { return !writers.isEmpty(); }
     public clojure.lang.IFn readerFor(long tag) { return readers.get(tag); }
     public clojure.lang.IFn recordCtor(String name) { return recordCtors.get(name); }
 

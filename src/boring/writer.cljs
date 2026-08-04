@@ -141,14 +141,17 @@
                  ;; map key got a fresh budget -- so nesting through key
                  ;; positions could repeatedly renew a cap set as a SECURITY
                  ;; bound. The JVM carries the same field for the same reason.
-                 ^:mutable depthOffset])
+                 ^:mutable depthOffset
+                 ;; Pre-resolved core options for reusable writers. Kept opaque
+                 ;; here to avoid coupling the byte emitter back to core.
+                 ^:mutable opts])
 
 (defn writer
   ([] (writer 256))
   ([size]
    (let [b (js/Uint8Array. (max 64 size))]
      (Writer. b (js/DataView. (.-buffer b)) 0 (js/Map.) 0 true true false false false nil
-              (js/Map.) true false 0 1024 false nil false 0))))
+              (js/Map.) true false 0 1024 false nil false 0 nil))))
 
 (defn reset! [^Writer w]
   (set! (.-pos w) 0)
@@ -709,7 +712,8 @@
     ;;
     ;; Registration is an instruction, not a suggestion: a handler exists
     ;; precisely to override what boring would do on its own.
-    (get-in (.-registry w) [:writers (type x)])
+    (and (some? (.-registry w))
+         (get-in (.-registry w) [:writers (type x)]))
     (let [h (get-in (.-registry w) [:writers (type x)])]
       (head! w TAG (check-tag! (:tag h)))
       (write-value! w ((:fn h) x)))

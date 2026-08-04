@@ -495,9 +495,11 @@
     recalled, so a value that throws part-way leaves a partial prefix on the
     stream. nippy's `freeze-to-out!` documents the same property for the same
     reason. If you need all-or-nothing, stage into a `ByteArrayOutputStream`.
-  - **A single leaf larger than the buffer still grows it.** A 200 MB string or
-    byte array is one CBOR item with a length header, so it cannot be split
-    across chunks. Collections stream at every depth; leaves do not.
+  - **Large byte and text strings bypass the chunk.** A caller's byte array is
+    handed directly to `out`, avoiding both buffer growth and a second memory
+    copy. Text first allocates its complete UTF-8 representation, so it halves
+    peak memory rather than making it constant. Primitive typed arrays and
+    pinned indexed-map keys can still grow the writer buffer.
 
   Returns the byte count."
   ;; RESOLVED ONCE, by whichever arity was called -- the 3-arity's options come

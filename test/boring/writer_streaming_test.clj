@@ -118,7 +118,8 @@
     (let [sink (proxy [OutputStream] [] (write ([_]) ([_ _ _])))]
       (doseq [[label v] [["ASCII string" (apply str (repeat 400000 \x))]
                          ["UTF-8 string" (apply str (repeat 400000 "\u00e9"))]
-                         ["byte array"   (byte-array 1000000)]]]
+                         ["byte array"   (byte-array 1000000)]
+                         ["bignum"       (.shiftLeft java.math.BigInteger/ONE 800000)]]]
         (let [w (boring/writer 64 o)]
           (boring/write-to! w v sink o)
           (is (<= (alength ^bytes (boring/buffer w)) 64)
@@ -130,6 +131,12 @@
           s (apply str (repeat 100000 "a\u00e9"))]
       (boring/write-to! w s out o)
       (is (= s (boring/decode (.toByteArray out) o)))))
+  (testing "a directly streamed bignum magnitude still round-trips"
+    (let [out (ByteArrayOutputStream.)
+          w (boring/writer 64 o)
+          n (.shiftLeft java.math.BigInteger/ONE 800000)]
+      (boring/write-to! w n out o)
+      (is (= n (boring/decode (.toByteArray out) o)))))
   (testing "a large leaf inside a PINNED span still buffers, because a map key
             must stay contiguous for the index's sorted flag"
     (let [out (ByteArrayOutputStream.)
