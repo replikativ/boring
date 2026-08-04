@@ -1594,10 +1594,6 @@
              ;; else's data and stays visible.
              (cond
                footer? nil
-               ;; The retry above already established this is a genuine frame
-               ;; at the final position; `readFrom` does not move `position`,
-               ;; so `atEnd` cannot be consulted here.
-               (identical? ::index-frame v) nil
                (and (.atEnd r) (frame/index-frame? v start)) nil
                :else (cons v (step frame-at))))))) (frame/footer-start bs)))))
 

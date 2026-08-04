@@ -2832,3 +2832,32 @@
       (let [bs (boring/encode {:a 1})]
         (is (= {:a 1} (boring/decode bs)))
         (is (= [{:a 1}] (vec (boring/decode-seq bs))))))))
+
+(deftest an-ordinary-keyword-is-not-a-sentinel
+  (testing "`decode-seq` compared each decoded item against `::index-frame` --
+            a leftover sentinel from a refactor, and dead code, since nothing
+            produces it any more. Keywords are INTERNED, so a user's
+            `:boring.core/index-frame` is that exact object: a sequence
+            containing it silently truncated there. `[1 :boring.core/index-frame
+            3]` came back `[1]`. Two items lost, no error, on a namespaced
+            keyword anybody could write.
+
+            The lesson is about sentinels rather than this keyword: a sentinel
+            drawn from the same value space as the data cannot be distinguished
+            from the data."
+    (let [o {:stringref false}
+          seq-of (fn [xs] (let [w (boring/writer 4096 o)
+                                out #?(:clj (java.io.ByteArrayOutputStream.) :cljs nil)]
+                            #?(:clj (do (doseq [x xs] (boring/write-to! w x out))
+                                        (vec (boring/decode-seq (.toByteArray out) o)))
+                               :cljs (let [acc (atom [])]
+                                       (boring/write-seq! w xs #(swap! acc conj %) o)
+                                       (vec (boring/decode-seq
+                                             (let [n (reduce + (map #(.-length %) @acc))
+                                                   b (js/Uint8Array. n)]
+                                               (reduce (fn [off c] (.set b c off)
+                                                         (+ off (.-length c))) 0 @acc)
+                                               b)
+                                             o))))))]
+      (doseq [k [:boring.core/index-frame :boring/index :boring.core/whatever]]
+        (is (= [1 k 3] (seq-of [1 k 3])) (str "a sequence holding " k))))))
