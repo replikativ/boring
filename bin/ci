@@ -164,6 +164,13 @@ stage_cljs () {
 # nice-to-have. Counts are kept modest enough to run on every push.
 # The reference readers in interop/ are documentation that EXECUTES. A snippet
 # in a markdown file rots silently; this one breaks the build.
+# Not in `all`: it runs the index suite four times over, which is minutes. It
+# is the gate that proves the index tests DEPEND on the index, so it belongs in
+# CI proper rather than in a local `bin/ci` run.
+stage_index_mutants () {
+  run index-mutants bin/index-mutants
+}
+
 stage_interop () {
   if python3 -c "import cbor2" 2>/dev/null; then
     run interop-python python3 interop/test_read_boring.py
@@ -237,6 +244,7 @@ case "${1:-all}" in
   nippy)     stage_nippy ;;
   hasch)     stage_hasch ;;
   interop)   stage_interop; stage_interop_rust ;;
+  mutants)   stage_index_mutants ;;
   artifact)  stage_artifact ;;
   lint)      stage_lint ;;
   fuzz)      stage_fuzz ;;

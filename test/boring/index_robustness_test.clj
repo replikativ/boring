@@ -1281,3 +1281,57 @@
           (is (= vs (mapv nav/value (nav/items bs opts)))))))
     (testing "and the genuinely empty sealed sequence still reads as empty"
       (is (= 0 (count (nav/items (seal [] opts) opts)))))))
+
+;; ------------------------------------- the two paths nothing depended on
+;;
+;; Disabling each index path INDIVIDUALLY -- each falls back to the scan, which
+;; returns the same answers -- and running the three index namespaces:
+;;
+;;   index load (whole index dead)   4 tests notice
+;;   Items.nth (item by position)    1
+;;   lookup-map (map key lookup)     0     <-- nothing
+;;   nth-item (array element)        0     <-- nothing
+;;
+;; `lookup-map` is the headline: it is the `get-in` acceleration the README
+;; leads with, 27 us against 181 us, and its entire indexed branch could be
+;; deleted with every test still green. Both bare paths later turned out to
+;; carry defects that agents found and the suite could not -- `nth-item` had no
+;; anchor validation at all, and `lookup-map` reported present keys as absent.
+;;
+;; No assertion about a returned VALUE can close this, because the index is a
+;; pure optimisation and the scan returns the same value. Counting the walking
+;; is what distinguishes them, and it is deterministic where timing is not.
+
+(deftest the-index-is-actually-consulted-for-a-map-key
+  (testing "`lookup-map`'s indexed branch, which nothing depended on"
+    (let [o {:profile :canonical}
+          m (into {} (for [i (range 200)] [(format "k%03d" i) i]))
+          indexed (nav/source (boring/encode-indexed m (assoc o :index 8 :index-min 8)) o)
+          plain (nav/source (boring/encode m o) o)]
+      (testing "both find the key -- the index changes the work, not the answer"
+        (is (= 150 (nav/value (get indexed "k150"))))
+        (is (= 150 (nav/value (get plain "k150")))))
+      (let [walked (fn [c k] (nav/skips c 0) (nav/value (get c k)) (nav/skips c))
+            with (walked indexed "k150")
+            without (walked plain "k150")]
+        (is (< (* 4 with) without)
+            (str "an indexed lookup must do far less walking: " with " vs " without))
+        ;; A ceiling as well as a ratio: at stride 8 the walk from an anchor is
+        ;; bounded, so this cannot quietly degrade to "a bit better than a scan".
+        (is (< with 40) (str "and it must be bounded by the stride, not the map: " with))))))
+
+(deftest the-index-is-actually-consulted-for-an-array-element
+  (testing "`nth-item`'s indexed branch, which nothing depended on either"
+    (let [o {:profile :canonical}
+          v (vec (range 200))
+          indexed (nav/source (boring/encode-indexed v (assoc o :index 8 :index-min 8)) o)
+          plain (nav/source (boring/encode v o) o)]
+      (testing "both reach the element"
+        (is (= 150 (nav/value (nth indexed 150))))
+        (is (= 150 (nav/value (nth plain 150)))))
+      (let [walked (fn [c i] (nav/skips c 0) (nav/value (nth c i)) (nav/skips c))
+            with (walked indexed 150)
+            without (walked plain 150)]
+        (is (< (* 4 with) without)
+            (str "an indexed nth must do far less walking: " with " vs " without))
+        (is (< with 20) (str "and be bounded by the stride: " with))))))

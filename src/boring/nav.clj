@@ -553,6 +553,22 @@
 
 (defn cursor? [x] (instance? Cursor x))
 
+(defn ^:no-doc skips
+  "Structural skips this cursor's reader has performed, and a setter to zero it.
+
+  Test support, and the reason it exists is worth stating: the index is a PURE
+  OPTIMISATION -- same answers, fewer steps -- so no assertion about a returned
+  VALUE can tell a live index from a dead one, and timing it is flaky.
+  Per-path mutation showed what that costs: the indexed branches of both
+  `lookup-map` and `nth-item` could be deleted outright with the whole suite
+  still green, and both later turned out to carry defects nothing had caught.
+
+  Counting the walking is the observable that distinguishes them. Reaching
+  `k150` in a 200-key map is 17 skips through the index and 301 without."
+  (^long [c] (.-skips ^Reader (.rdr ^Nav (.nav ^Cursor c))))
+  ([c ^long n] (set! (.-skips ^Reader (.rdr ^Nav (.nav ^Cursor c))) n) c))
+
+
 (defn value
   "Realise the subtree at the cursor into a Clojure value, through the ordinary
   decoder -- same registry, same records, same everything.

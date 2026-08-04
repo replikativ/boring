@@ -595,8 +595,25 @@ public final class Reader {
      * too-deep subtree. Leaving depth raised made the NEXT, unrelated call
      * fail too.
      */
+    /**
+     * How many structural skips this reader has performed.
+     *
+     * Exists so a test can tell whether the OFFSET INDEX was actually
+     * consulted. The index is a pure optimisation -- same answers, fewer
+     * steps -- so no assertion about the RESULT can distinguish a live index
+     * from a dead one, and measuring it by wall clock is flaky. Per-path
+     * mutation showed the consequence: `lookup-map`'s and `nth-item`'s indexed
+     * branches could both be deleted outright with the whole suite still
+     * green, and both later turned out to carry defects nothing had found.
+     *
+     * A plain field increment on a path that already does a bounds-checked
+     * walk; measured at the noise floor.
+     */
+    public long skips;
+
     public long skipFrom(long p) {
         if (busy) throw concurrentUse();
+        skips++;
         busy = true;
         long save = pos; int d = depth, sd = skipDepth;
         try { pos = p; skipDepth = 0; skipValue(); return pos; }
