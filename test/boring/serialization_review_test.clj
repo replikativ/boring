@@ -736,3 +736,26 @@
                      (c/hex->bytes
                       "a2d81b8272636c6f6a7572652f736f727465642d6d6170a161610100a1010100")
                      {:check-duplicate-keys false}))))))
+
+(deftest a-stack-overflow-surfaces-as-a-typed-depth-error
+  (testing "`:max-depth` bounds recursion in ITEMS, and the stack cost per item
+            is not uniform -- a chain of tags costs about 2.5x a chain of
+            containers. Capping the option does not fix that, because any cap is
+            calibrated against one stack size and a servlet or agent thread gets
+            a fraction of the main thread's: CI passes and the request thread
+            does not. doc/SECURITY.md promises no raw StackOverflowError escapes"
+    (let [tags (fn [n] (byte-array (concat (mapcat (fn [_] [(unchecked-byte 0xd8)
+                                                            (unchecked-byte 0x27)])
+                                                   (range n))
+                                           [(unchecked-byte 0x80)])))
+          on-stack (fn [bytes-stack f]
+                     (let [p (promise)]
+                       (doto (Thread. nil #(deliver p (try (f) (catch Throwable t t)))
+                                      "depth-probe" bytes-stack)
+                         .start .join)
+                       @p))]
+      (doseq [[stack n] [[(* 256 1024) 2000] [(* 256 1024) 20000]]]
+        (let [r (on-stack stack #(boring/decode (tags n) {:max-depth 2048}))]
+          (is (instance? clojure.lang.ExceptionInfo r)
+              (str "stack " stack " depth " n " gave " (class r)))
+          (is (= :boring/max-depth-exceeded (:type (ex-data r)))))))))

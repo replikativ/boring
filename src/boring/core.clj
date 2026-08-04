@@ -619,7 +619,27 @@
      ~@body
      (catch IndexOutOfBoundsException e#
        (throw (ex-info "boring: input ended mid-value (truncated or malformed)"
-                       {:type :boring/truncated-input} e#)))))
+                       {:type :boring/truncated-input} e#)))
+     ;; A STACK OVERFLOW IS A DEPTH ERROR, and it has to be caught to be one.
+     ;;
+     ;; `:max-depth` bounds recursion in ITEMS, and the stack it costs per item
+     ;; is not uniform: a chain of tags costs about 2.5x a chain of containers,
+     ;; so 440 nested tags -- 881 bytes -- overflow a 1 MiB thread stack while
+     ;; the default limit of 1024 is still nowhere in sight. Capping the option
+     ;; does not fix that, because the cap was calibrated on the main thread's
+     ;; 8 MiB stack and a servlet or agent thread gets a fraction of it: CI
+     ;; passes and the request thread does not.
+     ;;
+     ;; Catching Error is normally wrong. Here the boundary is a decoder entry
+     ;; point, the stack has fully unwound by the time this runs, and the
+     ;; alternative is an untyped failure that doc/SECURITY.md promises cannot
+     ;; escape -- on input an attacker chooses, on whatever stack the caller
+     ;; happens to have.
+     (catch StackOverflowError e#
+       (throw (ex-info (str "boring: input nests deeper than this thread's stack can "
+                            "decode; lower :max-depth or decode on a thread with a "
+                            "larger stack")
+                       {:type :boring/max-depth-exceeded})))))
 
 (defn- max-items-opt
   "`:max-items`, validated. 0 means unlimited, which is the default.
