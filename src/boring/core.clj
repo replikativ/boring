@@ -618,10 +618,19 @@
   advertised default was the one path never exercised.
 
   An index exists to be navigated; producing one that cannot be is not a
-  trade-off worth offering. Pass `:stringref true` explicitly and it is honoured
-  -- you simply get an index nothing can use."
+  trade-off worth offering -- so an EXPLICIT `:stringref true` is now REFUSED
+  with `:boring/incompatible-options` rather than honoured. It used to be
+  honoured, producing a file whose index `boring.nav` refuses outright, which
+  is the same silent-useless-output this function's siblings already reject:
+  `write-seq!` and `write-indexed!` have raised on that combination all along.
+  Three functions, one rule, and this was the one that did not follow it."
   (^bytes [v] (encode-indexed v nil))
   (^bytes [v opts]
+   (when (true? (:stringref opts))
+     (throw (ex-info (str "boring: :stringref true cannot be combined with an index -- "
+                          "boring.nav cannot resolve string references from an offset, "
+                          "so the index would be unusable. Drop one of the two.")
+                     {:type :boring/incompatible-options :stringref true})))
    (let [opts (if (contains? opts :stringref) opts (assoc opts :stringref false))
          ^bytes body (encode v opts)
          idx (build-index body opts)]

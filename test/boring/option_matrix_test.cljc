@@ -102,3 +102,22 @@
                 refused rather than truncated to something plausible"
         (is (= :boring/bad-option
                (m/verdict #(boring/build-index bs {:index 2147483648}))))))))
+
+(deftest an-option-typo-is-caught-rather-than-ignored
+  (testing "Unknown keys pass -- callers thread their own map through, and
+            konserve does -- but a key ONE CHARACTER from a real option is far
+            more likely a typo than a foreign key, and this library has shipped
+            two defects that were exactly that. The suggestion is the point:
+            an error that names what you probably meant costs nothing to act on."
+    (doseq [[typo meant] [[:max-item :max-items]
+                          [:stringrefs :stringref]
+                          [:cannonical :canonical]
+                          [:shape :shapes]]]
+      (let [d (try (do (boring/encode {:a 1} {typo true}) nil)
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e (ex-data e)))]
+        (is (= :boring/bad-option (:type d)) (str typo))
+        (is (= meant (:did-you-mean d)) (str typo " should suggest " meant))))
+    (testing "and a key that looks nothing like an option is left alone, which
+              is what keeps the option map open"
+      (doseq [k [:konserve/version :totally-unrelated :x]]
+        (is (some? (boring/encode {:a 1} {k true})) (str k))))))

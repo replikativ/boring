@@ -224,6 +224,14 @@
                     :want (str "a non-negative integer no greater than " max-index-stride)}
    :float-policy   {:pred #{:preserve-width :shortest}
                     :want ":preserve-width or :shortest"}
+   ;; `:canonical` and `:canonical-order` are LOCKED BY EVERY PROFILE, so
+   ;; passing either can only ever produce `:boring/incompatible-options`. They
+   ;; stay in the spec deliberately rather than being dropped: a dropped key is
+   ;; an unknown key, and `{:cannonical true}` would then be indistinguishable
+   ;; from a stray one. The conflict error names the profile and the value it
+   ;; defines, which is more use than silence. Say what you want by NAMING a
+   ;; profile -- that is what a profile is.
+   :canonical      {:pred boolish? :want "true or false"}
    :canonical-order {:pred #{:rfc8949 :rfc7049}
                      :want ":rfc8949 or :rfc7049"}
    ;; A function is legal on both platforms: ClojureScript has one time type,
@@ -263,7 +271,6 @@
    ;; turned nothing off, on the option doc/SECURITY.md names for lenient
    ;; decoding.
    :stringref                    {:pred boolish? :want "true or false"}
-   :canonical                    {:pred boolish? :want "true or false"}
    :shapes                       {:pred boolish? :want "true or false"}
    :incl-metadata?               {:pred boolish? :want "true or false"}
    :permit-reserved-simple-values {:pred boolish? :want "true or false"}
@@ -285,6 +292,38 @@
 (def ^:private preds
   (persistent! (reduce-kv (fn [m k v] (assoc! m k (:pred v))) (transient {}) spec)))
 
+(defn- near-miss
+  "A spec key within one edit of `k`, or nil.
+
+  Unknown keys pass -- callers thread their own map through, and konserve does
+  -- but a key ONE CHARACTER from a real option is far more likely a typo than
+  a foreign key, and this library has shipped two defects that were exactly
+  that. `:max-item`, `:stringrefs` and `:cannonical` are caught; anything that
+  looks nothing like an option is left alone.
+
+  Only ever runs on keys the spec does not know, so the cost falls on the
+  unusual case rather than on every option of every call."
+  [k]
+  (when (keyword? k)
+    (let [a (name k)
+          n (count a)
+          within-one?
+          (fn [b]
+            (let [m (count b)]
+              (when (<= (Math/abs (- n m)) 1)
+                (loop [i 0 j 0 slack 1]
+                  (cond (and (= i n) (= j m)) true
+                        (neg? slack) false
+                        (= i n) (recur i (inc j) (dec slack))
+                        (= j m) (recur (inc i) j (dec slack))
+                        (= (nth a i) (nth b j)) (recur (inc i) (inc j) slack)
+                        (= n m) (recur (inc i) (inc j) (dec slack))
+                        (< n m) (recur i (inc j) (dec slack))
+                        :else (recur (inc i) j (dec slack)))))))]
+      (first (filter #(and (not= % k) (= (namespace k) (namespace %))
+                           (within-one? (name %)))
+                     (keys spec))))))
+
 (defn validate!
   "Check every KNOWN key in `opts`. Returns `opts`.
 
@@ -296,9 +335,15 @@
   [opts]
   (reduce-kv (fn [_ k v]
                (let [p (get preds k)]
-                 (when (and p (not (p v)))
-                   (let [{:keys [want type]} (get spec k)]
-                     (bad-option! k v want type))))
+                 (if p
+                   (when-not (p v)
+                     (let [{:keys [want type]} (get spec k)]
+                       (bad-option! k v want type)))
+                   (when-let [m (near-miss k)]
+                     (throw (ex-info (str "boring: unknown option " k
+                                          " -- did you mean " m "?")
+                                     {:type :boring/bad-option :option k
+                                      :did-you-mean m})))))
                nil)
              nil opts)
   opts)
