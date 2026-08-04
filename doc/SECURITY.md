@@ -21,6 +21,46 @@ file usually already has filesystem access, so the decoder is not the weakest
 link. The kabel and konserve cases are the ones where the decoder genuinely *is*
 the boundary.
 
+## Navigating bytes you do not trust
+
+`boring.nav` reads a document without decoding it, guided by an optional
+offset index sealed into the file. **That index is data, and on an untrusted
+document it is attacker-chosen.**
+
+What a chosen index can do is narrower than it first looks: it can misdirect a
+lookup to a different place *within the same blob*. It cannot read outside the
+document, loop forever, or allocate without bound — anchors are range-checked
+and every walk is behind the typed error boundary, verified against chosen
+indexes on both heap and memory-mapped sources. And the attacker wrote every
+byte already, so a value they misdirect you to is one they could have sent
+directly.
+
+**It matters when an application verifies one part of a document and then acts
+on another.** Two `get`s can be made to resolve to overlapping regions, so you
+checked one thing and used a different one — the shape of Android's Master Key
+bug, where one ZIP entry was verified and its duplicate installed. If you
+validate a field and then navigate to a payload, that is the case to think
+about.
+
+Pass `{:trust-index :ignore}` and `nav` never reads the index; it scans, which
+is the reference implementation the indexed paths are checked against. Lookups
+cost what they would on a file with no index — measured, 301 skips against 17
+for one key in a 200-key map — and the question does not arise.
+
+Not yet built, and named here so the gap is visible rather than implied: a
+`:validate` setting that walks every anchor chain at load and refuses an index
+that does not hold together. It is measured at about one unindexed scan
+(12.2 ms on a 4.6 MB, 200 000-item file), after which lookups run at full
+speed — so it is never worse than having no index. Until it exists,
+`:trust-index` accepts only `:trusted` and `:ignore`.
+
+Two amplification paths on the `nav` side are also uncharged and unmeasured by
+this page: cursor construction in `seq`/`reduce`/`items`/`count` is not charged
+to `:max-items` at all, and the index frame decodes with the budgets
+deliberately lifted. Both are bounded by the message size, so a transport cap
+bounds them — but the multiplier has not been measured and may exceed the
+decode figures below.
+
 ## Trust boundary
 
 `decode` is the boundary.

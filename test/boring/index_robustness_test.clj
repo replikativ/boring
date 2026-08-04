@@ -1402,3 +1402,44 @@
         (dotimes [i n]
           (is (= (nav/value (nth ix i)) (nav/value (nth pl i)))
               (str "vec n=" n " stride=" stride " " profile " idx " i)))))))
+
+(deftest trust-index-ignore-scans-instead
+  (testing "A chosen index can misdirect a lookup WITHIN the blob it came with.
+            That gains an attacker nothing directly -- they wrote every byte,
+            so they could have sent the value they misdirect you to. It matters
+            when an application verifies one part of a document and acts on
+            another: two `get`s can be made to resolve to overlapping regions,
+            so you checked one thing and used a different one.
+
+            `:trust-index :ignore` removes the question by scanning. The scan
+            is the reference implementation the indexed paths are checked
+            against, so this setting needs no separate correctness argument --
+            only proof that it really is scanning, which is what the skip
+            counts below are for."
+    (let [o {:profile :canonical}
+          m (into {} (for [i (range 200)] [(format "k%03d" i) i]))
+          bs (boring/encode-indexed m (assoc o :index 8 :index-min 8))
+          walked (fn [opts k] (let [c (nav/source bs opts)]
+                                (nav/skips c 0)
+                                [(nav/value (get c k)) (nav/skips c)]))
+          [tv trusted-skips] (walked o "k150")
+          [iv scan-skips] (walked (assoc o :trust-index :ignore) "k150")]
+      (testing "same answer either way -- the index is an optimisation"
+        (is (= 150 tv))
+        (is (= 150 iv)))
+      (testing "but `:ignore` really does scan, and the default really does not"
+        (is (< (* 4 trusted-skips) scan-skips)
+            (str "trusted " trusted-skips " skips, ignored " scan-skips)))
+      (testing "and every key still reads back under `:ignore`"
+        (let [c (nav/source bs (assoc o :trust-index :ignore))]
+          (doseq [i (range 0 200 17)]
+            (is (= i (nav/value (get c (format "k%03d" i))))))))
+      (testing "an unimplemented or misspelt value is refused rather than
+                silently meaning `:trusted` -- `:validate` is measured but not
+                yet built, and naming a behaviour boring does not perform would
+                be worse than not offering it"
+        (doseq [bad [:validate :nope "trusted" nil]]
+          (is (= :boring/bad-option
+                 (try (do (nav/source bs (assoc o :trust-index bad)) nil)
+                      (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+              (pr-str bad)))))))

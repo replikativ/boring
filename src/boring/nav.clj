@@ -149,7 +149,12 @@
                  "with boring/decode.")
             {}))
     (let [nav (Nav. r opts (atom {}) nil src)]
-      (Nav. r opts (atom {}) (read-index nav) src))))
+      ;; `:trust-index :ignore` skips the index entirely and scans. The scan is
+      ;; the reference implementation the indexed paths are checked against, so
+      ;; this is the one setting whose correctness needs no separate argument.
+      (Nav. r opts (atom {})
+            (when-not (= :ignore (:trust-index opts)) (read-index nav))
+            src))))
 
 (defn- fork-nav ^Nav [^Nav n]
   (let [src (.src n)

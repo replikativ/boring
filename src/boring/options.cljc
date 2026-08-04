@@ -218,6 +218,26 @@
                     :want ":local-date or :sql-date"}
    :encode-fallback {:pred #(or (nil? %) (= :placeholder %) (callable? %))
                      :want "nil, :placeholder, or a function"}
+   ;; How much of a sealed index to believe, for `boring.nav`.
+   ;;
+   ;;   :trusted  use it (the default, and today's behaviour)
+   ;;   :ignore   never read it -- always scan
+   ;;
+   ;; `:ignore` exists because a chosen index can misdirect a lookup WITHIN the
+   ;; blob it came with. That gains an attacker nothing directly -- they wrote
+   ;; every byte, so they could have sent the value they misdirect you to. It
+   ;; matters when an application verifies one part of a document and then acts
+   ;; on another: two `get`s can be made to resolve to overlapping regions, so
+   ;; you checked one thing and used a different one. Scanning removes the
+   ;; question, at the cost of the acceleration.
+   ;;
+   ;; A third value, `:validate` -- walk every anchor chain at load and refuse
+   ;; the index if any link fails -- is measured (about one unindexed scan:
+   ;; 12.2 ms on a 4.6 MB, 200 000-item file) and not yet implemented. It is
+   ;; deliberately NOT accepted here until it is, because an option that names
+   ;; a behaviour it does not perform is worse than one that does not exist.
+   :trust-index    {:pred #{:trusted :ignore}
+                    :want ":trusted or :ignore"}
    :registry       {:pred #(or (nil? %) (registry? %))
                     :want #?(:clj "a TagRegistry from boring/tag-registry"
                              :cljs "a registry map from boring/tag-registry")}
