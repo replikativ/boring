@@ -2482,3 +2482,56 @@
        (is (not= :boring/bad-tag-number
                  (err-type #(boring/register-tag (boring/tag-registry)
                                                  Long/MAX_VALUE nil nil identity)))))))
+
+#?(:clj
+   (deftest the-index-retry-applies-only-where-the-file-says-the-footer-is
+     (testing "the budget retry accepted anything frame-SHAPED at any offset, so
+               two concatenated sealed files ended at the FIRST file's footer:
+               352 records decoded as 200 under :max-depth 4, silently, with no
+               error. Gated on the trailing back-pointer now"
+       (let [mk (fn [n] (let [o (java.io.ByteArrayOutputStream.)]
+                          (boring/write-seq! (boring/writer 4096)
+                                             (vec (for [i (range n)] {:e i :v (str "v" i)})) o)
+                          (.toByteArray o)))
+             both (let [o (java.io.ByteArrayOutputStream.)]
+                    (.write o ^bytes (mk 200)) (.write o ^bytes (mk 150)) (.toByteArray o))]
+         (is (= 352 (count (boring/decode-seq both))))
+         (is (= 352 (count (boring/decode-seq both {:max-items 600}))))
+         (is (not= 200 (err-type #(count (boring/decode-seq both {:max-depth 4}))))
+             "a budget too small for the second footer must error, never truncate")))
+
+     (testing "and a single sealed file still reads back under budgets too small
+               for its own footer, which is what the retry exists for"
+       (let [o (java.io.ByteArrayOutputStream.)]
+         (boring/write-seq! (boring/writer 4096)
+                            (vec (for [i (range 200)] {:e i :v (str "v" i)})) o)
+         (let [bs (.toByteArray o)]
+           (is (= 200 (count (boring/decode-seq bs {:max-depth 3}))))
+           (is (= 200 (count (boring/decode-seq bs {:max-items 700})))))))
+
+     (testing "the retry must not lift :max-items for anything but the footer --
+               a 500 000-element tag-40 item under {:max-items 100} was re-read
+               with NO budget and allocated 473 MB before reporting the same
+               error it would otherwise have reported for free"
+       (let [bos (java.io.ByteArrayOutputStream.)]
+         (.write bos ^bytes (c/hex->bytes "d82882831a0007a1200101d84e5a0007a120"))
+         (dotimes [_ 500000] (.write bos 1))
+         (let [doc (.toByteArray bos)
+               tmx (java.lang.management.ManagementFactory/getThreadMXBean)
+               tid (.getId (Thread/currentThread))
+               before (.getThreadAllocatedBytes tmx tid)]
+           (err-type #(doall (boring/decode-seq doc {:max-items 100})))
+           (is (< (- (.getThreadAllocatedBytes tmx tid) before) 50000000)
+               "the budgeted decode must not allocate the whole reconstruction"))))))
+
+(deftest rfc-3339-offsets-stop-at-eighteen-hours-exactly
+  (testing "the narrowing landed on `1[0-8]:[0-5]\\d`, which admits +18:01 to
+            +18:59 -- 720 offsets java.time cannot hold, under a doc sentence
+            written in the same commit claiming the opposite"
+    (doseq [o ["+18:01" "+18:59" "-18:30" "+19:00"]]
+      (is (= :boring/bad-tag-content
+             (err-type #(boring/decode (tag0-bytes (str "2020-01-01T00:00:00" o))))) o)))
+  (testing "while the bound itself and everything below it stay legal"
+    (doseq [o ["+18:00" "-18:00" "+17:59" "Z"]]
+      (is (not= :boring/bad-tag-content
+                (err-type #(boring/decode (tag0-bytes (str "2020-01-01T00:00:00" o))))) o))))

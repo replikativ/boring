@@ -1196,7 +1196,7 @@
         ;; character. `\d{2}` accepted hour 24, which RFC 3339 5.6 caps at 23
         ;; and which `js/Date` silently ROLLED FORWARD to the next day -- a
         ;; wrong value out of an invalid document, on both platforms.
-        (when-not (re-matches #"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d{1,9})?([Zz]|[+-](0\d|1[0-8]):[0-5]\d)" s)
+        (when-not (re-matches #"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d{1,9})?([Zz]|[+-]((0\d|1[0-7]):[0-5]\d|18:00))" s)
           (err :boring/bad-tag-content
                (str "boring: tag 0 content is not a valid RFC 3339 instant: " s)
                {:tag 0 :value s}))

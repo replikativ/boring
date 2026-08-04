@@ -388,8 +388,7 @@
              (step []
                (lazy-seq
                 (if-not (rd/at-end? r)
-                  (let [start (rd/position r)
-                        v (try
+                  (let [v (try
                             {:ok (rd/read-next! r)}
                             (catch :default e
                               ;; From INSIDE the reader, "the buffer ends
@@ -424,7 +423,17 @@
                       ;; not happened yet at the moment the last item is read.
                       ;; The JVM arity resolves it the same way.
                       (if (and (rd/at-end? r)
-                               (index-frame? (:ok v) start)
+                               ;; -1, NOT the reader position. `position` is
+                               ;; relative to the CURRENT BUFFER, which the
+                               ;; refill above compacts, so it is only the file
+                               ;; offset while the whole file fits one pull
+                               ;; block. Past that the back-pointer comparison
+                               ;; failed and every frame came back as an item:
+                               ;; a 139 KB file read as 4001 items at the
+                               ;; default 64 KiB chunk. `index-frame?`'s own
+                               ;; docstring says the streaming decoder passes
+                               ;; -1; this did not.
+                               (index-frame? (:ok v) -1)
                                (not (refill!)))
                         nil
                         (do (swap! state assoc :last-good (rd/position r))

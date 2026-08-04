@@ -1100,34 +1100,63 @@
 
 (declare index-walk index-walk*)
 
+(defn- footer-start
+  "Where a genuine index footer begins in `bs`, or -1.
+
+  `seal-index!` ends every sealed file with a byte string of exactly 8 bytes --
+  `0x48` and the offset the frame itself starts at -- so the footer announces
+  its own position and that position is checkable without decoding anything.
+  Reading it here, once, is what lets the decoder know which item is the footer
+  BEFORE it tries to read it."
+  ^long [^bytes bs]
+  (let [n (alength bs)]
+    (if (or (< n 9) (not= 0x48 (bit-and (aget bs (- n 9)) 0xff)))
+      -1
+      (let [p (loop [i 0 acc 0]
+                (if (= i 8) acc
+                    (recur (inc i) (+ (* acc 256) (bit-and (aget bs (+ (- n 8) i)) 0xff)))))]
+        ;; The pointer is also the length of the data section, so it must land
+        ;; inside the file and leave room for the frame it points at.
+        (if (and (>= p 0) (< p (- n 9))) p -1)))))
+
 (defn- read-item-or-frame
   "Read the next top-level item at `start`, giving boring's OWN footer its own
-  budgets if the caller's turn out to be too small for it.
+  budgets -- and ONLY at the offset the file says the footer begins.
 
-  `boring.nav` already isolates the index frame's depth budget, with a comment
-  explaining that the caller's limit is a bound on THEIR data and was never a
-  statement about boring's footer. The sequence decoders never got the same
-  treatment, so `write-seq!`'s default output -- which appends a frame four to
-  five levels deep -- could not be read back under any `:max-depth` below 5,
-  even when every data item was depth 1. A valid index made reading fail where
-  no index would have succeeded: the same inversion, in the other reader.
+  `boring.nav` isolates the frame's depth budget, with a comment explaining that
+  the caller's limit bounds THEIR data and was never a statement about boring's
+  footer; the sequence decoders needed the same, because `write-seq!` appends a
+  frame four to five levels deep and a file whose data is depth 1 could not be
+  read back under `:max-depth 4`.
 
-  Retried rather than pre-emptively widened, so a caller's limits still apply to
-  everything they realise. The retry is at the same offset with the budgets
-  lifted; if what comes back is not a genuine index frame, the ORIGINAL error is
-  raised, because then it really was their data that overran."
-  [^Reader r ^long start]
+  THE OFFSET GATE IS THE WHOLE SAFETY ARGUMENT, and its absence was a defect of
+  its own: a first version retried at any offset and accepted whatever came
+  back if it merely LOOKED like a frame. Two concatenated sealed files then
+  ended at the first file's footer -- 352 records decoded as 200 under
+  `:max-depth 4`, silently, with no error. And because the retry also lifted
+  `:max-items`, a document that had nothing to do with the index could be
+  re-read with no budget at all: a 3 MB tag-40 item under `{:max-items 100}`
+  allocated 473 MB before reporting the same error it would have reported for
+  free. Both are reachable by anyone who follows doc/SECURITY.md's advice to set
+  a budget.
+
+  With the gate, the retry happens at exactly one offset in a file, and only
+  when the file's own trailing back-pointer names it."
+  [^Reader r ^long start ^long frame-at]
   (try
     (.readNext r)
     (catch clojure.lang.ExceptionInfo e
-      (if-not (#{:boring/max-depth-exceeded :boring/max-items-exceeded}
-               (:type (ex-data e)))
+      (if-not (and (= start frame-at)
+                   (#{:boring/max-depth-exceeded :boring/max-items-exceeded}
+                    (:type (ex-data e))))
         (throw e)
         (let [saved-d (.-maxDepth r) saved-m (.-maxItems r) saved-n (.-items r)]
           (set! (.-maxDepth r) (int (max saved-d 32)))
           (set! (.-maxItems r) 0)
           (let [v (try (.readFrom r start)
-                       (catch Throwable _ (throw e))
+                       ;; ExceptionInfo only. `catch Throwable` here relabelled a
+                       ;; genuine OutOfMemoryError as :boring/max-items-exceeded.
+                       (catch clojure.lang.ExceptionInfo _ (throw e))
                        (finally (set! (.-maxDepth r) (int saved-d))
                                 (set! (.-maxItems r) saved-m)
                                 (set! (.-items r) saved-n)))]
@@ -1644,14 +1673,14 @@
      (set! (.-autoConstructRecords r)
            (boolean (get opts :auto-construct-records? false)))
      (set! (.-registry r) (or (:registry opts) TagRegistry/EMPTY))
-     ((fn step []
+     ((fn step [^long frame-at]
         (lazy-seq
          (when-not (.atEnd r)
             ;; Each item opens a fresh stringref namespace, so the reader's
             ;; per-message state must be cleared between items — but not its
             ;; ident cache, which is a pure function of bytes.
            (let [start (.position r)
-                 v (with-decode-errors (read-item-or-frame r start))]
+                 v (with-decode-errors (read-item-or-frame r start frame-at))]
              ;; THE INDEX FRAME IS NOT AN ITEM. `write-seq!` indexes by default,
              ;; so without this every caller of `decode-seq` would find a
              ;; phantom `#boring/index [...]` after their data. It is dropped
@@ -1664,7 +1693,7 @@
                ;; so `atEnd` cannot be consulted here.
                (identical? ::index-frame v) nil
                (and (.atEnd r) (index-frame? v start)) nil
-               :else (cons v (step)))))))))))
+               :else (cons v (step frame-at))))))) (footer-start bs)))))
 
 ;; ## Optional hasch integration, activated if hasch is present
 ;;
