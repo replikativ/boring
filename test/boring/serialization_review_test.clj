@@ -7,6 +7,7 @@
             [clojure.zip]
             [boring.core :as boring]
             [boring.data :as data]
+            [boring.conformance :as c]
             [boring.nav :as nav]))
 
 (def o {:stringref false})
@@ -717,3 +718,21 @@
   (testing "non-array keys keep RFC 8949 5.6.1 semantics"
     ;; a2 01 01 fb3ff0000000000000 02 -- keys 1 and 1.0 are DISTINCT
     (is (= 2 (count (boring/decode (unhex "a20101fb3ff000000000000002") o))))))
+
+(deftest a-sorted-collection-key-does-not-crash-the-decoder
+  (testing "`createAsIfByAssoc` compares keys with Clojure equality, which runs
+            a SORTED collection's comparator -- and a sorted map decoded from
+            the wire can be asked to compare itself with anything. This 32-byte
+            document threw a raw ClassCastException out of `decode`: untyped,
+            not suppressed by :check-duplicate-keys false, and reaching
+            decode-seq and nav/value too. ClojureScript accepted the same bytes,
+            so one document was a crash on one platform and a value on the other"
+    (let [d (boring/decode
+             (c/hex->bytes
+              "a2d81b8272636c6f6a7572652f736f727465642d6d6170a161610100a1010100"))]
+      (is (= 2 (count d)))
+      (is (some sorted? (keys d)) "the sorted-map key survives as one"))
+    (is (= 2 (count (boring/decode
+                     (c/hex->bytes
+                      "a2d81b8272636c6f6a7572652f736f727465642d6d6170a161610100a1010100")
+                     {:check-duplicate-keys false}))))))

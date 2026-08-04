@@ -1620,7 +1620,27 @@ public final class Reader {
                 return java.util.Arrays.equals((boolean[]) a, (boolean[]) b);
             if (a instanceof Object[] && b instanceof Object[])
                 return java.util.Arrays.deepEquals((Object[]) a, (Object[]) b);
-            return clojure.lang.Util.equiv(a, b);
+            // A COMPARATOR FAILURE IS "NOT EQUAL", not an exception.
+            //
+            // `Util.equiv` on a sorted collection runs its comparator, and a
+            // sorted map decoded from the wire can be asked to compare itself
+            // with anything at all -- so a 32-byte document whose map has a
+            // `clojure/sorted-map` frame and an ordinary map as its two keys
+            // threw a raw ClassCastException out of `decode`, untyped,
+            // undisableable by `:check-duplicate-keys false`, and through
+            // `decode-seq` and `nav/value` as well. It also broke honest round
+            // trips: `{(sorted-map "a" 1) :x, {:b 1} :y}` encodes and then
+            // fails to decode. ClojureScript accepted the same bytes, so one
+            // document was a crash on one platform and a value on the other.
+            //
+            // Two values whose comparators cannot relate them are, for the
+            // purpose of duplicate detection, distinct -- which is the answer
+            // the caller needs and the one CBOR's data-item equality implies.
+            try {
+                return clojure.lang.Util.equiv(a, b);
+            } catch (ClassCastException e) {
+                return false;
+            }
         }
 
         @Override public int hashCode() { return hash; }
@@ -1698,8 +1718,28 @@ public final class Reader {
             // handled by a bounded, allocation-free content scan.
             if (checkDuplicateKeys && n > 1 && anyArrayKey(kvs, n))
                 checkDistinctSmall(kvs, n);
-            clojure.lang.IPersistentMap m =
-                clojure.lang.PersistentArrayMap.createAsIfByAssoc(kvs);
+            clojure.lang.IPersistentMap m;
+            try {
+                m = clojure.lang.PersistentArrayMap.createAsIfByAssoc(kvs);
+            } catch (ClassCastException e) {
+                // `createAsIfByAssoc` compares keys with Clojure equality, which
+                // runs a SORTED collection's comparator -- and a sorted map
+                // decoded from the wire can be asked to compare itself with
+                // anything. A 32-byte document whose map holds a
+                // `clojure/sorted-map` frame and an ordinary map as its two keys
+                // therefore threw a raw ClassCastException out of `decode`:
+                // untyped, not suppressed by `:check-duplicate-keys false`,
+                // reaching `decode-seq` and `nav/value` too, and accepted
+                // without complaint on ClojureScript -- one document, a crash on
+                // one platform and a value on the other. It also broke honest
+                // round trips of maps a caller can build in Clojure today.
+                //
+                // The hash map compares only on a hash COLLISION, so it builds
+                // the same value without asking two unrelated collections to
+                // order themselves. Falling back is not a degradation: above the
+                // array-map threshold this is the representation anyway.
+                return clojure.lang.PersistentHashMap.create(kvs);
+            }
             if (checkDuplicateKeys && m.count() != n) {
                 checkDistinctSmall(kvs, n); // finds the key for typed ex-data
                 throw Err.of("duplicate-map-key", "boring: duplicate map key");
