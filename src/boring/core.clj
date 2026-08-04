@@ -461,6 +461,14 @@
   current position and advances it; throws `BufferOverflowException` if `v` does
   not fit, which is the caller's cue to flush.
 
+  ON THAT OVERFLOW THE BORROW IS LEFT SET. This function ends the borrow
+  `encode-buffered!` records, but the `.put` that throws happens first and the
+  clearing `set!` is not in a `finally` -- so a writer that has just overflowed
+  a `ByteBuffer` refuses `trim!` with `:boring/bad-argument` until something
+  else consumes it. Any later `encode` clears it, and so does a retry of this
+  call into a larger buffer, so the recovery is the thing you were going to do
+  anyway; it is worth knowing only if you flush by trimming.
+
   This exists because hand-rolling it is a trap rather than because it is
   clever. The two-line version --
 
