@@ -188,8 +188,22 @@
 ;;
 ;; One row per option, and the row is the whole rule: what a legal value is,
 ;; and what to say when it is not. `:pred` is called only when the key is
-;; PRESENT, so a default never has to satisfy its own predicate at runtime --
-;; the test freezes the defaults instead.
+;; PRESENT, so a default never has to satisfy its own predicate at runtime.
+;;
+;; WHICH LEAVES THE DEFAULTS UNGUARDED, and this comment used to end "-- the
+;; test freezes the defaults instead", naming a test that does not exist.
+;; Nothing under `test/` requires `boring.options` at all: `option_matrix.cljc`
+;; freezes VERDICTS (what each entry point does with a given map) and
+;; `generative_test.cljc` freezes the profile NAMES, both through
+;; `boring.core`. A default widened here -- `:max-depth` to 100 000, say -- is
+;; caught only if some behavioural assertion happens to notice.
+;;
+;; The same gap covers this namespace's whole exported surface. `spec`,
+;; `profile-defaults`, `profile-locked`, `max-safe-depth`, `max-index-stride`,
+;; `validate!` and `check-profile-conflicts!` have no reference anywhere in
+;; `src/`, `test/` or `bench/` outside this file, so every one of them is
+;; reachable only through the paths `resolve-opts` and `check-opts` happen to
+;; take. That is fine for the code and not fine for the guarantee.
 
 (def spec
   {:profile        {:pred #(contains? profile-defaults %)

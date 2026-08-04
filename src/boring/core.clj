@@ -580,6 +580,14 @@
   `decode` still returns the value and any CBOR reader consumes both. Pass it
   to `boring.nav/source` and lookups inside large containers become jumps.
 
+  UNLESS NOTHING CLEARS `:index-min`, in which case there is no index and the
+  result is the PLAIN ENCODING, one item: `(alength (encode-indexed [1 2 3]))`
+  is 4, the same 4 bytes `(encode [1 2 3] {:stringref false})` gives, and
+  `decode-seq` sees one item rather than two. Nothing is lost and every reader
+  still reads it -- but a caller who branches on \"is this a sequence\" cannot
+  assume. `write-indexed!` and the ClojureScript `encode-indexed` both state
+  this; the sentence above used to be unconditional here only.
+
   `:index` is the stride (default 16) and `:index-min` the smallest container
   worth a node (default 16). Sorted map keys -- `:canonical` or `:archival` --
   additionally allow binary search; without them a lookup still jumps anchor to
@@ -1426,10 +1434,29 @@
   no symmetric read path -- `decode-seq`'s own docstring conceded the chunking
   workaround. This is that workaround, done once and correctly.
 
-  Bounded memory means bounded by the LARGEST SINGLE ITEM plus the chunk size,
-  not by the stream. That is the real limit and it is not a compromise: an item
-  has to fit in memory to be a Clojure value at all, so streaming can only ever
-  mean a sequence of items -- which is exactly what a datahike dump is.
+  Bounded memory means bounded by the LARGEST SINGLE ITEM, not by the stream.
+  That is the real limit and it is not a compromise: an item has to fit in
+  memory to be a Clojure value at all, so streaming can only ever mean a
+  sequence of items -- which is exactly what a datahike dump is.
+
+  The CONSTANT on that bound is several, not one, and this used to say \"plus
+  the chunk size\" as though it were one. `refill!` ends with
+  `(.reset r (Arrays/copyOf buf new-limit))`: `Reader.reset` has no
+  `(byte[], off, len)` form, so every refill allocates a full second copy of a
+  buffer `grow` has already doubled to hold the largest item. Measured as
+  bytes allocated per byte of file, over 32 MiB of byte-string items, with
+  `decode-seq` on the same bytes in the same run as the control:
+
+      item size    decode-seq-from     decode-seq (control)
+      1 MiB              3.2x                 1.00x
+      4 MiB              3.6x                 1.00x
+     16 MiB              5.5x                 1.00x
+
+  Linear in the file, not quadratic -- I looked for that specifically -- but
+  rising with item size, because the copied buffer tracks the largest item
+  rather than the chunk. ClojureScript's refill hands its reader
+  `(.subarray buf 0 new-limit)` -- a view over the same storage, not a copy --
+  so it pays the buffer's growth and nothing on top of it.
 
   The reader's hot path is untouched. Refilling happens between items, not
   inside `u8()`, so this costs nothing when decoding from a byte array.

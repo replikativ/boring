@@ -33,10 +33,14 @@
    (defn- wire-name
      "The name a record of `record-sym` in `ns-sym` carries on the wire.
 
-     Must match `boring.data/record-type-name`, which munges `-` to `_` so the
-     JVM class name and the ClojureScript `pr-str` name agree."
+     Must match `boring.data/record-type-name`: the NAMESPACE segment is munged
+     and the record name is not, which is what a JVM class name does and what
+     ClojureScript's `pr-str` name is normalised to. Munging the whole string
+     -- which this did -- produced a key no wire name ever matches, so a
+     hyphenated record type looked up here was never found and came back an
+     `UnknownRecord`."
      [ns-sym record-sym]
-     (str/replace (str ns-sym "." record-sym) "-" "_")))
+     (str (str/replace (str ns-sym) "-" "_") "." record-sym)))
 
 #?(:clj
    (defn- cljs-records
@@ -103,12 +107,19 @@
      and there is no runtime `resolve` -- and performs no lookup driven by wire
      content on either platform.
 
-         (def registry (boring/auto-registry))
+         (require '[boring.records :as records] '[boring.core :as boring])
+
+         (def registry (records/auto-registry))
          (boring/decode bs {:registry registry})
+
+     THIS NAMESPACE, not `boring.core`. These two lines read `boring/auto-registry`
+     for a while, and `boring/` is the alias this codebase's docs give
+     `boring.core` everywhere else -- where `(resolve 'boring.core/auto-registry)`
+     is nil. doc/EXTENDING.md had it right the whole time.
 
      `prefix` is a literal string, for narrowing to your own namespaces:
 
-         (boring/auto-registry \"my.app\")
+         (records/auto-registry \"my.app\")
 
      A literal rather than a predicate function on purpose: the macro would
      have to `eval` a function to apply it at expansion time, and during
@@ -132,7 +143,7 @@
      ([] `(auto-registry ""))
      ([prefix]
       (assert (string? prefix)
-              "boring/auto-registry takes a literal namespace prefix string")
+              "boring.records/auto-registry takes a literal namespace prefix string")
       (let [cljs?   (some? (:ns &env))
             pairs   (if cljs?
                       (cljs-records @@(requiring-resolve 'cljs.env/*compiler*))
