@@ -16,6 +16,19 @@
           (recur (* n 2))
           (/ (* ms 1e6) n))))))
 
+(defn- ab [fa fb burst rounds]
+  (dotimes [_ (* burst 20)] (fa) (fb))
+  (loop [i 0 best-a js/Number.MAX_SAFE_INTEGER best-b js/Number.MAX_SAFE_INTEGER]
+    (if (= i rounds)
+      [(/ best-a burst) (/ best-b burst)]
+      (let [a0 (now)
+            _ (dotimes [_ burst] (fa))
+            a1 (now)
+            _ (dotimes [_ burst] (fb))
+            b1 (now)]
+        (recur (inc i) (min best-a (* 1e6 (- a1 a0)))
+               (min best-b (* 1e6 (- b1 a1))))))))
+
 (def payloads
   [["small-map" {:name "Alice" :tags #{:a :b :c} :score 42}]
    ["mixed" {:id 7 :n 12345678 :d 3.14159 :s "hello world" :ok true}]
@@ -30,11 +43,17 @@
     (let [bs (boring/encode v)
           w (boring/writer 65536)
           on (boring/reader bs)
-          off (boring/reader bs {:check-duplicate-keys false})]
+          off (boring/reader bs {:check-duplicate-keys false})
+          [default-ns resolve-ns]
+          (ab #(boring/encode-buffered! w v)
+              #(boring/encode-buffered! w v {})
+              (if (= nm "datom-maps-200") 10 100) 80)]
       (println nm
                "encode" (.toFixed (bench #(boring/encode v)) 1)
                "reused/default" (.toFixed (bench #(boring/encode-buffered! w v)) 1)
                "reused/resolve" (.toFixed (bench #(boring/encode-buffered! w v {})) 1)
+               "AB/default" (.toFixed default-ns 1)
+               "AB/resolve" (.toFixed resolve-ns 1)
                "decode/check" (.toFixed (bench #(boring/decode-with on bs)) 1)
                "decode/no-check" (.toFixed (bench #(boring/decode-with off bs)) 1)))))
 
