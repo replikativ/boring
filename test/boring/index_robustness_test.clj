@@ -1205,7 +1205,7 @@
           ;; The seed is pinned so CI is deterministic; the exhaustive
           ;; single-byte sweep in `the-item-total-must-match-the-data-section`
           ;; is what covers the space this no longer samples randomly.
-           (tc/quick-check
+          (tc/quick-check
            4000
            (prop/for-all
             [damage gen-damage]

@@ -557,7 +557,7 @@
   ([^bytes bs] (decode bs nil))
   ([^bytes bs opts]
    (with-decode-errors (.read (configure-reader! (Reader. (bytes! bs "decode"))
-                                                  (opt/check-opts opts))))))
+                                                 (opt/check-opts opts))))))
 
 (defn decode-with
   "Decode using a reusable Reader.
@@ -1718,7 +1718,19 @@
 (defonce ^{:doc "True if the optional hasch integration is active."}
   hasch-integration?
   (try
+    ;; HASCH ITSELF IS PROBED FIRST, not `boring.hasch`. The catch below reads
+    ;; as "the integration namespace is absent", and that was the same thing
+    ;; only while `boring/hasch.cljc` was missing from the jar -- which it was,
+    ;; silently, in every release. Shipping it made the two different: the
+    ;; require now FINDS the namespace and fails inside it on `hasch.benc`,
+    ;; wrapped in a Compiler$CompilerException that neither catch matches, so
+    ;; `(require 'boring.core)` threw for every consumer without hasch.
+    ;;
+    ;; Probing the optional dependency directly is what the comment above
+    ;; always claimed this did.
+    (require 'hasch.benc)
     (require 'boring.hasch)
     true
     (catch java.io.FileNotFoundException _ false)
-    (catch ClassNotFoundException _ false)))
+    (catch ClassNotFoundException _ false)
+    (catch Exception _ false)))

@@ -579,7 +579,6 @@
 ;; constructor is enough. Security is the same: reading looks the name up, it
 ;; never resolves a symbol or evaluates anything from the wire.
 
-
 (def ^:const default-index-stride
   "Stride used when `:index` is not given. Matches the JVM's."
   16)

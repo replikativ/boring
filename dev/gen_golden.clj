@@ -22,10 +22,20 @@
 (defn- hex [^bytes bs]
   (str/join (map #(format "%02x" %) bs)))
 
-(defn- render-entries [corpus]
-  (str/join "\n"
-            (for [[label value opts] corpus]
-              (format "   %-22s %s" (pr-str label) (pr-str (hex (boring/encode value opts)))))))
+(defn- render-entries
+  "Entries at `indent` spaces.
+
+  PARAMETERISED because the two maps sit at different depths -- `jvm-only` is
+  nested inside a reader conditional -- and emitting both at three spaces put
+  the generator in permanent conflict with `clojure -M:format`: regenerating
+  un-formatted the file, so the CI format job was red, and a job that is always
+  red is a job nobody reads."
+  [corpus indent]
+  (let [pad (apply str (repeat indent \space))]
+    (str/join "\n"
+              (for [[label value opts] corpus]
+                (str pad (format "%-22s %s" (pr-str label)
+                                 (pr-str (hex (boring/encode value opts)))))))))
 
 (defn -main [& _]
   (let [out "test/boring/golden_v1.cljc"
@@ -38,11 +48,11 @@
              "(ns boring.golden-v1)\n"
              "\n"
              "(def portable\n"
-             "  {" (str/triml (render-entries g/portable)) "})\n"
+             "  {" (str/triml (render-entries g/portable 3)) "})\n"
              "\n"
              "#?(:clj\n"
              "   (def jvm-only\n"
-             "     {" (str/triml (render-entries g/jvm-only)) "}))\n")]
+             "     {" (str/triml (render-entries g/jvm-only 6)) "}))\n")]
     (spit out content)
     (println "wrote" out)
     (println " " (count g/portable) "portable +" (count g/jvm-only) "jvm-only vectors")))

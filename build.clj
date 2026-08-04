@@ -177,9 +177,21 @@
                          segment-source-class " — release must be built on "
                          "JDK 22+ (this is " build-jdk ")")
                     {:build-jdk build-jdk})))
-  (let [{:keys [exit]} (clojure.java.shell/sh "bin/check-artifact")]
+  ;; `--release`, AND with BORING_VERSION set to the version actually being
+  ;; published. Without the flag `check-artifact` checks whatever the working
+  ;; tree builds and its snapshot guard is unreachable, so a guard written to
+  ;; refuse publishing a SNAPSHOT could never fire on the one path that
+  ;; publishes. The flag also needs the variable, which CI does not set -- the
+  ;; version is computed here from the revision count -- so it is passed
+  ;; explicitly rather than hoped for.
+  (let [{:keys [exit out err]}
+        (clojure.java.shell/sh "bin/check-artifact" "--release"
+                               :env (assoc (into {} (System/getenv))
+                                           "BORING_VERSION" version))]
     (when-not (zero? exit)
-      (throw (ex-info "boring: refusing to deploy, bin/check-artifact failed" {}))))
+      (println out) (println err)
+      (throw (ex-info "boring: refusing to deploy, bin/check-artifact --release failed"
+                      {:version version}))))
   (dd/deploy {:installer :remote
               :artifact jar-file
               :pom-file (b/pom-path {:lib lib :class-dir jar-dir})}))

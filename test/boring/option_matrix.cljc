@@ -66,7 +66,7 @@
    ["reader"          (fn [o] (boring/decode-with (boring/reader (encoded) o) (encoded)))]
    ["decode-with"     (fn [o] (boring/decode-with (boring/reader #?(:clj (byte-array 0)
                                                                     :cljs (js/Uint8Array. 0))
-                                                                o)
+                                                                 o)
                                                   (encoded)))]
    ["decode-seq"      (fn [o] (first (boring/decode-seq (encoded) o)))]
    ["decode-seq-from" (fn [o] (first (boring/decode-seq-from (source-of (encoded)) o)))]])

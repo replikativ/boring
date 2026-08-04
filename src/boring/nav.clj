@@ -93,13 +93,13 @@
   ;; carry no nodes at all.
   (if-let [^longs cs (some-> ^Nav nav .idx :containers)]
     (loop [lo 0 hi (dec (alength cs))]
-        (if (> lo hi)
-          -1
-          (let [mid (quot (+ lo hi) 2)
-                c (aget cs mid)]
-            (cond (= c off) mid
-                  (< c off) (recur (inc mid) hi)
-                  :else (recur lo (dec mid))))))
+      (if (> lo hi)
+        -1
+        (let [mid (quot (+ lo hi) 2)
+              c (aget cs mid)]
+          (cond (= c off) mid
+                (< c off) (recur (inc mid) hi)
+                :else (recur lo (dec mid))))))
     -1))
 
 (defn- probe-for
@@ -604,7 +604,6 @@
   `k150` in a 200-key map is 17 skips through the index and 301 without."
   (^long [c] (.-skips ^Reader (.rdr ^Nav (.nav ^Cursor c))))
   ([c ^long n] (set! (.-skips ^Reader (.rdr ^Nav (.nav ^Cursor c))) n) c))
-
 
 (defn value
   "Realise the subtree at the cursor into a Clojure value, through the ordinary
