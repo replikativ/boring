@@ -1257,7 +1257,15 @@
   the first `zip/up` or `zip/root` after it. A caller who only replaces and
   reads gets no error at all; nothing escapes, because the value cannot leave
   the zipper without passing through `up`, but you may be several steps past
-  the line that was wrong. Decode, edit, re-encode."
+  the line that was wrong. Decode, edit, re-encode.
+
+  AT THE ROOT it never arrives, because there is no `up` to take:
+  `(-> z (zip/replace 5) zip/root)` returns 5 and `zip/up` returns nil, while
+  the same replace one level down raises `:boring/read-only` on `root`. That is
+  not a hole in the guard -- a root replacement discards the document rather
+  than editing it, so there are no offsets left to be inconsistent with -- but
+  \"anything that edits throws\" was false there, and it was the one spelling a
+  reader would reach for first."
   [^Cursor c]
   (zip/zipper
    (fn branch? [^Cursor x] (contains? #{:array :map} (value-type x)))

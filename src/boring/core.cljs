@@ -694,10 +694,26 @@
   passes it to `boring.nav/source` and lookups inside large containers become
   jumps.
 
-  `:stringref false` IS FORCED, exactly as on the JVM: an index records byte
-  offsets, and a string reference resolves against a table built from every
-  preceding string, so an offset alone cannot be decoded inside a stringref
-  namespace.
+  `:stringref false` IS FORCED: an index records byte offsets, and a string
+  reference resolves against a table built from every preceding string, so an
+  offset alone cannot be decoded inside a stringref namespace.
+
+  UNCONDITIONALLY here, which is NOT what the JVM does and is the one place
+  this function's bytes differ from its twin's. The JVM forces it only when the
+  caller has not said otherwise -- `(if (contains? opts :stringref) opts ...)`
+  -- and its docstring offers the trade explicitly: \"pass `:stringref true`
+  and it is honoured, you simply get an index nothing can use\". There is no
+  such escape here. Measured on `(vec (repeat 20 \"aaaaaaaaaa\"))`, the same
+  `.cljc` call on the two platforms:
+
+      (encode-indexed v)                  268 bytes both platforms
+      (encode-indexed v {:stringref true})  JVM 122 bytes, opening d9 0100
+                                           CLJS 268 bytes, no namespace
+
+  So a document built this way is portable only while nobody passes
+  `:stringref true`. Losing the option is the safer of the two answers -- what
+  it buys on the JVM is an index `boring.nav` then refuses -- but it is a
+  divergence, not a match.
 
   Returns the plain encoding when nothing clears `:index-min`, which is what the
   JVM does and why the result is always decodable either way."
