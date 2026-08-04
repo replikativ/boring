@@ -167,6 +167,11 @@ stage_cljs () {
 stage_interop () {
   if python3 -c "import cbor2" 2>/dev/null; then
     run interop-python python3 interop/test_read_boring.py
+    # A stronger claim than "cbor2 can read us": that boring and cbor2 emit
+    # the IDENTICAL octet sequence for a canonical encoding. A reader can be
+    # wrong in the same direction as the writer and the round trip still
+    # closes; two independent encoders agreeing byte for byte cannot.
+    run interop-canonical python3 interop/test_canonical_bytes.py
   else
     echo "\u2500\u2500\u25b6 interop-python"
     echo "   SKIPPED - python3 cbor2 not installed (pip install cbor2)"
