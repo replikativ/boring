@@ -165,6 +165,17 @@ public final class Reader {
 
     private long items;
 
+    /** Whether `v` parses as an ordinary RFC 3339 instant. Used to validate the
+     *  non-leap part of a leap-second timestamp before preserving it. */
+    private static boolean parsesAsInstant(String v) {
+        try {
+            java.time.OffsetDateTime.parse(v);
+            return true;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
     /** `:60` in the seconds field -- valid RFC 3339, unrepresentable as an Instant. */
     private static boolean isLeapSecond(String v) {
         int i = v.indexOf(':');
@@ -1591,6 +1602,20 @@ public final class Reader {
         return (clojure.lang.IPersistentVector) tv.persistent();
     }
 
+    /** A Number as an exact BigInteger, or null if it is not integral.
+     *
+     *  `longValue()` narrows silently, which is how a tag-1002 key of 2^64+1
+     *  became 1 and aliased the base key. Every integral CBOR type this reader
+     *  produces is covered; a float or anything else returns null. */
+    private static java.math.BigInteger exactInteger(Object o) {
+        if (o instanceof clojure.lang.BigInt) return ((clojure.lang.BigInt) o).toBigInteger();
+        if (o instanceof java.math.BigInteger) return (java.math.BigInteger) o;
+        if (o instanceof Long || o instanceof Integer
+            || o instanceof Short || o instanceof Byte)
+            return java.math.BigInteger.valueOf(((Number) o).longValue());
+        return null;
+    }
+
     /** 10^e for the small e RFC 9581's decimal scale factors use. */
     private static long pow10(int e) {
         long r = 1;
@@ -2027,7 +2052,19 @@ public final class Reader {
                 // discard what it cannot represent, it hands it back
                 // untouched. Silently normalising was the one option that loses
                 // data without saying so.
-                if (isLeapSecond(v)) return Data.MAKE_TAGGED.invoke(Long.valueOf(0), v);
+                //
+                // VALIDATED FIRST, not merely recognised. This returned as soon
+                // as it found `:60` after the second colon, before the real date
+                // parser ever ran -- so `9999-99-99T99:99:60Z` was accepted and
+                // preserved. Preserving a legal leap second does not make an
+                // impossible month, day, hour or minute legal.
+                //
+                // The check is the ordinary parser on a copy with `:60` replaced
+                // by `:59`: everything except the leap second itself has to be a
+                // real timestamp. If that fails, control falls through to the
+                // normal tag-0 path, which reports the malformed date.
+                if (isLeapSecond(v) && parsesAsInstant(v.replace(":60", ":59")))
+                    return Data.MAKE_TAGGED.invoke(Long.valueOf(0), v);
                 java.time.Instant t;
                 try {
                     t = java.time.Instant.parse(v);
@@ -2377,7 +2414,19 @@ public final class Reader {
                     // A TEXT KEY IS ELECTIVE and skipped -- see the negative-key
                     // note below; RFC 9581 3 groups the two together.
                     if (!(k instanceof Number)) continue;
-                    long kk = ((Number) k).longValue();
+                    // EXACT, not narrowed. `longValue()` wrapped, so a key of
+                    // 2^64+1 came out as 1 and ALIASED the base key -- an
+                    // unknown critical key evading the rule that is supposed to
+                    // reject it. A key too wide for a long is by definition one
+                    // we do not implement: unsigned means critical (error),
+                    // negative means elective (ignore).
+                    java.math.BigInteger kb = exactInteger(k);
+                    if (kb == null || kb.bitLength() > 63) {
+                        if (kb != null && kb.signum() < 0) continue;   // elective
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 has unknown critical key " + k, "tag", 1002L);
+                    }
+                    long kk = kb.longValueExact();
                     if (kk == 4 || kk == 5)
                         throw Err.of("bad-tag-content",
                             "boring: tag 1002 base key " + kk + " (decimal fraction /"
@@ -2453,13 +2502,38 @@ public final class Reader {
                     if (Double.isNaN(d) || Double.isInfinite(d))
                         throw Err.of("bad-tag-content",
                                      "boring: tag 1002 base value is not finite", "tag", 1002L);
-                    double secs = Math.floor(d);
-                    long nanos = Math.round((d - secs) * 1e9);
-                    if (Math.abs((secs + nanos / 1e9) - d) > 1e-9)
+                    // EXACT OR REFUSED, which is what the comment always said
+                    // and the arithmetic did not do. `Math.round` plus a 1e-9
+                    // tolerance ACCEPTED 5.0e-10 and rounded it to one
+                    // nanosecond -- a value the tolerance was meant to catch,
+                    // since its whole error is below the threshold -- and the
+                    // final `(long) secs` SATURATED, so 1.0e20 came back as
+                    // Long.MAX_VALUE seconds instead of being refused.
+                    //
+                    // BigDecimal.valueOf uses Double.toString, i.e. the
+                    // shortest decimal that round-trips, so this asks "is the
+                    // value as written a whole number of nanoseconds". 1.5 and
+                    // 0.1 are; 5.0e-10 is not. `new BigDecimal(double)` would
+                    // use the exact binary value and reject 0.1, which is too
+                    // strict for a duration somebody actually wrote down.
+                    java.math.BigDecimal nanosDec =
+                        java.math.BigDecimal.valueOf(d).movePointRight(9);
+                    java.math.BigInteger totalNanos;
+                    try {
+                        totalNanos = nanosDec.toBigIntegerExact();
+                    } catch (ArithmeticException e) {
                         throw Err.of("bad-tag-content",
                             "boring: tag 1002 base value " + d
                             + " is not representable to nanosecond precision", "tag", 1002L);
-                    return java.time.Duration.ofSeconds((long) secs, nanos);
+                    }
+                    java.math.BigInteger[] qr = totalNanos.divideAndRemainder(
+                        java.math.BigInteger.valueOf(1000000000L));
+                    if (qr[0].bitLength() > 63)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 base value " + d
+                            + " does not fit a java.time.Duration", "tag", 1002L);
+                    return java.time.Duration.ofSeconds(qr[0].longValueExact(),
+                                                        qr[1].longValueExact());
                 }
                 // With a scaled fraction present, RFC 9581 requires an INTEGER
                 // base and an UNSIGNED fraction. Both were accepted and
@@ -2471,7 +2545,12 @@ public final class Reader {
                 if (!(nano instanceof Number) || nano instanceof Double || nano instanceof Float)
                     throw Err.of("bad-tag-content",
                                  "boring: tag 1002 fraction must be an integer", "tag", 1002L);
-                long fv = ((Number) nano).longValue();
+                java.math.BigInteger fb = exactInteger(nano);
+                if (fb == null || fb.bitLength() > 63)
+                    throw Err.of("bad-tag-content",
+                        "boring: tag 1002 fraction " + nano
+                        + " does not fit a java.time.Duration", "tag", 1002L);
+                long fv = fb.longValueExact();
                 if (fv < 0)
                     throw Err.of("bad-tag-content",
                         "boring: tag 1002 fraction " + fv + " must be unsigned", "tag", 1002L);

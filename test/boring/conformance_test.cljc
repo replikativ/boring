@@ -1060,6 +1060,24 @@
                                   {:stringref false}))
               (str "tag " good)))))))
 
+(deftest a-leap-second-is-validated-before-it-is-preserved
+  (testing "both readers identified a leap second by finding `:60` after the
+            second colon and returned the inert tag BEFORE the real date parser
+            ran. So `9999-99-99T99:99:60Z` was accepted and handed back intact.
+            Preserving a legal leap second does not make an impossible month,
+            day, hour or minute legal -- the non-leap part still has to be a
+            real timestamp."
+    ;; c0 74 "9999-99-99T99:99:60Z"
+    (is (= :boring/bad-tag-content
+           (try (do (boring/decode (c/hex->bytes "c074393939392d39392d39395439393a39393a36305a")) nil)
+                (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                  (:type (ex-data e)))))
+        "an impossible date is refused even wearing a leap second")
+    (testing "and a real one is still preserved, string intact"
+      ;; c0 74 "2016-12-31T23:59:60Z"
+      (let [v (boring/decode (c/hex->bytes "c074323031362d31322d33315432333a35393a36305a"))]
+        (is (= "2016-12-31T23:59:60Z" (:value v)))))))
+
 (deftest rfc-8949-appendix-f1-is-rejected-in-full
   (testing "every byte sequence RFC 8949 Appendix F.1 names as not well-formed
             must raise a typed error, on both platforms.

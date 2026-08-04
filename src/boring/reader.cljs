@@ -800,7 +800,15 @@
         ;; a semantic differential (value here, error there) on input a real
         ;; producer emits. doc/SECURITY.md names those as their own defect
         ;; class. Both platforms now preserve.
-        (if (leap-second? s)
+        ;; VALIDATED FIRST, not merely recognised. This returned as soon as it
+        ;; found `:60` after the second colon, before `js/Date` ever saw the
+        ;; string -- so `9999-99-99T99:99:60Z` was accepted and preserved.
+        ;; Preserving a legal leap second does not make an impossible month,
+        ;; day, hour or minute legal. The check is the ordinary parser on a copy
+        ;; with `:60` replaced by `:59`; if that fails, control falls through to
+        ;; the normal path, which reports the malformed date.
+        (if (and (leap-second? s)
+                 (not (js/isNaN (.getTime (js/Date. (.replace s ":60" ":59"))))))
           (data/tagged-value 0 s)
           (let [d (js/Date. s)]
             (when (js/isNaN (.getTime d))
