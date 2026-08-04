@@ -52,8 +52,9 @@ archive — and an archive is what [datahike][] needed, which is why boring
 exists.
 
 boring takes the reach: it is [CBOR][rfc8949] — **IETF STD 94**, a full
-Internet Standard, with implementations in 26 languages, its own IANA tag
-registry and a standard diagnostic notation. It is the format with the widest
+Internet Standard since December 2020, with [implementations in 26
+languages][cbor-impls], its own IANA tag registry and a standard diagnostic
+notation. It is the format with the widest
 reach that can still carry edn faithfully: keywords, symbols, sets, ratios,
 records, metadata. A foreign reader gets your data as ordinary CBOR whether or
 not it knows what a keyword is.
@@ -365,5 +366,6 @@ only, and are not distributed in boring's jar.
 [transit-format]: https://github.com/cognitect/transit-format
 [incognito]: https://github.com/replikativ/incognito
 [rfc8949]: https://www.rfc-editor.org/rfc/rfc8949
+[cbor-impls]: https://cbor.io/impls.html
 [rfc8746]: https://www.rfc-editor.org/rfc/rfc8746
 [cde]: https://datatracker.ietf.org/doc/draft-ietf-cbor-serialization/
