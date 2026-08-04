@@ -117,6 +117,23 @@
            (str "boring: decoded more than " (.-maxItems r) " items")
            {:max-items (.-maxItems r)}))))
 
+(defn- count-items!
+  "Charge `n` items at once, for host objects the decoder BUILDS rather than
+  reads.
+
+  `count-item!` runs from `read!`, so it only ever sees values that arrived as
+  their own data item. A tag-40 payload arrives as ONE byte string and is then
+  expanded into a host object per element -- exactly the amplification the
+  budget exists to bound, and exactly what it could not see. Mirrors
+  `Reader.countItems` on the JVM."
+  [^Reader r n]
+  (when (pos? (.-maxItems r))
+    (set! (.-items r) (+ (.-items r) n))
+    (when (> (.-items r) (.-maxItems r))
+      (err :boring/max-items-exceeded
+           (str "boring: decoded more than " (.-maxItems r) " items")
+           {:max-items (.-maxItems r)}))))
+
 (defn- need! [^Reader r n]
   (when (> n (remaining r))
     (err :boring/truncated-input
@@ -697,6 +714,8 @@
 
 (def ^:private DURATION-SCALES #{-3 -6 -9 -12 -15 -18})
 
+(def ^:private MIN-I64 (js/BigInt "-9223372036854775808"))
+(def ^:private MAX-I64 (js/BigInt "9223372036854775807"))
 (def ^:private ZERO-N (js/BigInt 0))
 (def ^:private NANOS-N (js/BigInt 999999999))
 
@@ -727,6 +746,13 @@
   [k]
   (cond
     (and (number? k) (js/Number.isInteger k)) k
+    ;; A NON-INTEGRAL NUMERIC KEY IS CRITICAL, not elective. This returned nil,
+    ;; which `validate-duration!` reads as "text key: elective" and skips -- so
+    ;; `1002({1: 5, 1.5: 0})` was accepted here and rejected on the JVM, whose
+    ;; `exactInteger` returns null for a Double and then raises "unknown
+    ;; critical key". RFC 9581 3 makes only NEGATIVE INTEGER keys and TEXT
+    ;; STRING keys elective; 1.5 is neither, so the unsigned rule applies.
+    (number? k) :critical
     (= "bigint" (goog/typeOf k))
     (if (and (<= k (js/BigInt js/Number.MAX_SAFE_INTEGER))
              (>= k (js/BigInt (- js/Number.MAX_SAFE_INTEGER))))
@@ -794,6 +820,20 @@
     (when-not (or (number? @base) (= "bigint" (goog/typeOf @base)))
       (err :boring/bad-tag-content
            "boring: tag 1002 base value must be a number" {:tag 1002}))
+    ;; RANGE-CHECKED, because doc/COMPATIBILITY.md promises this tag is
+    ;; validated to the JVM's standard and the JVM refuses a base it cannot
+    ;; carry in a java.time.Duration. `1002({1: 1.0e20})` and `1002({1: 2^64})`
+    ;; were both accepted here and refused there. One bound covers both: a
+    ;; Duration's seconds field is a signed 64-bit count, and `1e20` is an
+    ;; integral JS number well past it.
+    (let [b @base]
+      (when (if (= "bigint" (goog/typeOf b))
+              (or (< b MIN-I64) (> b MAX-I64))
+              (or (not (js/isFinite b))
+                  (< b -9223372036854775808) (> b 9223372036854775807)))
+        (err :boring/bad-tag-content
+             (str "boring: tag 1002 base value " b " does not fit a 64-bit second count")
+             {:tag 1002})))
     (when-let [[scale fv] @frac]
       ;; With a scaled fraction present, RFC 9581 requires an INTEGER base and
       ;; an UNSIGNED fraction.
@@ -962,13 +1002,21 @@
                   ;; do: `n` is bounded only by remaining bytes, so ~3 bytes per
                   ;; key gave n^2/2 comparisons — 48 KB of input measured at
                   ;; 2.1 s of blocked event loop.
+                  ;; KEYED ON CONTENT FOR ARRAY-LIKES. `hash` of a Uint8Array
+                  ;; is identity-derived, so two byte strings with the same
+                  ;; bytes -- ONE CBOR data item, RFC 8949 5.6.1 -- never
+                  ;; collided, and both survived into PersistentArrayMap's raw
+                  ;; constructor: `39649([[h'01', h'01'], [[1, 2]]])` built a
+                  ;; two-entry map per row whose keys are the same key. The JVM
+                  ;; rejects it, and doc/SECURITY.md promises both platforms
+                  ;; compare by CBOR data-item equality.
                 _ (let [seen (js/Set.)]
                     (dotimes [i n]
                       (let [k (aget ks i)
-                            h (hash k)]
+                            h (if (array-key? k) (array-content-key k) (hash k))]
                         (when (.has seen h)
                           (dotimes [j i]
-                            (when (= (aget ks j) k)
+                            (when (same-key? (aget ks j) k)
                               (err :boring/bad-tag-content
                                    (str "boring: shaped array has a duplicate key: "
                                         (pr-str k))
@@ -1063,7 +1111,14 @@
         ;; on the JVM, so the platforms disagreed about which documents are
         ;; valid -- a parser differential, and the lenient side is the one
         ;; running in a browser.
-        (when-not (re-matches #"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})" s)
+        ;; AT MOST NINE FRACTION DIGITS. RFC 3339 5.6 caps `time-secfrac` at
+        ;; nothing, but `Instant.parse` stops at nanoseconds, so a ten-digit
+        ;; fraction was refused on the JVM and accepted here -- and then
+        ;; TRUNCATED to milliseconds by `js/Date` without a word. The truncation
+        ;; from four digits up is a real platform limit (a Date holds
+        ;; milliseconds; doc/COMPATIBILITY.md records it), but the two
+        ;; platforms must at least agree on which documents are legal.
+        (when-not (re-matches #"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d{1,9})?([Zz]|[+-]\d{2}:\d{2})" s)
           (err :boring/bad-tag-content
                (str "boring: tag 0 content is not a valid RFC 3339 instant: " s)
                {:tag 0 :value s}))
@@ -1089,7 +1144,15 @@
                    (str "boring: tag 0 content is not a valid RFC 3339 instant: " s)
                    {:tag 0 :value s}))
             d)))
-    1 (let [v (read! r)]
+    1 (let [v0 (read! r)
+            ;; A BIGNUM IS A NUMBER for tag 1. RFC 8949 3.4.2 says the content
+            ;; is "a numerical value ... represented as an integer or a
+            ;; floating-point number", and boring's own bignum handler returns a
+            ;; BigInt -- so `1(2(h'01'))`, epoch second 1, decoded to an instant
+            ;; on the JVM and was refused here. Whether a bignum qualifies is
+            ;; arguable; the platforms disagreeing is not. Converted rather than
+            ;; carried, so an out-of-range one still fails the Date check below.
+            v (if (= "bigint" (goog/typeOf v0)) (js/Number v0) v0)]
         (when-not (number? v)
           (err :boring/bad-tag-content "boring: tag 1 must wrap a number" {:tag 1}))
         (let [d (js/Date. (* v 1000))]
@@ -1129,6 +1192,37 @@
       ;; these map directly rather than through a stand-in.
     (77 78 79 85 86) (read-typed-array! r tag)
 
+    ;; The other RFC 8746 typed arrays: VALIDATED, then preserved.
+    ;;
+    ;; ClojureScript decodes 5 of the 24 to a JS typed array and the JVM decodes
+    ;; 21; that asymmetry is documented and deliberate. What was not documented,
+    ;; and not intended, is that the other 16 fell through to the unknown-tag
+    ;; path and were therefore not CHECKED either -- `64("nope")` and
+    ;; `67(129)` decoded to TaggedValues here and were refused on the JVM. Over
+    ;; 1600 of the differential corpus's disagreements were this one shape.
+    ;;
+    ;; So the shape is enforced with the JVM's rule -- a definite-length byte
+    ;; string whose length is a multiple of the element size -- and the value is
+    ;; preserved as a TaggedValue, which re-encodes to identical bytes. The two
+    ;; platforms now accept and reject the same documents even where they build
+    ;; different values from them. 76 is reserved and 83/87 are float128, which
+    ;; the JVM does not implement either.
+    (64 65 66 67 68 69 70 71 72 73 74 75 80 81 82 84)
+    (let [bs (read! r)
+          elem (case tag
+                 (64 68 72) 1
+                 (65 69 73 80 84) 2
+                 (66 70 74 81) 4
+                 (67 71 75 82) 8)]
+      (when-not (instance? js/Uint8Array bs)
+        (err :boring/bad-tag-content
+             (str "boring: typed-array tag " tag " must wrap a byte string") {:tag tag}))
+      (when-not (zero? (mod (.-byteLength bs) elem))
+        (err :boring/bad-tag-content
+             (str "boring: typed-array tag " tag " payload is not a multiple of " elem)
+             {:tag tag}))
+      (data/tagged-value tag bs))
+
     ;; Tags 32 (URI), 1002 (duration) and 1004 (full-date) have no
     ;; ClojureScript counterpart, so they stay `TaggedValue`s: decoding a URI
     ;; to a bare string looks lossless -- a URI is its string form -- but is
@@ -1144,6 +1238,20 @@
     32 (let [v (read! r)]
          (when-not (string? v)
            (err :boring/bad-tag-content "boring: tag 32 must wrap a text string" {:tag 32}))
+         ;; GRAMMAR-CHECKED, not merely typed. `java.net.URI` refuses `"4:56"`
+         ;; -- a colon appearing before any `/`, `?` or `#` makes what precedes
+         ;; it a SCHEME, and RFC 3986 3.1 requires a scheme to start with a
+         ;; letter -- so that document was accepted here and rejected there.
+         ;; `js/URL` is not the check to use: it demands an absolute URL and
+         ;; would reject the relative references RFC 3986 4.1 allows and the
+         ;; JVM accepts.
+         (let [i (.search v #"[/?#]")
+               colon (.indexOf v ":")]
+           (when (and (not= -1 colon) (or (= -1 i) (< colon i))
+                      (not (re-matches #"[A-Za-z][A-Za-z0-9+.\-]*" (subs v 0 colon))))
+             (err :boring/bad-tag-content
+                  (str "boring: tag 32 content is not a valid URI: " v)
+                  {:tag 32 :value v})))
          (data/tagged-value 32 v))
 
     1002 (let [v (read! r)]
@@ -1244,6 +1352,10 @@
                     (str "boring: tag 40 dimensions " (pr-str dims)
                          " do not match the " declared "-element payload")
                     {:tag 40}))
+             ;; CHARGED BEFORE IT IS BUILT -- see `count-items!`. Everything
+             ;; below turns one byte string into `total` host objects plus the
+             ;; vectors holding them, none of which goes through `read!`.
+             (count-items! r total)
              (if (and (= 2 (count shape)) typed?)
                ;; A 2-D typed array keeps the zero-copy array-of-subarrays it
                ;; has always produced; everything else becomes nested vectors.

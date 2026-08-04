@@ -76,7 +76,11 @@ keywords and symbols), 40 (multi-dimensional array), 64–86 (RFC 8746 typed
 arrays — the JVM emits the five its primitive array types map to, s16/s32/s64/
 f32/f64 little-endian, and reads 21 of the 24 tag numbers; 76 is reserved and
 the two f128 tags stay TaggedValues. ClojureScript reads the five it can map to
-a JS typed array and leaves the rest tagged), 258 (set), **1002 (duration, RFC 9581)**, **1004 (full-date,
+a JS typed array and leaves the rest tagged — but **validates all 21 either
+way**, so the two platforms accept and reject the same documents and differ only
+in what they hand back. They did not: the 16 ClojureScript does not read fell
+through to the unknown-tag path unchecked, so `64("nope")` decoded there and was
+refused on the JVM), 258 (set), **1002 (duration, RFC 9581)**, **1004 (full-date,
 RFC 8943)**.
 
 ### Stringref index space
@@ -231,10 +235,23 @@ critical, at most one scaled-fraction key, unsigned fraction, nothing finer than
 a nanosecond) even though it hands back the map unconverted, and RFC 8943's
 full-date grammar for tag 1004.
 
-One residual, and it is a platform limit rather than a decision: JavaScript has
-one number type, so `{1: 5.0, -9: 1}` is indistinguishable from `{1: 5, -9: 1}`
-in ClojureScript and only the JVM refuses the float base. A base with an actual
-fractional part is caught on both.
+That claim has been tested against, so it is worth saying what it does and does
+not cover. It means the two platforms **accept and reject the same documents**.
+It does not mean they build the same value from them — the whole point of these
+rows is that they cannot.
+
+Residuals, all of them platform limits rather than decisions:
+
+- JavaScript has one number type, so `{1: 5.0, -9: 1}` is indistinguishable from
+  `{1: 5, -9: 1}` in ClojureScript and only the JVM refuses the float base. A
+  base with an actual fractional part is caught on both.
+- A tag-0 fraction longer than **three digits** is truncated to milliseconds on
+  ClojureScript, because that is what a `js/Date` holds. Both platforms refuse
+  more than nine digits, so they agree on which documents are legal; they
+  disagree on how much of a legal one survives. A JVM `Instant` keeps all nine.
+- Tag 40 accepts a payload written under any of the 21 typed-array tags the JVM
+  reads, and only the 5 ClojureScript reads. The same asymmetry as the row
+  below, reached through a different tag.
 
 A regex is symmetric — both platforms have the type, so tag 35 has no caveat.
 

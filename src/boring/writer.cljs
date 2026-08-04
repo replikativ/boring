@@ -442,11 +442,24 @@
   `c1 00` -- silently becoming tag 1 -- and `tag -1` emitted `ff 00`, the BREAK
   code followed by an item, which is not one well-formed CBOR value at all. No
   exception either way: just output no reader can parse, or the wrong tag. The
-  JVM has rejected both since `writeTag` gained its check; this is the port."
+  JVM has rejected both since `writeTag` gained its check; this is the port.
+
+  THE BIGINT BRANCH IS CHECKED HERE, not delegated. `head!` range-checks its
+  BigInt argument, but it narrows every BigInt at or below
+  `Number.MAX_SAFE_INTEGER` to a Number FIRST -- and a negative BigInt is below
+  that bound, so it landed back on the unchecked Number path this function was
+  written to replace. `(tagged-value (js/BigInt -1) 0)` emitted `d90100 ff 00`:
+  a stringref namespace, then a bare BREAK code, which boring's own decoder
+  then rejects as `:boring/unexpected-break`. `(js/BigInt -100)` silently
+  became tag 28. Delegating a range check to a function that changes the type
+  before performing it is not a range check."
   [t]
   (cond
-    ;; head! already range-checks BigInt against [0, 2^64-1].
-    (= "bigint" (goog/typeOf t)) t
+    (= "bigint" (goog/typeOf t))
+    (if (or (< t (js/BigInt 0)) (> t (js/BigInt "18446744073709551615")))
+      (throw (ex-info (str "boring: tag must be an unsigned 64-bit integer, got " t)
+                      {:type :boring/bad-tag :tag (str t)}))
+      t)
     (not (number? t))
     (throw (ex-info (str "boring: tag must be an integer, got " (pr-str t))
                     {:type :boring/bad-tag :tag t}))

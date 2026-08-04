@@ -2181,3 +2181,121 @@
                                 out))))]
       (is (= :boring/duplicate-map-key
              (err-type #(boring/decode bs {:stringref false})))))))
+
+;; ------------------------------------------------- second semantic re-audit
+;;
+;; Ten findings from .internal/CBOR-SEMANTIC-MEMORY-REAUDIT-2.md, each pinned by
+;; the reproducer that found it.
+
+(defn- tag27-hex
+  "Hex for `27([nm, <arg>])`, with `arg-hex` already encoded."
+  [nm arg-hex]
+  (str "d81b82" (hex-byte (+ 0x60 (count nm)))
+       (apply str (map #(hex-byte #?(:clj (int %) :cljs (.charCodeAt % 0))) nm))
+       arg-hex))
+
+(defn- tag0-bytes
+  "`0(s)` as platform bytes, letting the encoder size the text header."
+  [s]
+  (c/hex->bytes (str "c0" (c/bytes->hex (boring/encode s {:stringref false})))))
+
+(deftest max-items-bounds-what-the-decoder-builds-not-only-what-it-reads
+  (testing "a tag-40 payload arrives as ONE byte string and is expanded into a
+            host object per element, none of which goes through `read` -- so the
+            item budget never saw it. A 500,018-byte document declaring
+            dimensions [500000 1 1] built 71 MB of nested vectors, a 149x
+            amplification, with {:max-items 100} set and honoured"
+    ;; tag 78 (sint32 little-endian) rather than tag 64: both platforms decode
+    ;; it to a typed array, so the test exercises the BUDGET rather than the
+    ;; documented gap in which typed-array tags each platform reads.
+    ;; 500000 bytes / 4 = 125000 elements, dims [125000 1 1].
+    (let [n 500000
+          head (c/hex->bytes (str "d82882" "831a0001e8480101" "d84e5a0007a120"))
+          doc  #?(:clj (let [bos (java.io.ByteArrayOutputStream.)]
+                         (.write bos ^bytes head)
+                         (dotimes [_ n] (.write bos 1))
+                         (.toByteArray bos))
+                  :cljs (let [out (js/Uint8Array. (+ (.-length head) n))]
+                          (.set out head 0)
+                          (.fill out 1 (.-length head))
+                          out))]
+      (is (= :boring/max-items-exceeded
+             (err-type #(boring/decode doc {:max-items 100}))))))
+
+  (testing "and a tag-40 that fits the budget still decodes"
+    (is (not= :boring/max-items-exceeded
+              (err-type #(dec-hex "d82882820202d8404401020304"))))))
+
+(deftest a-tag-number-is-validated-however-it-is-written
+  (testing "a negative BigInt tag emitted `ff` -- a bare BREAK code -- because
+            `check-tag!` delegated its range check to a function that narrows
+            BigInt to Number BEFORE checking. The library must not emit a
+            document it cannot itself parse"
+    (doseq [t [#?(:clj -1 :cljs (js/BigInt -1))
+               #?(:clj -100 :cljs (js/BigInt -100))]]
+      (is (= :boring/bad-tag
+             (err-type #(boring/encode (data/tagged-value t 0))))
+          (str "tag " t))))
+  (testing "a legal one still round-trips -- an UNINTERPRETED tag, so the
+            round trip is of the tag number and not of a date"
+    (let [v (data/tagged-value #?(:clj 999 :cljs (js/BigInt 999)) 0)]
+      (is (= 0 (:value (boring/decode (boring/encode v))))))))
+
+(deftest a-leap-second-does-not-excuse-an-impossible-timestamp
+  (testing "the repair used to validate a leap second replaced EVERY `:60`, so
+            an impossible minute or UTC offset was repaired on the way past and
+            the repair was what got validated"
+    (doseq [s ["2016-12-31T23:60:60Z"
+               "2016-12-31T23:59:60+00:60"
+               "2016-12-31T23:59:60-00:60"]]
+      (is (= :boring/bad-tag-content (err-type #(boring/decode (tag0-bytes s))))
+          s)))
+  (testing "while a real leap second is still preserved rather than refused"
+    (is (not= :boring/bad-tag-content
+              (err-type #(boring/decode (tag0-bytes "2016-12-31T23:59:60Z")))))))
+
+(deftest tag-27-collection-markers-require-an-array
+  (testing "`seqableContent` admitted anything Seqable, and `seq` of a map
+            yields MAP ENTRIES -- so a simple value and a map both became sets
+            of vectors nobody encoded"
+    (doseq [[nm arg] [["clojure/sorted-set" "f8ac"]
+                      ["clojure/sorted-set" "a10102"]
+                      ["clojure/queue" "a10102"]]]
+      (is (= :boring/bad-tag-content (err-type #(dec-hex (tag27-hex nm arg))))
+          (str nm " " arg))))
+  (testing "an array still works, and so do the two shapes both platforms admit"
+    (is (= #{1 2} (dec-hex (tag27-hex "clojure/sorted-set" "820201"))))
+    (is (= #{} (dec-hex (tag27-hex "clojure/sorted-set" "f6"))))
+    (is (= #{1 2} (dec-hex (tag27-hex "clojure/sorted-set" "d90102820201"))))))
+
+(deftest rfc-3339-grammar-is-the-same-grammar-on-both-platforms
+  (testing "RFC 3339 has no expanded-year production; `Instant.parse` accepts
+            java.time's own extension and ClojureScript's grammar refuses it"
+    (is (= :boring/bad-tag-content
+           (err-type #(boring/decode (tag0-bytes "+10000-01-01T00:00:00Z"))))))
+  (testing "a fraction longer than nanoseconds is refused rather than silently
+            truncated to milliseconds on one platform and rejected on the other"
+    (is (= :boring/bad-tag-content
+           (err-type #(boring/decode (tag0-bytes "2020-01-01T00:00:00.1234567890Z"))))))
+  (testing "ordinary instants are unaffected"
+    (is (not= :boring/bad-tag-content
+              (err-type #(boring/decode (tag0-bytes "2020-01-01T00:00:00Z")))))))
+
+(deftest tag-1-accepts-a-bignum-on-both-platforms
+  (testing "boring's own bignum handler produces the integer type each platform
+            uses for large integers, so `1(2(h'01'))` -- epoch second 1 -- must
+            not decode on one and be refused on the other"
+    (is (not= :boring/bad-tag-content (err-type #(dec-hex "c1c24101"))))))
+
+(deftest unimplemented-typed-array-tags-are-still-validated
+  (testing "ClojureScript decodes 5 of RFC 8746's 24 tags and the JVM 21 -- a
+            documented asymmetry. What was neither documented nor intended is
+            that the rest fell through to the unknown-tag path UNVALIDATED, so
+            a tag-64 wrapping a text string decoded on one platform and was
+            refused on the other"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d840646e6f7065"))))
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d8431881"))))
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d84343010203")))
+        "a payload that is not a whole number of elements"))
+  (testing "a well-formed one is accepted on both, whatever it decodes to"
+    (is (not= :boring/bad-tag-content (err-type #(dec-hex "d843480102030405060708"))))))

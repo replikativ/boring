@@ -166,11 +166,50 @@ public final class Reader {
 
     /** `:60` in the seconds field -- valid RFC 3339, unrepresentable as an Instant. */
     private static boolean isLeapSecond(String v) {
+        return secondsColon(v) >= 0;
+    }
+
+    /** Index of the colon before the SECONDS field, or -1. */
+    private static int secondsColon(String v) {
         int i = v.indexOf(':');
-        if (i < 0) return false;
+        if (i < 0) return -1;
         int j = v.indexOf(':', i + 1);
-        return j >= 0 && j + 2 < v.length()
-               && v.charAt(j + 1) == '6' && v.charAt(j + 2) == '0';
+        return (j >= 0 && j + 2 < v.length()
+                && v.charAt(j + 1) == '6' && v.charAt(j + 2) == '0') ? j : -1;
+    }
+
+    /**
+     * The timestamp with its leap second lowered to :59, for validation only.
+     *
+     * ONE occurrence, at a known index -- `String.replace(":60", ":59")` is
+     * GLOBAL, so it repaired an impossible minute or UTC offset on the way past
+     * and then validated the repair. `2016-12-31T23:60:60Z` (minute 60) and
+     * `2016-12-31T23:59:60+00:60` (offset minute 60) were both preserved as
+     * inert tag-0 values; ClojureScript's `.replace` takes only the first
+     * occurrence and rejected all of them, so this was a parser differential on
+     * top of accepting impossible dates.
+     */
+    private static String withoutLeapSecond(String v, int j) {
+        return v.substring(0, j + 1) + "59" + v.substring(j + 3);
+    }
+
+    /**
+     * Charge `n` items at once, for host objects a decoder BUILDS rather than
+     * reads.
+     *
+     * `countItem` is called from `read()`, so it only ever sees things that
+     * arrived as their own data item. A tag-40 payload arrives as ONE byte
+     * string and is then expanded into one host object per element, which is
+     * exactly the amplification the budget exists to bound and exactly what it
+     * could not see: a 500 018-byte document declaring dimensions
+     * [500000, 1, 1] built 71 MB of nested vectors -- 149x -- with
+     * `{:max-items 100}` set and honoured.
+     */
+    private void countItems(long n) {
+        if (maxItems > 0 && (items += n) > maxItems)
+            throw Err.of("max-items-exceeded",
+                "boring: decoded more than " + maxItems + " items",
+                "max-items", maxItems);
     }
 
     private void countItem() {
@@ -928,9 +967,21 @@ public final class Reader {
     }
 
     private static Object seqableContent(Object argument, String name) {
+        // A LIST OR A SET, not anything Seqable. `Seqable` admits maps and
+        // records, and `RT.seq` of a map yields MAP ENTRIES -- so
+        // `27(["clojure/sorted-set", simple(172)])` decoded to `#{[:n 172]}`
+        // and `27(["clojure/sorted-set", {1: 2}])` to `#{[1 2]}`: a silently
+        // WRONG VALUE built out of a payload that is not an array at all.
+        //
+        // Sets are admitted because ClojureScript's `seq-content` admits them
+        // (`sequential?` or `set?`), and a map is not `sequential?` there --
+        // so this was also the lenient half of a parser differential.
+        //
+        // null still passes: `RT.seq(null)` is an empty collection on both
+        // platforms, and that parity predates this.
         if (argument == null
                 || argument instanceof java.util.List
-                || argument instanceof clojure.lang.Seqable)
+                || argument instanceof java.util.Set)
             return argument;
         throw Err.of("bad-tag-content",
             "boring: " + name + " must wrap an array, got "
@@ -1145,6 +1196,37 @@ public final class Reader {
      */
     private static final int KW_SYMREF_PREFIX = 0xD827D819;
 
+    private TagRegistry identFastPathFor;
+    private boolean identFastPathOk;
+
+    /**
+     * Whether the five-byte identifier shortcut may be taken at all.
+     *
+     * It returns an interned identifier WITHOUT reaching `readTagged`, which is
+     * where `registry.readerFor(tag)` is consulted -- so a caller who
+     * registered a reader for tag 39 or tag 25 had it silently ignored for the
+     * five-byte form and honoured for `D8 27 D9 0019 00`, the same value under
+     * a wider stringref index. Acceptance depended on which legal encoding the
+     * producer chose, and ClojureScript honoured the override for both.
+     *
+     * That is exactly the defect the comment on `readTagged` says was fixed
+     * ("registering a reader for a tag boring knows natively was SILENTLY
+     * IGNORED"); the optimisation reintroduced it for the one tag a consumer
+     * with its own symbol type is most likely to override.
+     *
+     * Cached against the registry's IDENTITY rather than recomputed: the field
+     * is public and assigned directly, so there is no setter to hook, and a
+     * reference compare plus a boolean is what the hot path can afford.
+     */
+    private boolean identFastPath() {
+        if (registry != identFastPathFor) {
+            identFastPathFor = registry;
+            identFastPathOk = registry.readerFor(39) == null
+                           && registry.readerFor(25) == null;
+        }
+        return identFastPathOk;
+    }
+
     /**
      * Hot entry point; the rest of the dispatch lives in readGeneral().
      *
@@ -1160,7 +1242,8 @@ public final class Reader {
 
         // Repeated keyword/symbol: D8 27 D8 19 <idx>
         if (b0 == 0xD8 && pos + 4 < limit
-                && s32(pos) == KW_SYMREF_PREFIX) {
+                && s32(pos) == KW_SYMREF_PREFIX
+                && identFastPath()) {
             int idx = b(pos + 4);
             if (idx < 24) {                       // inline uint: byte IS the index
                 pos += 5;
@@ -2105,6 +2188,17 @@ public final class Reader {
             }
             case 0: {                                        // RFC 3339 string
                 String v = stringContent(read(), 0);
+                // RFC 3339's `date-fullyear` is exactly four digits. There is
+                // no expanded-year production in the grammar, and RFC 8949
+                // 3.4.1 defers to RFC 3339 -- but `Instant.parse` accepts
+                // java.time's own `+10000-01-01T00:00:00Z` extension, so the
+                // JVM took a document ClojureScript's grammar refuses. Rejected
+                // here rather than left to the parser, since the parser is the
+                // thing being too generous.
+                if (v.length() > 0 && (v.charAt(0) == '+' || v.charAt(0) == '-'))
+                    throw Err.of("bad-tag-content",
+                        "boring: tag 0 content is not a valid RFC 3339 instant: " + v,
+                        "tag", 0L, "value", v);
                 // A LEAP SECOND is preserved rather than normalised.
                 //
                 // RFC 3339 permits `time-second = 60`, and `Instant.parse`
@@ -2131,7 +2225,8 @@ public final class Reader {
                 // by `:59`: everything except the leap second itself has to be a
                 // real timestamp. If that fails, control falls through to the
                 // normal tag-0 path, which reports the malformed date.
-                if (isLeapSecond(v) && parsesAsInstant(v.replace(":60", ":59")))
+                int lsColon = secondsColon(v);
+                if (lsColon >= 0 && parsesAsInstant(withoutLeapSecond(v, lsColon)))
                     return Data.MAKE_TAGGED.invoke(Long.valueOf(0), v);
                 java.time.Instant t;
                 try {
@@ -2788,6 +2883,14 @@ public final class Reader {
                     throw Err.of("bad-tag-content",
                         "boring: tag 40 dimensions " + dims
                         + " do not match the " + declared + "-element payload", "tag", 40L);
+                // CHARGED BEFORE IT IS BUILT. Everything below turns one byte
+                // string into `total` host objects plus the vectors holding
+                // them, and none of that goes through `read()`, so the item
+                // budget never saw it. `total` is the element count and the
+                // nesting adds the intermediate vectors on top, which is why
+                // the charge is made here rather than per element inside
+                // nestDims: the point is to refuse BEFORE allocating.
+                countItems(total);
                 // A 2-D typed array keeps its dedicated primitive matrix type
                 // (double[][], long[][]), which is what boring writes and what
                 // `boring.core` dispatches on. Everything else -- any other

@@ -108,15 +108,22 @@ costs more heap than one byte. Re-measured, wire bytes to retained heap:
 | 100 000 short strings | 7.8× |
 | map of 50 000 entries | 11.7× |
 | 50 000 two-element vectors | **23.1×** |
+| tag 40, dimensions `[500000, 1, 1]` | **149×** |
 
 **This page previously said "roughly 5×", and that was wrong by a factor of
 five.** The old table's worst case was an array of *empty* arrays, which is
 cheap precisely because empty collections return shared singletons — it had been
 64× until that fix. Empty containers are the best case, not the worst.
 
+The last row is the worst case and the reason the paragraph below is stated the
+way it is: a typed array is 1.0× only while it stays a typed array. Wrap the
+same bytes in tag 40 and declare dimensions over them and it becomes one host
+object per element — same payload, 149× the heap. That row is now bounded by
+`:max-items`, which is charged before the reconstruction is allocated.
+
 Read the shape of the table rather than any single number. **Bulk payloads do
-not amplify at all**: a megabyte byte string or typed array decodes to a
-megabyte. What amplifies is OBJECT COUNT — a one-byte container head that
+not amplify at all — as long as they stay bulk**: a megabyte byte string or
+typed array decodes to a megabyte. What amplifies is OBJECT COUNT — a one-byte container head that
 becomes a `PersistentVector` with a header, an array and slots is the worst
 per-byte case there is. So amplification tracks how many objects a document
 asks for, not how many bytes it occupies.
@@ -137,6 +144,14 @@ Three limits, and they bound different things:
 else bounded the TOTAL, so a document within the size and depth limits could
 still amplify past anything documented. Set it from the table above — items are
 a good proxy for objects, and objects are what cost.
+
+It charges what the decoder **builds**, not only what it reads. That distinction
+had teeth: a tag-40 multi-dimensional array arrives as one byte string and is
+then expanded into one host object per element, none of which passes through the
+item reader. A 500,018-byte document declaring dimensions `[500000, 1, 1]` built
+**71 MB** of nested vectors — 149× — with `{:max-items 100}` set and honoured.
+The element count is now charged before the reconstruction is allocated, so the
+budget refuses instead of building.
 
 **The budget is PER TOP-LEVEL ITEM**, and per positional read in `boring.nav`.
 It is not a budget for a whole file. That is deliberate and matches what the
