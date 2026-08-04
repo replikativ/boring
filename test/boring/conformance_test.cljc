@@ -2581,3 +2581,48 @@
                                     [(unchecked-byte 0x48)]
                                     (repeat 8 (unchecked-byte 0xff))))]
          (is (not= :boring/bad-option (err-type #(doall (boring/decode-seq bs)))))))))
+
+(deftest option-typos-are-refused-not-silently-honoured
+  (testing ":float-policy was COMPARED, not validated -- the writer asked
+            `(= :preserve-width v)`, so a typo, a string or nil selected
+            :shortest and silently narrowed every Double to a Float. That is
+            precisely the corruption the option exists to prevent"
+    (doseq [v [:preserve-widht "preserve-width" nil 1]]
+      (is (= :boring/bad-option (err-type #(boring/encode 1.5 {:float-policy v})))
+          (pr-str v))))
+  (testing "and both legal values still work"
+    (doseq [v [:preserve-width :shortest]]
+      (is (not= :boring/bad-option (err-type #(boring/encode 1.5 {:float-policy v})))
+          (pr-str v))))
+  (testing ":encode-fallback took anything `ifn?`, so `:placehodler` was invoked
+            as a keyword lookup and silently replaced unencodable values with
+            nil, while a vector threw untyped"
+    (doseq [v [:placehodler [1 2] {} #{1}]]
+      (is (= :boring/bad-option
+             (err-type #(boring/encode #?(:clj (Object.) :cljs (js/WeakMap.))
+                                       {:encode-fallback v})))
+          (pr-str v)))))
+
+#?(:clj
+   (deftest shapes-never-changes-the-value
+     (testing "the shaped-array encoding carries keys and values and nothing
+               else, so a map that is MORE than its entries cannot go in one.
+               Records were excluded; sorted maps and maps with metadata were
+               not, and came back as plain maps with the extra silently gone.
+               `=` returns true for both, which is why round-trip tests missed it"
+       (let [sorted [(sorted-map "0" 1) (sorted-map "0" 2)]
+             metad  [(with-meta {:a 1} {:m 1}) (with-meta {:a 2} {:m 2})]]
+         (is (every? sorted? (boring/decode (boring/encode sorted {:shapes true}))))
+         (is (= [{:m 1} {:m 2}] (mapv meta (boring/decode (boring/encode metad {:shapes true})))))))
+
+     (testing "`containsKey` on a sorted map runs its comparator against a key
+               from a different map, which threw a raw ClassCastException out of
+               encode"
+       (is (not= :boring/bad-option
+                 (err-type #(boring/encode [{false nil} (sorted-map "0" nil)]
+                                           {:shapes true})))))
+
+     (testing "and plain maps are still shaped, which is what the option is for"
+       (let [v (vec (repeat 20 {:a 1 :b 2 :c 3}))]
+         (is (< (alength (boring/encode v {:shapes true}))
+                (alength (boring/encode v {:shapes false}))))))))

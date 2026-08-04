@@ -1217,21 +1217,52 @@ public final class Writer {
      * required to iterate in the same order.
      */
     @SuppressWarnings("rawtypes")
+    /**
+     * A map the shaped-array encoding can represent WITHOUT LOSING ANYTHING.
+     *
+     * The shape carries keys and values and nothing else, so a map that is more
+     * than its entries cannot go in one. Records were already excluded; sorted
+     * maps and maps carrying metadata were not, and `writeShapedArray` emitted
+     * them as plain maps -- `[(sorted-map "0" 1) (sorted-map "0" 2)]` came back
+     * as two PersistentArrayMaps, and `with-meta` maps came back with their
+     * metadata gone. `=` still returned true for both, which is why the
+     * round-trip tests could not see it: the defect is in what `=` ignores.
+     *
+     * `:shapes` is an optimisation. An optimisation that silently changes the
+     * value is not one.
+     */
+    private static boolean plainMap(Object o) {
+        if (!(o instanceof Map) || o instanceof clojure.lang.IRecord) return false;
+        if (o instanceof clojure.lang.Sorted) return false;
+        return !(o instanceof clojure.lang.IObj)
+               || ((clojure.lang.IObj) o).meta() == null;
+    }
+
     private Object[] homogeneousShape(List l) {
         int rows = l.size();
         if (rows < 2) return null;               // one row cannot amortise the keys
         Object first = l.get(0);
-        if (!(first instanceof Map) || first instanceof clojure.lang.IRecord) return null;
+        if (!plainMap(first)) return null;
         Map m0 = (Map) first;
         int n = m0.size();
         if (n == 0) return null;
         Object[] keys = m0.keySet().toArray();
         for (int i = 1; i < rows; i++) {
             Object o = l.get(i);
-            if (!(o instanceof Map) || o instanceof clojure.lang.IRecord) return null;
+            if (!plainMap(o)) return null;
             Map m = (Map) o;
             if (m.size() != n) return null;
-            for (int k = 0; k < n; k++) if (!m.containsKey(keys[k])) return null;
+            // `containsKey` on a SORTED map runs its comparator, and the key it
+            // is handed comes from a different map -- so
+            // `[{false nil} (sorted-map "0" nil)]` threw a raw
+            // ClassCastException out of `encode`. A map that cannot be probed
+            // is not part of a homogeneous shape; that is an answer, not an
+            // error.
+            try {
+                for (int k = 0; k < n; k++) if (!m.containsKey(keys[k])) return null;
+            } catch (ClassCastException e) {
+                return null;
+            }
         }
         return keys;
     }

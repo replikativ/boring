@@ -217,6 +217,23 @@
   (data/unknown-record "boring/unencodable"
                        {:type (.getName (class x)) :repr (pr-str x)}))
 
+(defn- float-policy!
+  "`:float-policy`, validated rather than compared.
+
+  The writer asked `(= :preserve-width (:float-policy opts))`, so ANY other
+  value selected `:shortest` -- including `:preserve-widht`, `\"preserve-width\"`
+  and nil. A typo therefore silently narrowed every Double to a Float, which is
+  precisely the corruption this option exists to prevent and precisely what
+  datahike's dumps must not do. Silence was the worst available behaviour: the
+  bytes are valid CBOR and the loss shows up as a changed value much later."
+  [opts]
+  (let [v (get opts :float-policy :preserve-width)]
+    (when-not (#{:preserve-width :shortest} v)
+      (throw (ex-info (str "boring: :float-policy must be :preserve-width or :shortest, got "
+                           (pr-str v))
+                      {:type :boring/bad-option :option :float-policy :value v})))
+    v))
+
 (defn- encode-fallback-fn
   "`:encode-fallback` is `nil` (throw, the default), `:placeholder` for
   `unencodable`, or a function of the offending value returning a replacement."
@@ -224,8 +241,15 @@
   (cond
     (nil? fb) nil
     (= :placeholder fb) unencodable
-    (ifn? fb) fb
-    :else (throw (ex-info "boring: :encode-fallback must be nil, :placeholder, or a function"
+    ;; A FUNCTION, not merely something invocable. `ifn?` is true of keywords,
+    ;; symbols, maps, sets and vectors -- so `:placehodler`, one letter wrong,
+    ;; was accepted as a fallback, invoked as `(:placehodler v)`, and silently
+    ;; replaced every unencodable value with nil. A vector fallback threw
+    ;; untyped instead. The option exists to make a lossy substitution
+    ;; deliberate; taking a typo for one is the opposite.
+    (fn? fb) fb
+    :else (throw (ex-info (str "boring: :encode-fallback must be nil, :placeholder, or a function, got "
+                          (pr-str fb))
                           {:type :boring/bad-option :value fb}))))
 
 (defn- max-depth-opt
@@ -248,7 +272,7 @@
   ^Writer [^Writer w opts]
   (set! (.-stringref w) (boolean (:stringref opts)))
   (set! (.-inclMetadata w) (boolean (get opts :incl-metadata? true)))
-  (set! (.-preserveWidth w) (= :preserve-width (:float-policy opts)))
+  (set! (.-preserveWidth w) (= :preserve-width (float-policy! opts)))
   (set! (.-canonical w) (boolean (:canonical opts)))
   (set! (.-legacyCanonicalOrder w) (= :rfc7049 (:canonical-order opts)))
   (set! (.-shapes w) (boolean (:shapes opts)))
