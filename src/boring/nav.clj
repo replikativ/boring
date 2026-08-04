@@ -973,7 +973,7 @@
   affordable."
   ;; No primitive hints: five args with three of them primitive is one past
   ;; what Clojure allows, and the boxing here is once per anchor, not per item.
-  [^Nav nav ^longs offsets stride total k]
+  [^Nav nav ^longs offsets stride k]
   (let [^booleans done (:anchor-checked (.idx nav))
         ^booleans okv (:anchor-ok (.idx nav))]
     (if (or (nil? done) (>= (long k) (alength done)))
@@ -1042,7 +1042,7 @@
           (if (or (neg? i) (>= i total))
             nf
             (let [anchor (quot (long i) stride)]
-              (if-not (anchor-sound? nav offsets stride total anchor)
+              (if-not (anchor-sound? nav offsets stride anchor)
                 ;; A middle anchor cannot be validated at load without walking
                 ;; to it, which is the work the index exists to avoid -- so it
                 ;; is validated HERE, against its neighbour, the first time
