@@ -10,6 +10,7 @@
   Options (all optional):
 
     :profile        :clojure (default) | :interop | :archival | :canonical
+                    | :canonical-rfc7049
     :float-policy   :preserve-width (default) | :shortest
     :stringref      true (default under :clojure) | false
 
@@ -17,7 +18,7 @@
   :float-policy exists because datahike's dumps must not narrow a double to a
   float -- the class, not just the value, has to survive.
 
-  The four profiles answer four different questions:
+  The five profiles answer five different questions:
 
     :clojure    round-trip fidelity within Clojure, smallest bytes.
     :interop    can any conformant CBOR reader read this? (no extensions)
@@ -25,6 +26,10 @@
                 types survive? (sorted keys + fixed-width floats)
     :canonical  do these bytes agree octet-for-octet with other canonical
                 encoders? (RFC 8949 4.2.2, which narrows floats)
+    :canonical-rfc7049
+                do they agree with a clj-cbor peer? (length-first key order,
+                RFC 7049 3.9 -- which is also what Python cbor2's
+                `canonical=True` and Rust ciborium produce)
 
   :archival and :canonical are NOT the same and cannot be: RFC determinism
   requires the shortest float form, which discards the Double/Float
@@ -71,8 +76,19 @@
 (defn writer
   "Create a reusable Writer. Not thread-safe; one per thread or per loop.
 
-  With `opts`, they are resolved ONCE here and used by every 2-arity
-  `encode-into!` / `encode-buffered!` / `write-to!` on this writer. Prefer this
+  `initial-size` is a BYTE COUNT for the internal buffer, not an options map.
+  There is no `(writer opts)` arity, so `(writer {:stringref false})` -- the
+  natural thing to type, and the shape `boring.nav` pushes callers toward --
+  is a raw `ClassCastException` from the `^long` hint rather than anything
+  typed. Write `(writer 256 {:stringref false})`.
+
+  With `opts`, they are resolved ONCE here and used by every no-options arity
+  on this writer: `encode-into!`, `encode-buffered!`, `write-to!`,
+  `write-to-buffer!`, `write-seq!`, `write-indexed!` and `seal-index!`. All
+  seven, which is worth listing rather than gesturing at -- the 3-arity
+  `write-seq!` resolved nil instead for a while, so a writer built
+  `(writer n {:stringref false})` silently emitted stringref through that one
+  entry point. Prefer this
   to passing the same map on every call: `resolve-opts` merges the caller's map
   over the profile defaults, which allocates ~230-300 B per call. On a log
   event that is the difference between 452 and 220 heap bytes, and it bites
@@ -376,9 +392,18 @@
   heuristic would put back exactly the per-message allocation reuse exists to
   remove. Call it after a known-large job — not in a loop.
 
-  Throws `:boring/bad-argument` mid-stream, where the buffer still holds bytes
-  that have not reached the sink. A trimmed writer is otherwise a usable
-  writer, in whatever state `reset` would leave it."
+  Throws `:boring/bad-argument` in TWO states, and the second is the likelier
+  one. Mid-stream, where the buffer still holds bytes that have not reached the
+  sink. And after `encode-buffered!`, whose bytes live in the buffer this
+  replaces -- so `(do (encode-buffered! w v) (trim! w))` refuses, which is the
+  documented allocation-free loop and therefore exactly where a caller thinks
+  to reclaim a peak. The way out is to consume the borrow first:
+  `write-to!`, `write-to-buffer!` or `encode-into!` all end it, and the next
+  `encode` clears it too. The Java message names the recovery; only this
+  docstring was short.
+
+  A trimmed writer is otherwise a usable writer, in whatever state `reset`
+  would leave it."
   ^long [^Writer w]
   (.trim w))
 
@@ -560,6 +585,13 @@
   additionally allow binary search; without them a lookup still jumps anchor to
   anchor rather than entry to entry.
 
+  `:index 0` is the documented OFF switch on `write-seq!` and `write-indexed!`,
+  and `boring.options`' own validator message says so for every entry point
+  (\"0 turns indexing off\"). HERE IT IS A `:boring/bad-option`, and so is it on
+  `build-index`, because an `encode-indexed` that does not index is just
+  `encode` -- silently returning an unindexed single item would change what the
+  return value IS, from a two-item sequence to one item. Call `encode` instead.
+
   `:stringref false` IS FORCED, because the sentence above would otherwise be
   false by default. The default profile writes stringref, and `boring.nav`
   categorically refuses a stringref document -- a stringref is an index into a
@@ -638,10 +670,19 @@
 
   `:index-min` (default 16) is a SEPARATE knob and gates CONTAINER nodes, not
   the frame: a map or array with fewer than that many entries gets no node of
-  its own. Raising it to a number no container reaches gives an index over the
-  ITEMS ONLY -- the right shape for a log you seek into but do not navigate
-  within. Measured on 20 items of 40-entry maps: 6873 bytes at the default,
-  6611 with `:index-min 1000`.
+  its own. Raising it ABOVE the largest container but NO HIGHER THAN the item
+  count gives an index over the ITEMS ONLY -- the right shape for a log you
+  seek into but do not navigate within. Measured on 100 items of 40-entry maps
+  (`{:k0 0 ... :k39 39}`): 34 167 bytes at the default, 32 861 with
+  `:index-min 41`, against 32 800 unindexed. The frame is one node of 100
+  counts; the default's is 101 nodes.
+
+  BOTH BOUNDS MATTER, and this paragraph used to state only the first --
+  \"raising it to a number no container reaches\", illustrated with 20 items at
+  `:index-min 1000`. That configuration produces NO INDEX AT ALL, which is the
+  opposite of items-only, and it contradicted the paragraph below. Measured:
+  20 items, 6873 bytes at the default and 6560 with `:index-min 1000`, with no
+  frame in the second.
 
   It DOES decide whether a short sequence gets a frame at all. The sequence is
   itself a node, so the same threshold applies to it: fewer than `:index-min`

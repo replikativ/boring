@@ -494,8 +494,19 @@
         ;; do. `(int n)` on a head declaring 2^31 entries threw an untyped
         ;; ArithmeticException, and below that it returned an IMPOSSIBLE number
         ;; -- 1048576 entries from a five-byte document -- while `decode`,
-        ;; `seq`, `reduce`, `nth` and `byte-span` on the same bytes all report
-        ;; :boring/bad-count. Reachable by flipping byte 0 to 0x9B or 0xBB.
+        ;; `seq`, `byte-span`, `value` and `(reduce f coll)` on the same bytes
+        ;; all report :boring/bad-count. Reachable by flipping byte 0 to 0x9B
+        ;; or 0xBB.
+        ;;
+        ;; NOT all of them, and this comment used to say so. Measured on a 0xBB
+        ;; head declaring 2^20 pairs over nine bytes:
+        ;; `(reduce f init coll)` gives :boring/truncated-input,
+        ;; because IReduceInit walks `child-offsets` without the `room` guard
+        ;; this arity and `child-offsets` share; `nth` and `get` return their
+        ;; not-found value and report nothing, which is the contract of the
+        ;; arity the caller chose. Typed either way -- the guarantee is that no
+        ;; untyped throwable escapes, not that one keyword covers every entry
+        ;; point.
         ;;
         ;; One entry is at least one byte, so a count larger than the bytes
         ;; that follow cannot be honest.
@@ -565,7 +576,19 @@
 
 ;; --------------------------------------------------------------- public API
 
-(defn cursor? [x] (instance? Cursor x))
+(defn cursor?
+  "True if `x` is a cursor -- something `get`, `nth`, `seq` or `reduce` handed
+  back rather than a value they realised.
+
+  Worth having because only `value` is TOTAL. It takes anything and returns
+  anything already realised unchanged, which is what makes
+  `(value (get c k))` safe when you cannot see from the outside whether `k`
+  descended a map (cursor) or a tag (realised value). The rest of this
+  namespace is not: `value-type`, `byte-span` and `raw-bytes` are `^Cursor`
+  hinted, so a realised value reaches them as a bare ClassCastException, and
+  `children` is `(fn [c] c)` and simply hands a non-cursor straight back --
+  `(children 5)` is `5`. Ask here when the answer decides which one you call."
+  [x] (instance? Cursor x))
 
 (defn ^:no-doc skips
   "Structural skips this cursor's reader has performed, and a setter to zero it.
@@ -616,7 +639,16 @@
 
 (defn raw-bytes
   "The encoded bytes of the subtree at the cursor, copied out. A re-encodable
-  slice: `(boring/decode (raw-bytes c))` equals `(value c)`."
+  slice: `(boring/decode (raw-bytes c) opts)` equals `(value c)`, for the SAME
+  `opts` the cursor's `source` was given.
+
+  The options are not optional, and the docstring used to omit them. `value`
+  realises through the nav's own reader, which carries the registry `source`
+  was handed; `boring/decode` with no options carries none. With a record
+  registered under `\"user.Pt\"`, `value` gives back a `Pt` and a bare `decode`
+  of the same bytes gives back a `#boring/record` fallback -- equal bytes,
+  unequal values, and no error to notice it by. Registry-free documents were
+  the only ones the tests covered, and there the claim happens to hold."
   ^bytes [^Cursor c]
   (let [^Nav nav (.nav c)
         [s e] (byte-span c)]
@@ -624,7 +656,11 @@
 
 (defn children
   "A reducible/seqable of child cursors (arrays) or MapEntries of realised key
-  to value cursor (maps). Prefer `reduce` over `seq` in a hot loop."
+  to value cursor (maps). Prefer `reduce` over `seq` in a hot loop.
+
+  Identity on anything that is not a cursor -- a tag that `get` already
+  realised arrives here as its value and leaves unchanged, so a walk gets the
+  scalar back instead of an error. `cursor?` is how you tell the two apart."
   [^Cursor c] c)
 
 (def ^:private shorts-class (class (short-array 0)))
@@ -1064,7 +1100,16 @@
       (reduce (fn [^long n _] (inc n)) 0 this)))
 
   clojure.lang.Indexed
-  (nth [this i] (.nth this i nil))
+  ;; THROWS out of range, as `Indexed` specifies and as `Cursor.nth` already
+  ;; does. It returned nil here, so the two `nth`s on the two navigable types
+  ;; disagreed -- and `Cursor`'s own comment claimed both threw. The 3-arity
+  ;; not-found form is the way to ask without an exception, on both.
+  (nth [this i]
+    (let [v (.nth this i ::none)]
+      (if (identical? ::none v)
+        (throw (IndexOutOfBoundsException.
+                (str "boring.nav: index " i " out of bounds for this sequence")))
+        v)))
   (nth [_ i nf]
     (let [^Reader r (.rdr nav)
           end (long (or (:data-end idx) (.size r)))]
@@ -1169,8 +1214,11 @@
   **`boring.nav` is not thread-safe, and sharing one source silently returns
   WRONG ANSWERS.** A source owns one `Reader`, and a Reader carries mutable
   position, depth and scratch state that every cursor derived from it shares.
-  Measured, 200 parallel passes over one `items` returned 10 plausible but
+  Measured, 200 parallel passes over one `items` returned 6 plausible but
   wrong documents with no exception at all, alongside a spread of typed errors.
+  (This said 10, against the 6 that `doc/SECURITY.md` and `Reader.java`'s
+  detector comment both record for the same run. One experiment, three
+  write-ups, one of them drifted.)
 
   Nothing about the surface warns you: the namespace is read-only navigation,
   `Items` is reducible, and `boring.mmap` picks a shared arena precisely so the
@@ -1198,8 +1246,18 @@
 
 (defn zipper
   "A read-only clojure.zip zipper over the cursor. `down`, `right`, `node` and
-  friends work; anything that edits throws, because a change of length would
-  cascade through every offset after it."
+  friends work; an edit throws `:boring/read-only`, because a change of length
+  would cascade through every offset after it.
+
+  WHEN it throws is worth stating, because \"anything that edits throws\" was
+  too strong. The guard is `make-node`, which `clojure.zip` calls only when an
+  edit has to be rebuilt into its parent -- so `zip/insert-child`, `zip/remove`
+  and `zip/edit` throw where you wrote them, but a `zip/replace` is ACCEPTED
+  and `zip/node` reads the replacement straight back. The failure arrives at
+  the first `zip/up` or `zip/root` after it. A caller who only replaces and
+  reads gets no error at all; nothing escapes, because the value cannot leave
+  the zipper without passing through `up`, but you may be several steps past
+  the line that was wrong. Decode, edit, re-encode."
   [^Cursor c]
   (zip/zipper
    (fn branch? [^Cursor x] (contains? #{:array :map} (value-type x)))

@@ -2861,3 +2861,27 @@
                                              o))))))]
       (doseq [k [:boring.core/index-frame :boring/index :boring.core/whatever]]
         (is (= [1 k 3] (seq-of [1 k 3])) (str "a sequence holding " k))))))
+
+(deftest a-sequence-is-navigable-on-both-platforms
+  (testing "`nav` refuses a document that opens a stringref namespace -- a
+            cursor holding only an offset cannot resolve one. The JVM's
+            `write-seq!` indexes by default and therefore forces stringref off;
+            the ClojureScript arity cannot index, so it had no such trigger and
+            its default output carried `d9 0100` per item. The same portable
+            call produced a navigable file on one platform and not the other,
+            while the ClojureScript docstring promised `boring.nav` could read
+            it. Forced off there too now."
+    (let [w (boring/writer 4096)
+          acc (atom [])
+          sink (fn [c] (swap! acc conj c))
+          n #?(:clj (let [out (java.io.ByteArrayOutputStream.)]
+                      (boring/write-seq! w [{:a 1 :b "x"} {:a 2 :b "x"}] out)
+                      (reset! acc [(.toByteArray out)])
+                      (alength ^bytes (first @acc)))
+               :cljs (boring/write-seq! w [{:a 1 :b "x"} {:a 2 :b "x"}] sink))]
+      (is (pos? n))
+      (testing "no item opens a stringref namespace (d9 0100)"
+        (doseq [chunk @acc]
+          (let [b0 #?(:clj (bit-and (aget ^bytes chunk 0) 0xff) :cljs (aget chunk 0))]
+            (is (not= 0xd9 b0)
+                "a sequence meant to be navigable must not open a stringref namespace")))))))

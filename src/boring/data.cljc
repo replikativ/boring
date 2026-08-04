@@ -73,6 +73,22 @@
 ;; equality semantics — equal to another UnknownRecord of the same type with
 ;; the same fields, NOT equal to a bare map with those fields.
 ;;
+;; That last clause holds ON THE JVM ONLY. On ClojureScript `=` between an
+;; UnknownRecord and a map is ASYMMETRIC: `(= u {:a 1})` is false and
+;; `(= {:a 1} u)` is TRUE. This is a deftype satisfying IMap, so cljs `map?` is
+;; true of it while `record?` is false, and cljs's `equiv-map` excludes only
+;; REAL records — so the map's own `-equiv` accepts it. `hash` disagrees in
+;; both directions either way, so set membership follows whichever side you put
+;; it on: `(contains? #{u} {:a 1})` is true and `(contains? #{{:a 1}} u)` is
+;; false. Measured, same expression on both platforms:
+;;
+;;   [(= u {:a 1}) (= {:a 1} u) (= (hash u) (hash {:a 1}))
+;;    (contains? #{{:a 1}} u) (contains? #{u} {:a 1})]
+;;   JVM   [false false false false false]
+;;   CLJS  [false true  false false true ]
+;;
+;; Do not rely on `=` between an UnknownRecord and a map in portable code.
+;;
 ;; It does NOT assert that the sender used `defrecord`, and cannot: tag 27
 ;; carries no such bit, a registered write handler may emit a map payload for
 ;; a `deftype`, and a frame from Python carries no origin information at all.

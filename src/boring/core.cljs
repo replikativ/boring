@@ -434,6 +434,31 @@
                            "or write the indexed file on the JVM.")
                       {:type :boring/unsupported-option :option k :value (get opts k)})))))
 
+(defn- navigable-seq-opts
+  "`write-seq!`'s options with stringref off, unless the caller asked for it.
+
+  A stringref is an index into a table built from every preceding string, so a
+  cursor holding only an offset cannot resolve one and `boring.nav` refuses
+  such a document outright. The JVM's `write-seq!` indexes by default and
+  therefore forces stringref off already -- indexing declares navigational
+  intent. This arity cannot index, so it had no such trigger, and the default
+  output carried a `d9 0100` namespace per item: the SAME portable call
+  produced a navigable file on the JVM and an unnavigable one in a browser,
+  while this function's own docstring promised `boring.nav` could read it.
+
+  Forced off UNCONDITIONALLY, which is what the JVM does when it indexes --
+  `(cond-> o (pos? stride) (assoc :stringref false))` overrides whatever the
+  writer was built with. Honouring an explicit `{:stringref true}` here is not
+  possible anyway: `resolve-opts` merges the profile, so by the time options
+  arrive `:stringref true` is present whether the caller asked for it or was
+  simply handed the `:clojure` default, and the two cannot be told apart.
+
+  This mirrors the asymmetry the JVM already has -- `encode` keeps stringref,
+  `write-seq!` does not. If you want stringref compression in a sequence and
+  do not need to navigate it, call `encode-into!` in a loop."
+  [o]
+  (assoc o :stringref false))
+
 (defn write-seq!
   "Encode each value as a consecutive top-level item, appending to `sink`, a
   function of one Uint8Array. Returns the total byte count.
@@ -444,6 +469,12 @@
   `:boring/unsupported-option` rather than quietly producing a file that cannot
   be navigated. READING past an index written elsewhere works on both platforms
   -- see `decode-seq`.
+
+  **Stringref is off**, as it is on the JVM's indexed default, so the output is
+  navigable. It was on, and this docstring claimed navigability anyway: the
+  same portable call produced a `boring.nav`-readable file on the JVM and a
+  `d9 0100`-prefixed one here that `nav` refuses outright. If you want the
+  compression and do not need to navigate, call `encode-into!` in a loop.
 
   `sink` receives bytes it OWNS. This used to pass `.subarray` of the writer's
   reusable buffer, which is a view rather than a copy: a sink that retained the
@@ -460,7 +491,7 @@
    ;; so `(write-seq! (writer 256 {:index 16}) vs sink)` returned a byte count
    ;; and a plain sequence -- the same silent loss the 4-arity exists to
    ;; prevent, reachable by moving the option from the call to the writer.
-   (let [o (doto (writer-opts w) reject-index-opts!)]
+   (let [o (-> (writer-opts w) (doto reject-index-opts!) navigable-seq-opts)]
      (reduce (fn [total v]
                (let [n (wr/position (write-root! w v o))]
                  (sink (.slice (wr/buffer w) 0 n))
@@ -468,7 +499,7 @@
              0 values)))
   ([w values sink opts]
    (reject-index-opts! opts)
-   (let [o (resolve-opts opts)]
+   (let [o (navigable-seq-opts (resolve-opts opts))]
      (reduce (fn [total v]
                (let [n (wr/position (write-root! w v o))]
                  (sink (.slice (wr/buffer w) 0 n))
