@@ -89,6 +89,19 @@ public final class TagRegistry {
             throw Err.of("bad-tag-number",
                 "boring: tag numbers are unsigned; got " + tag
                 + ". This API accepts 0 to " + Long.MAX_VALUE + ".");
+        // 25 and 256 are STRUCTURAL, not semantic: they are how the format
+        // encodes string repetition, and the reader resolves them while
+        // building the value rather than at the tag dispatch a registered
+        // reader hooks. So an override was honoured for a bare `25(0)` and
+        // silently ignored for the same reference inside a tag-39 identifier --
+        // the same table entry meaning two different things depending on where
+        // it appeared. Refusing to register is the only answer that is true
+        // everywhere.
+        if (tag == 25 || tag == 256)
+            throw Err.of("bad-tag-number",
+                "boring: tag " + tag + " is structural (stringref) and cannot be"
+                + " given a reader; it is resolved while the value is built,"
+                + " not at tag dispatch. Use :stringref false to turn it off.");
         return tag;
     }
 

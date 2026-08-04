@@ -593,7 +593,24 @@
       (check-array-dups! (keys m) :boring/duplicate-map-key "map key"))
     m))
 
+(defn- definite-bytes!
+  "Refuse an indefinite-length byte string as a typed-array payload.
+
+  RFC 8746 2 defines the content as a byte string whose length is a whole
+  number of elements, and the JVM reads the head by hand and so has always
+  required the definite form. ClojureScript routed the payload through `read!`,
+  which MERGES indefinite chunks into one Uint8Array -- so
+  `67(_ h'01020304' h'05060708')` decoded here and was refused there."
+  [^Reader r tag]
+  (need! r 1)
+  (when (== 0x5f (aget (.-buf r) (.-pos r)))
+    (err :boring/bad-tag-content
+         (str "boring: typed-array tag " tag
+              " must wrap a definite-length byte string")
+         {:tag tag})))
+
 (defn- read-typed-array! [^Reader r tag]
+  (definite-bytes! r tag)
   (let [bs (read! r)]
     (when-not (instance? js/Uint8Array bs)
       (err :boring/bad-tag-content
@@ -827,10 +844,15 @@
     ;; Duration's seconds field is a signed 64-bit count, and `1e20` is an
     ;; integral JS number well past it.
     (let [b @base]
+      ;; `9223372036854775807` is not a JS number -- the literal rounds UP to
+      ;; 2^63 -- so `(> b 9223372036854775807)` compared against 2^63 and let a
+      ;; float base of exactly 2^63 through, which the JVM refuses. For doubles
+      ;; the bound has to be `>= 2^63`, the first value past a signed 64-bit
+      ;; second count that a double can actually hold.
       (when (if (= "bigint" (goog/typeOf b))
               (or (< b MIN-I64) (> b MAX-I64))
               (or (not (js/isFinite b))
-                  (< b -9223372036854775808) (> b 9223372036854775807)))
+                  (< b -9223372036854775808) (>= b 9223372036854775808)))
         (err :boring/bad-tag-content
              (str "boring: tag 1002 base value " b " does not fit a 64-bit second count")
              {:tag 1002})))
@@ -1118,7 +1140,11 @@
         ;; from four digits up is a real platform limit (a Date holds
         ;; milliseconds; doc/COMPATIBILITY.md records it), but the two
         ;; platforms must at least agree on which documents are legal.
-        (when-not (re-matches #"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d{1,9})?([Zz]|[+-]\d{2}:\d{2})" s)
+        ;; RANGES IN THE GRAMMAR, matching Reader.RFC3339 character for
+        ;; character. `\d{2}` accepted hour 24, which RFC 3339 5.6 caps at 23
+        ;; and which `js/Date` silently ROLLED FORWARD to the next day -- a
+        ;; wrong value out of an invalid document, on both platforms.
+        (when-not (re-matches #"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d{1,9})?([Zz]|[+-]([01]\d|2[0-3]):[0-5]\d)" s)
           (err :boring/bad-tag-content
                (str "boring: tag 0 content is not a valid RFC 3339 instant: " s)
                {:tag 0 :value s}))
@@ -1142,6 +1168,22 @@
             (when (js/isNaN (.getTime d))
               (err :boring/bad-tag-content
                    (str "boring: tag 0 content is not a valid RFC 3339 instant: " s)
+                   {:tag 0 :value s}))
+            ;; THE CALENDAR IS CHECKED, not just the grammar. `js/Date` does not
+            ;; reject an impossible day -- it ROLLS IT FORWARD -- so
+            ;; `0("2020-02-30T00:00:00Z")` decoded to 2020-03-01 and re-encoded
+            ;; a DIFFERENT DOCUMENT than the one that arrived, while the JVM
+            ;; rejected it outright. `2019-02-29` did the same.
+            ;;
+            ;; The test is that the parsed instant renders back to the date it
+            ;; was given: a rolled-over date cannot, because it is a different
+            ;; day. Compared on the date only, so a non-UTC offset -- which
+            ;; legitimately shifts the rendered day -- is not caught by it; the
+            ;; grammar above has already bounded every field.
+            (when (and (or (= "Z" (subs s (dec (count s)))) (= "z" (subs s (dec (count s)))))
+                       (not= (subs s 0 10) (subs (.toISOString d) 0 10)))
+              (err :boring/bad-tag-content
+                   (str "boring: tag 0 content is not a real calendar date: " s)
                    {:tag 0 :value s}))
             d)))
     1 (let [v0 (read! r)
@@ -1208,7 +1250,8 @@
     ;; different values from them. 76 is reserved and 83/87 are float128, which
     ;; the JVM does not implement either.
     (64 65 66 67 68 69 70 71 72 73 74 75 80 81 82 84)
-    (let [bs (read! r)
+    (let [_ (definite-bytes! r tag)
+          bs (read! r)
           elem (case tag
                  (64 68 72) 1
                  (65 69 73 80 84) 2
@@ -1245,6 +1288,15 @@
          ;; `js/URL` is not the check to use: it demands an absolute URL and
          ;; would reject the relative references RFC 3986 4.1 allows and the
          ;; JVM accepts.
+         ;; CHARACTERS TOO, not only the scheme. Checking the scheme alone left
+         ;; `"a b"`, `"a|b"` and `"%zz"` accepted here and rejected on the JVM.
+         ;; RFC 3986 Appendix A: a URI reference is built from unreserved,
+         ;; reserved and pct-encoded characters, and a `%` must introduce two
+         ;; hex digits.
+         (when-not (re-matches #"(?:[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=]|%[0-9A-Fa-f]{2})*" v)
+           (err :boring/bad-tag-content
+                (str "boring: tag 32 content is not a valid URI: " v)
+                {:tag 32 :value v}))
          (let [i (.search v #"[/?#]")
                colon (.indexOf v ":")]
            (when (and (not= -1 colon) (or (= -1 i) (< colon i))

@@ -277,6 +277,14 @@
       (-> (boring/tag-registry)
           (boring/register-tag 40001 java.net.URI str #(java.net.URI. %))))"
   ^TagRegistry [^TagRegistry reg tag cls write-fn read-fn]
+  ;; INTEGER, checked here rather than left to `(long tag)`. That coercion
+  ;; TRUNCATES: `1.5` registered a handler under tag 1 -- a different tag than
+  ;; the caller named, silently. `TagRegistry.checkTag` never saw the 1.5,
+  ;; because by then it was a long. Found by a test written for the
+  ;; ClojureScript half of the same defect.
+  (when-not (integer? tag)
+    (throw (ex-info (str "boring: tag numbers are integers; got " (pr-str tag))
+                    {:type :boring/bad-tag-number :tag tag})))
   ;; Explicit lets rather than cond->: the threaded intermediate would lose its
   ;; type hint and each .with* call would reflect.
   (let [^TagRegistry r (if (and cls write-fn)

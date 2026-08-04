@@ -164,6 +164,24 @@ public final class Reader {
         }
     }
 
+    /**
+     * RFC 3339 5.6 `date-time`, as a grammar rather than as whatever the host
+     * parser tolerates. Kept character-for-character in step with the regex in
+     * `boring.reader`'s tag-0 handler: the two platforms must agree on which
+     * documents exist before they can agree on what they mean.
+     *
+     * Ranges are checked here where they are cheap and unambiguous (hour 00-23,
+     * minute 00-59, second 00-60 for the leap second); the calendar itself --
+     * whether 2020-02-30 exists -- is left to the date parser below, which is
+     * the thing that actually knows.
+     */
+    private static final java.util.regex.Pattern RFC3339 =
+        java.util.regex.Pattern.compile(
+            "\\d{4}-\\d{2}-\\d{2}[Tt]"
+            + "(?:[01]\\d|2[0-3]):[0-5]\\d:(?:[0-5]\\d|60)"
+            + "(?:\\.\\d{1,9})?"
+            + "(?:[Zz]|[+-](?:[01]\\d|2[0-3]):[0-5]\\d)");
+
     /** `:60` in the seconds field -- valid RFC 3339, unrepresentable as an Instant. */
     private static boolean isLeapSecond(String v) {
         return secondsColon(v) >= 0;
@@ -1219,10 +1237,16 @@ public final class Reader {
      * reference compare plus a boolean is what the hot path can afford.
      */
     private boolean identFastPath() {
+        // Tag 25 is NOT tested here, and that is deliberate rather than an
+        // omission. It is a structural tag -- stringref is how the format
+        // encodes repetition, not a value type -- and `TagRegistry` now refuses
+        // to register a reader for it at all, so there is nothing to bypass.
+        // The clause that used to be here could not have an effect: the slow
+        // path reads tag 25 inside tag 39 by hand too, so disabling the
+        // shortcut changed nothing.
         if (registry != identFastPathFor) {
             identFastPathFor = registry;
-            identFastPathOk = registry.readerFor(39) == null
-                           && registry.readerFor(25) == null;
+            identFastPathOk = registry.readerFor(39) == null;
         }
         return identFastPathOk;
     }
@@ -1986,6 +2010,15 @@ public final class Reader {
                                          : (long) LONG_LE.get(b, off + (i << 3));
                     return a;
                 }
+                // CHARGED, because THIS branch is the one that amplifies. A
+                // primitive long[] above is one object for the whole payload --
+                // 1.0x, which is what doc/SECURITY.md's table says about typed
+                // arrays. A vector of boxed BigInt is one object per element:
+                // 1 MB of `ff` bytes under tag 67 retained 11 MB, 12.5x, with
+                // `{:max-items 100}` set and honoured. The budget must see the
+                // objects the decoder BUILDS, and it could not see these because
+                // the payload arrived as a single byte string.
+                countItems(n);
                 Object[] w = new Object[n];
                 for (int i = 0; i < n; i++) {
                     long u = tag == 67 ? (long) LONG_BE.get(b, off + (i << 3))
@@ -2195,7 +2228,17 @@ public final class Reader {
                 // JVM took a document ClojureScript's grammar refuses. Rejected
                 // here rather than left to the parser, since the parser is the
                 // thing being too generous.
-                if (v.length() > 0 && (v.charAt(0) == '+' || v.charAt(0) == '-'))
+                // RFC 3339 5.6's grammar, enforced where java.time is looser
+                // than it. `Instant.parse` is a java.time parser, not an RFC
+                // 3339 one, and the three places it differs all let a document
+                // through that ClojureScript refuses:
+                //
+                //   expanded years   `+10000-01-01T00:00:00Z`  (no such production)
+                //   empty secfrac    `...T00:00:00.Z`          (time-secfrac = "." 1*DIGIT)
+                //   hour 24          `...T24:00:00Z`           (time-hour = 00-23, and
+                //                                               it silently ROLLED FORWARD
+                //                                               to the next day)
+                if (!RFC3339.matcher(v).matches())
                     throw Err.of("bad-tag-content",
                         "boring: tag 0 content is not a valid RFC 3339 instant: " + v,
                         "tag", 0L, "value", v);

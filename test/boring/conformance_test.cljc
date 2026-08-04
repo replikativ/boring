@@ -2299,3 +2299,86 @@
         "a payload that is not a whole number of elements"))
   (testing "a well-formed one is accepted on both, whatever it decodes to"
     (is (not= :boring/bad-tag-content (err-type #(dec-hex "d843480102030405060708"))))))
+
+;; -------------------------------------------------- third semantic re-audit
+
+(defn- tag32-hex [u]
+  (str "d820" (hex-byte (+ 0x60 (count u)))
+       (apply str (map #(hex-byte #?(:clj (int %) :cljs (.charCodeAt % 0))) u))))
+
+#?(:clj
+   (deftest max-items-bounds-typed-array-reconstruction-too
+     ;; JVM only, and that is the finding rather than a gap in the test: the
+     ;; amplification exists exactly where the host has no lossless primitive
+     ;; form and BOXES. ClojureScript preserves tag 67 as its bytes, so a
+     ;; million of them stay a million bytes there.
+     (testing "a typed array is 1.0x only while it STAYS a typed array. A
+               uint64 array whose values exceed 2^63 has no lossless long, so it
+               becomes one boxed object per element: 1 MB of `ff` under tag 67
+               retained 11 MB, 12.5x, with {:max-items 100} set and honoured.
+               The first fix charged tag-40 reconstruction and missed this one"
+       (let [bos (java.io.ByteArrayOutputStream.)]
+         (.write bos ^bytes (c/hex->bytes "d8475a000f4240"))
+         (dotimes [_ 1000000] (.write bos 0xff))
+         (is (= :boring/max-items-exceeded
+                (err-type #(boring/decode (.toByteArray bos) {:max-items 100}))))))
+
+     (testing "while the PRIMITIVE path is not charged, because it does not
+               amplify: the same million bytes of small values is one long[]"
+       (let [bos (java.io.ByteArrayOutputStream.)]
+         (.write bos ^bytes (c/hex->bytes "d8475a000f4240"))
+         (dotimes [_ 1000000] (.write bos 1))
+         (is (not= :boring/max-items-exceeded
+                   (err-type #(boring/decode (.toByteArray bos) {:max-items 100}))))))))
+
+(deftest rfc-3339-ranges-and-the-calendar-are-both-checked
+  (testing "an impossible day is not a date. `js/Date` ROLLS IT FORWARD rather
+            than refusing, so 2020-02-30 decoded to 2020-03-01 on ClojureScript
+            and re-encoded a different document than the one that arrived"
+    (doseq [s ["2020-02-30T00:00:00Z" "2019-02-29T00:00:00Z"]]
+      (is (= :boring/bad-tag-content (err-type #(boring/decode (tag0-bytes s)))) s)))
+  (testing "hour 24 is out of RFC 3339 5.6's range on both platforms, and both
+            used to roll it forward to the next day"
+    (is (= :boring/bad-tag-content
+           (err-type #(boring/decode (tag0-bytes "2020-01-01T24:00:00Z"))))))
+  (testing "and `time-secfrac` needs at least one digit"
+    (is (= :boring/bad-tag-content
+           (err-type #(boring/decode (tag0-bytes "2020-01-01T00:00:00.Z"))))))
+  (testing "real dates, leap days and leap seconds still decode"
+    (doseq [s ["2020-02-29T00:00:00Z" "2020-01-01T23:59:60Z" "2020-01-01T00:00:00.5Z"]]
+      (is (not= :boring/bad-tag-content
+                (err-type #(boring/decode (tag0-bytes s)))) s))))
+
+(deftest a-typed-array-payload-is-a-definite-length-byte-string
+  (testing "RFC 8746 2. ClojureScript routed the payload through the general
+            reader, which MERGES indefinite chunks, so a form the JVM refuses
+            decoded there"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d8435f44010203044405060708ff"))))
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d84e5f44010203044405060708ff")))))
+  (testing "the definite form is unaffected"
+    (is (not= :boring/bad-tag-content (err-type #(dec-hex "d843480102030405060708"))))))
+
+(deftest tag-32-content-is-checked-as-a-uri-not-only-as-a-scheme
+  (testing "checking the scheme alone left characters RFC 3986 has no
+            production for accepted on ClojureScript and rejected on the JVM"
+    (doseq [u ["a b" "a|b" "%zz"]]
+      (is (= :boring/bad-tag-content (err-type #(dec-hex (tag32-hex u)))) u)))
+  (testing "and both absolute and relative references still decode"
+    (doseq [u ["http://a.b" "/a/b" "ab"]]
+      (is (not= :boring/bad-tag-content (err-type #(dec-hex (tag32-hex u)))) u))))
+
+(deftest structural-tags-cannot-be-given-a-reader
+  (testing "stringref is resolved while the value is BUILT, not at tag
+            dispatch, so a reader registered for it applied to a bare 25(0) and
+            was silently ignored for the same reference inside a tag-39
+            identifier -- one registration meaning two things"
+    (doseq [t [25 256]]
+      (is (= :boring/bad-tag-number
+             (err-type #(boring/register-tag (boring/tag-registry) t nil nil identity)))
+          (str "tag " t))))
+  (testing "and a tag number that no document can carry is refused rather than
+            registered dead"
+    (doseq [t [-1 1.5]]
+      (is (= :boring/bad-tag-number
+             (err-type #(boring/register-tag (boring/tag-registry) t nil nil identity)))
+          (str "tag " t)))))

@@ -115,15 +115,17 @@ five.** The old table's worst case was an array of *empty* arrays, which is
 cheap precisely because empty collections return shared singletons — it had been
 64× until that fix. Empty containers are the best case, not the worst.
 
-The last row is the worst case and the reason the paragraph below is stated the
-way it is: a typed array is 1.0× only while it stays a typed array. Wrap the
-same bytes in tag 40 and declare dimensions over them and it becomes one host
-object per element — same payload, 149× the heap. That row is now bounded by
-`:max-items`, which is charged before the reconstruction is allocated.
+The `long[]` row is 1.0× only while the values fit a `long`. The same tag over
+values above 2^63 has no lossless primitive form and becomes a vector of boxed
+integers — **12.5×**, measured. Tag 64 (uint8) is **2.08×** whatever its values,
+because Java has no unsigned byte and it widens to `short[]`. And wrapping any
+of them in tag 40 with dimensions over them makes one host object per element —
+149×. The tag-40 and boxed rows are now charged against `:max-items`; the
+widening one cannot be, since it is a single object.
 
-Read the shape of the table rather than any single number. **Bulk payloads do
-not amplify at all — as long as they stay bulk**: a megabyte byte string or
-typed array decodes to a megabyte. What amplifies is OBJECT COUNT — a one-byte container head that
+Read the shape of the table rather than any single number. **A bulk payload does
+not amplify while it stays bulk**: a megabyte byte string decodes to a megabyte.
+What amplifies is OBJECT COUNT — a one-byte container head that
 becomes a `PersistentVector` with a header, an array and slots is the worst
 per-byte case there is. So amplification tracks how many objects a document
 asks for, not how many bytes it occupies.
@@ -145,13 +147,20 @@ else bounded the TOTAL, so a document within the size and depth limits could
 still amplify past anything documented. Set it from the table above — items are
 a good proxy for objects, and objects are what cost.
 
-It charges what the decoder **builds**, not only what it reads. That distinction
-had teeth: a tag-40 multi-dimensional array arrives as one byte string and is
-then expanded into one host object per element, none of which passes through the
-item reader. A 500,018-byte document declaring dimensions `[500000, 1, 1]` built
-**71 MB** of nested vectors — 149× — with `{:max-items 100}` set and honoured.
-The element count is now charged before the reconstruction is allocated, so the
-budget refuses instead of building.
+It counts **objects the decoder builds**, not only items it reads. That
+distinction had teeth twice. A tag-40 multi-dimensional array arrives as one
+byte string and is expanded into one host object per element, none of which
+passes through the item reader: dimensions `[500000, 1, 1]` built **71 MB** of
+nested vectors from 500,018 bytes — 149× — with `{:max-items 100}` set. A uint64
+typed array whose values exceed 2^63 has no lossless `long`, so it becomes a
+vector of boxed integers: 1 MB of `0xff` under tag 67 retained **11 MB**, 12.5×.
+Both are charged before the reconstruction is allocated.
+
+**It bounds object count, not bytes**, and one case is worth naming because it
+looks like the same thing and is not: tag 64 (uint8) decodes to a `short[]`,
+because Java has no unsigned byte. 4 MB in becomes 8 MB held — 2.08× — in a
+*single* object, which no item budget can see. Typed arrays are bounded by your
+transport size limit, not by `:max-items`.
 
 **The budget is PER TOP-LEVEL ITEM**, and per positional read in `boring.nav`.
 It is not a budget for a whole file. That is deliberate and matches what the

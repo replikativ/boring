@@ -235,20 +235,32 @@ critical, at most one scaled-fraction key, unsigned fraction, nothing finer than
 a nanosecond) even though it hands back the map unconverted, and RFC 8943's
 full-date grammar for tag 1004.
 
-That claim has been tested against, so it is worth saying what it does and does
-not cover. It means the two platforms **accept and reject the same documents**.
-It does not mean they build the same value from them — the whole point of these
-rows is that they cannot.
+That claim has been tested against — twice, adversarially — so it is worth
+saying what it does and does not cover. The intent is that the two platforms
+**accept and reject the same documents**, and it does not mean they build the
+same value from them; the whole point of these rows is that they cannot.
+
+Treat it as a goal the suite enforces for the shapes it covers, not as a proved
+invariant. Two rounds of audit found sixteen shapes where it did not hold, all
+now closed and pinned. One known exception survives, below.
 
 Residuals, all of them platform limits rather than decisions:
 
 - JavaScript has one number type, so `{1: 5.0, -9: 1}` is indistinguishable from
   `{1: 5, -9: 1}` in ClojureScript and only the JVM refuses the float base. A
   base with an actual fractional part is caught on both.
-- A tag-0 fraction longer than **three digits** is truncated to milliseconds on
-  ClojureScript, because that is what a `js/Date` holds. Both platforms refuse
-  more than nine digits, so they agree on which documents are legal; they
-  disagree on how much of a legal one survives. A JVM `Instant` keeps all nine.
+- A tag-0 fraction longer than **three digits** is truncated to milliseconds —
+  **on both platforms by default**, not only on ClojureScript. `js/Date` and
+  `java.util.Date` both hold milliseconds, and `:instant-type` defaults to
+  `:date`. `0("2020-01-01T00:00:00.123456789Z")` decodes to `.123` and
+  *re-encodes as a different document* on either side. `{:instant-type
+  :instant}` keeps all nine digits on the JVM; ClojureScript has no equivalent.
+  Both refuse more than nine digits, so they agree on which documents are legal.
+- **Tag 1's accepted epoch range differs**, and this is the one known place the
+  two platforms disagree about legality. A `js/Date` spans ±8.64e12 seconds; a
+  `java.time.Instant` spans ±3.1e16. An epoch second between those bounds — say
+  `1(1e13)` — decodes to a year-318205 instant on the JVM and is refused on
+  ClojureScript. Neither is wrong about CBOR; the hosts simply differ.
 - Tag 40 accepts a payload written under any of the 21 typed-array tags the JVM
   reads, and only the 5 ClojureScript reads. The same asymmetry as the row
   below, reached through a different tag.

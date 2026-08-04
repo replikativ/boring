@@ -470,8 +470,23 @@
 
     (def registry
       (-> (boring/tag-registry)
-          (boring/register-tag 40001 js/URL #(.-href %) #(js/URL. %))))"
+          (boring/register-tag 40001 js/URL #(.-href %) #(js/URL. %))))
+
+  The tag number is validated, as it is on the JVM. It used to be taken as a
+  map key and never looked at, so `-1` and `1.5` were accepted here and refused
+  there — and a reader registered under a tag number no document can carry is
+  silently dead rather than wrong, which is the harder kind to notice."
   [reg tag type write-fn read-fn]
+  (when-not (and (number? tag) (js/Number.isSafeInteger tag) (not (neg? tag)))
+    (throw (ex-info (str "boring: tag numbers are unsigned integers; got " (pr-str tag))
+                    {:type :boring/bad-tag-number :tag tag})))
+  ;; Structural, not semantic -- see TagRegistry.checkTag on the JVM. Stringref
+  ;; is resolved while the value is built, not at tag dispatch, so a reader
+  ;; registered here would apply in some positions and not others.
+  (when (or (== tag 25) (== tag 256))
+    (throw (ex-info (str "boring: tag " tag " is structural (stringref) and cannot be"
+                         " given a reader. Use :stringref false to turn it off.")
+                    {:type :boring/bad-tag-number :tag tag})))
   (cond-> reg
     (and type write-fn) (assoc-in [:writers type] {:tag tag :fn write-fn})
     read-fn (assoc-in [:readers tag] read-fn)))
