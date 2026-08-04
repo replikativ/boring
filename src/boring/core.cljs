@@ -92,10 +92,28 @@
   w)
 
 (defn encode
+  "Encode `v` to a fresh Uint8Array: ONE CBOR data item, and never anything
+  else.
+
+  This is the interchange primitive. The bytes are `application/cbor`, any CBOR
+  reader in any language consumes them whole -- including boring on the JVM,
+  which is the point of having both -- and nothing is appended.
+
+  If you are storing rather than sending, `write-seq!` writes many values as a
+  CBOR sequence (RFC 8742) and `encode-indexed` seals a navigable index onto
+  one large value. Neither is a better `encode`; they produce a different
+  artifact, and `:index` is not an option here because it would change what the
+  return value IS -- one item becomes a sequence."
   ([v] (encode v nil))
   ([v opts] (wr/to-bytes (write-root! (wr/writer 256) v (resolve-opts opts)))))
 
 (defn encode-into!
+  "Encode `v` using the reusable writer `w`, returning a Uint8Array. Reusing
+  `w` avoids reallocating the buffer and the stringref table between calls.
+
+  Still allocates the returned array -- `to-bytes` is a `.slice`, which copies.
+  For a loop that allocates nothing per message use `encode-buffered!` with
+  `buffer`, and read the hazard documented there before you do."
   ([w v] (wr/to-bytes (write-root! w v (writer-opts w))))
   ([w v opts] (wr/to-bytes (write-root! w v (resolve-opts opts)))))
 
@@ -105,7 +123,25 @@
   ([w v] (wr/position (write-root! w v (writer-opts w))))
   ([w v opts] (wr/position (write-root! w v (resolve-opts opts)))))
 
-(defn buffer [w] (wr/buffer w))
+(defn buffer
+  "The writer's internal buffer. Valid bytes are [0, count) where `count` is
+  what `encode-buffered!` returned.
+
+  **This array must not outlive the call, and must not cross an async
+  boundary.** It is the writer's live Uint8Array, not a copy: the next encode
+  overwrites it in place. Hand it to a promise, a `setTimeout`, a WebSocket
+  send that queues, or an IndexedDB `put`, while the calling code loops on the
+  same writer, and the bytes change underneath the pending operation -- no
+  exception anywhere, just a bad blob and nothing to point at. `write-seq!`'s
+  docstring tells the same story from the other side: it used to hand `sink` a
+  `.subarray` of this buffer, and a sink that retained it saw every item
+  overwritten by the next.
+
+  There is no thread to cross here, which is the one way this is gentler than
+  the JVM sibling. Asynchrony alone is enough.
+
+  If the bytes outlive the call, use `encode-into!`, which copies."
+  [w] (wr/buffer w))
 
 (defn- bytes!
   "The input, or a typed error -- see the JVM `bytes!`. A nil reached the reader
@@ -155,6 +191,26 @@
   r)
 
 (defn decode
+  "Decode the first CBOR item in `bs`, a Uint8Array.
+
+  Errors are `ex-info` carrying a `:type` keyword -- `:boring/truncated-input`,
+  `:boring/invalid-utf8`, `:boring/bad-count`, `:boring/max-depth-exceeded`,
+  `:boring/duplicate-map-key`, `:boring/unregistered-tag`, and so on. The same
+  keywords as the JVM, because a `.cljc` codebase dispatches on them on both
+  platforms; doc/SECURITY.md tabulates them.
+
+  `:tolerate-unknown-tags` (default true) makes an unregistered tag surface as
+  a `boring.data/TaggedValue`; false makes it an error, which is the
+  closed-reader behaviour datahike's dump requirements ask for.
+
+  Options are validated by the SHARED `boring.options` spec, so a typo is
+  refused here exactly as it is on the JVM. `:auto-construct-records?` is the
+  one that is refused for being JVM-only rather than for being wrong: advanced
+  compilation minifies constructor names and there is no runtime `resolve`, so
+  it throws `:boring/unsupported-option` rather than quietly handing a browser
+  `UnknownRecord`s where the server got records. Use `register-record` with an
+  explicit constructor, or `boring.records/auto-registry`, both of which are
+  portable."
   ([bs] (decode bs nil))
   ([bs opts] (rd/read! (configure-reader! (rd/reader (bytes! bs "decode"))
                                           (opt/check-opts opts)))))
