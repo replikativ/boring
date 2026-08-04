@@ -717,7 +717,10 @@ public final class Writer {
         if (borrowed)
             throw Err.of("bad-argument",
                 "boring: trim() would replace a buffer that encode-buffered! has"
-                + " lent out; read the bytes (or call reset) first");
+                + " lent out. Copy them out first -- encode-into!,"
+                + " write-to! or write-to-buffer! all end the borrow -- or"
+                + " encode anything else on this writer, which starts a new"
+                + " one");
         long freed = buf.length - initialSize;
         if (freed > 0) { buf = new byte[initialSize]; pos = 0; }
         if (srKeys.length > 16) initSymtab(16);

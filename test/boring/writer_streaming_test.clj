@@ -357,3 +357,42 @@
         (boring/encode-buffered! w (vec (range 500)))
         (boring/encode-into! w {:a 1})
         (is (pos? (boring/trim! w)) "and after a later encode ends the borrow")))))
+
+(deftest all-three-readers-agree-on-concatenated-sealed-files
+  (testing "Two files `write-seq!` wrote, appended. The trailing frame's
+            back-pointer is relative to the SECOND file, so it is stale for the
+            concatenation: `decode-seq` and `nav/items` both publish it as
+            data. `decode-seq-from` deleted it -- 123, 123, 122 on the same
+            bytes -- because it passed -1 as the item's offset, and
+            `index-frame?` treats -1 as \"the caller cannot supply one\" and
+            skips the back-pointer test, which is the only check that tells a
+            frame describing THIS file from one carried in from another.
+
+            A stream has no random access, but it does know how many bytes it
+            has consumed. That is the offset."
+    (let [o {:stringref false}
+          seal (fn [vs] (let [w (boring/writer 65536 o)
+                              out (java.io.ByteArrayOutputStream.)]
+                          (boring/write-seq! w vs out (merge o {:index 16}))
+                          (.toByteArray out)))
+          a (seal (vec (for [i (range 60)] {:id i})))
+          b (seal (vec (for [i (range 61)] {:id i :x "y"})))
+          cat (byte-array (concat (seq a) (seq b)))
+          from (fn [^bytes bs opts]
+                 (count (boring/decode-seq-from
+                         (java.io.ByteArrayInputStream. bs) opts)))]
+      (testing "the control: a single sealed file still has its frame
+                recognised, at every chunk size -- otherwise this could pass by
+                the streaming reader simply never recognising a frame again"
+        (doseq [n [0 1 60 500]]
+          (let [bs (seal (vec (for [i (range n)] {:id i})))]
+            (is (= n (count (boring/decode-seq bs o))) (str n " decode-seq"))
+            (is (= n (from bs o)) (str n " decode-seq-from"))
+            (is (= n (from bs (assoc o :chunk-size 64)))
+                (str n " decode-seq-from, frame split across refills")))))
+      (testing "and on the concatenation all three agree"
+        (let [want (count (boring/decode-seq cat o))]
+          (is (= 123 want) "both frames are data here: neither describes this file")
+          (is (= want (count (nav/items cat o))))
+          (is (= want (from cat o)))
+          (is (= want (from cat (assoc o :chunk-size 64)))))))))

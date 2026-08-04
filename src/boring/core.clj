@@ -453,10 +453,17 @@
   (^long [^Writer w v ^ByteBuffer bb]
    (let [n (encode-buffered! w v)]
      (.put bb ^bytes (.buffer w) 0 (int n))
+     (set! (.-borrowed w) false)          ; copied out -- see the 4-arity
      n))
   (^long [^Writer w v ^ByteBuffer bb opts]
    (let [n (encode-buffered! w v opts)]
      (.put bb ^bytes (.buffer w) 0 (int n))
+     ;; The bytes are IN THE CALLER'S BUFFER now, so the borrow
+     ;; `encode-buffered!` records is over. Left set, it made `trim!`
+     ;; permanently unreachable after the documented allocation-free loop --
+     ;; a guard against silent corruption turning into a guard against the
+     ;; feature it was protecting.
+     (set! (.-borrowed w) false)
      n)))
 
 (defn ^:no-doc configure-reader!
@@ -1372,7 +1379,8 @@
          ;; rather than the only one that validates it.
          chunk (int (get opts :chunk-size 65536))
          r     (Reader. (byte-array 0))
-         state (volatile! {:buf (byte-array chunk) :limit 0 :last-good 0 :eof? false})]
+         state (volatile! {:buf (byte-array chunk) :limit 0 :last-good 0 :base 0
+                           :eof? false})]
      (configure-reader! r o)
      ;; `last-good` is the offset just past the last COMPLETE item, not the
      ;; reader's current position. A failed read leaves the position somewhere
@@ -1381,7 +1389,7 @@
      ;; would compact a negative number of bytes. Rewind to the last item.
      (letfn [(refill!
                []
-               (let [{:keys [^bytes buf ^long limit ^long last-good eof?]} @state
+               (let [{:keys [^bytes buf ^long limit ^long last-good eof? ^long base]} @state
                      rest-len (- limit last-good)
                      _ (when (pos? last-good)
                          (System/arraycopy buf last-good buf 0 rest-len))
@@ -1393,14 +1401,32 @@
                          -1
                          (.read in buf (int rest-len) (int (- (alength buf) rest-len))))
                      new-limit (if (pos? n) (+ rest-len n) rest-len)]
+                 ;; `base` is how many bytes were discarded by earlier
+                 ;; compactions, so `base + last-good` is a position in the
+                 ;; FILE rather than in the current buffer. Without it the
+                 ;; streaming reader had no absolute offset at all, so it
+                 ;; passed -1 to `index-frame?` -- which by construction skips
+                 ;; the back-pointer test. Concatenate two sealed files and the
+                 ;; trailing frame's pointer is relative to the second one, so
+                 ;; it is stale for the whole; `decode-seq` and `nav` both
+                 ;; publish it as data, and this reader silently deleted it.
+                 ;; 123, 123, 122 on the same bytes.
                  (vreset! state {:buf buf :limit new-limit :last-good 0
+                                 :base (+ base last-good)
                                  :eof? (or eof? (neg? n))})
                  (.reset r (java.util.Arrays/copyOf buf (int new-limit)))
                  (pos? n)))
              (step []
                (lazy-seq
                 (if-not (.atEnd r)
-                  (let [v (try
+                  (let [;; CAPTURED BEFORE THE READ. `last-good` is advanced to
+                        ;; the position AFTER the item in the `:ok` branch
+                        ;; below, and the frame test runs after that -- so
+                        ;; reading it there gives the frame's END, and the
+                        ;; back-pointer comparison failed on every genuine
+                        ;; sealed file. 60 items came back 61.
+                        item-start (+ (long (:base @state)) (long (:last-good @state)))
+                        v (try
                             ;; The boundary goes around the READ and nothing
                             ;; else, so the retry logic below sees typed errors
                             ;; and dispatches on `:type` exactly as it does for
@@ -1475,7 +1501,15 @@
                           ;; stream too, not just the buffer -- `.atEnd` only
                           ;; means the current chunk is exhausted, so a refill
                           ;; that succeeds proves the frame was not last.
-                          (if (and (frame/index-frame? (:ok v) -1) (.atEnd r) (not (refill!)))
+                          ;; THE ITEM'S OWN FILE OFFSET, not -1. `index-frame?`
+                          ;; treats -1 as "the caller cannot supply one" and
+                          ;; skips the back-pointer test entirely -- the only
+                          ;; check that tells a frame describing THIS file from
+                          ;; one carried in from another. `base + last-good` is
+                          ;; that offset; `last-good` was captured before this
+                          ;; item was read, so it is where the item starts.
+                          (if (and (frame/index-frame? (:ok v) item-start)
+                                   (.atEnd r) (not (refill!)))
                             nil
                             (cons (:ok v) (step))))
                       (refill!) (step)
