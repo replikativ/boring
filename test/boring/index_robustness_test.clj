@@ -1240,3 +1240,31 @@
       (is (= (inc (count vs)) (count (reader-loop clean)))
           "and a bare Reader sees one MORE item -- the frame -- which is what
            makes `decode-seq` a real second opinion rather than the same code"))))
+
+(deftest a-sequence-node-claiming-no-items-must-be-backed-by-no-data
+  (testing "A node with zero items has zero anchors, so the far-end check
+            short-circuits before it looks at the data at all -- and `count`
+            then returned 0 and `nth` nil over a file holding all 60 of its
+            records. Present in the file, returned by `decode-seq`, unreachable
+            through the index. Zero items is only honest when the data section
+            is empty, which is one comparison."
+    (let [vs (vec (for [i (range 60)] {:id i}))
+          w (boring/writer 65536 opts)
+          out (ByteArrayOutputStream.)]
+      (doseq [v vs] (boring/write-to! w v out))
+      (let [dl (.size out)]
+        (boring/write-to! w (boring.data/unknown-record
+                             boring/index-name
+                             [16 (int-array [-1]) (int-array [0]) [(byte-array 0)] [false]
+                              (byte-array (map unchecked-byte
+                                               [0 0 0 0 0 0 (bit-shift-right dl 8)
+                                                (bit-and dl 0xff)]))])
+                          out)
+        (let [bs (.toByteArray out)]
+          (is (= 60 (count (boring/decode-seq bs opts)))
+              "the control: the records really are all there")
+          (is (= 60 (count (nav/items bs opts)))
+              "so `count` must not believe a total of zero")
+          (is (= vs (mapv nav/value (nav/items bs opts)))))))
+    (testing "and the genuinely empty sealed sequence still reads as empty"
+      (is (= 0 (count (nav/items (seal [] opts) opts)))))))

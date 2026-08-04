@@ -831,7 +831,17 @@
                             ;; section's end for the sequence, the container's
                             ;; own end otherwise.
                             (let [m (alength a)]
-                              (or (zero? m)
+                              (or (if (neg? c)
+                                    ;; A SEQUENCE NODE CLAIMING ZERO ITEMS has
+                                    ;; no anchors, so the far-end check below
+                                    ;; short-circuits and never looks at the
+                                    ;; data -- and `count` then returned 0 and
+                                    ;; `nth` nil over a file holding all 60 of
+                                    ;; its records. Zero items is only honest
+                                    ;; if the data section is empty, which is
+                                    ;; one comparison.
+                                    (and (zero? m) (zero? ptr))
+                                    (zero? m))
                                   (let [covered (* st (dec m))
                                         remaining (- cnt covered)
                                         per (if (and (not (neg? c)) (= MAJOR-MAP (.majorAt r c)))
