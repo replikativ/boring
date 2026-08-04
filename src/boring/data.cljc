@@ -174,6 +174,22 @@
        (-pr-writer [_ w _] (-write w (str "#boring/record [" rtype " " (pr-str rfields) "]")))]))
 
 (defn unknown-record
+  "A tag-27 frame carrying a wire type name and a FIELD MAP.
+
+  `fields` is a map. That is the contract, not an accident of the constructor
+  being permissive: a record is a named product of fields, tag 27 is CBOR's
+  \"serialised language-independent object with type name and constructor
+  arguments\", and the reader reconstructs one by looking the name up and
+  handing it the map.
+
+  A non-map payload encodes and decodes as valid CBOR, but it comes back a
+  tagged literal rather than an `UnknownRecord` -- so
+  `(= v (decode (encode v)))` is false for it. The bytes are stable and
+  nothing is lost from the wire; what does not survive is the claim that this
+  was a record, because with no field map it was not one. boring's own index
+  frame is the exception that proves the rule: its payload is an array, it is
+  read by `boring.frame` rather than by the record path, and it is deliberately
+  not reconstructed as a record."
   ([type fields] (UnknownRecord. type fields nil))
   ([type fields m] (UnknownRecord. type fields m)))
 
