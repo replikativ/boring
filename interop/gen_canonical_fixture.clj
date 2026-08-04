@@ -55,7 +55,27 @@
   before writing it, so a wrong spec fails here rather than weakening the gate.
 
   Run: clojure -Sdeps '{:paths [\"src\" \"interop\" \"target/classes\"]}' \\
-         -M -m gen-canonical-fixture"
+         -M -m gen-canonical-fixture
+
+  THE OUTPUT IS COMMITTED, and has to be REGENERATED AND COMMITTED whenever
+  boring's canonical bytes change. `bin/ci` regenerates before it checks --
+  deliberately, so the gate can fail on a boring regression rather than on a
+  frozen snapshot of one -- and the cost of that choice is that NO GATE READS
+  THE COMMITTED COPY, so nothing can tell you it has gone stale.
+
+  It had. The committed fixture carried an expected-7049 column holding
+  BYTEWISE bytes with an empty expected-8949 (\"identical to 7049\") beside it
+  -- the shape this generator produced before `:canonical` and
+  `:canonical-rfc7049` became separate profiles -- in 462 of the 989 rows.
+  A clean checkout running the command in `test_canonical_bytes.py`'s own
+  docstring was told boring disagreed with cbor2 on 924 of 989 cases, and
+  `interop/rust` on 462 of 987. Those two commands are the evidence README's
+  \"asserted byte-for-byte identical to cbor2's own\" offers a reader, so the
+  committed artifact is published evidence even though it is not the gate.
+
+  The output is deterministic -- two runs against the same library produce
+  byte-identical files -- so a non-empty `git status --short interop/` after
+  running this means the encoding moved, not that the generator is noisy."
   (:require [boring.core :as boring])
   (:import (java.util Arrays)))
 
