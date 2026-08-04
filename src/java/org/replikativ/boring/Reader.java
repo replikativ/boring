@@ -180,7 +180,19 @@ public final class Reader {
             "\\d{4}-\\d{2}-\\d{2}[Tt]"
             + "(?:[01]\\d|2[0-3]):[0-5]\\d:(?:[0-5]\\d|60)"
             + "(?:\\.\\d{1,9})?"
-            + "(?:[Zz]|[+-](?:[01]\\d|2[0-3]):[0-5]\\d)");
+            + "(?:[Zz]|[+-](?:0\\d|1[0-8]):[0-5]\\d)");
+
+    /**
+     * RFC 3339 5.6 `full-date`, for tag 1004.
+     *
+     * `LocalDate.parse` is a java.time parser and accepts java.time's expanded
+     * years, so `1004("+10000-01-01")` decoded to a LocalDate here and was
+     * refused on ClojureScript. The same defect tag 0 had, in the tag next to
+     * it, missed because a reproducer used an 11-byte length header for a
+     * 12-character string and so tested a truncated string instead.
+     */
+    private static final java.util.regex.Pattern RFC3339_DATE =
+        java.util.regex.Pattern.compile("\\d{4}-\\d{2}-\\d{2}");
 
     /** `:60` in the seconds field -- valid RFC 3339, unrepresentable as an Instant. */
     private static boolean isLeapSecond(String v) {
@@ -2795,6 +2807,10 @@ public final class Reader {
                 if (!(v instanceof String))
                     throw Err.of("bad-tag-content",
                                  "boring: tag 1004 must wrap an RFC 3339 full-date string",
+                                 "tag", 1004L);
+                if (!RFC3339_DATE.matcher((String) v).matches())
+                    throw Err.of("bad-tag-content",
+                                 "boring: tag 1004 content is not a full-date: " + v,
                                  "tag", 1004L);
                 try {
                     java.time.LocalDate d = java.time.LocalDate.parse((String) v);

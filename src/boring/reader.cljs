@@ -673,6 +673,24 @@
                 (.-message e) ")")
            {:tag 27}))))
 
+(defn- real-date?
+  "Whether the leading `YYYY-MM-DD` of `s` is a date that exists.
+
+  Built from the fields and read back, which is the only way to ask JavaScript:
+  `js/Date` has no invalid-day error, it rolls February 30th forward to March
+  1st. `setUTCFullYear` rather than `Date.UTC`, because the latter maps years
+  0-99 into the 1900s and would call `0050-01-01` a different date than the one
+  it was handed."
+  [s]
+  (let [y (js/parseInt (subs s 0 4) 10)
+        m (js/parseInt (subs s 5 7) 10)
+        d (js/parseInt (subs s 8 10) 10)
+        dt (js/Date. 0)]
+    (.setUTCFullYear dt y (dec m) d)
+    (and (== y (.getUTCFullYear dt))
+         (== m (inc (.getUTCMonth dt)))
+         (== d (.getUTCDate dt)))))
+
 (defn- leap-second?
   "`:60` in the seconds field -- valid RFC 3339 (5.6), representable by neither
   platform.
@@ -1144,7 +1162,7 @@
         ;; character. `\d{2}` accepted hour 24, which RFC 3339 5.6 caps at 23
         ;; and which `js/Date` silently ROLLED FORWARD to the next day -- a
         ;; wrong value out of an invalid document, on both platforms.
-        (when-not (re-matches #"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d{1,9})?([Zz]|[+-]([01]\d|2[0-3]):[0-5]\d)" s)
+        (when-not (re-matches #"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d{1,9})?([Zz]|[+-](0\d|1[0-8]):[0-5]\d)" s)
           (err :boring/bad-tag-content
                (str "boring: tag 0 content is not a valid RFC 3339 instant: " s)
                {:tag 0 :value s}))
@@ -1161,6 +1179,23 @@
         ;; day, hour or minute legal. The check is the ordinary parser on a copy
         ;; with `:60` replaced by `:59`; if that fails, control falls through to
         ;; the normal path, which reports the malformed date.
+        ;; THE CALENDAR, CHECKED BEFORE ANYTHING ELSE RETURNS.
+        ;;
+        ;; This lived below, gated on a trailing `Z`, and after the leap-second
+        ;; branch had already returned -- so it caught exactly one of the three
+        ;; ways an impossible day arrives. `0("2020-02-30T00:00:00+00:00")` still
+        ;; decoded to 2020-03-01 and re-encoded a DIFFERENT DOCUMENT, and
+        ;; `0("2020-02-30T23:59:60Z")` was preserved as an inert leap second
+        ;; without the day ever being looked at.
+        ;;
+        ;; Checked on the FIELDS, not by rendering the parsed instant: a non-UTC
+        ;; offset legitimately shifts the rendered day, which is what forced the
+        ;; `Z` gate in the first place. Year, month and day are what the grammar
+        ;; above already isolated, so ask whether that triple is a real date.
+        (when-not (real-date? s)
+          (err :boring/bad-tag-content
+               (str "boring: tag 0 content is not a real calendar date: " s)
+               {:tag 0 :value s}))
         (if (and (leap-second? s)
                  (not (js/isNaN (.getTime (js/Date. (.replace s ":60" ":59"))))))
           (data/tagged-value 0 s)
@@ -1168,22 +1203,6 @@
             (when (js/isNaN (.getTime d))
               (err :boring/bad-tag-content
                    (str "boring: tag 0 content is not a valid RFC 3339 instant: " s)
-                   {:tag 0 :value s}))
-            ;; THE CALENDAR IS CHECKED, not just the grammar. `js/Date` does not
-            ;; reject an impossible day -- it ROLLS IT FORWARD -- so
-            ;; `0("2020-02-30T00:00:00Z")` decoded to 2020-03-01 and re-encoded
-            ;; a DIFFERENT DOCUMENT than the one that arrived, while the JVM
-            ;; rejected it outright. `2019-02-29` did the same.
-            ;;
-            ;; The test is that the parsed instant renders back to the date it
-            ;; was given: a rolled-over date cannot, because it is a different
-            ;; day. Compared on the date only, so a non-UTC offset -- which
-            ;; legitimately shifts the rendered day -- is not caught by it; the
-            ;; grammar above has already bounded every field.
-            (when (and (or (= "Z" (subs s (dec (count s)))) (= "z" (subs s (dec (count s)))))
-                       (not= (subs s 0 10) (subs (.toISOString d) 0 10)))
-              (err :boring/bad-tag-content
-                   (str "boring: tag 0 content is not a real calendar date: " s)
                    {:tag 0 :value s}))
             d)))
     1 (let [v0 (read! r)

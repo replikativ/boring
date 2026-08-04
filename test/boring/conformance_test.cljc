@@ -2382,3 +2382,58 @@
       (is (= :boring/bad-tag-number
              (err-type #(boring/register-tag (boring/tag-registry) t nil nil identity)))
           (str "tag " t)))))
+
+;; ------------------------------------------------- fourth semantic re-audit
+
+(defn- tag1004-hex [d]
+  (str "d903ec" (hex-byte (+ 0x60 (count d)))
+       (apply str (map #(hex-byte #?(:clj (int %) :cljs (.charCodeAt % 0))) d))))
+
+(deftest an-impossible-day-is-refused-however-it-is-written
+  (testing "the calendar check ran below the leap-second return and only for a
+            trailing Z, so it caught one of the three ways an impossible day
+            arrives: with an offset it still decoded to the following day and
+            re-encoded a DIFFERENT document, and with :60 seconds it was
+            preserved without the day being looked at"
+    (doseq [s ["2020-02-30T00:00:00Z"
+               "2020-02-30T00:00:00+00:00"
+               "2020-02-30T23:59:60Z"
+               "2019-02-29T00:00:00Z"]]
+      (is (= :boring/bad-tag-content (err-type #(boring/decode (tag0-bytes s)))) s)))
+  (testing "and real dates -- including a leap day, a leap second, and a year
+            below 100, which Date.UTC would have mapped into the 1900s -- still
+            decode on both platforms"
+    (doseq [s ["2020-02-29T00:00:00Z" "2020-01-01T23:59:60Z"
+               "0050-01-01T00:00:00Z" "2020-01-01T00:00:00-00:00"]]
+      (is (not= :boring/bad-tag-content (err-type #(boring/decode (tag0-bytes s)))) s))))
+
+(deftest rfc-3339-offsets-agree-across-platforms
+  (testing "the shared grammar allowed offsets to +-23:59, which RFC 3339 does
+            permit and java.time.ZoneOffset does not hold -- so 125 documents
+            decoded on ClojureScript and were refused on the JVM. Both now stop
+            at the +-18:00 java.time can represent"
+    (is (= :boring/bad-tag-content
+           (err-type #(boring/decode (tag0-bytes "2020-01-01T00:00:00+23:00")))))
+    (is (not= :boring/bad-tag-content
+              (err-type #(boring/decode (tag0-bytes "2020-01-01T00:00:00+18:00")))))))
+
+(deftest tag-1004-uses-the-rfc-3339-grammar-not-the-host-parser
+  (testing "`LocalDate.parse` accepts java.time's expanded years, so
+            1004(\"+10000-01-01\") decoded on the JVM and was refused on
+            ClojureScript -- the same defect tag 0 had, in the tag beside it"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex (tag1004-hex "+10000-01-01")))))
+    (is (not= :boring/bad-tag-content (err-type #(dec-hex (tag1004-hex "2020-01-01")))))))
+
+#?(:clj
+   (deftest max-depth-is-validated-like-max-items
+     (testing ":max-depth went straight through `int`: 1.5 truncated to 1, -1
+               and 0 disabled the nesting bound outright, and a string escaped
+               untyped -- from the option parser for a documented safety control
+               whose sibling :max-items was already correct"
+       (doseq [v [-1 0 1.5 "x"]]
+         (is (= :boring/bad-option
+                (err-type #(boring/decode (c/hex->bytes "01") {:max-depth v})))
+             (pr-str v))))
+     (testing "and a legal one still applies"
+       (is (= :boring/max-depth-exceeded
+              (err-type #(boring/decode (c/hex->bytes "81818101") {:max-depth 2})))))))

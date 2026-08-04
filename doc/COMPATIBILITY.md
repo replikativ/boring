@@ -240,9 +240,21 @@ saying what it does and does not cover. The intent is that the two platforms
 **accept and reject the same documents**, and it does not mean they build the
 same value from them; the whole point of these rows is that they cannot.
 
-Treat it as a goal the suite enforces for the shapes it covers, not as a proved
-invariant. Two rounds of audit found sixteen shapes where it did not hold, all
-now closed and pinned. One known exception survives, below.
+Treat it as a goal the suite enforces for the shapes it covers, **not as a
+proved invariant**. Three rounds of adversarial audit found it broken each time
+— most recently 198 documents across six classes, three of which the commit
+before had claimed to close. Each round's cases are now pinned by tests. Assume
+the next round would find more, and do not build a security property on this
+sentence.
+
+Two deliberate exceptions are named below: tag 1's epoch range, and RFC 3339
+offsets beyond ±18:00.
+
+**Offsets beyond ±18:00 are refused on both platforms**, though RFC 3339 §5.6
+permits up to ±23:59. `java.time.ZoneOffset` stops at ±18:00, so honouring the
+full range would mean a document a browser accepts and a server rejects. Every
+real-world offset is within ±14:00. This refuses conforming input, deliberately,
+in exchange for the two platforms agreeing.
 
 Residuals, all of them platform limits rather than decisions:
 

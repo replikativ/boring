@@ -228,6 +228,22 @@
     :else (throw (ex-info "boring: :encode-fallback must be nil, :placeholder, or a function"
                           {:type :boring/bad-option :value fb}))))
 
+(defn- max-depth-opt
+  "`:max-depth`, validated, exactly as its sibling `:max-items` is.
+
+  It went straight through `int`, so `1.5` truncated to 1, `-1` disabled the
+  nesting bound entirely (the reader tests `depth > maxDepth`), and a bignum or
+  a string escaped as a raw host exception -- four untyped failures out of the
+  option parser for a documented safety control, while the control next to it
+  was correct."
+  ^long [opts]
+  (let [v (get opts :max-depth 1024)]
+    (when-not (and (integer? v) (pos? v) (<= v Integer/MAX_VALUE))
+      (throw (ex-info (str "boring: :max-depth must be a positive integer no greater "
+                           "than " Integer/MAX_VALUE ", got " (pr-str v))
+                      {:type :boring/bad-option :option :max-depth :value v})))
+    (long v)))
+
 (defn- configure!
   ^Writer [^Writer w opts]
   (set! (.-stringref w) (boolean (:stringref opts)))
@@ -238,7 +254,7 @@
   (set! (.-shapes w) (boolean (:shapes opts)))
   (set! (.-permitReservedSimpleValues w)
         (boolean (:permit-reserved-simple-values opts)))
-  (set! (.-maxDepth w) (int (get opts :max-depth 1024)))
+  (set! (.-maxDepth w) (int (max-depth-opt opts)))
   (set! (.-encodeFallback w) (encode-fallback-fn (:encode-fallback opts)))
   ;; ALWAYS set, never `when-let`. A reusable writer kept the previous call's
   ;; registry: after one `encode-into!` with a custom registry, the next call
@@ -588,7 +604,7 @@
   (set! (.-tolerateUnknownTags r) (boolean (get opts :tolerate-unknown-tags true)))
   (set! (.-instantAsDate r) (not= :instant (get opts :instant-type :date)))
   (set! (.-fullDateAsSqlDate r) (= :sql-date (get opts :date-type :local-date)))
-  (set! (.-maxDepth r) (int (get opts :max-depth 1024)))
+  (set! (.-maxDepth r) (int (max-depth-opt opts)))
   ;; 0 = unlimited, which is the default. See Reader.maxItems for why the budget
   ;; counts ITEMS rather than bytes.
   (set! (.-maxItems r) (max-items-opt opts))
@@ -1574,7 +1590,7 @@
      (set! (.-tolerateUnknownTags r) (boolean (get opts :tolerate-unknown-tags true)))
      (set! (.-instantAsDate r) (not= :instant (get opts :instant-type :date)))
      (set! (.-fullDateAsSqlDate r) (= :sql-date (get opts :date-type :local-date)))
-     (set! (.-maxDepth r) (int (get opts :max-depth 1024)))
+     (set! (.-maxDepth r) (int (max-depth-opt opts)))
   ;; 0 = unlimited, which is the default. See Reader.maxItems for why the budget
   ;; counts ITEMS rather than bytes.
      (set! (.-maxItems r) (max-items-opt opts))
