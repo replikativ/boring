@@ -1194,8 +1194,19 @@
           gen-site (gen/choose frame-at (dec n))
           gen-damage (gen/vector (gen/tuple gen-site (gen/choose 0 255)) 1 4)
           result
-          (tc/quick-check
-           400
+          ;; 4000, not 400, AND a fixed seed. At 400 random cases this detected
+          ;; its own regression in 5 runs out of 13 -- it reported the tree
+          ;; GREEN with the fix it exists to guard reverted, which makes it
+          ;; worse than no test: it converts "unverified" into "verified". A
+          ;; property that fires 38% of the time is a property you have not
+          ;; measured, and I had claimed this one verified on the strength of
+          ;; two runs.
+          ;;
+          ;; The seed is pinned so CI is deterministic; the exhaustive
+          ;; single-byte sweep in `the-item-total-must-match-the-data-section`
+          ;; is what covers the space this no longer samples randomly.
+           (tc/quick-check
+           4000
            (prop/for-all
             [damage gen-damage]
             (let [c (java.util.Arrays/copyOf clean n)]
@@ -1223,7 +1234,9 @@
                  (or (not (and (contains? a :ok) (contains? b :ok)))
                      (let [xs (:ok a) ys (:ok b)]
                        (and (= (count xs) (count ys))
-                            (= (mapv re-encode xs) (mapv re-encode ys))))))))))]
+                            (= (mapv re-encode xs) (mapv re-encode ys)))))))))
+           ;; Pinned so CI is deterministic -- see the note on the case count.
+           :seed 1785873600000)]
       (is (:pass? result)
           (str "a damaged file where the two readers disagree: "
                (pr-str (:shrunk result))))))
