@@ -466,6 +466,18 @@
      (set! (.-borrowed w) false)
      n)))
 
+(defn- bytes!
+  "The input, or a typed error. `(Reader. nil)` is a raw NullPointerException,
+  and doc/SECURITY.md's third guarantee says none escapes -- `nav/source` was
+  the only read path that honoured it for a nil argument. A nil here is a
+  caller mistake rather than bad data, but the guarantee does not distinguish
+  and a caller's `catch ExceptionInfo` should not have to either."
+  ^bytes [bs entry]
+  (when (nil? bs)
+    (throw (ex-info (str "boring: " entry " needs a byte array, got nil")
+                    {:type :boring/bad-argument :entry entry})))
+  bs)
+
 (defn ^:no-doc configure-reader!
   "Apply decode options to a Reader. Public only so `boring.nav` can apply the
   SAME options its docstrings promise -- it realises values through this reader,
@@ -505,7 +517,8 @@
   behaviour datahike's dump requirements ask for."
   ([^bytes bs] (decode bs nil))
   ([^bytes bs opts]
-   (with-decode-errors (.read (configure-reader! (Reader. bs) (opt/check-opts opts))))))
+   (with-decode-errors (.read (configure-reader! (Reader. (bytes! bs "decode"))
+                                                  (opt/check-opts opts))))))
 
 (defn decode-with
   "Decode using a reusable Reader.
@@ -514,7 +527,7 @@
   reader keeps whatever it was last configured with, which is what makes the
   two-arity form fast and also what makes it a state-leak hazard across
   tenants -- pass opts unless the reader is yours alone."
-  ([^Reader r ^bytes bs] (.reset r bs) (with-decode-errors (.read r)))
+  ([^Reader r ^bytes bs] (.reset r (bytes! bs "decode-with")) (with-decode-errors (.read r)))
   ([^Reader r ^bytes bs opts]
    (.reset r bs)
    (configure-reader! r (opt/check-opts opts))
@@ -1165,7 +1178,7 @@
    ;; a raw ClassCastException. Going through the one gate is what makes that
    ;; class of drift impossible rather than fixed.
    (let [opts (resolve-opts opts)
-         r (Reader. bs)
+         r (Reader. (bytes! bs "build-index"))
          stride (let [i (long (get opts :index default-index-stride))]
                   ;; 0 means "no index" everywhere else, and building an index
                   ;; with no index is not a thing this function can do -- it
@@ -1550,7 +1563,7 @@
    ;; happened to still match. A copy that agrees today is a copy that can stop
    ;; agreeing tomorrow, silently, since nothing compares them.
    (let [opts (opt/check-opts opts)
-         r (configure-reader! (Reader. bs) opts)]
+         r (configure-reader! (Reader. (bytes! bs "decode-seq")) opts)]
      ((fn step [^long frame-at]
         (lazy-seq
          (when-not (.atEnd r)

@@ -2816,3 +2816,19 @@
       (doseq [hex ["83010203" "a201020304"]]
         (is (some? (boring/build-index (c/hex->bytes hex) {:index 1 :index-min 1}))
             hex)))))
+
+(deftest a-nil-input-is-a-typed-error-on-every-read-path
+  (testing "doc/SECURITY.md's third guarantee says nothing escapes as a raw
+            NullPointerException, so a caller's `catch ExceptionInfo` is
+            sufficient. `(Reader. nil)` is exactly that, and four of the five
+            read paths raised it -- `nav/source` was the only one that honoured
+            the guarantee. A nil is a caller mistake rather than bad data, but
+            the guarantee does not distinguish and neither should the caller."
+    (doseq [[label f] [["decode"      #(boring/decode nil)]
+                       ["decode-seq"  #(doall (boring/decode-seq nil))]
+                       ["build-index" #(boring/build-index nil)]]]
+      (is (= :boring/bad-argument (err-type f)) label))
+    (testing "the control: the same entry points still read real bytes"
+      (let [bs (boring/encode {:a 1})]
+        (is (= {:a 1} (boring/decode bs)))
+        (is (= [{:a 1}] (vec (boring/decode-seq bs))))))))

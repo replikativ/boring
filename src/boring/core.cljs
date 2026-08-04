@@ -107,6 +107,16 @@
 
 (defn buffer [w] (wr/buffer w))
 
+(defn- bytes!
+  "The input, or a typed error -- see the JVM `bytes!`. A nil reached the reader
+  and surfaced as a raw host error, which doc/SECURITY.md's third guarantee
+  says cannot happen."
+  [bs entry]
+  (when (nil? bs)
+    (throw (ex-info (str "boring: " entry " needs a Uint8Array, got nil")
+                    {:type :boring/bad-argument :entry entry})))
+  bs)
+
 (defn- configure-reader! [^rd/Reader r opts]
   (set! (.-tolerateUnknownTags r) (boolean (get opts :tolerate-unknown-tags true)))
   ;; No :instant-type here — CLJS has only js/Date, so the JVM's Date/Instant
@@ -146,12 +156,13 @@
 
 (defn decode
   ([bs] (decode bs nil))
-  ([bs opts] (rd/read! (configure-reader! (rd/reader bs) (opt/check-opts opts)))))
+  ([bs opts] (rd/read! (configure-reader! (rd/reader (bytes! bs "decode"))
+                                          (opt/check-opts opts)))))
 
 (defn decode-with
   "Decode using a reusable Reader. With `opts`, every option is re-applied on
   this call; without them the reader keeps its previous configuration."
-  ([r bs] (rd/reset! r bs) (rd/read! r))
+  ([r bs] (rd/reset! r (bytes! bs "decode-with")) (rd/read! r))
   ([r bs opts]
    (rd/reset! r bs)
    (configure-reader! r (opt/check-opts opts))
@@ -171,7 +182,7 @@
   heap."
   ([bs] (decode-seq bs nil))
   ([bs opts]
-   (let [r (configure-reader! (rd/reader bs) (opt/check-opts opts))
+   (let [r (configure-reader! (rd/reader (bytes! bs "decode-seq")) (opt/check-opts opts))
          ;; THE FOOTER IS NOT DECODED AT ALL, exactly as on the JVM. This used
          ;; to read the item and judge it afterwards, which had two costs. A
          ;; forged frame got materialised before anything looked at it. And the
@@ -562,7 +573,8 @@
   ([bs opts]
    ;; RESOLVED, like every other public entry point, even though nothing here
    ;; encodes -- see the JVM `build-index`.
-   (let [opts (resolve-opts opts)
+   (let [_ (bytes! bs "build-index")
+         opts (resolve-opts opts)
          stride (get opts :index default-index-stride)
          _ (when (zero? stride)
              (throw (ex-info (str "boring: :index 0 turns indexing off, which build-index "
