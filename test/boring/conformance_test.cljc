@@ -1078,6 +1078,36 @@
       (let [v (boring/decode (c/hex->bytes "c074323031362d31322d33315432333a35393a36305a"))]
         (is (= "2016-12-31T23:59:60Z" (:value v)))))))
 
+(deftest a-canonical-set-element-is-encoded-exactly-once
+  (testing "ClojureScript staged each element to sort it and then called
+            `write-value!` on the ORIGINAL element again, so a registered
+            handler ran twice per element. A handler that reads a clock, a
+            counter or anything else mutable could then emit bytes different
+            from the ones the sort used -- output that is neither canonical nor
+            sorted, from the profile whose entire promise is that equal values
+            give equal bytes. The JVM was fixed first; the canonical MAP path
+            has always copied its staged key bytes."
+    ;; `:encode-fallback` rather than a registered tag: it is consulted from the
+    ;; canonical scratch writer too (which inherits it), it is portable, and
+    ;; String is dispatched before the registry so a handler for it could never
+    ;; run anyway.
+    (let [calls (atom 0)
+          unencodable (fn [] #?(:clj (Object.) :cljs (js/Object.)))
+          opts {:profile :canonical
+                :encode-fallback (fn [_] (swap! calls inc) (str "v" @calls))}]
+      ;; built programmatically: the reader dedups literal set elements
+      (boring/encode (into #{} [(unencodable) (unencodable) (unencodable)]) opts)
+      (is (= 3 @calls)
+          (str "one fallback call per element, got " @calls
+               " -- twice per element means the sorted bytes and the emitted"
+               " bytes came from different invocations"))))
+  (testing "and the bytes are still sorted and decodable"
+    (let [opts {:profile :canonical}
+          bs (boring/encode #{"bb" "a" "ccc"} opts)]
+      (is (= #{"a" "bb" "ccc"} (boring/decode bs opts)))
+      (is (= (vec bs) (vec (boring/encode #{"ccc" "a" "bb"} opts)))
+          "iteration order must not change the bytes"))))
+
 (deftest rfc-8949-appendix-f1-is-rejected-in-full
   (testing "every byte sequence RFC 8949 Appendix F.1 names as not well-formed
             must raise a typed error, on both platforms.

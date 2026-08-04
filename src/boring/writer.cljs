@@ -544,7 +544,16 @@
                         {:type :boring/canonical-duplicate}))))
     (head! w TAG TAG-SET)
     (head! w ARRAY (count s))
-    (doseq [[_ v] sorted] (write-value! w v))))
+    ;; THE STAGED BYTES, not a second encoding. This called `write-value!` on
+    ;; the original element again, so a registered handler ran TWICE per element
+    ;; -- and a handler that reads a clock, a counter or anything else mutable
+    ;; could emit bytes different from the ones the sort used, making the
+    ;; "canonical" output neither canonical nor sorted. The JVM was fixed first;
+    ;; the canonical MAP path a few lines below has always done it this way.
+    (doseq [[eb _] sorted]
+      (ensure! w (.-length eb))
+      (.set (.-buf w) eb (.-pos w))
+      (set! (.-pos w) (+ (.-pos w) (.-length eb))))))
 
 (defn- write-map-entries! [^Writer w m]
   (if-not (.-canonical w)
