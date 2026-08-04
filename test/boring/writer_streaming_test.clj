@@ -324,3 +324,36 @@
         (is (= 40 (count (boring/decode-seq a))))
         (is (= 40 (count (boring/decode-seq a {:max-depth 3})))
             "including under a budget too small for the footer")))))
+
+(deftest trim-refuses-to-pull-a-borrowed-buffer-away
+  (testing "`encode-buffered!` hands back a byte count and tells the caller to
+            read the bytes out of `buffer`; every other entry point copies them
+            out. `trim!` replaces the buffer with a fresh, ZEROED one -- so
+            trimming between the two gave the caller 25 zero bytes for
+            `{:id 7 :name \"hello\"}`, which `decode` then read as the integer
+            0. A wrong value out of an ordinary two-call sequence, with no
+            error anywhere.
+
+            `pos` cannot tell a borrow from an already-copied encode: it is
+            non-zero after both. So the borrow is recorded."
+    (let [w (boring/writer 8)]
+      ;; grow it first, so trim has something to give back and the test is not
+      ;; about a writer that was never oversized
+      (boring/encode-buffered! w (vec (range 500)))
+      (let [n (boring/encode-buffered! w {:id 7 :name "hello"})]
+        (is (= :boring/bad-argument
+               (try (boring/trim! w) nil
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+            "the borrow is refused")
+        (is (= {:id 7 :name "hello"}
+               (boring/decode (java.util.Arrays/copyOf ^bytes (boring/buffer w) n)))
+            "and the bytes the caller was told to read are still there")))
+    (testing "while the flows that copy out still free memory -- the refusal has
+              to be narrow or `trim!` stops doing its job"
+      (let [w (boring/writer 8)]
+        (boring/encode-into! w (vec (range 500)))
+        (is (pos? (boring/trim! w)) "after encode-into!, which copies"))
+      (let [w (boring/writer 8)]
+        (boring/encode-buffered! w (vec (range 500)))
+        (boring/encode-into! w {:a 1})
+        (is (pos? (boring/trim! w)) "and after a later encode ends the borrow")))))

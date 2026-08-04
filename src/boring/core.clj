@@ -331,10 +331,20 @@
   hako reaches for with off-heap segments; on-heap gets there too as long as
   nobody insists on a freshly-allocated byte[] per message.
 
-  The buffer is overwritten by the next encode. Do not retain it."
-  (^long [^Writer w v] (.position ^Writer (write-root! w v (writer-opts w))))
+  The buffer is overwritten by the next encode. Do not retain it.
+
+  The borrow is RECORDED on the writer, so `trim!` -- which replaces the buffer
+  with a fresh, zeroed one -- refuses rather than pulling it out from under
+  you. It used to do exactly that, and `{:id 7 :name \"hello\"}` came back as
+  25 zero bytes that `decode` read as the integer 0."
+  (^long [^Writer w v]
+   (let [n (.position ^Writer (write-root! w v (writer-opts w)))]
+     (set! (.-borrowed w) true)
+     n))
   (^long [^Writer w v opts]
-   (.position ^Writer (write-root! w v (resolve-opts opts)))))
+   (let [n (.position ^Writer (write-root! w v (resolve-opts opts)))]
+     (set! (.-borrowed w) true)
+     n)))
 
 (defn buffer
   "The writer's internal buffer. Valid bytes are [0, count) where `count` is

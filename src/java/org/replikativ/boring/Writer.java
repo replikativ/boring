@@ -662,6 +662,7 @@ public final class Writer {
 
     /** Reset for reuse. Keeps the buffer; clears the stringref namespace. */
     public void reset() {
+        borrowed = false;              // a new value: the old borrow is over
         // WHILE STREAMING, RESET MEANS "the previous value is finished", so its
         // tail has to reach the sink before `pos` goes to zero -- otherwise a
         // `write-seq!` loop would silently drop the last partial chunk of every
@@ -710,6 +711,13 @@ public final class Writer {
             throw Err.of("bad-argument",
                 "boring: trim() during a stream would discard buffered bytes;"
                 + " finish the stream first");
+        // The same rule, for the same reason, one case wider. `encodeBuffered`
+        // lends the caller this buffer; replacing it underneath them is the
+        // buffered-mode twin of discarding a stream's tail.
+        if (borrowed)
+            throw Err.of("bad-argument",
+                "boring: trim() would replace a buffer that encode-buffered! has"
+                + " lent out; read the bytes (or call reset) first");
         long freed = buf.length - initialSize;
         if (freed > 0) { buf = new byte[initialSize]; pos = 0; }
         if (srKeys.length > 16) initSymtab(16);
@@ -734,9 +742,24 @@ public final class Writer {
      * `encode-into!` exists to avoid. Contents are overwritten by the next
      * encode; do not retain.
      */
+    /**
+     * Whether the caller currently holds a BORROWED view of this buffer.
+     *
+     * `encodeBuffered` hands back a byte count and tells the caller to read the
+     * bytes out of `buffer()`; every other entry point copies them out. `pos`
+     * cannot tell the two apart -- it is non-zero after both -- and `trim()`
+     * replaces the buffer with a fresh, zeroed one. So trimming between an
+     * `encode-buffered!` and the `buffer` read it invites gave the caller 25
+     * zero bytes for `{:id 7 :name "hello"}`, which `decode` then read as the
+     * integer 0. A wrong value out of an ordinary two-call sequence, with no
+     * error anywhere.
+     */
+    public boolean borrowed;
+
     public byte[] buffer() { return buf; }
 
     public byte[] toByteArray() {
+        borrowed = false;              // copied out: the buffer is ours again
         byte[] out = new byte[pos];
         System.arraycopy(buf, 0, out, 0, pos);
         return out;

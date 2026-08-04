@@ -506,12 +506,37 @@ targeting `draft-ietf-cbor-cde`, which is a parked WG document.
 
 Two consequences worth stating plainly, because both surprise people:
 
+- **`-0.0` has no ClojureScript counterpart, and that is visible in the
+  bytes.** JavaScript has one number type, and in it `-0` is a `Number` that
+  every Clojure operation reports as equal to `0`: `(= 0 (- 0))`,
+  `(identical? 0 (- 0))`, and `{0 :a (- 0) :b}` has one entry. boring encodes
+  it as the IEEE half `f9 8000` regardless, so two values ClojureScript cannot
+  tell apart encode differently — under `:canonical` as well, where `0` is
+  `00`. It is reachable from ordinary arithmetic: `(* -1 0)`, `(- 0)`,
+  `(reduce * 1 [-1 0])`.
+
+  This is deliberate. Encoding it as `00` would make a ClojureScript producer
+  silently drop the sign for a JVM or browser consumer that can represent it,
+  and the round trip through `decode` does give `-0.0` back on the JVM. But if
+  you rely on `:canonical` meaning *equal values encode identically*, know that
+  ClojureScript's notion of equal is coarser than the wire's here. The JVM has
+  the same seam one step further out: `(= 0.0 -0.0)` is true in Clojure while
+  the two encode as `f9 0000` and `f9 8000`.
+
 - **Canonical is lossy.** It reduces a bignum that fits to a basic integer and
   narrows a float to its shortest round-tripping form. A `BigInteger` may come
   back a `Long`; a `Double` may come back narrower. That is required, not a
   defect — you cannot both agree octet-for-octet with other canonical encoders
   and preserve a host type the wire has no room for. Use `:clojure` or
   `:interop` when type fidelity matters more than interchange agreement.
+
+  **The knob is `:float-policy`, not the profile**, and the name undersells it:
+  `{:float-policy :shortest}` reduces bignums too, under any profile. So
+  `(encode (bigint 0) {:float-policy :shortest})` is `00`, not `c2 41 00`, and
+  decodes to a `Long`. On the JVM this is easy to miss because `(= 0N 0)` is
+  true; on ClojureScript `(= (js/BigInt 0) 0)` is false and the round trip
+  visibly fails. `:canonical` implies `:shortest`, which is why this reads as a
+  canonical-only property and is not one.
 
   If what you actually want is a *stable byte sequence* rather than agreement
   with other encoders — two exports that diff clean, a dump you can sign — use
