@@ -270,7 +270,13 @@
   minifies constructor names — use `register-record` there (and in `.cljc`).
 
   Pass `wire-name` to override the name used on the wire, in both directions."
-  (^TagRegistry [reg cls] (register-record-class reg cls (.getName ^Class cls)))
+  ;; THE SAME WIRE NAME EVERY OTHER PATH WRITES. This defaulted to the raw
+  ;; class name, so a type registered through here went on the wire as
+  ;; `my_ns.My-Rec` while `encode` of the same type wrote `my-ns/My-Rec` --
+  ;; two names for one type inside one version, which is worse than either
+  ;; name being wrong. `TagRegistry.recordName` is the one place that decides.
+  (^TagRegistry [reg cls]
+   (register-record-class reg cls (.recordName TagRegistry/EMPTY ^Class cls)))
   (^TagRegistry [^TagRegistry reg cls wire-name]
    (let [n (.getName ^Class cls)
          idx (.lastIndexOf n ".")

@@ -2885,3 +2885,36 @@
           (let [b0 #?(:clj (bit-and (aget ^bytes chunk 0) 0xff) :cljs (aget chunk 0))]
             (is (not= 0xd9 b0)
                 "a sequence meant to be navigable must not open a stringref namespace")))))))
+
+(deftest every-registration-path-writes-the-same-wire-name
+  (testing "A record's wire name is decided in several places -- the writer's
+            fallback, `record-type-name`, `boring.records/wire-name`, and
+            `register-record-class`'s default. They must all say the same
+            thing, and one of them did not: `register-record-class` defaulted
+            to the raw class name, so a type registered through it went out as
+            `my_ns.My-Rec` while `encode` of the SAME TYPE wrote
+            `my-ns/My-Rec`. Two names for one type inside one version, which is
+            worse than either name being wrong.
+
+            An audit of the consuming projects found this, and also found that
+            NOTHING here asserted a wire-name string at all -- `register-records`,
+            `record-type-name`, `auto-registry` and `registry-for` had zero test
+            references between them. That gap is why a format change could reach
+            three consumers before anything noticed."
+    (let [p (->ConfPoint 1 2)
+          expected (data/record-type-name p)]
+      (testing "the shape itself: namespace as written, slash, name as written"
+        (is (re-matches #"[^/]+/[A-Za-z][A-Za-z0-9]*" expected)
+            (str "unexpected wire-name shape: " expected))
+        (is (not (re-find #"_" expected))
+            "the namespace must not be munged"))
+      (testing "and the bytes carry exactly that name"
+        (let [hex (c/bytes->hex (boring/encode p {:stringref false}))]
+          (is (re-find (re-pattern (c/bytes->hex (boring/encode expected {:stringref false}))) hex)
+              "the encoded record must contain the encoded wire name")))
+      #?(:clj
+         (testing "every registration path agrees with it"
+           (let [via-class (boring/register-record-class (boring/tag-registry) (class p))
+                 back (boring/decode (boring/encode p) {:registry via-class})]
+             (is (= p back)
+                 "register-record-class must register the name encode writes")))))))
