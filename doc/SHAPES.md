@@ -552,8 +552,13 @@ contract:
 - every captured node is byte-identical to one the walk found — always;
 - the two agree completely once `:index-min` excludes frames.
 
-Every frame boring emits has **3 entries or fewer**, so 4 is the boundary and
-the default of 16 clears it comfortably.
+Every *structural* frame boring emits — a sorted map's `[name, map]`, a shaped
+array's `[keys, rows]` — has 3 entries or fewer. The `boring/index` frame's own
+payload has **6** (`[stride, containers, counts, slots, sorted, <8 bytes>]`, as
+:275 and :425 spell out), and a re-index over an already-sealed file — which
+`doc/STORAGE.md` presents as a real operation — walks that frame like any other
+container. At `:index-min` 4 or 6 the walk captures a node for it; at 7 it does
+not. So **7 is the boundary**, and the default of 16 clears it comfortably.
 
 Tags are **descended through**, not stepped over. A set is tag 258 around an
 array, a record tag 27 around `[name, map]`, a shaped array tag 39649 around

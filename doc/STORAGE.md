@@ -177,6 +177,12 @@ the sequence with an index by default** (stride 16):
 (boring/write-seq! w events out {:index 0})   ; off
 ```
 
+`:index 0` is the off switch on `write-seq!` and `write-indexed!` — but **not**
+on `encode-indexed` or `build-index`, where it raises `:boring/bad-option`. An
+`encode-indexed` that does not index is just `encode`, and silently returning an
+unindexed single item would change what the return value *is*. Call `encode`
+there instead.
+
 Four things follow from the default:
 
 - **`:stringref false` is forced** whenever a stride is set, and passing
@@ -194,8 +200,11 @@ Four things follow from the default:
 
 The frame is one extra CBOR item holding the offsets of every Nth item, and
 `nav/items` then jumps rather than skips — on 200 000 records, reaching the last
-one takes **10.6 ms** unindexed against **0.6 µs** indexed, for 0.68% of the
-file. The
+one takes **10.6 ms** unindexed against **1–2 µs** indexed, for 0.34% of the
+file. Those are the stride-16 numbers, which is what the paragraph above says
+the default is; an earlier version of this sentence quoted the **stride-8** row
+of `doc/SHAPES.md`'s table (0.6 µs, 0.68%) under the stride-16 heading, so it
+promised a seek twice as fast at twice the cost. The
 offsets are stored as deltas in the narrowest type that holds them, so even a
 stride of 1 — no scan at all — costs 2.7% rather than the 10.9% absolute
 offsets would. `doc/SHAPES.md` has the format and the full stride table.

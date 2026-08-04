@@ -66,7 +66,7 @@ decode figures below.
 `decode` is the boundary.
 
 - **Untrusted**: every byte of the input.
-- **Trusted**: the handlers you install. A `register-tag!` or `register-record!`
+- **Trusted**: the handlers you install. A `register-tag` or `register-record`
   callback runs with your process's privileges and boring does not sandbox it.
   Vet what you register.
 
