@@ -211,6 +211,35 @@
    (configure-reader! r (resolve-opts opts))
    (rd/read! r)))
 
+(def ^:const index-name
+  "Tag-27 type name for a sequence/container index. Must match boring.core's."
+  "boring/index")
+
+(defn- index-frame?
+  "True for the tag-27 frame the JVM `seal-index!` appends, at offset `start`.
+
+  CLJS had no recognition of this at all, so the library's OWN default JVM
+  output decoded to N+1 items here and N on the JVM -- the same portable CBOR
+  sequence, two different logical results. Writing the index is still
+  JVM-only; reading past it must not be.
+
+  Authenticity, not just the name: a six-element payload whose last element is
+  the 8-byte back-pointer, and that pointer equal to where the frame starts,
+  which it is by construction since it doubles as the length of the data
+  section before it. A name collision must not delete a logical item."
+  [v ^number start]
+  (and (data/tagged-frame? v)
+       (= index-name (data/frame-name v))
+       (let [p (data/frame-payload v)]
+         (and (sequential? p)
+              (= 6 (count p))
+              (let [ptr (nth (vec p) 5)]
+                (and (instance? js/Uint8Array ptr)
+                     (= 8 (.-length ptr))
+                     (or (neg? start)
+                         (= start (areduce ptr i acc 0
+                                           (+ (* acc 256) (aget ptr i)))))))))))
+
 (defn decode-seq
   "Lazily decode consecutive top-level CBOR items (RFC 8742 sequence).
 
@@ -223,7 +252,13 @@
      ((fn step []
         (lazy-seq
          (when-not (rd/at-end? r)
-           (cons (rd/read-next! r) (step)))))))))
+           ;; The index frame is METADATA, not an item -- and only in the final
+           ;; position, the only place the JVM sealer can put it.
+           (let [start (rd/position r)
+                 v (rd/read-next! r)]
+             (if (and (rd/at-end? r) (index-frame? v start))
+               nil
+               (cons v (step)))))))))))
 
 (defn- grow
   "A Uint8Array of at least `n` bytes holding `buf`'s contents."

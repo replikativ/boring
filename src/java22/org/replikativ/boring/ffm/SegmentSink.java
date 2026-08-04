@@ -59,7 +59,11 @@ public final class SegmentSink extends OutputStream {
 
     @Override
     public void write(byte[] src, int off, int len) {
-        if (off < 0 || len < 0 || off + len > src.length)
+        // SUBTRACTION after the non-negativity checks, never addition. This is
+        // a public OutputStream, so the arguments are not necessarily the
+        // writer's own: `off + len` can overflow to a negative and slip past a
+        // `>` comparison, leaving the real bounds check to a lower layer.
+        if (off < 0 || len < 0 || off > src.length - len)
             throw new IndexOutOfBoundsException(
                 "off=" + off + " len=" + len + " src=" + src.length);
         checkRoom(len);
@@ -72,7 +76,9 @@ public final class SegmentSink extends OutputStream {
      *  its tail, and the index frame is at the END -- so the failure would look
      *  like a corrupt index rather than a full buffer. */
     private void checkRoom(long n) {
-        if (pos + n > capacity)
+        // `capacity - pos` rather than `pos + n`: a segment near Long.MAX_VALUE
+        // would overflow the addition.
+        if (n > capacity - pos)
             throw new IllegalStateException(
                 "boring: segment of " + capacity + " bytes is full at " + pos
                 + " and cannot take " + n + " more");

@@ -655,6 +655,22 @@
          (seal-index! w out idx (alength body) (resolve-opts opts))
          (.toByteArray out))))))
 
+(defn- index-opt
+  "`:index` / `:index-min`, validated. Both were coerced with `long` and then
+  narrowed to a Java int with no domain check, so `:index 1.5` silently became
+  stride 1, `:index -1` silently turned indexing OFF although only 0 is
+  documented as the off switch, `:index 2147483648` escaped as a raw
+  ArithmeticException, and a non-numeric value escaped from host coercion."
+  ^long [opts k default]
+  (let [v (get opts k default)]
+    (when-not (and (integer? v) (not (neg? v)) (<= v Integer/MAX_VALUE))
+      (throw (ex-info (str "boring: " k " must be a non-negative integer no greater "
+                           "than " Integer/MAX_VALUE
+                           (when (= k :index) " (0 turns indexing off)")
+                           ", got " (pr-str v))
+                      {:type :boring/bad-option :option k :value v})))
+    (long v)))
+
 (def ^:const default-index-stride
   "Stride `write-seq!` indexes at unless told otherwise. See its docstring for
   why a sequence is indexed by default and a single `encode`d value never is."
@@ -751,12 +767,12 @@
   ;; is forced; that is why the 4-arity is the one that can complain.
   (^long [^Writer w values ^java.io.OutputStream out]
    (let [o (writer-opts w)
-         stride (or (:index o) default-index-stride)]
+         stride (index-opt o :index default-index-stride)]
      (write-seq-resolved! w values out
                           (cond-> o (pos? (long stride)) (assoc :stringref false))
-                          stride (or (:index-min o) 16))))
+                          stride (index-opt o :index-min 16))))
   (^long [^Writer w values ^java.io.OutputStream out opts]
-   (let [stride (or (:index opts) default-index-stride)]
+   (let [stride (index-opt opts :index default-index-stride)]
      (when (and (pos? (long stride)) (true? (:stringref opts)))
        (throw (ex-info (str "boring: :stringref true cannot be combined with :index -- "
                             "boring.nav cannot resolve string references from an offset, "
@@ -766,7 +782,7 @@
      (write-seq-resolved! w values out
                           (cond-> (resolve-opts opts)
                             (pos? (long stride)) (assoc :stringref false))
-                          stride (or (:index-min opts) 16)))))
+                          stride (index-opt opts :index-min 16)))))
 
 (defn- write-seq-resolved!
   "`write-seq!` with options already resolved. See the note on its 3-arity."
@@ -943,12 +959,12 @@
   noise, but uncompressed it is not."
   (^long [^Writer w v ^java.io.OutputStream out]
    (let [o (writer-opts w)
-         stride (or (:index o) default-index-stride)]
+         stride (index-opt o :index default-index-stride)]
      (write-indexed-resolved! w v out
                               (cond-> o (pos? (long stride)) (assoc :stringref false))
-                              stride (or (:index-min o) 16))))
+                              stride (index-opt o :index-min 16))))
   (^long [^Writer w v ^java.io.OutputStream out opts]
-   (let [stride (or (:index opts) default-index-stride)]
+   (let [stride (index-opt opts :index default-index-stride)]
      (when (and (pos? (long stride)) (true? (:stringref opts)))
        (throw (ex-info (str "boring: :stringref true cannot be combined with :index -- "
                             "boring.nav cannot resolve string references from an offset, "
@@ -958,7 +974,7 @@
      (write-indexed-resolved! w v out
                               (cond-> (resolve-opts opts)
                                 (pos? (long stride)) (assoc :stringref false))
-                              stride (or (:index-min opts) 16)))))
+                              stride (index-opt opts :index-min 16)))))
 
 (def ^:const index-name
   "Tag-27 type name for a sequence/container index. See doc/SHAPES.md.
@@ -982,11 +998,37 @@
   "boring/index")
 
 (defn- index-frame?
-  "True for the tag-27 frame `seal-index!` appends. Both fallback shapes count:
-  the payload is an array, so it decodes to a `TaggedLiteral` rather than an
-  `UnknownRecord`, but `frame-name` reads either."
-  [v]
-  (and (data/tagged-frame? v) (= index-name (data/frame-name v))))
+  "True for the tag-27 frame `seal-index!` appends, at file offset `start`.
+
+  Both fallback shapes count: the payload is an array, so it decodes to a
+  `TaggedLiteral` rather than an `UnknownRecord`, but `frame-name` reads either.
+
+  AUTHENTICITY, not just the name. This tested the name alone, so ANY final
+  tag-27 item called `boring/index` was silently erased from `decode-seq` --
+  including a malformed one, and including one somebody put there as data. A
+  name collision should not delete a logical item from a sequence.
+
+  The check mirrors the cheap half of what `boring.nav/read-index` does: the
+  payload must be a six-element array whose last element is the 8-byte
+  back-pointer, and that pointer must equal the offset the frame actually
+  starts at -- which it does by construction, since it doubles as the length of
+  the data section preceding it. `start` of -1 means the caller cannot supply
+  an offset (the streaming decoder, whose positions are buffer-relative across
+  refills); the shape check still applies."
+  [v ^long start]
+  (and (data/tagged-frame? v)
+       (= index-name (data/frame-name v))
+       (let [p (data/frame-payload v)]
+         (and (sequential? p)
+              (= 6 (count p))
+              (let [ptr (nth (vec p) 5)]
+                (and (bytes? ptr)
+                     (= 8 (alength ^bytes ptr))
+                     (or (neg? start)
+                         (= start
+                            (areduce ^bytes ptr i acc 0
+                                     (+ (bit-shift-left acc 8)
+                                        (bit-and (aget ^bytes ptr i) 0xFF)))))))))))
 
 (declare index-walk index-walk*)
 
@@ -1194,7 +1236,7 @@
   ([^bytes bs opts]
    (let [r (Reader. bs)
          stride (long (let [i (:index opts)] (if (and i (pos? (long i))) i 16)))
-         min-entries (long (or (:index-min opts) 16))
+         min-entries (long (index-opt opts :index-min 16))
          idx (try
                (scan-index r 0 (alength bs) stride min-entries 0)
                (catch StackOverflowError _
@@ -1450,7 +1492,7 @@
                           ;; stream too, not just the buffer -- `.atEnd` only
                           ;; means the current chunk is exhausted, so a refill
                           ;; that succeeds proves the frame was not last.
-                          (if (and (index-frame? (:ok v)) (.atEnd r) (not (refill!)))
+                          (if (and (index-frame? (:ok v) -1) (.atEnd r) (not (refill!)))
                             nil
                             (cons (:ok v) (step))))
                       (refill!) (step)
@@ -1507,14 +1549,15 @@
             ;; Each item opens a fresh stringref namespace, so the reader's
             ;; per-message state must be cleared between items — but not its
             ;; ident cache, which is a pure function of bytes.
-           (let [v (with-decode-errors (.readNext r))]
+           (let [start (.position r)
+                 v (with-decode-errors (.readNext r))]
              ;; THE INDEX FRAME IS NOT AN ITEM. `write-seq!` indexes by default,
              ;; so without this every caller of `decode-seq` would find a
              ;; phantom `#boring/index [...]` after their data. It is dropped
              ;; only in the final position, which is the only place `seal-index!`
              ;; can put it -- a frame of that name anywhere else is somebody
              ;; else's data and stays visible.
-             (if (and (.atEnd r) (index-frame? v))
+             (if (and (.atEnd r) (index-frame? v start))
                nil
                (cons v (step)))))))))))
 

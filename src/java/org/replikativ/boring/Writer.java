@@ -742,6 +742,12 @@ public final class Writer {
      *  the stream would otherwise FLUSH whatever a previous unrelated encode
      *  left in the buffer, prefixing the stream with somebody else's bytes. */
     public void beginStream(java.io.OutputStream out) {
+        // `sink == null` is ALSO the writer's signal for buffered mode, so a
+        // null here did not stream and did not fail: `write-to!` returned 0,
+        // wrote nowhere, and left the encoded bytes in the private buffer.
+        // False success is the worst of the three outcomes available.
+        if (out == null)
+            throw Err.of("bad-argument", "boring: the stream sink must not be null");
         sink = out;
         flushed = 0;
         pos = 0;

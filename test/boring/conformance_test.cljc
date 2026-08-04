@@ -1108,6 +1108,35 @@
       (is (= (vec bs) (vec (boring/encode #{"ccc" "a" "bb"} opts)))
           "iteration order must not change the bytes"))))
 
+(deftest a-sealed-sequence-decodes-to-the-same-items-on-both-platforms
+  (testing "JVM `write-seq!` appends a tag-27 `boring/index` frame by default,
+            and JVM `decode-seq` hides it. ClojureScript had no recognition of
+            it at all, so the library's OWN default output decoded to N+1 items
+            there and N on the JVM -- the same portable CBOR sequence, two
+            different logical results. Writing the index is JVM-only; reading
+            past it must not be.
+
+            The bytes below are a real sealed sequence of three `{1: n}` maps at
+            stride 1, produced by write-seq!."
+    (let [o {:stringref false}
+          ;; a1 0101 / a1 0102 / a1 0103, then the tag-27 frame
+          ;; produced by (write-seq! w [{1 1} {1 2} {1 3}] out {:index 1 :index-min 1})
+          bs (c/hex->bytes
+              (str "a10101a10102a10103d81b826c626f72696e672f696e6465788601"
+                   "d84e50ffffffff000000000300000006000000"
+                   "d84e5003000000010000000100000001000000"
+                   "844300030341014101410184f4f5f5f5480000000000000009"))]
+      (is (= [{1 1} {1 2} {1 3}] (vec (boring/decode-seq bs o)))
+          "three items, not four -- the frame is metadata")))
+  (testing "and an impostor sharing the name is NOT erased"
+    (let [o {:stringref false}
+          ;; a1 0101 then tag 27 ["boring/index", {"not" "an index"}]
+          bs (c/hex->bytes (str "a10101"
+                                "d81b826c626f72696e672f696e646578"
+                                "a1636e6f7468616e20696e646578"))]
+      (is (= 2 (count (vec (boring/decode-seq bs o))))
+          "a name collision must not delete a logical item"))))
+
 (deftest rfc-8949-appendix-f1-is-rejected-in-full
   (testing "every byte sequence RFC 8949 Appendix F.1 names as not well-formed
             must raise a typed error, on both platforms.
