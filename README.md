@@ -8,11 +8,38 @@
 **Fast, portable serialization for Clojure and ClojureScript — in a format the
 rest of the world can already read.**
 
-Clojure's serialization story is split three ways. [nippy][] and [hako][] are
-fast and JVM-only. [fressian][] is portable across Clojure but speaks to no
-other language. [transit][] speaks to other languages, but it is slower, and
-its own README — in the [Java][transit-java], [Clojure][transit-clj] and
-[ClojureScript][transit-cljs] implementations alike — says what it is for:
+Clojure is a hosted language on purpose. Rich Hickey could have built a Lisp
+with its own runtime and its own everything, and chose not to, because a
+language that only talks to itself is a silo no matter how good it is. That
+decision is why Clojure has libraries, deployment stories and a job market.
+
+The community made the opposite decision about serialization, and mostly did
+not notice. [nippy][] and [hako][] are fast and JVM-only. [fressian][] is
+portable across Clojure and speaks to no other language. [transit][] was
+explicitly designed for reach — that part is not a criticism — but in practice
+its reach is Clojure, ClojureScript and a short list of ports, several of them
+unmaintained, against a specification still at 0.8.
+
+**The argument for reach is stronger for data than it ever was for code**,
+because code runs in a world you control and data does not. When you write
+bytes to IO you are writing to an *open* world: the consumer may be rewritten
+in another language, or be another team, or be a cache that some later service
+reads, or be nobody at all for five years. This is the same argument Clojure
+already makes about maps — open, extensible, not closing over what you happen
+to know today, not encoding constraints into the data that the data does not
+need. A format that can only be read by re-running your code encodes the
+biggest constraint of all.
+
+And data outlives code. It outlives the application, usually the platform, and
+often the ability to run the program that wrote it. A durable format is a bet
+that someone can still read your bytes when your build no longer resolves. That
+is a reason not to invent a format lightly — and to assume your format's reach
+will exceed what you can currently imagine for it, even when every consumer is
+internal and known today.
+
+[transit][]'s own README — in the [Java][transit-java], [Clojure][transit-clj]
+and [ClojureScript][transit-cljs] implementations alike — is honest about which
+bet it is making:
 
 > Transit is intended primarily as a wire protocol for transferring data
 > between applications. If storing Transit data durably, readers and writers
@@ -20,19 +47,33 @@ its own README — in the [Java][transit-java], [Clojure][transit-clj] and
 > migrating/transforming/re-storing that data when and if the transit format
 > changes.
 
-The libraries are at 1.x; the [specification][transit-format] is at 0.8. That
-is a reasonable position for a wire protocol and a poor one for an archive —
-and an archive is what [datahike][] needed, which is why boring exists.
+That is a reasonable position for a wire protocol and a poor one for an
+archive — and an archive is what [datahike][] needed, which is why boring
+exists.
 
-Every one of those options trades reach for speed, or speed for reach, or
-durability for either.
+boring takes the reach: it is [CBOR][rfc8949] — **IETF STD 94**, a full
+Internet Standard, with implementations in 26 languages, its own IANA tag
+registry and a standard diagnostic notation. It is the format with the widest
+reach that can still carry edn faithfully: keywords, symbols, sets, ratios,
+records, metadata. A foreign reader gets your data as ordinary CBOR whether or
+not it knows what a keyword is.
 
-boring takes the reach: it is [CBOR][rfc8949], an IETF standard with
-implementations in 26 languages. On the JVM it gives up nothing for it — it
-beats nippy on every payload we measure and trades wins with [hako][]. On
-ClojureScript it is always smaller on the wire than transit, faster on the
+**The usual trade is that reach costs speed. Here it does not.** On the JVM
+boring beats nippy on every payload we measure and trades wins with [hako][].
+On ClojureScript it is always smaller on the wire than transit, faster on the
 datom-shaped data it was built for, and slower on generic data — see
 [Performance](doc/PERFORMANCE.md), which says exactly where.
+
+Getting there did not require changing a single byte of CBOR. Where boring
+needed more, it grew *inside* the format rather than around it: string
+deduplication is [stringref](doc/COMPATIBILITY.md), a registered CBOR extension; the offset index
+that makes a memory-mapped file navigable is an ordinary tagged item at the end
+of the file, which every other CBOR reader simply skips. A file boring writes
+stays a file `cbor2` and `cbor.me` can read.
+
+So: use CBOR by default, and reach for something else only when you have a
+reason you would still defend in five years, to whoever is holding your data
+then.
 
 ```clojure
 (require '[boring.core :as boring])
