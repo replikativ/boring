@@ -409,3 +409,31 @@
                              wide-map (assoc sorted-opts :index 16 :index-min mn))
                             sorted-opts)]
           (is (= 42 (nav/value (get-in c ["k0042" "v"]))) (str "min " mn)))))))
+
+(deftest seal-index-accepts-the-nil-build-index-returns
+  (testing "`build-index` documents itself as returning \"a map ready for
+            `seal-index!`, or nil if nothing was worth indexing\", and the two
+            are documented as a pair -- but `seal-index!` NPE'd on that nil.
+            Every document whose containers all sit below `:index-min` takes
+            that path, which is the common case for small values, so the
+            documented pairing failed on ordinary input."
+    (let [o {:stringref false}
+          small (boring/encode [1 2] o)]
+      (is (nil? (boring/build-index small {:index 16 :index-min 16}))
+          "the control: this really is the nil case")
+      (let [w (boring/writer 4096 o)
+            out (ByteArrayOutputStream.)]
+        (is (= 0 (boring/seal-index! w out (boring/build-index small {:index 16 :index-min 16})
+                                     (alength ^bytes small) o))
+            "sealing nothing writes nothing")
+        (is (= 0 (.size out)))))
+    (testing "and a real index still seals"
+      (let [o {:stringref false}
+            v (vec (range 40))
+            bs (boring/encode v o)
+            w (boring/writer 4096 o)
+            out (ByteArrayOutputStream.)]
+        (.write out ^bytes bs)
+        (is (pos? (boring/seal-index! w out (boring/build-index bs {:index 4 :index-min 4})
+                                      (alength ^bytes bs) o)))
+        (is (= v (first (boring/decode-seq (.toByteArray out) o))))))))

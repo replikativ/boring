@@ -198,7 +198,17 @@
            (let [start (rd/position r)]
              (if (== start frame-at)
                nil
-               (cons (rd/read-next! r) (step)))))))))))
+               ;; THE SHAPE CHECK AS WELL AS THE POSITION ONE, matching the JVM.
+               ;; `footer-start` needs the frame's payload header to be the
+               ;; literal `0x86`, so a frame whose payload is written
+               ;; indefinite-length (`9f ... ff`) is not found by position --
+               ;; and the JVM then catches it with `index-frame?` while this
+               ;; had no second gate at all. Same bytes, one item on the JVM
+               ;; and two here.
+               (let [v (rd/read-next! r)]
+                 (if (and (rd/at-end? r) (frame/index-frame? v start))
+                   nil
+                   (cons v (step)))))))))))))
 
 (defn- grow
   "A Uint8Array of at least `n` bytes holding `buf`'s contents."

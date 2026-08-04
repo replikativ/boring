@@ -1098,9 +1098,11 @@
                 ;; Decided on RAW offsets, before `base` is folded in: the
                 ;; Reader is positioned over this item's own buffer.
               (let [sorted (boolean (and srt (aget ^booleans srt 0)))]
-                (when (pos? base)
-                  (dotimes [k (alength ^ints kept)]
-                    (aset ^ints kept k (int (+ base (aget ^ints kept k))))))
+                ;; No `base` rebasing here. `scan-into!` is reached only from
+                ;; `scan-index`, always with base 0, and the branch that used to
+                ;; rebase carried an `^ints` hint that has been wrong since
+                ;; `kept` widened to a long[] -- so it was dead code that would
+                ;; have thrown a ClassCastException had anything reached it.
                 (.add acc [(int (+ base p)) (int n) kept sorted])))
             end))))))
 
@@ -1300,7 +1302,7 @@
   ([^Writer w ^java.io.OutputStream out index data-len]
    ;; The writer's options were resolved when the writer was built, so this
    ;; arity is already past the gate.
-   (seal-index-with! w out index data-len (writer-opts w)))
+   (if (nil? index) 0 (seal-index-with! w out index data-len (writer-opts w))))
   ([^Writer w ^java.io.OutputStream out index data-len opts]
    ;; RESOLVED, like every other public entry point. This was the one that was
    ;; not: every option reached `configure!` unchecked, so `{:float-policy
@@ -1311,7 +1313,13 @@
    ;; entry point that accepts garbage and fails untyped is exactly what the
    ;; option gate exists to make impossible, and `boring.options` claims in its
    ;; own docstring that resolution is the one thing every entry point does.
-   (seal-index-with! w out index data-len (resolve-opts opts))))
+   ;; NIL IS THE DOCUMENTED "nothing was worth indexing" from `build-index`,
+   ;; and the two are documented as a pair -- so the pairing NPE'd on any
+   ;; document whose containers all sat below `:index-min`, which is the
+   ;; common case for small values. Sealing nothing writes nothing.
+   (if (nil? index)
+     0
+     (seal-index-with! w out index data-len (resolve-opts opts)))))
 
 (defn- seal-index-with!
   [^Writer w ^java.io.OutputStream out index data-len opts]
