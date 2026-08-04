@@ -1100,6 +1100,39 @@
 
 (declare index-walk index-walk*)
 
+(defn- read-item-or-frame
+  "Read the next top-level item at `start`, giving boring's OWN footer its own
+  budgets if the caller's turn out to be too small for it.
+
+  `boring.nav` already isolates the index frame's depth budget, with a comment
+  explaining that the caller's limit is a bound on THEIR data and was never a
+  statement about boring's footer. The sequence decoders never got the same
+  treatment, so `write-seq!`'s default output -- which appends a frame four to
+  five levels deep -- could not be read back under any `:max-depth` below 5,
+  even when every data item was depth 1. A valid index made reading fail where
+  no index would have succeeded: the same inversion, in the other reader.
+
+  Retried rather than pre-emptively widened, so a caller's limits still apply to
+  everything they realise. The retry is at the same offset with the budgets
+  lifted; if what comes back is not a genuine index frame, the ORIGINAL error is
+  raised, because then it really was their data that overran."
+  [^Reader r ^long start]
+  (try
+    (.readNext r)
+    (catch clojure.lang.ExceptionInfo e
+      (if-not (#{:boring/max-depth-exceeded :boring/max-items-exceeded}
+               (:type (ex-data e)))
+        (throw e)
+        (let [saved-d (.-maxDepth r) saved-m (.-maxItems r) saved-n (.-items r)]
+          (set! (.-maxDepth r) (int (max saved-d 32)))
+          (set! (.-maxItems r) 0)
+          (let [v (try (.readFrom r start)
+                       (catch Throwable _ (throw e))
+                       (finally (set! (.-maxDepth r) (int saved-d))
+                                (set! (.-maxItems r) saved-m)
+                                (set! (.-items r) saved-n)))]
+            (if (index-frame? v start) ::index-frame (throw e))))))))
+
 (defn- index-walk
   "Walk the value at `p`, returning where it ENDS, and accumulating index nodes
   into `acc` on the way back up.
@@ -1618,16 +1651,20 @@
             ;; per-message state must be cleared between items — but not its
             ;; ident cache, which is a pure function of bytes.
            (let [start (.position r)
-                 v (with-decode-errors (.readNext r))]
+                 v (with-decode-errors (read-item-or-frame r start))]
              ;; THE INDEX FRAME IS NOT AN ITEM. `write-seq!` indexes by default,
              ;; so without this every caller of `decode-seq` would find a
              ;; phantom `#boring/index [...]` after their data. It is dropped
              ;; only in the final position, which is the only place `seal-index!`
              ;; can put it -- a frame of that name anywhere else is somebody
              ;; else's data and stays visible.
-             (if (and (.atEnd r) (index-frame? v start))
-               nil
-               (cons v (step)))))))))))
+             (cond
+               ;; The retry above already established this is a genuine frame
+               ;; at the final position; `readFrom` does not move `position`,
+               ;; so `atEnd` cannot be consulted here.
+               (identical? ::index-frame v) nil
+               (and (.atEnd r) (index-frame? v start)) nil
+               :else (cons v (step)))))))))))
 
 ;; ## Optional hasch integration, activated if hasch is present
 ;;

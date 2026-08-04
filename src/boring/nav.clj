@@ -626,9 +626,27 @@
           ;; about boring's own footer.
           saved (.-maxDepth r)
           _ (set! (.-maxDepth r) (int (max saved 32)))
+          ;; AND ITS OWN ITEM BUDGET, for exactly the same reason the depth
+          ;; budget above is isolated -- the argument was written out once and
+          ;; then applied to only one of the two limits.
+          ;;
+          ;; The frame's item cost scales with the NODE COUNT, so a 500-record
+          ;; log written with default `write-seq!` options overran a budget that
+          ;; was generous for its data: `.readFrom` threw, the catch-all below
+          ;; returned nil, `:data-end` was lost, and `items` then walked past the
+          ;; data section into the frame and reported 501 items for 500 records.
+          ;; A silently wrong count out of a default-written file.
+          ;;
+          ;; The counter is restored too, not just the limit: the frame must not
+          ;; spend the caller's budget on its way past.
+          savedMax (.-maxItems r)
+          savedN (.-items r)
+          _ (set! (.-maxItems r) 0)
           [stride raw-containers ^ints counts slots sorted _]
           (try (boring.data/frame-payload (.readFrom r ptr))
-               (finally (set! (.-maxDepth r) (int saved))))
+               (finally (set! (.-maxDepth r) (int saved))
+                        (set! (.-maxItems r) savedMax)
+                        (set! (.-items r) savedN)))
           ;; CONTAINERS ARRIVE AT EITHER WIDTH. `seal-index!` emits int32 when
           ;; every offset fits and sint64 when one does not, and the CBOR tag is
           ;; the declaration -- the same narrowest-that-fits rule the slot

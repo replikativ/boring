@@ -151,7 +151,10 @@ public final class Reader {
      */
     public long maxItems = 0;
 
-    private long items;
+    /** Items charged so far. Public so the sequence decoders and `boring.nav`
+     *  can save and restore it around reading boring's OWN index frame, which
+     *  must not spend the caller's budget. */
+    public long items;
 
     /** Whether `v` parses as an ordinary RFC 3339 instant. Used to validate the
      *  non-leap part of a leap-second timestamp before preserving it. */

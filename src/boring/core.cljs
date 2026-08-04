@@ -388,7 +388,8 @@
              (step []
                (lazy-seq
                 (if-not (rd/at-end? r)
-                  (let [v (try
+                  (let [start (rd/position r)
+                        v (try
                             {:ok (rd/read-next! r)}
                             (catch :default e
                               ;; From INSIDE the reader, "the buffer ends
@@ -407,8 +408,27 @@
                                 (throw e))))]
                     (cond
                       (contains? v :ok)
-                      (do (swap! state assoc :last-good (rd/position r))
-                          (cons (:ok v) (step)))
+                      ;; THE INDEX FRAME IS NOT AN ITEM HERE EITHER. `decode-seq`
+                      ;; has recognised it since the cross-platform parity fix;
+                      ;; this arity never did, so every JVM-written default
+                      ;; sequence read through the streaming path -- the
+                      ;; documented way to read a dump larger than the heap --
+                      ;; came back with a phantom trailing frame: 40 items
+                      ;; became 41, and an empty indexed sequence became 1.
+                      ;;
+                      ;; `at-end?` is checked against the buffer AND the source:
+                      ;; a frame is only a footer when nothing follows it, and
+                      ;; on a pull source "nothing follows" means EOF as well.
+                      ;; A refill is ATTEMPTED, not a flag consulted: `:eof?`
+                      ;; is only set once a pull has come back empty, which has
+                      ;; not happened yet at the moment the last item is read.
+                      ;; The JVM arity resolves it the same way.
+                      (if (and (rd/at-end? r)
+                               (index-frame? (:ok v) start)
+                               (not (refill!)))
+                        nil
+                        (do (swap! state assoc :last-good (rd/position r))
+                            (cons (:ok v) (step))))
                       (refill!) (step)
                       :else (throw (:need-more v))))
                   (when (refill!) (step)))))]
