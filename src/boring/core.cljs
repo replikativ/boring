@@ -147,13 +147,15 @@
   (cond
     (nil? fb) nil
     (= :placeholder fb) unencodable
-    ;; A FUNCTION, not merely something invocable. `ifn?` is true of keywords,
-    ;; symbols, maps, sets and vectors -- so `:placehodler`, one letter wrong,
-    ;; was accepted as a fallback, invoked as `(:placehodler v)`, and silently
-    ;; replaced every unencodable value with nil. A vector fallback threw
-    ;; untyped instead. The option exists to make a lossy substitution
-    ;; deliberate; taking a typo for one is the opposite.
-    (fn? fb) fb
+    ;; INVOCABLE, but not one of the DATA types that happen to be invocable.
+    ;; `ifn?` is true of keywords, symbols, maps, sets and vectors, so
+    ;; `:placehodler` -- one letter wrong -- was accepted, invoked as
+    ;; `(:placehodler v)`, and silently replaced every unencodable value with
+    ;; nil, while a vector threw untyped. `fn?` fixed that and went too far the
+    ;; other way: it rejects vars, multimethods and any record or `reify`
+    ;; implementing IFn, all of which are legitimate fallbacks.
+    (and (ifn? fb)
+         (not (or (keyword? fb) (symbol? fb) (map? fb) (set? fb) (vector? fb)))) fb
     :else (throw (ex-info (str "boring: :encode-fallback must be nil, :placeholder, or a function, got "
                           (pr-str fb))
                           {:type :boring/bad-option :value fb}))))

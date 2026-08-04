@@ -241,13 +241,15 @@
   (cond
     (nil? fb) nil
     (= :placeholder fb) unencodable
-    ;; A FUNCTION, not merely something invocable. `ifn?` is true of keywords,
-    ;; symbols, maps, sets and vectors -- so `:placehodler`, one letter wrong,
-    ;; was accepted as a fallback, invoked as `(:placehodler v)`, and silently
-    ;; replaced every unencodable value with nil. A vector fallback threw
-    ;; untyped instead. The option exists to make a lossy substitution
-    ;; deliberate; taking a typo for one is the opposite.
-    (fn? fb) fb
+    ;; INVOCABLE, but not one of the DATA types that happen to be invocable.
+    ;; `ifn?` is true of keywords, symbols, maps, sets and vectors, so
+    ;; `:placehodler` -- one letter wrong -- was accepted, invoked as
+    ;; `(:placehodler v)`, and silently replaced every unencodable value with
+    ;; nil, while a vector threw untyped. `fn?` fixed that and went too far the
+    ;; other way: it rejects vars, multimethods and any record or `reify`
+    ;; implementing IFn, all of which are legitimate fallbacks.
+    (and (ifn? fb)
+         (not (or (keyword? fb) (symbol? fb) (map? fb) (set? fb) (vector? fb)))) fb
     :else (throw (ex-info (str "boring: :encode-fallback must be nil, :placeholder, or a function, got "
                           (pr-str fb))
                           {:type :boring/bad-option :value fb}))))
@@ -1784,7 +1786,21 @@
             ;; per-message state must be cleared between items — but not its
             ;; ident cache, which is a pure function of bytes.
            (let [start (.position r)
-                 v (with-decode-errors (read-item-or-frame r start frame-at))]
+                 ;; THE FOOTER IS NOT DECODED AT ALL. It is being SKIPPED, not
+                 ;; used, so reading its value was never necessary -- and reading
+                 ;; it under lifted budgets is what made a forged frame a bomb:
+                 ;; the prefix gate ran first, then the payload was materialised,
+                 ;; and `index-frame?` only judged the result afterwards. A file
+                 ;; whose frame slot held a nested-array payload allocated 102 MB
+                 ;; under `{:max-items 100}` and returned its two honest items
+                 ;; with no error.
+                 ;;
+                 ;; If the file's own back-pointer names this offset and the
+                 ;; seventeen frame bytes are here, the rest of the file is the
+                 ;; footer by construction. Stopping is the whole answer, and it
+                 ;; allocates nothing whatever the payload claims to be.
+                 footer? (= start frame-at)
+                 v (when-not footer? (with-decode-errors (.readNext r)))]
              ;; THE INDEX FRAME IS NOT AN ITEM. `write-seq!` indexes by default,
              ;; so without this every caller of `decode-seq` would find a
              ;; phantom `#boring/index [...]` after their data. It is dropped
@@ -1792,6 +1808,7 @@
              ;; can put it -- a frame of that name anywhere else is somebody
              ;; else's data and stays visible.
              (cond
+               footer? nil
                ;; The retry above already established this is a genuine frame
                ;; at the final position; `readFrom` does not move `position`,
                ;; so `atEnd` cannot be consulted here.

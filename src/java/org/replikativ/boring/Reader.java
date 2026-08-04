@@ -1738,6 +1738,16 @@ public final class Reader {
                 // the same value without asking two unrelated collections to
                 // order themselves. Falling back is not a degradation: above the
                 // array-map threshold this is the representation anyway.
+                //
+                // THE DUPLICATE CHECK STILL RUNS. The first version of this
+                // returned here directly, so a map carrying one sorted key
+                // stopped being checked at all: `{sorted-map: .., {1 1}: .., 1:
+                // .., 1: ..}` decoded to a three-entry map with the default
+                // `:check-duplicate-keys true`, while the same duplicate without
+                // the sorted key threw. A fallback that also drops a documented
+                // guarantee is a second defect wearing the first one's clothes.
+                if (checkDuplicateKeys && n > 1)
+                    checkDistinct(kvs, n, 2, "map key", "duplicate-map-key");
                 return clojure.lang.PersistentHashMap.create(kvs);
             }
             if (checkDuplicateKeys && m.count() != n) {
