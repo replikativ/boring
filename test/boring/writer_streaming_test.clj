@@ -209,3 +209,27 @@
                  (boring/write-indexed! (boring/writer 4096 nil) {:a 1}
                                         (ByteArrayOutputStream.)
                                         {:index 16 :stringref true})))))
+
+(deftest trim-gives-back-what-one-large-job-grew
+  (testing "a writer's growth is one-way -- buffer, symbol table and index
+            arrays all keep their PEAK size -- which is what makes reuse
+            allocation-free and also what pins a 256 MB buffer in a pool after
+            one exceptional value. `trim!` is the explicit way back"
+    (let [w (boring/writer 64)]
+      (boring/encode-into! w (byte-array 1000000))
+      (is (> (alength (boring/buffer w)) 1000000) "the big job grew it")
+      (is (pos? (boring/trim! w)) "and trim reports what it released")
+      (is (= 64 (alength (boring/buffer w))) "back to the size it was built at")
+      (is (= {:a 1} (boring/decode (boring/encode-into! w {:a 1})))
+          "a trimmed writer is a usable writer")))
+
+  (testing "trimming a writer that never grew is a no-op, not an error"
+    (is (zero? (boring/trim! (boring/writer 64)))))
+
+  (testing "and mid-stream it refuses, because the buffer holds bytes that have
+            not reached the sink yet"
+    (let [^org.replikativ.boring.Writer w (boring/writer 64)]
+      (.beginStream w (ByteArrayOutputStream.))
+      (is (= :boring/bad-argument
+             (try (boring/trim! w) (catch clojure.lang.ExceptionInfo e
+                                     (:type (ex-data e)))))))))

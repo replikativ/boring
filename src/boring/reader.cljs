@@ -29,6 +29,20 @@
 (def text-decoder
   (js/TextDecoder. "utf-8" #js {:fatal true :ignoreBOM true}))
 
+;; `:validate-utf8 false` HAS TO DECODE, not merely skip the manual check.
+;;
+;; Turning validation off left every byte going through the fatal decoder above,
+;; so `61 ff` came back as a raw JS TypeError -- "The encoded data was not valid
+;; for encoding utf-8" -- from an option whose whole purpose is to accept that
+;; input. The JVM's decoder uses REPLACE for both malformed and unmappable input
+;; when validation is off, so the two platforms disagreed about whether the
+;; option existed: lenient there, fatal-and-untyped here.
+;;
+;; Two decoders rather than one constructed per call: TextDecoder construction
+;; is not free and the mode is fixed for the life of a read.
+(def replacing-decoder
+  (js/TextDecoder. "utf-8" #js {:fatal false :ignoreBOM true}))
+
 (defn- not== [a b] (not (== a b)))
 
 (defn- err
@@ -221,7 +235,8 @@
         start (.-pos r)]
     (need! r n)
     (when (.-validateUtf8 r) (validate-utf8! r start n))
-    (let [s (.decode text-decoder (.subarray (.-buf r) start (+ start n)))]
+    (let [s (.decode (if (.-validateUtf8 r) text-decoder replacing-decoder)
+                     (.subarray (.-buf r) start (+ start n)))]
       (set! (.-pos r) (+ start n))
       ;; Inside a namespace only: a string outside one is not a table entry,
       ;; and registering it shifted every later index by one.
@@ -240,7 +255,8 @@
   (datom-maps-200 543 -> 894 us). The micro-benchmark measured JavaScript that
   the compiler does not actually emit."
   [^Reader r start n]
-  (.decode text-decoder (.subarray (.-buf r) start (+ start n))))
+  (.decode (if (.-validateUtf8 r) text-decoder replacing-decoder)
+           (.subarray (.-buf r) start (+ start n))))
 
 (defn- intern-ident [s]
   ;; charCodeAt + == rather than (= ":" (.charAt s 0)): the latter goes through
@@ -336,6 +352,87 @@
           (.join parts "")
           (do (.push parts c) (recur)))))))
 
+;; ## Duplicate keys the host compares by identity
+;;
+;; A CBOR byte string decodes to a Uint8Array, and two Uint8Arrays are `=` only
+;; when they are the SAME OBJECT. So `{h'01': 1, h'01': 2}` -- one key repeated,
+;; which RFC 8949 5.6 makes invalid -- decoded to a TWO-ENTRY map: more entries
+;; than the wire described, carrying the very duplicate the check exists to
+;; reject. Every typed array from tags 77-86 has the same shape.
+;;
+;; The count comparisons below catch every key the host itself compares by
+;; value, and they are free. They cannot catch these. The JVM had exactly this
+;; gap and closed it with a content-aware probe; this is the same rule.
+
+(defn- array-key? [x] (.isView js/ArrayBuffer x))
+
+(defn- array-content-key
+  "A string equal for exactly the array-like values CBOR calls the same data
+  item.
+
+  Built from the UNDERLYING BYTES, not from `.join` of the elements: joining a
+  Float64Array renders -0.0 as \"0\" and would report two DIFFERENT data items
+  as a duplicate, rejecting a valid map. Bytes are what the wire carried and
+  what `java.util.Arrays.equals` compares on the JVM, so the platforms agree.
+
+  The constructor name is part of the key: a tag-77 Int16Array and a byte
+  string with the same bytes are different data items."
+  [x]
+  (str (.. x -constructor -name) ":"
+       (.join (js/Uint8Array. (.-buffer x) (.-byteOffset x) (.-byteLength x)) ",")))
+
+(defn- same-key?
+  "Host equality first, content equality only for array-likes.
+
+  `identical?` leads because boring's ident cache returns the SAME keyword
+  object for a repeated key, so the overwhelmingly common case is a pointer
+  comparison and never reaches the rest."
+  [a b]
+  (or (identical? a b)
+      (= a b)
+      (and (array-key? a) (array-key? b)
+           (= (array-content-key a) (array-content-key b)))))
+
+;; Whether an interleaved [k v k v ...] array holds a repeated key. O(n^2), but
+;; n is bounded by the array-map threshold, so it is at most 28 comparisons.
+(defn- dup-key? [arr n]
+  (loop [i 0]
+    (if (>= i n)
+      false
+      (let [a (aget arr (* 2 i))
+            dup (loop [j (inc i)]
+                  (if (>= j n)
+                    false
+                    (let [b (aget arr (* 2 j))]
+                      (if (same-key? a b) true (recur (inc j))))))]
+        (if dup true (recur (inc i)))))))
+
+(defn- check-array-dups!
+  "Reject array-like members of `xs` that are content-equal, in one pass.
+
+  The Set is allocated on the FIRST array-like member, so a map or set without
+  one -- which is nearly all of them -- pays one `ArrayBuffer.isView` per member
+  and allocates nothing.
+
+  Residual gap, stated rather than implied: a byte string NESTED inside a vector
+  or map key is still compared by the host, so `{[h'01']: 1, [h'01']: 2}` keeps
+  two entries. The JVM has the identical gap for the identical reason, so the
+  platforms agree on what they accept; doc/SECURITY.md records it."
+  [xs err-type what]
+  (loop [s (seq xs) seen nil]
+    (when s
+      (let [x (first s)]
+        (if (array-key? x)
+          (let [ck (array-content-key x)
+                seen (or seen (js/Set.))]
+            (when (.has seen ck)
+              (err err-type
+                   (str "boring: duplicate " what " (byte-identical " ck ")")
+                   {:key ck}))
+            (.add seen ck)
+            (recur (next s) seen))
+          (recur (next s) seen))))))
+
 (defn- read-indefinite-array! [^Reader r]
   (enter! r)
   (let [v (loop [acc (transient [])]
@@ -355,11 +452,13 @@
                         [(persistent! acc) n]
                         (recur (assoc! acc k (read! r)) (inc n)))))]
     (exit! r)
-    (when (and (.-checkDuplicateKeys r) (not= (count m) pairs))
-      (err :boring/duplicate-map-key
-           (str "boring: duplicate map key in an indefinite-length map of "
-                pairs " pairs")
-           {:declared pairs :actual (count m)}))
+    (when (.-checkDuplicateKeys r)
+      (when (not= (count m) pairs)
+        (err :boring/duplicate-map-key
+             (str "boring: duplicate map key in an indefinite-length map of "
+                  pairs " pairs")
+             {:declared pairs :actual (count m)}))
+      (check-array-dups! (keys m) :boring/duplicate-map-key "map key"))
     m))
 
 (defn- read-array! [^Reader r n]
@@ -403,24 +502,6 @@
 
 (defn- read-map! [^Reader r n]
   (if (zero? n) {} (read-map-n! r n)))
-
-;; Whether an interleaved [k v k v ...] array holds a repeated key.
-;;
-;; `identical?` first, `=` only as a fallback: boring's ident cache returns the
-;; SAME keyword object for a repeated key, so the overwhelmingly common case is
-;; a pointer comparison. O(n^2), but n is bounded by the array-map threshold,
-;; so it is at most 28 comparisons.
-(defn- dup-key? [arr n]
-  (loop [i 0]
-    (if (>= i n)
-      false
-      (let [a (aget arr (* 2 i))
-            dup (loop [j (inc i)]
-                  (if (>= j n)
-                    false
-                    (let [b (aget arr (* 2 j))]
-                      (if (or (identical? a b) (= a b)) true (recur (inc j))))))]
-        (if dup true (recur (inc i)))))))
 
 ;; Separate function for the same inlining reason as read-array-small!.
 (defn- read-map-small! [^Reader r n]
@@ -471,10 +552,14 @@
     ;; a repeated key is shorter than the declared count. The previous version
     ;; allocated a js/Set per map and hashed every key — O(n) work and an
     ;; allocation, for a check a single count comparison already makes.
-    (when (and (nil? fast) (.-checkDuplicateKeys r) (not= (count m) n))
-      (err :boring/duplicate-map-key
-           (str "boring: duplicate map key in a map of declared size " n)
-           {:declared n :actual (count m)}))
+    (when (and (nil? fast) (.-checkDuplicateKeys r))
+      (when (not= (count m) n)
+        (err :boring/duplicate-map-key
+             (str "boring: duplicate map key in a map of declared size " n)
+             {:declared n :actual (count m)}))
+      ;; The small-map path is covered by `dup-key?`, which compares content
+      ;; directly; only the transient path needs this second pass.
+      (check-array-dups! (keys m) :boring/duplicate-map-key "map key"))
     m))
 
 (defn- read-typed-array! [^Reader r tag]
@@ -507,6 +592,38 @@
     (err :boring/bad-tag-content
          (str "boring: " nm " must wrap an array") {:tag 27}))
   argument)
+
+(defn- list-marker-content
+  "A tag-27 argument that must be an ARRAY, and not merely something seqable.
+
+  Stricter than `seq-content` on purpose, and the difference is the JVM's:
+  `seqableContent` admits nil -- an empty sorted set is a sensible reading of a
+  null payload -- while `listMarkerContent` does not, because a null is not an
+  array. CLJS reached both through `(vec argument)`, which turns nil into `[]`
+  and a string into a vector of its characters, so `27([\"java/object-array\",
+  null])` decoded here and was refused there."
+  [argument nm]
+  (when-not (vector? argument)
+    (err :boring/bad-tag-content
+         (str "boring: " nm " must wrap an array, got " (pr-str argument))
+         {:tag 27}))
+  argument)
+
+(defn- sorted-content
+  "`(into coll xs)` with incomparable members reported as a typed error.
+
+  CLJS `compare` on two values of different types throws a bare JS Error, which
+  walked straight out through the typed-error contract; the JVM catches the
+  corresponding ClassCastException and reports `:boring/bad-tag-content`. One
+  byte of wire reaches this."
+  [coll xs nm]
+  (try
+    (into coll xs)
+    (catch :default e
+      (err :boring/bad-tag-content
+           (str "boring: " nm " members are not mutually comparable ("
+                (.-message e) ")")
+           {:tag 27}))))
 
 (defn- leap-second?
   "`:60` in the seconds field -- valid RFC 3339 (5.6), representable by neither
@@ -563,6 +680,143 @@
   [x]
   (or (= "bigint" (goog/typeOf x))
       (and (number? x) (js/Number.isInteger x))))
+
+(def ^:private DURATION-SCALES #{-3 -6 -9 -12 -15 -18})
+
+(def ^:private ZERO-N (js/BigInt 0))
+(def ^:private NANOS-N (js/BigInt 999999999))
+
+(defn- zero-n? [b] (identical? b ZERO-N))
+
+(defn- pow10n [^number n]
+  (loop [i n acc (js/BigInt 1)] (if (zero? i) acc (recur (dec i) (* acc (js/BigInt 10))))))
+
+(defn- as-bigint
+  "`x` as a BigInt when it is a CBOR integer, else nil."
+  [x]
+  (cond (= "bigint" (goog/typeOf x)) x
+        (and (number? x) (js/Number.isInteger x)) (js/BigInt x)
+        :else nil))
+
+(defn- duration-key
+  "A tag-1002 map key as a plain JS integer, or one of `:elective` (ignore it)
+  and `:critical` (reject it) when it is not one boring can implement.
+
+  EXACT, never narrowed. A key of 2^64+1 truncated to a JS number would ALIAS
+  the base key 1 and slip past the very rule that is supposed to reject it --
+  the JVM had exactly that defect, found by `exactInteger`. A key too wide for
+  a safe integer is by definition one boring does not implement: unsigned means
+  critical (error), negative means elective (ignore).
+
+  `nil` for a key that is not an integer at all. RFC 9581 3 groups text-string
+  keys with negative ones: both are elective and both are skipped."
+  [k]
+  (cond
+    (and (number? k) (js/Number.isInteger k)) k
+    (= "bigint" (goog/typeOf k))
+    (if (and (<= k (js/BigInt js/Number.MAX_SAFE_INTEGER))
+             (>= k (js/BigInt (- js/Number.MAX_SAFE_INTEGER))))
+      (js/Number k)
+      (if (< k (js/BigInt 0)) :elective :critical))
+    :else nil))
+
+(defn- validate-duration!
+  "RFC 9581 4's map rules for tag 1002, ENFORCED rather than assumed.
+
+  ClojureScript keeps the value a `TaggedValue` -- there is no
+  `java.time.Duration` here -- but \"we do not convert it\" is not a reason to
+  accept a shape the JVM rejects. RFC 9581 3 makes unsigned keys CRITICAL: a
+  reader that does not understand one must fail rather than ignore it, and a
+  reader that admits one the other platform refuses is a parser differential
+  whichever value the two sides go on to produce.
+
+  What boring does not represent -- decimal-fraction and bigfloat bases (keys 4
+  and 5) -- is refused by name rather than reported as \"no base value\".
+  Refusing a conforming form we cannot carry losslessly is honest; ignoring it
+  is not."
+  [v]
+  (let [base (volatile! nil)
+        seen-base? (volatile! false)
+        frac (volatile! nil)                          ; [scale value-as-BigInt]
+        frac-seen? (volatile! false)]
+    (doseq [k (keys v)]
+      (let [kk (duration-key k)]
+        (cond
+          (nil? kk) nil                               ; text key: elective
+          (= :elective kk) nil
+          (= :critical kk)
+          (err :boring/bad-tag-content
+               (str "boring: tag 1002 has unknown critical key " k) {:tag 1002})
+          (or (== kk 4) (== kk 5))
+          (err :boring/bad-tag-content
+               (str "boring: tag 1002 base key " kk " (decimal fraction /"
+                    " bigfloat) is not a form boring represents") {:tag 1002})
+          (== kk 1) (do (vreset! seen-base? true) (vreset! base (get v k)))
+          ;; Unsigned and not the base: critical and unimplemented.
+          (>= kk 0)
+          (err :boring/bad-tag-content
+               (str "boring: tag 1002 has unknown critical key " kk) {:tag 1002})
+          (DURATION-SCALES kk)
+          (do
+            ;; RFC 9581 3.3: "Each extended time data item MUST NOT contain
+            ;; more than one of these keys."
+            (when @frac-seen?
+              (err :boring/bad-tag-content
+                   "boring: tag 1002 has more than one decimally scaled fraction key"
+                   {:tag 1002}))
+            (vreset! frac-seen? true)
+            (let [fv (as-bigint (get v k))]
+              (when (nil? fv)
+                (err :boring/bad-tag-content
+                     "boring: tag 1002 fraction must be an integer" {:tag 1002}))
+              (vreset! frac [(- kk) fv])))
+          ;; EVERY OTHER NEGATIVE KEY IS IGNORED, which RFC 9581 3 requires:
+          ;; the extended time is still usable without what they carry. `{1: 5,
+          ;; -1: 0}` -- timescale UTC, the DEFAULT -- is a conforming duration.
+          :else nil)))
+    (when-not @seen-base?
+      (err :boring/bad-tag-content
+           "boring: tag 1002 has no base value (key 1)" {:tag 1002}))
+    (when-not (or (number? @base) (= "bigint" (goog/typeOf @base)))
+      (err :boring/bad-tag-content
+           "boring: tag 1002 base value must be a number" {:tag 1002}))
+    (when-let [[scale fv] @frac]
+      ;; With a scaled fraction present, RFC 9581 requires an INTEGER base and
+      ;; an UNSIGNED fraction.
+      ;;
+      ;; Residual, and it is a platform limit rather than a decision: JS has one
+      ;; number type, so `{1: 5.0, -9: 1}` is indistinguishable from
+      ;; `{1: 5, -9: 1}` here and the JVM rejects only the former. A base with
+      ;; an actual fractional part is caught.
+      (when-not (cbor-integer? @base)
+        (err :boring/bad-tag-content
+             "boring: tag 1002 base value must be an integer when a scaled fraction is present"
+             {:tag 1002}))
+      (when (< fv ZERO-N)
+        (err :boring/bad-tag-content
+             (str "boring: tag 1002 fraction " fv " must be unsigned") {:tag 1002}))
+      ;; BigInt arithmetic throughout: a legal fraction at scale -18 runs to
+      ;; 999999999e9, which is past `Number.MAX_SAFE_INTEGER`, so doing this in
+      ;; JS numbers would lose the low digits of the very check being made.
+      (if (<= scale 9)
+        (when (> fv (/ NANOS-N (pow10n (- 9 scale))))
+          (err :boring/bad-tag-content
+               (str "boring: tag 1002 fraction " fv "e-" scale " is a second or more")
+               {:tag 1002}))
+        ;; -12/-15/-18 are picoseconds and finer. Accepted when they land on a
+        ;; whole nanosecond, refused otherwise -- the JVM has no room below 1 ns
+        ;; and silently dropping the remainder is the truncation this handler
+        ;; exists to prevent, so both platforms refuse rather than differ.
+        (let [div (pow10n (- scale 9))]
+          (when-not (zero-n? (js-mod fv div))
+            (err :boring/bad-tag-content
+                 (str "boring: tag 1002 fraction " fv "e-" scale
+                      " is finer than a nanosecond")
+                 {:tag 1002}))
+          (when (> (/ fv div) NANOS-N)
+            (err :boring/bad-tag-content
+                 (str "boring: tag 1002 fraction " fv "e-" scale " is a second or more")
+                 {:tag 1002})))))))
 
 (defn- stringref-arg!
   "The argument of tag 25, which MUST be an unsigned integer.
@@ -768,10 +1022,15 @@
                 n (count items)
                 st (into #{} items)]
               ;; Maps reject duplicate keys; sets silently collapsed them.
-            (when (and (.-checkDuplicateKeys r) (not== (count st) n))
-              (err :boring/duplicate-set-element
-                   (str "boring: tag 258 declared " n " elements but "
-                        (count st) " are distinct") {:declared n}))
+            (when (.-checkDuplicateKeys r)
+              (when (not== (count st) n)
+                (err :boring/duplicate-set-element
+                     (str "boring: tag 258 declared " n " elements but "
+                          (count st) " are distinct") {:declared n}))
+              ;; And the ones the host compares by identity, which survive the
+              ;; count check as two elements: two independently allocated but
+              ;; byte-equal Uint8Arrays are ONE CBOR data item.
+              (check-array-dups! items :boring/duplicate-set-element "set element"))
             st))
     (2 3) (let [bs (read! r)]
             (when-not (instance? js/Uint8Array bs)
@@ -876,16 +1135,7 @@
     1002 (let [v (read! r)]
            (when-not (map? v)
              (err :boring/bad-tag-content "boring: tag 1002 must wrap a map" {:tag 1002}))
-           (let [sec (get v 1) nano (get v -9)]
-             (when (nil? sec)
-               (err :boring/bad-tag-content
-                    "boring: tag 1002 has no base value (key 1)" {:tag 1002}))
-             (when-not (number? sec)
-               (err :boring/bad-tag-content
-                    "boring: tag 1002 base value must be a number" {:tag 1002}))
-             (when-not (or (nil? nano) (number? nano))
-               (err :boring/bad-tag-content
-                    "boring: tag 1002 fraction must be a number" {:tag 1002})))
+           (validate-duration! v)
            (data/tagged-value 1002 v))
 
     1004 (let [v (read! r)]
@@ -1025,8 +1275,11 @@
                (do (when-not (map? argument)
                      (err :boring/bad-tag-content
                           "boring: clojure/sorted-map must wrap a map" {:tag 27}))
-                   (into (sorted-map) argument))
-               "clojure/sorted-set" (into (sorted-set) (seq-content argument "clojure/sorted-set"))
+                   (sorted-content (sorted-map) argument "clojure/sorted-map"))
+               "clojure/sorted-set"
+               (sorted-content (sorted-set)
+                               (seq-content argument "clojure/sorted-set")
+                               "clojure/sorted-set")
                "clojure/queue"      (into cljs.core/PersistentQueue.EMPTY
                                           (seq-content argument "clojure/queue"))
                ;; ClojureScript has no character type -- `\a` READS as the
@@ -1049,22 +1302,67 @@
                ;; hierarchy, so they decode to the closest thing that exists:
                ;; a vector, a string, or an ex-info. JVM data still DECODES
                ;; rather than surfacing as an UnknownRecord to unwrap.
-               "java/boolean-array" (vec argument)
-               "java/char-array"    argument
-               "java/string-array"  (vec argument)
-               "java/object-array"  (vec argument)
+               ;; ELEMENT DOMAINS TOO, not merely the container shape. The JVM
+               ;; builds a `boolean[]`/`String[]`, so it rejects an element that
+               ;; is not one; `(vec argument)` accepted anything, and
+               ;; `27(["java/boolean-array", [1]])` decoded to `[1]` here and
+               ;; was refused there. A portable format has to accept and reject
+               ;; the same wire shapes on both platforms even when the value it
+               ;; produces on one of them is a stand-in.
+               "java/boolean-array"
+               (let [l (list-marker-content argument "java/boolean-array")]
+                 (doseq [x l]
+                   (when-not (boolean? x)
+                     (err :boring/bad-tag-content
+                          "boring: java/boolean-array element is not a boolean"
+                          {:tag 27})))
+                 l)
+               "java/char-array"
+               (do (when-not (string? argument)
+                     (err :boring/bad-tag-content
+                          "boring: java/char-array must wrap a text string" {:tag 27}))
+                   argument)
+               "java/string-array"
+               (let [l (list-marker-content argument "java/string-array")]
+                 (doseq [x l]
+                   (when-not (or (nil? x) (string? x))
+                     (err :boring/bad-tag-content
+                          "boring: java/string-array element is not a string" {:tag 27})))
+                 l)
+               "java/object-array" (list-marker-content argument "java/object-array")
                "clojure/ex-info"
                (do (when-not (and (vector? argument) (== 3 (count argument)))
                      (err :boring/bad-tag-content
                           "boring: clojure/ex-info must wrap [message data cause]" {:tag 27}))
-                   (ex-info (nth argument 0) (nth argument 1) (nth argument 2)))
+                   (when-not (map? (nth argument 1))
+                     (err :boring/bad-tag-content
+                          "boring: clojure/ex-info data must be a map" {:tag 27}))
+                   (when-not (or (nil? (nth argument 0)) (string? (nth argument 0)))
+                     (err :boring/bad-tag-content
+                          "boring: clojure/ex-info message must be a text string"
+                          {:tag 27}))
+                   (ex-info (or (nth argument 0) "") (nth argument 1)
+                            ;; A non-exception cause is DROPPED, not carried:
+                            ;; the JVM's `cause instanceof Throwable ? ... :
+                            ;; null` does the same, and a decoded map sitting in
+                            ;; `ex-cause` is not a cause on either platform.
+                            (when (instance? js/Error (nth argument 2))
+                              (nth argument 2))))
                "java/throwable"
                (do (when-not (and (vector? argument) (== 3 (count argument)))
                      (err :boring/bad-tag-content
                           "boring: java/throwable must wrap [class message cause]" {:tag 27}))
+                   (when-not (string? (nth argument 0))
+                     (err :boring/bad-tag-content
+                          "boring: java/throwable class must be a text string" {:tag 27}))
+                   (when-not (or (nil? (nth argument 1)) (string? (nth argument 1)))
+                     (err :boring/bad-tag-content
+                          "boring: java/throwable message must be a text string"
+                          {:tag 27}))
                    (ex-info (or (nth argument 1) "")
                             {:boring/throwable-class (nth argument 0)}
-                            (nth argument 2)))
+                            (when (instance? js/Error (nth argument 2))
+                              (nth argument 2))))
                "java/period"
                (do (when-not (and (string? argument)
                                   (re-matches #"[+-]?P(?!$)([+-]?\d+Y)?([+-]?\d+M)?([+-]?\d+W)?([+-]?\d+D)?"

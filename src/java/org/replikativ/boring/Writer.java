@@ -419,7 +419,7 @@ public final class Writer {
 
     private long[] idxSeq = new long[1024];
     private int idxSeqN = 0;
-    private int idxItems = 0;
+    private long idxItems = 0;
     private int idxItemCountdown = 1;
 
     /**
@@ -433,11 +433,28 @@ public final class Writer {
             idxSeq[idxSeqN++] = checkedOffset(off);   // already file-relative
             idxItemCountdown = idxStride;
         }
+        // COUNTED AS A LONG AND REFUSED AT THE BOUNDARY, rather than wrapped.
+        //
+        // The index frame carries this count in an int32 array, alongside the
+        // per-container counts -- widening it would change the wire format of
+        // every file, for a limit no in-memory container can reach anyway. So
+        // the sequence count keeps the wire type it has and the writer stops at
+        // it, HERE, at the item that would overflow rather than at the end of a
+        // multi-hour job with a silently wrong footer.
+        //
+        // Reachable: the offsets went 64-bit precisely so files past 2 GiB
+        // work, and 2^31 items is a ~64 GB datom dump, not a theoretical bound.
+        // `:index 0` writes such a sequence with no index at all.
+        if (idxItems == Integer.MAX_VALUE)
+            throw Err.of("index-too-large",
+                "boring: a sequence index cannot describe more than "
+                + Integer.MAX_VALUE + " items; write this sequence with :index 0");
         idxItems++;
     }
 
-    /** How many top-level items `idxItem` has seen. */
-    public int idxItemTotal() { return idxItems; }
+    /** How many top-level items `idxItem` has seen. Never above
+     *  {@code Integer.MAX_VALUE}: {@link #idxItem} refuses to go past it. */
+    public long idxItemTotal() { return idxItems; }
 
     /** Offsets of every `stride`th top-level item. */
     public long[] idxItemOffsets() { return java.util.Arrays.copyOf(idxSeq, idxSeqN); }
@@ -619,8 +636,12 @@ public final class Writer {
     private int srCount;
     private int srNextIndex;
 
+    /** What {@link #trim()} goes back to. */
+    private final int initialSize;
+
     public Writer(int initialSize) {
-        this.buf = new byte[Math.max(64, initialSize)];
+        this.initialSize = Math.max(64, initialSize);
+        this.buf = new byte[this.initialSize];
         this.pos = 0;
         // 16, not 256. The table grows by rehash and a reused writer keeps
         // whatever it grew to, so the only cost of starting small is a few
@@ -664,6 +685,43 @@ public final class Writer {
             java.util.Arrays.fill(srKeys, null);
             srCount = 0;
         }
+    }
+
+    /**
+     * Give back everything an exceptional job grew, and return the number of
+     * bytes of buffer released.
+     *
+     * A Writer is meant to be long-lived and reused, and every growth it has is
+     * one-way: the byte buffer, the stringref symbol table, and the index
+     * capture arrays all keep their PEAK size for the life of the writer. That
+     * is the right default -- it is what makes reuse allocation-free -- but a
+     * pooled writer that once encoded a 200 MB value then pins a 256 MB buffer
+     * forever while it goes back to encoding 200-byte datoms.
+     *
+     * So the policy is explicit rather than automatic: shrinking on a heuristic
+     * would reintroduce exactly the per-message allocation reuse exists to
+     * avoid. Call this after a known-large job, not in a loop.
+     *
+     * Refuses mid-stream, where `buf` holds bytes that have not reached the
+     * sink. Safe to call any other time; a trimmed writer is a usable writer.
+     */
+    public long trim() {
+        if (sink != null)
+            throw Err.of("bad-argument",
+                "boring: trim() during a stream would discard buffered bytes;"
+                + " finish the stream first");
+        long freed = buf.length - initialSize;
+        if (freed > 0) { buf = new byte[initialSize]; pos = 0; }
+        if (srKeys.length > 16) initSymtab(16);
+        idxReset();
+        if (idxOffs.length > 32) {
+            idxOffs = new long[32];
+            idxCnts = new int[32];
+            idxSrt = new boolean[32];
+            idxSlots = new long[32][];
+        }
+        if (idxSeq.length > 1024) idxSeq = new long[1024];
+        return Math.max(0, freed);
     }
 
     public int position() { return pos; }

@@ -446,6 +446,26 @@
   ^bytes [^Writer w]
   (.buffer w))
 
+(defn trim!
+  "Give a reused writer back everything one exceptional job grew. Returns the
+  bytes of buffer released.
+
+  Every growth in a writer is one-way — the byte buffer, the stringref symbol
+  table, and the index-capture arrays all keep their PEAK size for the life of
+  the writer. That is what makes reuse allocation-free, and it is the right
+  default. It is also why a pooled writer that once encoded a 200 MB value pins
+  a 256 MB buffer forever afterwards while it goes back to 200-byte datoms.
+
+  Explicit rather than automatic, and that is the whole design: shrinking on a
+  heuristic would put back exactly the per-message allocation reuse exists to
+  remove. Call it after a known-large job — not in a loop.
+
+  Throws `:boring/bad-argument` mid-stream, where the buffer still holds bytes
+  that have not reached the sink. A trimmed writer is otherwise a usable
+  writer, in whatever state `reset` would leave it."
+  ^long [^Writer w]
+  (.trim w))
+
 (defn- write-to-resolved!
   "`write-to!` with options already resolved."
   ^long [^Writer w v ^java.io.OutputStream out o]
@@ -689,6 +709,17 @@
   `constant memory` flatly, which was false for the default indexed path. See
   doc/STORAGE.md.
 
+  What the writer grew, it KEEPS -- buffer, symbol table and index arrays all
+  hold their peak for the life of the writer, which is what makes reuse
+  allocation-free. `trim!` is the way back after one exceptional job.
+
+  A sequence cannot be indexed past `Integer/MAX_VALUE` items: the frame carries
+  item counts in an int32 array, and widening that would change the wire format
+  of every file for a limit no in-memory container can reach anyway. The writer
+  refuses AT that item -- `:boring/index-too-large` -- rather than wrapping the
+  count and sealing a footer that describes the wrong thing. Write such a
+  sequence with `:index 0`.
+
   `:index N` seals the sequence with an offset index covering every Nth item,
   so `boring.nav/items` can jump to an item instead of skipping to it -- O(1)
   rather than O(n). N is the stride, and it is the size/speed knob: a lookup
@@ -716,8 +747,13 @@
   its own. Raising it to a number no container reaches gives an index over the
   ITEMS ONLY -- the right shape for a log you seek into but do not navigate
   within. Measured on 20 items of 40-entry maps: 6873 bytes at the default,
-  6611 with `:index-min 1000`. It does NOT suppress the frame for a short
-  sequence, which always costs ~37 bytes.
+  6611 with `:index-min 1000`.
+
+  It DOES decide whether a short sequence gets a frame at all. The sequence is
+  itself a node, so the same threshold applies to it: fewer than `:index-min`
+  items and no container clearing the bar means no frame and no ~37 bytes. This
+  paragraph used to promise the opposite -- \"always costs ~37 bytes\" -- which
+  stopped being true when `encode-indexed` and `write-seq!` were made to agree.
 
   `:index` FORCES `:stringref false`. `boring.nav` cannot resolve a string
   reference from an offset alone -- a stringref indexes a table built from every

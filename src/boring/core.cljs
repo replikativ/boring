@@ -294,12 +294,30 @@
   bad at both. Files — the case this exists for — read synchronously on Node.
 
   `:chunk-size` (default 64 KiB) is how much is requested at a time — the same
-  option name the JVM arity uses, since the point of this is symmetry. The
-  caller owns the source and closes it."
+  option name the JVM arity uses, since the point of this is symmetry. It must
+  be a positive integer, and it is a hint: a `pull` that returns a larger block
+  is fine, since nothing tells `pull` what was asked for.
+
+  `nil` is the ONLY end-of-input signal. An empty `Uint8Array` means \"nothing
+  right now\" and is retried; a source that keeps returning one raises
+  `:boring/stalled-source` rather than hanging. A `fs.readSync` loop should
+  therefore return `nil`, not a zero-length subarray, at EOF.
+
+  The caller owns the source and closes it."
   ([pull] (decode-seq-from pull nil))
   ([pull opts]
    (let [o (resolve-opts opts)
-         block (get opts :chunk-size 65536)
+         block (let [b (get opts :chunk-size 65536)]
+                 ;; VALIDATED, not trusted. `:chunk-size 0` sized the buffer at
+                 ;; zero and then copied the first block into it for a raw
+                 ;; `RangeError: offset is out of bounds`; a negative one threw
+                 ;; out of the `Uint8Array` constructor. Neither is a typed
+                 ;; error, and both are option mistakes rather than bad data.
+                 (when-not (and (number? b) (js/Number.isSafeInteger b) (pos? b))
+                   (throw (ex-info (str "boring: :chunk-size must be a positive integer, got "
+                                        (pr-str b))
+                                   {:type :boring/bad-option :option :chunk-size :value b})))
+                 b)
          r (configure-reader! (rd/reader (js/Uint8Array. 0)) o)
          state (atom {:buf (js/Uint8Array. block) :limit 0 :last-good 0 :eof? false})]
      ;; `last-good` is the offset just past the last COMPLETE item, NOT the
@@ -307,20 +325,49 @@
      ;; mid-item — and past the end of the valid bytes, since the byte reader
      ;; advances before it can discover it has run out — so compacting from the
      ;; position would copy a negative number of bytes. Rewind to the last item.
-     (letfn [(refill!
+     (letfn [(pull-block!
+               []
+               ;; AN EMPTY BLOCK IS NOT END OF INPUT. It used to be converted to
+               ;; `n = -1` and latched `eof?`, so a source that returned one --
+               ;; a short read at a buffer boundary, an fd with nothing ready
+               ;; yet -- silently DROPPED every byte after it and the sequence
+               ;; ended early with no error at all. The contract names `nil`,
+               ;; and only `nil`, as end of input.
+               ;;
+               ;; Skipping without a bound would spin forever on a source that
+               ;; always returns empty, so a run of them is a typed error rather
+               ;; than a hang. A pull built on `fs.readSync` should return `nil`
+               ;; when it reads 0 bytes.
+               (loop [tries 0]
+                 (let [c (pull)]
+                   (cond
+                     (nil? c) nil
+                     (pos? (.-length c)) c
+                     (< tries 64) (recur (inc tries))
+                     :else
+                     (throw (ex-info
+                             (str "boring: the pull source returned 65 empty blocks "
+                                  "without reaching end of input; return nil for EOF")
+                             {:type :boring/stalled-source}))))))
+             (refill!
                []
                (let [{:keys [buf limit last-good eof?]} @state
                      rest-len (- limit last-good)
                      _ (when (pos? last-good)
                          (.set buf (.subarray buf last-good limit) 0))
-                     buf (grow buf (+ rest-len block))
-                     ^js/Uint8Array chunk (when-not eof? (pull))
-                     n (if (and chunk (pos? (.-length chunk))) (.-length chunk) -1)
-                     _ (when (pos? n)
-                         (.set buf chunk rest-len))
-                     new-limit (if (pos? n) (+ rest-len n) rest-len)]
+                     ^js/Uint8Array chunk (when-not eof? (pull-block!))
+                     n (if chunk (.-length chunk) 0)
+                     ;; SIZED FROM THE BLOCK THAT ARRIVED, not from the
+                     ;; configured chunk size. `pull` is handed no requested
+                     ;; size and may legitimately return more than `block`;
+                     ;; growing to `rest-len + block` first and copying
+                     ;; afterwards threw a raw `RangeError` out of `.set` for
+                     ;; every source that did.
+                     buf (grow buf (+ rest-len (max n block)))
+                     _ (when (pos? n) (.set buf chunk rest-len))
+                     new-limit (+ rest-len n)]
                  (swap! state assoc :buf buf :limit new-limit :last-good 0
-                        :eof? (or eof? (neg? n)))
+                        :eof? (or eof? (nil? chunk)))
                  (rd/reset! r (.subarray buf 0 new-limit))
                  (pos? n)))
              (step []

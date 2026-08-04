@@ -161,3 +161,49 @@
     (let [bs (bytes-of [{:a 1} {:b 2} {:c 3}] nil)]
       (is (= 3 (count (stream-decode bs {:tolerate-unknown-tags false} 4)))
           "configuration survives repeated refills"))))
+
+;; --------------------------------------------------------- the pull contract
+;;
+;; ClojureScript only: the JVM arity takes an InputStream, whose read contract
+;; already distinguishes "0 bytes now" from "-1, end of input". A pull function
+;; has to say so itself, and boring's docstring names `nil` -- only `nil` -- as
+;; end of input.
+
+#?(:cljs
+   (deftest an-empty-block-is-not-end-of-input
+     (testing "an empty Uint8Array used to become n = -1 and latch EOF, so a
+               source that returned one -- a short read at a boundary, an fd
+               with nothing ready yet -- silently DROPPED every byte after it
+               and the sequence ended early with no error at all"
+       (let [blocks (atom [(js/Uint8Array. 0) (boring/encode 1)
+                           (js/Uint8Array. 0) (boring/encode 2) nil])]
+         (is (= [1 2] (vec (boring/decode-seq-from
+                            #(let [b (first @blocks)] (swap! blocks rest) b)))))))
+
+     (testing "and a source that only ever returns empty is a typed error rather
+               than an infinite loop"
+       (is (= :boring/stalled-source
+              (try (doall (boring/decode-seq-from (fn [] (js/Uint8Array. 0))))
+                   (catch :default e (:type (ex-data e)))))))))
+
+#?(:cljs
+   (deftest a-block-larger-than-the-chunk-size-is-accepted
+     (testing "`pull` is handed no requested size, so returning more than
+               :chunk-size is legal. The buffer was grown from the CONFIGURED
+               size before the block had even arrived, and the copy then threw a
+               raw RangeError out of .set"
+       (let [blocks (atom [(bytes-of [1 2 3] nil) nil])]
+         (is (= [1 2 3] (vec (boring/decode-seq-from
+                              #(let [b (first @blocks)] (swap! blocks rest) b)
+                              {:chunk-size 1}))))))))
+
+#?(:cljs
+   (deftest chunk-size-is-validated-not-trusted
+     (testing ":chunk-size 0 sized the buffer at zero and then copied into it,
+               for a raw RangeError; a negative one threw out of the Uint8Array
+               constructor. Both are option mistakes, and both now say so"
+       (doseq [bad [0 -1 1.5 "64" nil]]
+         (is (= :boring/bad-option
+                (try (doall (boring/decode-seq-from (fn [] nil) {:chunk-size bad}))
+                     (catch :default e (:type (ex-data e)))))
+             (str ":chunk-size " (pr-str bad)))))))

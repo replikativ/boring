@@ -2039,3 +2039,119 @@
       (is (= (->RegPoint 7 8) (boring/decode bs {:registry with-one})))
       (is (not (instance? RegPoint (boring/decode bs {:registry empty-reg})))
           "the registry we started from is unchanged"))))
+
+;; ---------------------------------------------------------- platform parity
+;;
+;; Every case below was found by reading the JVM reader against the CLJS one and
+;; asking "which documents does exactly one of these accept?". A parser
+;; differential is a defect of the FORMAT, not of either implementation: the
+;; whole claim boring makes is that a document means one thing, and a reader
+;; that admits what the other refuses breaks that claim whichever value the two
+;; sides go on to produce.
+
+(defn- err-type
+  "The `:type` of the typed error `f` raises, or `[:ok value]` when it returns."
+  [f]
+  (try [:ok (f)]
+       (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+         (:type (ex-data e)))))
+
+(defn- dec-hex
+  ([hex] (dec-hex hex nil))
+  ([hex opts] (boring/decode (c/hex->bytes hex) opts)))
+
+(defn- hex-byte [n]
+  (let [h #?(:clj (Integer/toHexString n) :cljs (.toString n 16))]
+    (if (== 1 (count h)) (str "0" h) h)))
+
+(deftest byte-strings-are-compared-by-content-not-identity
+  (testing "two byte strings with the same bytes are ONE CBOR data item, so a
+            map holding both is invalid -- but a host byte array compares by
+            IDENTITY on both platforms, so this decoded to a two-entry map
+            carrying the very duplicate the check exists to reject"
+    ;; {h'01': 1, h'01': 2}
+    (is (= :boring/duplicate-map-key (err-type #(dec-hex "a2410101410102")))))
+
+  (testing "and above the array-map threshold, where the small-map scan that
+            catches host-equal keys does not run at all"
+    ;; nine pairs: seven integer keys, then h'01' twice
+    (let [hex (str "a9"
+                   (apply str (for [i (range 7)] (str "18" (hex-byte (+ 100 i)) "01")))
+                   "410101410102")]
+      (is (= :boring/duplicate-map-key (err-type #(dec-hex hex))))))
+
+  (testing "tag 258 the same way: two independently allocated but byte-equal
+            elements are one element, and the set silently kept both"
+    ;; 258([h'01', h'01'])
+    (is (= :boring/duplicate-set-element (err-type #(dec-hex "d901028241014101")))))
+
+  (testing "byte strings that genuinely differ are still two distinct keys"
+    (is (= 2 (count (dec-hex "a2410101410202"))))))
+
+(deftest lenient-utf8-is-lenient-on-both-platforms
+  (testing ":validate-utf8 false replaces the malformed byte rather than raising
+            -- ClojureScript still routed it through a fatal TextDecoder, so an
+            option whose entire purpose is to accept this input produced a raw,
+            untyped host error there and a replacement character on the JVM"
+    (is (= "�" (dec-hex "61ff" {:validate-utf8 false}))))
+  (testing "and the default still refuses it, with the typed error"
+    (is (= :boring/invalid-utf8 (err-type #(dec-hex "61ff"))))))
+
+(deftest rfc-9581-duration-rules-hold-on-both-platforms
+  ;; ClojureScript keeps tag 1002 an inert TaggedValue -- there is no
+  ;; java.time.Duration here -- but "we do not convert it" is not a licence to
+  ;; accept a shape the JVM rejects.
+  (testing "an unsigned key other than the base is CRITICAL (RFC 9581 3)"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d903eaa201050205")))))
+  (testing "at most one decimally scaled fraction key (RFC 9581 3.3)"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d903eaa3010528012b01")))))
+  (testing "a negative fraction is not a duration"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d903eaa201052820")))))
+  (testing "finer than a nanosecond is refused rather than silently truncated"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d903eaa201052b01")))))
+  (testing "keys 4 and 5 -- decimal-fraction and bigfloat bases -- are refused
+            by name rather than reported as a missing base value"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d903eaa104820001")))))
+  (testing "but every OTHER negative key is elective and ignored, which the RFC
+            requires: {1: 5, -1: 0} is timescale UTC, the default"
+    (is (not= :boring/bad-tag-content (err-type #(dec-hex "d903eaa201052000")))))
+  (testing "and an ordinary seconds+nanoseconds duration still decodes"
+    (is (not= :boring/bad-tag-content (err-type #(dec-hex "d903eaa201052801"))))))
+
+(deftest tag-27-markers-accept-the-same-shapes-on-both-platforms
+  ;; The JVM builds a boolean[]/String[]/Object[] and so rejects what cannot go
+  ;; in one. ClojureScript reached all of them through `(vec argument)`, which
+  ;; turns nil into [] and a string into a vector of characters.
+  (let [marker (fn [nm arg-hex]
+                 (str "d81b82" (hex-byte (+ 0x60 (count nm)))
+                      (apply str (map #(hex-byte #?(:clj (int %) :cljs (.charCodeAt % 0)))
+                                      nm))
+                      arg-hex))]
+    (testing "java/boolean-array holds booleans, not integers"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "java/boolean-array" "8101"))))))
+    (testing "java/object-array wraps an array, and null is not one"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "java/object-array" "f6"))))))
+    (testing "java/string-array holds strings"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "java/string-array" "8101"))))))
+    (testing "java/char-array wraps a text string"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "java/char-array" "01"))))))
+    (testing "clojure/ex-info data must be a map"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "clojure/ex-info" "8361610101"))))))
+    (testing "java/throwable names a class, as a string"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "java/throwable" "8301f6f6"))))))
+    (testing "incomparable sorted-set elements are a TYPED error, not whatever
+              the host's compare happens to throw"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "clojure/sorted-set" "82016161"))))))
+    (testing "a null payload is an EMPTY sorted set on both platforms -- the JVM
+              admits it, so this is parity and not an oversight"
+      (is (= #{} (dec-hex (marker "clojure/sorted-set" "f6")))))
+    (testing "and the valid shapes still decode"
+      (is (= [true false] (vec (dec-hex (marker "java/boolean-array" "82f5f4")))))
+      (is (= ["a"] (vec (dec-hex (marker "java/string-array" "816161"))))))))

@@ -222,6 +222,20 @@ JavaScript has no `BigDecimal` or `Ratio`, so boring supplies its own carriers.
 All six re-encode to identical bytes, so a round trip through ClojureScript
 never corrupts a document; it just hands back less than the JVM would.
 
+**A `TaggedValue` is still validated to the JVM's standard.** Preserving a tag
+rather than converting it is not a licence to accept a shape the other platform
+refuses — a reader that admits an unknown *critical* key where the other errors
+is a parser differential whichever value the two sides go on to produce. So
+ClojureScript enforces RFC 9581's tag-1002 map rules (unsigned keys are
+critical, at most one scaled-fraction key, unsigned fraction, nothing finer than
+a nanosecond) even though it hands back the map unconverted, and RFC 8943's
+full-date grammar for tag 1004.
+
+One residual, and it is a platform limit rather than a decision: JavaScript has
+one number type, so `{1: 5.0, -9: 1}` is indistinguishable from `{1: 5, -9: 1}`
+in ClojureScript and only the JVM refuses the float base. A base with an actual
+fractional part is caught on both.
+
 A regex is symmetric — both platforms have the type, so tag 35 has no caveat.
 
 URI is not: ClojureScript has no URI type, so tag 32 stays a `TaggedValue`
@@ -409,6 +423,38 @@ referenced by index. It is strictly more expressive. boring does not use it:
 Revisit when the draft becomes an RFC and the numbers are assigned.
 
 [packed]: https://datatracker.ietf.org/doc/draft-ietf-cbor-packed/
+
+## Which APIs exist on which platform
+
+Reading is symmetric and is meant to stay that way: **every document one
+platform accepts, the other accepts, and to an equal value** — modulo the type
+substitutions tabled above. That is the promise this file is about, and the
+conformance suite is where it is enforced.
+
+Writing is not symmetric, and pretending otherwise would be the more expensive
+mistake.
+
+| | JVM | ClojureScript |
+|---|---|---|
+| `encode` / `decode` | ✔ | ✔ |
+| `decode-seq` (RFC 8742) | ✔ | ✔ |
+| `decode-seq-from` (streaming in) | `InputStream` | pull function |
+| `write-seq!` (streaming out) | ✔, streams within an item | ✔, buffers each whole item |
+| `write-to!` / `write-to-buffer!` | ✔ | — |
+| `encode-indexed` / `write-indexed!` / `seal-index!` | ✔ | — |
+| `boring.nav` (offset navigation) | ✔ | — |
+| `boring.mmap` (memory mapping) | ✔ | — |
+
+The index is **written** only on the JVM. It is **read past** on both: a
+ClojureScript `decode-seq` recognises a genuine trailing `boring/index` frame
+and does not hand it back as a phantom final item, so the library's own default
+JVM output yields the same N items on either side. It used to yield N there and
+N+1 here, which is the kind of asymmetry that is worth a table.
+
+Navigation and memory mapping are absent from ClojureScript because the
+capabilities are: there is no `mmap` in a browser, and offset navigation without
+one buys nothing over decoding the sequence. `write-indexed!` could be ported
+and has not been.
 
 ## Determinism
 

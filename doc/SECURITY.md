@@ -157,6 +157,21 @@ relying on this in a CLJS deployment, check the version.
 **Still enforce an input size limit at the transport.** boring reads what you
 give it, and `:max-items` caps the result rather than the arrival.
 
+## Malformed UTF-8
+
+By default a text string whose bytes are not valid UTF-8 is refused, with
+`:boring/invalid-utf8`. RFC 8949 §3.1 makes this the decoder's call, and
+refusing is the right default: silently substituting U+FFFD changes the value,
+and a value that differs between two readers of the same bytes is a parser
+differential.
+
+`{:validate-utf8 false}` switches to **replacement** decoding on both platforms
+— the malformed bytes become U+FFFD and the document is accepted. ClojureScript
+used to keep a fatal `TextDecoder` under this option, so the one setting that
+exists to accept such input raised an untyped host `TypeError` there while the
+JVM returned a string. Use it only for a producer you already know emits
+mis-encoded text and whose data you need anyway.
+
 ## Encode-side refusals
 
 Not every error is a decode error. boring refuses to ENCODE a value it cannot
@@ -196,10 +211,19 @@ maps, on both platforms, and the same rule applies to tag-258 sets
 (`:boring/duplicate-set-element`) — a set that declares *n* elements of which
 fewer are distinct is refused rather than silently collapsed.
 
-Duplicate detection compares **encoded key bytes**, so byte-string keys are
-compared by content rather than identity. Keys that merely *look* alike stay
-distinct, per §5.6.1: `1` and `1.0` are different keys, and so are the text
-string `"a"` and the byte string `h'61'`.
+Duplicate detection compares keys by **CBOR data-item equality**, in one pass,
+on both platforms. Host equality is used for values the host compares by value,
+and **content** equality for the ones it compares by identity — a `byte[]`,
+`short[]`, `int[]`, `long[]`, `double[]` or `float[]` on the JVM, any
+`Uint8Array` or typed array in ClojureScript. Two byte strings with the same
+bytes are one data item, so a map holding both is refused rather than decoded
+with two entries.
+
+Keys that merely *look* alike stay distinct, per §5.6.1: `1` and `1.0` are
+different keys, and so are the text string `"a"` and the byte string `h'61'`.
+Comparison deliberately does **not** run on raw encoded bytes: that would miss a
+key written once as a literal string and once as a stringref, which is the same
+key.
 
 `{:check-duplicate-keys false}` turns this off, giving **last-wins** — RFC 8949
 §5.6's second approach — on both platforms and at every map size. It is the
@@ -207,14 +231,16 @@ wrong default for anything reading untrusted input: silent last-wins is how two
 implementations end up disagreeing about what a document says, which is a
 parser differential with a signature check on the other side of it.
 
-**Known gap, stated rather than implied.** Duplicate detection compares encoded
-bytes for *byte-string* keys and host equality for everything else. Host array
-equality is identity on both platforms, so two content-equal **typed-array**
-keys (a `short[]`, a `Uint8Array`) are not detected, and neither are
-content-equal elements of a tag-258 set. Such a document decodes to a map or set
-with more entries than the wire describes. The byte-string scan is also O(n²) in
-the number of keys, which is attacker-controlled work on read. Both want the
-same fix — compare a hash of each key's *encoded* bytes — and neither is done.
+**Residual gap, stated rather than implied.** An array *nested inside* a
+compound key is still compared by the host, so `{[h'01']: 1, [h'01']: 2}` keeps
+two entries. Both platforms have this, for the same reason and to the same
+extent, so they agree on what they accept — which is the property that matters
+most here. Closing it means a deep content-aware walk of every key, and the
+work is attacker-controlled by construction; that trade has not been made.
+
+The detection itself is **not** quadratic. It was: byte-string keys went through
+an O(n²) pair scan that was unbounded above the array-map threshold, and a
+second O(n²) scan ran over the rest. Both are gone.
 
 ## Realistic harms, in order
 
