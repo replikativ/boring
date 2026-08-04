@@ -1550,8 +1550,33 @@ public final class Reader {
         }
     }
 
-    /** One pass, content-aware. Throws on the first duplicate. */
+    /** Below this, a pairwise scan beats a hash set: at most 28 comparisons and
+     *  NOTHING allocated, against a HashSet plus a KeyProbe per key.
+     *
+     *  Not a guess -- measured. Hashing every map unconditionally cost 16% of
+     *  datom-maps-200 decode (56.9 -> 66.0 us, against an unchanged hako in the
+     *  same A/B run), because a datom map is five keys and the allocation
+     *  dominates the comparisons it saves. Small maps are the common case by a
+     *  wide margin, so the threshold is where the work goes. */
+    private static final int DUP_SCAN_MAX = 8;
+
+    /** Content-aware, and O(n) above the threshold. Throws on the first
+     *  duplicate.
+     *
+     *  The quadratic branch is BOUNDED, which is what makes it safe: the pair
+     *  scan this replaced ran over maps of any size, so a large map was
+     *  attacker-controlled work on read. */
     private void checkDistinct(Object[] kvs, int n, int stride, String what, String errType) {
+        if (n <= DUP_SCAN_MAX) {
+            for (int i = 1; i < n; i++) {
+                Object a = kvs[i * stride];
+                for (int j = 0; j < i; j++)
+                    if (KeyProbe.eq(a, kvs[j * stride]))
+                        throw Err.of(errType, "boring: duplicate " + what + ": " + a,
+                                     "key", a);
+            }
+            return;
+        }
         java.util.HashSet<KeyProbe> seen = new java.util.HashSet<>(Math.max(4, n * 2));
         for (int i = 0; i < n; i++) {
             Object k = kvs[i * stride];
