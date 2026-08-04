@@ -1947,9 +1947,42 @@ public final class Writer {
 
     public void writeBytes(byte[] bs) {
         head(BYTES, bs.length);
-        ensure(bs.length);
-        System.arraycopy(bs, 0, buf, pos, bs.length);
-        pos += bs.length;
+        writePayload(bs, 0, bs.length);
+    }
+
+    /**
+     * A payload that is already a contiguous byte range, emitted AFTER its head.
+     *
+     * While streaming, a payload larger than the buffer goes STRAIGHT TO THE
+     * SINK instead of growing the buffer to hold it. A comment here used to
+     * claim that one CBOR item with a length header cannot be split across
+     * chunks, and that is simply wrong: a chunk boundary is a write-call
+     * boundary and has no CBOR meaning at all. The header has already been
+     * emitted and says how many bytes follow; where those bytes are handed to
+     * the OutputStream is nobody's business but ours.
+     *
+     * Concretely: a 1 MB byte array through a 64-byte writer used to leave that
+     * writer holding a 1 MiB buffer -- a second full-size copy of something the
+     * caller already had -- and now leaves it at 64 bytes.
+     *
+     * Not streaming, or small enough to fit: the ordinary buffered path, which
+     * keeps `buffer()`/`encode-buffered!` working exactly as before.
+     */
+    private void writePayload(byte[] src, int off, int len) {
+        if (sink != null && pinDepth == 0 && len > buf.length) {
+            if (pos > 0) flushChunk();
+            try {
+                sink.write(src, off, len);
+            } catch (java.io.IOException e) {
+                throw Err.of("io-error",
+                    "boring: writing to the sink failed: " + e.getMessage(), e);
+            }
+            flushed += len;
+            return;
+        }
+        ensure(len);
+        System.arraycopy(src, off, buf, pos, len);
+        pos += len;
     }
 
     /**
@@ -1998,6 +2031,16 @@ public final class Writer {
 
     private void writeStringLiteral(String s, int slot) {
         int n = s.length();
+        // A string that cannot fit the buffer skips the speculative path
+        // entirely. Speculating means reserving the whole payload up front so
+        // the loop can bail out to writeStringSlow on the first non-ASCII
+        // character -- which is exactly the growth streaming exists to avoid,
+        // and cannot be retracted once part of it has gone to the sink.
+        // writeStringSlow streams the payload after its head.
+        if (sink != null && pinDepth == 0 && (long) n + 5 > buf.length) {
+            writeStringSlow(s, slot);
+            return;
+        }
         // Speculate ASCII: reserve worst-case-for-ASCII and bail out if wrong.
         ensure(n + 5);
         int hdrStart = pos;
@@ -2057,9 +2100,12 @@ public final class Writer {
         checkWellFormedUtf16(s);
         byte[] utf = s.getBytes(StandardCharsets.UTF_8);
         head(TEXT, utf.length);
-        ensure(utf.length);
-        System.arraycopy(utf, 0, buf, pos, utf.length);
-        pos += utf.length;
+        // Streams past the buffer, like any other payload. `getBytes` still
+        // allocates the whole UTF-8 form first, so this halves the peak rather
+        // than removing it -- an incremental CharsetEncoder would be needed for
+        // that, and is not worth the complexity until someone has a string
+        // large enough to care.
+        writePayload(utf, 0, utf.length);
         // Byte length differs from char length here, so the slot from the
         // char-length probe is still valid but the threshold uses utf.length.
         if (slot >= 0) srInsertAt(slot, s, utf.length);

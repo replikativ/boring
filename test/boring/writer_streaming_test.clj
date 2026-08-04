@@ -106,16 +106,37 @@
       (is (<= (alength ^bytes (boring/buffer w)) 65536)
           (str "buffer grew to " (alength ^bytes (boring/buffer w)))))))
 
-(deftest a-leaf-larger-than-the-buffer-still-grows-it
-  (testing "documented, not a bug: a long string is ONE CBOR item with a length
-            header, so it cannot be split across chunks. nippy buffers the same
-            cases. Collections stream; leaves do not."
-    (let [sink (proxy [OutputStream] [] (write ([_]) ([_ _ _])))
-          s (apply str (repeat 400000 \x))
-          w (boring/writer 4096 o)]
-      (boring/write-to! w s sink o)
-      (is (>= (alength ^bytes (boring/buffer w)) 400000)
-          "the buffer had to grow to hold the one leaf"))))
+(deftest leaves-stream-too-rather-than-growing-the-buffer
+  (testing "this test used to assert the OPPOSITE, on a premise that was simply
+            wrong: a comment in the writer claimed one CBOR item with a length
+            header cannot be split across chunks. A chunk boundary is a
+            write-call boundary and has no CBOR meaning at all -- the head has
+            already said how many bytes follow, and where they are handed to the
+            OutputStream is nobody's business. A 1 MB byte array through a
+            64-byte writer used to leave it holding 1 MiB, a second full-size
+            copy of something the caller already had."
+    (let [sink (proxy [OutputStream] [] (write ([_]) ([_ _ _])))]
+      (doseq [[label v] [["ASCII string" (apply str (repeat 400000 \x))]
+                         ["UTF-8 string" (apply str (repeat 400000 "\u00e9"))]
+                         ["byte array"   (byte-array 1000000)]]]
+        (let [w (boring/writer 64 o)]
+          (boring/write-to! w v sink o)
+          (is (<= (alength ^bytes (boring/buffer w)) 64)
+              (str label " grew the buffer to " (alength ^bytes (boring/buffer w))))))))
+  (testing "and the bytes are still right, including a string that is only
+            partly ASCII -- the path that speculates and bails out"
+    (let [out (ByteArrayOutputStream.)
+          w (boring/writer 64 o)
+          s (apply str (repeat 100000 "a\u00e9"))]
+      (boring/write-to! w s out o)
+      (is (= s (boring/decode (.toByteArray out) o)))))
+  (testing "a large leaf inside a PINNED span still buffers, because a map key
+            must stay contiguous for the index's sorted flag"
+    (let [out (ByteArrayOutputStream.)
+          w (boring/writer 64 o)
+          k (apply str (repeat 5000 \k))]
+      (boring/write-to! w {k 1} out (assoc o :index 1 :index-min 1))
+      (is (= {k 1} (boring/decode (.toByteArray out) o))))))
 
 ;; ---------------------------------------------------------------- failure
 

@@ -662,8 +662,16 @@
 
 (defn write-seq!
   "Encode each value in `values` to `out` as consecutive top-level CBOR items.
-  Returns the number of bytes written. Constant memory: one value at a time,
-  through the writer's own buffer, with no intermediate array per item.
+  Returns the number of bytes written. Bounded memory for the DATA: one value at
+  a time, streamed, with byte and text payloads larger than the buffer going
+  straight to `out` rather than growing it.
+
+  NOT constant overall, and the difference matters at scale. Index capture is
+  O(anchors + indexed containers) and is held until the frame is sealed; the
+  frame itself is buffered while it is built; and `:canonical` stages every map
+  key and set element to sort them. An earlier version of this docstring said
+  `constant memory` flatly, which was false for the default indexed path. See
+  doc/STORAGE.md.
 
   `:index N` seals the sequence with an offset index covering every Nth item,
   so `boring.nav/items` can jump to an item instead of skipping to it -- O(1)
@@ -910,7 +918,14 @@
   of `encode-indexed`. Where `encode-indexed` builds the whole byte array and
   then WALKS it to derive the index -- two full copies of the document in
   memory, plus a second pass over every byte -- this captures the index nodes
-  as the writer emits them and never holds more than one chunk.
+  as the writer emits them, so the DATA streams in bounded memory.
+
+  Index capture is not bounded: it is O(anchors + indexed containers), held
+  until the frame is sealed, and the frame is buffered while it is built. On a
+  100 000-element vector at `{:index 1 :index-min 1}` that is real -- a 64-byte
+  writer grows to about 131 KB during sealing even though the body streamed.
+  An earlier version of this said it `never holds more than one chunk`, which
+  was false.
 
   The result is a two-item CBOR sequence: the value, then the index frame. So
   `decode` still returns the value, `decode-seq` hides the frame, and a foreign
