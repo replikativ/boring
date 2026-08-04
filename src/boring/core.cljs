@@ -12,6 +12,7 @@
     (datahike's dump requirements); values inside it stay ordinary numbers.
   - `Date` has millisecond resolution, so nanosecond instants do not survive."
   (:require [boring.data :as data]
+            [boring.options :as opt]
             [boring.reader :as rd]
             [boring.writer :as wr]))
 
@@ -19,81 +20,14 @@
 ;; encoding requires the shortest float form that round-trips, so 65504.0 must
 ;; go out as `f97bff`. Both platforms must agree here or a signed document
 ;; verifies on one and not the other.
-(def ^:private profile-defaults
-  {:clojure   {:stringref true  :float-policy :preserve-width :canonical false
-               :canonical-order :rfc8949}
-   :interop   {:stringref false :float-policy :preserve-width :canonical false
-               :shapes false :canonical-order :rfc8949}
-   ;; :archival -- sorted keys AND fixed-width floats; see the JVM boring.core
-   ;; for the reasoning. Kept in step with the JVM table deliberately: these two
-   ;; maps are the same contract written twice, and a profile that exists on one
-   ;; platform and not the other is a dump a browser peer cannot read.
-   :archival  {:stringref false :float-policy :preserve-width :canonical true
-               :shapes false :canonical-order :rfc8949}
-   :canonical {:stringref false :float-policy :shortest       :canonical true
-               :shapes false :canonical-order :rfc8949}
-   ;; clj-cbor's length-first key order (RFC 7049 3.9), as its own profile
-   ;; rather than a knob on :canonical.
-   ;;
-   ;; It was a free option, so `{:profile :canonical :canonical-order :rfc7049}`
-   ;; produced non-RFC-8949 bytes under the name the README gives the signing
-   ;; profile -- `{1000 :x, "a" :y}` begins a219 under one and a261 under the
-   ;; other. A signer and a verifier who disagree about a sub-option that does
-   ;; not appear in the profile name produce a mismatch nobody can see. Naming
-   ;; it makes the choice impossible to make by accident.
-   :canonical-rfc7049 {:stringref false :float-policy :shortest :canonical true
-                       :shapes false :canonical-order :rfc7049}})
-
-;; The nil-options path is every default encode. Keeping this shared avoids a
-;; merge/dissoc allocation per item in a reused-writer loop.
-(def ^:private default-opts (:clojure profile-defaults))
-
-;; Keys a profile DEFINES. Passing a conflicting value asks for two
-;; incompatible things at once, and the previous behaviour was to silently
-;; honour the user's -- so `{:profile :canonical :stringref true}` emitted the
-;; stringref extension from the profile whose entire purpose is agreement with
-;; other implementations, and `{:profile :canonical :canonical false}` turned
-;; determinism off while still calling itself canonical.
-;;
-;; `:canonical` is locked in EVERY profile: it is not a user knob, it is what
-;; `:profile :canonical` MEANS. Accepting it separately gave two ways to say
-;; the same thing that could disagree.
-;;
-;; `:stringref` stays free under :clojure -- kabel legitimately turns it off
-;; while keeping the default profile -- and `:float-policy` stays free under
-;; :interop, where either width is legal CBOR that every reader understands.
-(def ^:private profile-locked
-  {:clojure           #{:canonical :canonical-order}
-   :interop           #{:canonical :canonical-order :stringref :shapes}
-   :archival          #{:canonical :canonical-order :stringref :shapes :float-policy}
-   :canonical         #{:canonical :canonical-order :stringref :shapes :float-policy}
-   :canonical-rfc7049 #{:canonical :canonical-order :stringref :shapes :float-policy}})
-
-(defn- check-profile-conflicts! [profile base opts]
-  (let [conflicts (into (sorted-set)
-                        (filter (fn [k]
-                                  (and (contains? opts k)
-                                       (not= (get opts k) (get base k)))))
-                        (profile-locked profile))]
-    (when (seq conflicts)
-      (throw (ex-info (str "boring: " (pr-str (vec conflicts))
-                           " cannot be overridden under the " profile
-                           " profile -- the profile defines "
-                           (pr-str (select-keys base conflicts)))
-                      {:type :boring/incompatible-options
-                       :profile profile
-                       :conflicts (vec conflicts)
-                       :profile-values (select-keys base conflicts)})))))
-
-(defn- resolve-opts [opts]
-  (if (nil? opts)
-    default-opts
-    (let [profile (get opts :profile :clojure)
-          base (or (profile-defaults profile)
-                   (throw (ex-info "boring: unknown profile"
-                                   {:type :boring/unknown-profile :profile profile})))
-          _ (check-profile-conflicts! profile base opts)]
-      (merge base (dissoc opts :profile)))))
+;; Profiles, validation and resolution live in `boring.options`, shared with
+;; the JVM -- see that namespace for why. These two copies had already drifted:
+;; the conflict check was made allocation-free on the JVM and this one still
+;; built a sorted set on every encode, and `:index` capped at 2^31-1 there and
+;; at MAX_SAFE_INTEGER here, so this platform could write a stride the JVM's
+;; 32-bit slot arithmetic cannot read.
+(def ^:private default-opts opt/default-opts)
+(def ^:private resolve-opts opt/resolve-opts)
 
 (defn writer
   "Create a reusable writer. When supplied, `opts` are resolved once and used
@@ -120,77 +54,28 @@
 ;; compiler cannot infer the target of these `set!`s, and every downstream
 ;; ClojureScript build with :infer-externs on (which is shadow-cljs's default)
 ;; reports ten :infer-warnings pointing into this file.
-(defn unencodable
+(def unencodable
   "The default `:encode-fallback` placeholder -- see the JVM core."
-  [x]
-  (data/unknown-record "boring/unencodable"
-                       {:type (str (type x)) :repr (pr-str x)}))
+  opt/unencodable)
 
-(defn- max-depth-opt
-  "`:max-depth`, validated. Mirrors the JVM's `max-depth-opt`.
-
-  This read `(get opts :max-depth 1024)` and set it unchecked, so a non-numeric
-  value made every later `(> depth maxDepth)` compare against NaN -- which is
-  ALWAYS false in JavaScript. `{:max-depth :kw}` therefore removed the nesting
-  bound entirely and a 2000-deep document that the default correctly refuses
-  decoded fine, while the same option raised `:boring/bad-option` on the JVM.
-  doc/SECURITY.md names a browser as an attacker source and this as one of
-  three bounds."
-  [opts]
-  (let [v (get opts :max-depth 1024)]
-    ;; Capped at what the host stack survives -- see the JVM's max-depth-opt.
-    (when-not (and (number? v) (js/Number.isInteger v) (pos? v) (<= v 2048))
-      (throw (ex-info (str "boring: :max-depth must be a positive integer no greater "
-                           "than 2048, got " (pr-str v))
-                      {:type :boring/bad-option :option :max-depth :value v})))
-    v))
-
-(defn- float-policy!
-  "`:float-policy`, validated rather than compared.
-
-  The writer asked `(= :preserve-width (:float-policy opts))`, so ANY other
-  value selected `:shortest` -- including `:preserve-widht`, `\"preserve-width\"`
-  and nil. A typo therefore silently narrowed every Double to a Float, which is
-  precisely the corruption this option exists to prevent and precisely what
-  datahike's dumps must not do. Silence was the worst available behaviour: the
-  bytes are valid CBOR and the loss shows up as a changed value much later."
-  [opts]
-  (let [v (get opts :float-policy :preserve-width)]
-    (when-not (#{:preserve-width :shortest} v)
-      (throw (ex-info (str "boring: :float-policy must be :preserve-width or :shortest, got "
-                           (pr-str v))
-                      {:type :boring/bad-option :option :float-policy :value v})))
-    v))
-
-(defn- encode-fallback-fn [fb]
-  (cond
-    (nil? fb) nil
-    (= :placeholder fb) unencodable
-    ;; INVOCABLE, but not one of the DATA types that happen to be invocable.
-    ;; `ifn?` is true of keywords, symbols, maps, sets and vectors, so
-    ;; `:placehodler` -- one letter wrong -- was accepted, invoked as
-    ;; `(:placehodler v)`, and silently replaced every unencodable value with
-    ;; nil, while a vector threw untyped. `fn?` fixed that and went too far the
-    ;; other way: it rejects vars, multimethods and any record or `reify`
-    ;; implementing IFn, all of which are legitimate fallbacks.
-    (and (ifn? fb)
-         (not (or (keyword? fb) (symbol? fb) (map? fb) (set? fb) (vector? fb)))) fb
-    :else (throw (ex-info (str "boring: :encode-fallback must be nil, :placeholder, or a function, got "
-                               (pr-str fb))
-                          {:type :boring/bad-option :value fb}))))
+;; `max-depth-opt`, `float-policy!` and `encode-fallback-fn` used to live here,
+;; each validating its option at the point the option was READ -- so whether an
+;; option was checked at all depended on which code path ran.
+;; `boring.options` checks every one of them, once, where every entry point
+;; passes through. Everything below simply `get`s a value it knows is legal.
 
 (defn- configure-writer! [^wr/Writer w opts]
   (set! (.-stringref w) (boolean (:stringref opts)))
   (set! (.-inclMetadata w) (boolean (get opts :incl-metadata? true)))
-  (set! (.-preserveWidth w) (= :preserve-width (float-policy! opts)))
+  (set! (.-preserveWidth w) (= :preserve-width (get opts :float-policy :preserve-width)))
   (set! (.-canonical w) (boolean (:canonical opts)))
   (set! (.-legacyCanonicalOrder w) (= :rfc7049 (:canonical-order opts)))
   (set! (.-shapes w) (boolean (:shapes opts)))
   (set! (.-registry w) (:registry opts))
-  (set! (.-maxDepth w) (max-depth-opt opts))
+  (set! (.-maxDepth w) (get opts :max-depth 1024))
   (set! (.-permitReservedSimpleValues w)
         (boolean (:permit-reserved-simple-values opts)))
-  (set! (.-encodeFallback w) (encode-fallback-fn (:encode-fallback opts)))
+  (set! (.-encodeFallback w) (opt/fallback-fn (:encode-fallback opts)))
   w)
 
 (defn- write-root! [w v opts]
@@ -237,7 +122,7 @@
                          "is portable.")
                     {:type :boring/unsupported-option
                      :option :auto-construct-records?})))
-  (set! (.-maxDepth r) (max-depth-opt opts))
+  (set! (.-maxDepth r) (get opts :max-depth 1024))
   (set! (.-validateUtf8 r) (boolean (get opts :validate-utf8 true)))
   ;; WIRED, having been documented and then never applied on either platform.
   ;; The field existed and defaulted to true, but nothing set it, so
@@ -245,14 +130,9 @@
   (set! (.-checkDuplicateKeys r) (boolean (get opts :check-duplicate-keys true)))
   ;; `:max-items` was accepted and silently ignored here -- the only
   ;; heap-amplification control doc/SECURITY.md names did not exist on this
-  ;; platform at all. Validated rather than coerced: `-1` used to disable the
-  ;; bound on the JVM and a non-integer raised a raw host exception.
-  (let [mi (get opts :max-items 0)]
-    (when-not (and (integer? mi) (not (neg? mi)))
-      (throw (ex-info (str "boring: :max-items must be a non-negative integer "
-                           "(0 means unlimited), got " (pr-str mi))
-                      {:type :boring/bad-option :option :max-items :value mi})))
-    (set! (.-maxItems r) mi))
+  ;; platform at all. Validated in `boring.options` with everything else now,
+  ;; rather than inline in the one function that happens to read it.
+  (set! (.-maxItems r) (get opts :max-items 0))
   ;; ALWAYS set, never `when-let` -- a reusable reader kept the previous
   ;; call's registry. See the JVM core for the reproduction.
   (set! (.-registry r) (:registry opts))
@@ -260,7 +140,7 @@
 
 (defn decode
   ([bs] (decode bs nil))
-  ([bs opts] (rd/read! (configure-reader! (rd/reader bs) opts))))
+  ([bs opts] (rd/read! (configure-reader! (rd/reader bs) (opt/check-opts opts)))))
 
 (defn decode-with
   "Decode using a reusable Reader. With `opts`, every option is re-applied on
@@ -268,7 +148,7 @@
   ([r bs] (rd/reset! r bs) (rd/read! r))
   ([r bs opts]
    (rd/reset! r bs)
-   (configure-reader! r (resolve-opts opts))
+   (configure-reader! r (opt/check-opts opts))
    (rd/read! r)))
 
 (def ^:const index-name
@@ -308,7 +188,7 @@
   heap."
   ([bs] (decode-seq bs nil))
   ([bs opts]
-   (let [r (configure-reader! (rd/reader bs) opts)]
+   (let [r (configure-reader! (rd/reader bs) (opt/check-opts opts))]
      ((fn step []
         (lazy-seq
          (when-not (rd/at-end? r)
@@ -366,18 +246,12 @@
   The caller owns the source and closes it."
   ([pull] (decode-seq-from pull nil))
   ([pull opts]
-   (let [o (resolve-opts opts)
-         block (let [b (get opts :chunk-size 65536)]
-                 ;; VALIDATED, not trusted. `:chunk-size 0` sized the buffer at
-                 ;; zero and then copied the first block into it for a raw
-                 ;; `RangeError: offset is out of bounds`; a negative one threw
-                 ;; out of the `Uint8Array` constructor. Neither is a typed
-                 ;; error, and both are option mistakes rather than bad data.
-                 (when-not (and (number? b) (js/Number.isSafeInteger b) (pos? b))
-                   (throw (ex-info (str "boring: :chunk-size must be a positive integer, got "
-                                        (pr-str b))
-                                   {:type :boring/bad-option :option :chunk-size :value b})))
-                 b)
+   ;; `:chunk-size 0` sized the buffer at zero and then copied the first block
+   ;; into it for a raw `RangeError: offset is out of bounds`; a negative one
+   ;; threw out of the `Uint8Array` constructor. Checked in `boring.options`
+   ;; now, with every other option and on both platforms.
+   (let [o (opt/check-opts opts)
+         block (get opts :chunk-size 65536)
          r (configure-reader! (rd/reader (js/Uint8Array. 0)) o)
          state (atom {:buf (js/Uint8Array. block) :limit 0 :last-good 0 :eof? false})]
      ;; `last-good` is the offset just past the last COMPLETE item, NOT the
@@ -533,7 +407,11 @@
   Use `encode-buffered!` with `buffer` if you want the borrowed view and will
   consume it synchronously."
   ([w values sink]
-   (let [o (writer-opts w)]
+   ;; CHECKED HERE TOO. The 4-arity rejected `:index`; this one did not look,
+   ;; so `(write-seq! (writer 256 {:index 16}) vs sink)` returned a byte count
+   ;; and a plain sequence -- the same silent loss the 4-arity exists to
+   ;; prevent, reachable by moving the option from the call to the writer.
+   (let [o (doto (writer-opts w) reject-index-opts!)]
      (reduce (fn [total v]
                (let [n (wr/position (write-root! w v o))]
                  (sink (.slice (wr/buffer w) 0 n))
@@ -558,23 +436,6 @@
 (def ^:const default-index-stride
   "Stride used when `:index` is not given. Matches the JVM's."
   16)
-
-(defn- index-opt
-  "`:index` / `:index-min`, validated. Mirrors the JVM's `index-opt`.
-
-  Read its own way once on each platform, and both times the same four defects
-  followed: a fractional stride truncated, a negative one silently turned
-  indexing off although only 0 is documented for that, an oversized one escaped
-  as a host arithmetic error, and a non-numeric one escaped from coercion."
-  [opts k default]
-  (let [v (get opts k default)]
-    (when-not (and (number? v) (js/Number.isInteger v) (not (neg? v))
-                   (<= v js/Number.MAX_SAFE_INTEGER))
-      (throw (ex-info (str "boring: " k " must be a non-negative integer"
-                           (when (= k :index) " (0 turns indexing off)")
-                           ", got " (pr-str v))
-                      {:type :boring/bad-option :option k :value v})))
-    v))
 
 ;; ## Indexing an already-encoded blob
 ;;
@@ -684,12 +545,15 @@
   JVM docstring for the measurements."
   ([bs] (build-index bs nil))
   ([bs opts]
-   (let [stride (index-opt opts :index default-index-stride)
+   ;; RESOLVED, like every other public entry point, even though nothing here
+   ;; encodes -- see the JVM `build-index`.
+   (let [opts (resolve-opts opts)
+         stride (get opts :index default-index-stride)
          _ (when (zero? stride)
              (throw (ex-info (str "boring: :index 0 turns indexing off, which build-index "
                                   "cannot do; use `encode` instead")
                              {:type :boring/bad-option :option :index :value 0})))
-         min-entries (index-opt opts :index-min 16)
+         min-entries (get opts :index-min 16)
          r (rd/reader bs)
          acc (array)
          end (.-length bs)]
@@ -718,7 +582,7 @@
   predictable bytes, which is how the frame is found without parsing backwards."
   [index data-len opts]
   (let [{:keys [containers counts slots sorted]} index
-        stride (index-opt opts :index default-index-stride)
+        stride (get opts :index default-index-stride)
         packed (vec (map-indexed (fn [i s] (delta-slot s (max 0 (nth containers i))))
                                  slots))]
     ;; TYPED ARRAYS, not plain vectors. `boring.nav/read-index*` requires

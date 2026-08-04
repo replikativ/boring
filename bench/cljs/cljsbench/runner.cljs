@@ -7,6 +7,7 @@
             [boring.conformance-test]
             [boring.generative-test]
             [boring.golden-test]
+            [boring.option-matrix-test]
             [boring.streaming-test]))
 
 (enable-console-print!)
@@ -24,6 +25,7 @@
   (t/run-tests 'boring.canonical-parity-test
                'boring.cljs-writer-opts-test
                'boring.conformance-test 'boring.generative-test 'boring.golden-test
+               'boring.option-matrix-test
                'boring.streaming-test))
 
 (set! *main-cli-fn* -main)

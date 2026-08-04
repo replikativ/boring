@@ -59,6 +59,7 @@
   (:require [boring.core :as boring]
             [boring.data]
             [boring.errors :as err]
+            [boring.options :as opt]
             [clojure.zip :as zip])
   (:import (org.replikativ.boring Reader ByteSource)))
 
@@ -109,7 +110,18 @@
           bs))))
 
 (defn- nav-of ^Nav [src opts]
-  (let [opts (assoc opts :stringref false)
+  ;; VALIDATED like every other decode entry point. This was the one that was
+  ;; not: `nav/source` took whatever map it was handed straight to
+  ;; `configure-reader!`, so `{:max-depth "5"}` -- a security bound -- was
+  ;; accepted here and refused everywhere else.
+  ;;
+  ;; `check-opts` and not `resolve-opts`, for a reason worth stating: the map
+  ;; is STORED and handed to `boring/encode` later, by `probe-for`, which
+  ;; resolves it there. Resolving it here too would resolve it twice -- and
+  ;; resolution is deliberately not idempotent, because a resolved map has
+  ;; `:canonical` in it and re-resolving reads that as the caller trying to
+  ;; override what the profile locks.
+  (let [opts (assoc (opt/check-opts opts) :stringref false)
         ^Reader r (cond
                     (bytes? src) (Reader. ^bytes src)
                     (instance? ByteSource src) (Reader. ^ByteSource src)
