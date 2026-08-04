@@ -33,6 +33,7 @@
             [clojure.test.check.properties :as prop]
             [boring.core :as boring]
             [boring.nav :as nav]
+            [boring.frame]
             [boring.data])
   (:import (java.io ByteArrayOutputStream)
            (org.replikativ.boring Reader)))
@@ -929,3 +930,45 @@
                    (catch clojure.lang.ExceptionInfo _ true)
                    (catch Throwable _ false))
               (str "byte " i " -> " v " must be typed or fine, never untyped")))))))
+
+(deftest nav-and-decode-seq-agree-on-what-counts-as-a-frame
+  (testing "\"is this boring's index footer\" had four implementations, and
+            `boring.nav`'s was the weakest: it checked tag 27, then that the
+            payload was an array, then the name -- but never the array's
+            ELEMENT COUNT. `footer-start` requires the literal byte 0x86 and
+            `index-frame?` requires `(= 6 (count payload))`, so widening a
+            genuine frame's payload from six elements to seven produced one
+            file with two logical contents: `decode-seq` published the frame as
+            a trailing data item and reported 2, while `nav/items` used it as
+            an index and reported 1. Which answer you got depended on which API
+            you called.
+
+            All four now compare the same seventeen-byte constant."
+    (let [v (vec (for [i (range 40)] {:e i :a :n/x :v (str "v" i)}))
+          good (boring/encode-indexed v {:index 4 :index-min 4})
+          ;; Widen the payload header from 0x86 to 0x87 and splice one more
+          ;; element (null) in just before the trailing back-pointer, so the
+          ;; pointer stays last and every OTHER property of a genuine frame
+          ;; still holds.
+          p (long (#'boring.frame/footer-start good))
+          n (alength ^bytes good)
+          ptr-head (- n 9)
+          bad (let [out (byte-array (inc n))]
+                (System/arraycopy good 0 out 0 ptr-head)
+                (aset-byte out (+ p 16) (unchecked-byte 0x87))
+                (aset-byte out ptr-head (unchecked-byte 0xf6))
+                (System/arraycopy good ptr-head out (inc ptr-head) 9)
+                out)]
+      (testing "the control: the genuine file is accepted by both, so the
+                crafting below is what the disagreement is about and not some
+                unrelated breakage"
+        (is (not= -1 p) "the genuine file has a locatable footer")
+        (is (= 1 (count (boring/decode-seq good))))
+        (is (= 1 (count (nav/items good)))))
+      (testing "and the crafted one is refused by both"
+        (is (= -1 (#'boring.frame/footer-start bad))
+            "the byte-level gate refuses it")
+        (is (= (count (boring/decode-seq bad)) (count (nav/items bad)))
+            "nav and decode-seq report the same number of items")
+        (is (= 2 (count (nav/items bad)))
+            "namely two -- the data and the thing that is not a frame")))))

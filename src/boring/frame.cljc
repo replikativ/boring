@@ -1,0 +1,180 @@
+(ns ^:no-doc boring.frame
+  "Recognising boring's own trailing index frame — once, for both platforms.
+
+  Not part of the public API.
+
+  ## Why this is shared
+
+  \"Is this boring's index footer\" had FOUR implementations. `footer-start`
+  checked the 17 constant prefix bytes, the back-pointer's range, and that the
+  frame reaches EOF. `frame-prefix-at?` checked the prefix alone.
+  `index-frame?` decoded the item and checked its shape. `boring.nav`'s
+  `read-index*` had its own. Only the JVM had the first two at all —
+  ClojureScript had `index-frame?` and nothing else.
+
+  Each weaker copy has cost something real:
+
+  - The version that checked only the prefix and the pointer range, but not
+    that the frame ends at EOF, made `decode-seq` return **40 of 82 items**
+    from two concatenated sealed batches of equal length. No error. The second
+    batch's pointer named an offset inside the FIRST batch that also carried
+    the prefix.
+  - The version before that accepted any file whose byte at n-9 was `0x48`, so
+    nine appended bytes aimed the gate at offset 0 and whatever item lived
+    there was re-read with the budgets lifted — 473 MB from a 3 MB item.
+  - Having only the value-level check on ClojureScript meant the frame had to
+    be DECODED to be recognised, and its own fixed nesting was charged to the
+    caller's `:max-depth`. A valid 500-item file written by this library on the
+    JVM, which the JVM reads at `{:max-depth 3}`, raised
+    `:boring/max-depth-exceeded` on ClojureScript at both 3 and 4.
+
+  ## The two levels, and when each applies
+
+  `footer-start` is the strong one and the one to prefer: it decodes nothing,
+  so a forged frame cannot allocate anything, and it can check the EOF property
+  that the others only approximate. It needs random access and a file length.
+
+  `index-frame?` is the weak one, and exists for `decode-seq-from`, which has
+  neither — a stream has no length, and its buffer positions move under
+  refills. It is a shape check on an already-decoded value, so a caller
+  relying on it must gate it on end-of-input separately."
+  (:require [boring.data :as data]
+            #?(:cljs [boring.reader :as rd]))
+  #?(:clj (:import (org.replikativ.boring Reader))))
+
+(def ^:const index-name
+  "Tag-27 type name for a sequence/container index."
+  "boring/index")
+
+;; ------------------------------------------------------------ byte access
+;;
+;; The two host byte containers differ in exactly two ways: how you ask for the
+;; length, and whether an element comes back signed. Both are settled here, so
+;; nothing below is platform-specific.
+
+(defn- blen ^long [bs]
+  #?(:clj (alength ^bytes bs) :cljs (.-length bs)))
+
+(defn- ubyte ^long [bs ^long i]
+  #?(:clj (bit-and (aget ^bytes bs i) 0xff) :cljs (aget bs i)))
+
+(defn- ends-at
+  "Where the item at `p` ends, walking heads only — never building a value."
+  ^long [bs ^long p]
+  #?(:clj (.skipFrom (Reader. ^bytes bs) p)
+     :cljs (rd/skip-from (rd/reader bs) p)))
+
+;; ------------------------------------------------------------ the prefix
+
+(def prefix-bytes
+  "The exact bytes every sealed frame starts with: tag 27, a two-element array,
+  the text string `boring/index`, and the six-element payload array.
+
+  A CONSTANT, compared before anything is decoded. That is the whole point:
+  the gates that preceded it judged the frame only AFTER materialising it, and
+  materialising a forged frame is what a forged frame is for."
+  [0xd8 0x1b 0x82 0x6c 0x62 0x6f 0x72 0x69 0x6e 0x67
+   0x2f 0x69 0x6e 0x64 0x65 0x78 0x86])
+
+(def ^:const prefix-length 17)
+
+#?(:clj
+   (def ^:no-doc prefix-array
+     "The same constant as a `byte[]`, for callers that reach bytes through a
+     `Reader` rather than an array -- `boring.nav`, which must also work over a
+     memory-mapped `ByteSource`.
+
+     One constant, two access paths, so the rule cannot differ between them.
+     It differed before: `nav` checked tag 27, then that the payload was an
+     array, then the name -- but never the array's ELEMENT COUNT. Widen a
+     genuine frame's payload from six elements to seven and `nav` used it as an
+     index while `decode-seq` published it as a phantom trailing data item. One
+     file, two logical contents. The 0x86 in these bytes is that count."
+     (byte-array (map unchecked-byte prefix-bytes))))
+
+(defn prefix-at?
+  "Whether `bs` carries the frame prefix at `off`."
+  [bs ^long off]
+  (and (some? bs) (>= off 0) (<= (+ off prefix-length) (blen bs))
+       (loop [i 0]
+         (cond (= i prefix-length) true
+               (= (ubyte bs (+ off i)) (long (nth prefix-bytes i))) (recur (inc i))
+               :else false))))
+
+;; ------------------------------------------------------------ the strong gate
+
+(defn footer-start
+  "Where a genuine index footer begins in `bs`, or -1.
+
+  `seal-index!` ends every sealed file with a byte string of exactly 8 bytes --
+  `0x48` and the offset the frame itself starts at -- so the footer announces
+  its own position, and that position is checkable without decoding anything.
+  Reading it here, once, is what lets a decoder know which item is the footer
+  BEFORE it tries to read it."
+  ^long [bs]
+  (let [n (blen bs)]
+    (if (or (< n 9) (not= 0x48 (ubyte bs (- n 9))))
+      -1
+      ;; SHIFTS, not `(+ (* acc 256) b)`. Clojure's arithmetic is checked, so
+      ;; the top bit of an eight-byte pointer -- which any file can carry, and
+      ;; a corrupt one certainly can -- raised a raw ArithmeticException from
+      ;; inside the function whose whole job is deciding whether to trust these
+      ;; bytes. The range test below is what rejects a nonsense pointer.
+      (let [p (loop [i 0 acc 0]
+                (if (= i 8)
+                  acc
+                  (recur (inc i) (bit-or (bit-shift-left acc 8)
+                                         (ubyte bs (+ (- n 8) i))))))]
+        ;; Three conditions, and the third is the one that keeps being dropped.
+        ;; The pointer doubles as the length of the data section, so it must
+        ;; land inside the file and leave room for the frame it names -- and
+        ;; THE FRAME MUST END AT THE FILE'S END. Prefix plus pointer is not
+        ;; enough: concatenate two sealed batches of equal length and the
+        ;; second file's pointer names an offset inside the FIRST batch that
+        ;; also carries the prefix, so `decode-seq` stopped there and returned
+        ;; 40 of 82 items with no error, while `decode-seq-from`, `nav/items`,
+        ;; a bare Reader loop and ClojureScript all returned 82.
+        (if (and (>= p 0) (< p (- n 9)) (prefix-at? bs p) (= n (ends-at bs p)))
+          p
+          -1)))))
+
+;; ------------------------------------------------------------ the weak gate
+
+(defn index-frame?
+  "True for the tag-27 frame `seal-index!` appends, at offset `start`.
+
+  For `decode-seq-from` only -- see the namespace docstring. Everything with
+  random access should use `footer-start`, which decides the same question
+  without materialising anything.
+
+  Both fallback shapes count: the payload is an array, so it may decode to a
+  tagged literal rather than an unknown record, and `frame-name` reads either.
+
+  AUTHENTICITY, not just the name. This once tested the name alone, so ANY
+  final tag-27 item called `boring/index` was silently erased from a sequence
+  -- including a malformed one, and including one somebody put there as data. A
+  name collision must not delete a logical item.
+
+  `start` of -1 means the caller cannot supply an offset (the streaming
+  decoder, whose positions are buffer-relative across refills); the shape check
+  still applies."
+  [v ^long start]
+  (and (data/tagged-frame? v)
+       (= index-name (data/frame-name v))
+       (let [p (data/frame-payload v)]
+         (and (sequential? p)
+              ;; SIX, checked. `boring.nav/index-payload` destructured six
+              ;; names off this without checking the count, so a seven-element
+              ;; payload was used as an index there and published as a phantom
+              ;; trailing data item here -- one file, two logical contents.
+              (= 6 (count p))
+              (let [ptr (nth (vec p) 5)]
+                (and #?(:clj (bytes? ptr) :cljs (instance? js/Uint8Array ptr))
+                     (= 8 (blen ptr))
+                     (or (neg? start)
+                         (= start (loop [i 0 acc 0]
+                                    (if (= i 8)
+                                      acc
+                                      (recur (inc i)
+                                             (bit-or (bit-shift-left acc 8)
+                                                     (ubyte ptr i)))))))))))))

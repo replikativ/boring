@@ -59,6 +59,7 @@
   (:require [boring.core :as boring]
             [boring.data]
             [boring.errors :as err]
+            [boring.frame :as frame]
             [boring.options :as opt]
             [clojure.zip :as zip])
   (:import (org.replikativ.boring Reader ByteSource)))
@@ -569,15 +570,6 @@
   to value cursor (maps). Prefer `reduce` over `seq` in a hot loop."
   [^Cursor c] c)
 
-(defn- name-probe
-  "The encoded tag-27 type name, cached on the Nav."
-  ^bytes [^Nav nav]
-  (let [p (.probes nav)]
-    (or (get @p ::index-name)
-        (let [bs (boring/encode boring/index-name {:stringref false})]
-          (swap! p assoc ::index-name bs)
-          bs))))
-
 (def ^:private shorts-class (class (short-array 0)))
 (def ^:private ints-class (class (int-array 0)))
 
@@ -836,8 +828,19 @@
             ;; `boring/index` item instead of none. The name check below is
             ;; what keeps this from widening the false-positive surface.
             (when (and (<= 0 ptr) (< ptr bp)
-                       (= 6 (.majorAt r ptr))
-                       (= 27 (.headArgAt r ptr))
+                       ;; THE WHOLE 17-BYTE PREFIX, which is tag 27, the
+                       ;; two-element array, the name `boring/index` AND the
+                       ;; six-element payload header, in one comparison against
+                       ;; the same constant `boring.frame` compares.
+                       ;;
+                       ;; This checked tag 27, then that the payload was an
+                       ;; array, then the name -- and never the array's element
+                       ;; COUNT. So widening a genuine frame's payload from six
+                       ;; elements to seven left `nav` using it as an index
+                       ;; while `decode-seq`, `footer-start` and `index-frame?`
+                       ;; all refused it: one file, two logical contents, and
+                       ;; the disagreement decided by which API you called.
+                       (.bytesEqualAt r ptr frame/prefix-array)
                        ;; The frame must END EXACTLY AT THE FILE'S END.
                        ;;
                        ;; Without this, concatenating two sealed sequences lost
@@ -852,10 +855,7 @@
                        ;; "the index is the last thing in the file" is what
                        ;; tells the real one from an earlier one. Checked after
                        ;; the tag probes, which are cheap and reject faster.
-                       (= n (skip r ptr))
-                       (let [arr (.headEndAt r ptr)]
-                         (and (= 4 (.majorAt r arr))
-                              (.bytesEqualAt r (.headEndAt r arr) (name-probe nav)))))
+                       (= n (skip r ptr)))
               (index-payload r ptr))))))))
 
 (deftype Items [^Nav nav idx]

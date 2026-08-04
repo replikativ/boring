@@ -2729,3 +2729,30 @@
               d (c/bytes->hex (boring/encode-indexed [desc] opts))]
           (is (= (count a) (count d)))
           (is (not= a d)))))))
+
+(deftest a-sealed-file-reads-at-a-depth-budget-that-fits-its-data
+  (testing "The trailing index frame is boring's OWN metadata, and its fixed
+            nesting must not be charged to the caller's `:max-depth`. It was, on
+            ClojureScript: a valid 500-item file written by `write-seq!` on the
+            JVM -- which the JVM reads back at `{:max-depth 3}` -- raised
+            `:boring/max-depth-exceeded` in the browser at both 3 and 4. Write
+            on the server, fail on the client, on this library's own default
+            output. The JVM located the frame by its bytes and never decoded
+            it; ClojureScript decoded it and judged afterwards."
+    (let [v (vec (for [i (range 40)] {:e i :a "x" :v (str "v" i)}))
+          idx (boring/encode-indexed v {:index 4 :index-min 4})]
+      (testing "the control: this data really does fit in three levels, so a
+                failure below is the FRAME's nesting and not the data's.
+                `:stringref false` because `encode-indexed` forces it -- with
+                stringref on, the wrapping tag is a fourth level and the
+                comparison would be against a different document"
+        (is (= v (boring/decode (boring/encode v {:stringref false}) {:max-depth 3}))))
+      (testing "so every reader gets it back at that budget"
+        (is (= [v] (vec (boring/decode-seq idx {:max-depth 3}))))
+        (is (= [v] (vec (boring/decode-seq-from
+                         #?(:clj (java.io.ByteArrayInputStream. idx)
+                            :cljs (let [done (volatile! false)]
+                                    (fn [] (when-not @done (vreset! done true) idx))))
+                         {:max-depth 3})))))
+      (testing "and the frame is still not an item"
+        (is (= 1 (count (boring/decode-seq idx {:max-depth 3}))))))))

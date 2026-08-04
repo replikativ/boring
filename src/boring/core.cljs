@@ -12,6 +12,7 @@
     (datahike's dump requirements); values inside it stay ordinary numbers.
   - `Date` has millisecond resolution, so nanosecond instants do not survive."
   (:require [boring.data :as data]
+            [boring.frame :as frame]
             [boring.options :as opt]
             [boring.reader :as rd]
             [boring.writer :as wr]))
@@ -152,33 +153,10 @@
    (rd/read! r)))
 
 (def ^:const index-name
-  "Tag-27 type name for a sequence/container index. Must match boring.core's."
-  "boring/index")
-
-(defn- index-frame?
-  "True for the tag-27 frame the JVM `seal-index!` appends, at offset `start`.
-
-  CLJS had no recognition of this at all, so the library's OWN default JVM
-  output decoded to N+1 items here and N on the JVM -- the same portable CBOR
-  sequence, two different logical results. Writing the index is still
-  JVM-only; reading past it must not be.
-
-  Authenticity, not just the name: a six-element payload whose last element is
-  the 8-byte back-pointer, and that pointer equal to where the frame starts,
-  which it is by construction since it doubles as the length of the data
-  section before it. A name collision must not delete a logical item."
-  [v ^number start]
-  (and (data/tagged-frame? v)
-       (= index-name (data/frame-name v))
-       (let [p (data/frame-payload v)]
-         (and (sequential? p)
-              (= 6 (count p))
-              (let [ptr (nth (vec p) 5)]
-                (and (instance? js/Uint8Array ptr)
-                     (= 8 (.-length ptr))
-                     (or (neg? start)
-                         (= start (areduce ptr i acc 0
-                                           (+ (* acc 256) (aget ptr i)))))))))))
+  "Tag-27 type name for a sequence/container index. Must match the JVM's --
+  which it does by construction now: both read it from `boring.frame`, along
+  with the byte prefix derived from it."
+  frame/index-name)
 
 (defn decode-seq
   "Lazily decode consecutive top-level CBOR items (RFC 8742 sequence).
@@ -188,17 +166,23 @@
   heap."
   ([bs] (decode-seq bs nil))
   ([bs opts]
-   (let [r (configure-reader! (rd/reader bs) (opt/check-opts opts))]
+   (let [r (configure-reader! (rd/reader bs) (opt/check-opts opts))
+         ;; THE FOOTER IS NOT DECODED AT ALL, exactly as on the JVM. This used
+         ;; to read the item and judge it afterwards, which had two costs. A
+         ;; forged frame got materialised before anything looked at it. And the
+         ;; frame's OWN fixed nesting was charged to the caller's `:max-depth`,
+         ;; so a valid 500-item file this library writes on the JVM -- which
+         ;; the JVM reads at `{:max-depth 3}` -- raised
+         ;; `:boring/max-depth-exceeded` here at 3 and at 4. Write on the
+         ;; server, fail in the browser, on boring's own default output.
+         frame-at (frame/footer-start bs)]
      ((fn step []
         (lazy-seq
          (when-not (rd/at-end? r)
-           ;; The index frame is METADATA, not an item -- and only in the final
-           ;; position, the only place the JVM sealer can put it.
-           (let [start (rd/position r)
-                 v (rd/read-next! r)]
-             (if (and (rd/at-end? r) (index-frame? v start))
+           (let [start (rd/position r)]
+             (if (== start frame-at)
                nil
-               (cons v (step)))))))))))
+               (cons (rd/read-next! r) (step)))))))))))
 
 (defn- grow
   "A Uint8Array of at least `n` bytes holding `buf`'s contents."
@@ -320,11 +304,33 @@
                               ;; the ORIGINAL exception is kept, to be rethrown
                               ;; if it cannot, rather than reporting every
                               ;; malformed document as a truncation.
-                              (if (#{:boring/truncated-input :boring/bad-count}
-                                   (:type (ex-data e)))
+                              (condp contains? (:type (ex-data e))
+                                #{:boring/truncated-input :boring/bad-count}
                                 {:need-more e}
+                                ;; BORING'S OWN FOOTER, as the JVM arity does.
+                                ;; Without this branch the frame's own fixed
+                                ;; nesting was charged to the caller's budget,
+                                ;; so a valid 500-item file this library writes
+                                ;; on the JVM -- which the JVM streams back at
+                                ;; `{:max-depth 3}` -- raised
+                                ;; `:boring/max-depth-exceeded` here.
+                                ;;
+                                ;; A stream has no length to check a
+                                ;; back-pointer against, so the gate is END OF
+                                ;; INPUT instead: the seventeen prefix bytes at
+                                ;; this item's start, and nothing after it. A
+                                ;; budget error is definitive -- more bytes
+                                ;; cannot make a value shallower -- so deciding
+                                ;; immediately is sound where retrying a
+                                ;; truncation is not. Nothing is materialised.
+                                #{:boring/max-depth-exceeded :boring/max-items-exceeded}
+                                (if (and (frame/prefix-at? (:buf @state) (:last-good @state))
+                                         (not (refill!)))
+                                  {:frame true}
+                                  (throw e))
                                 (throw e))))]
                     (cond
+                      (contains? v :frame) nil
                       (contains? v :ok)
                       ;; THE INDEX FRAME IS NOT AN ITEM HERE EITHER. `decode-seq`
                       ;; has recognised it since the cross-platform parity fix;
@@ -352,7 +358,7 @@
                                ;; default 64 KiB chunk. `index-frame?`'s own
                                ;; docstring says the streaming decoder passes
                                ;; -1; this did not.
-                               (index-frame? (:ok v) -1)
+                               (frame/index-frame? (:ok v) -1)
                                (not (refill!)))
                         nil
                         (do (swap! state assoc :last-good (rd/position r))

@@ -31,6 +31,7 @@
   distinction. Pick by which of the two you actually need."
   (:require [boring.data :as data]
             [boring.errors :refer [with-decode-errors]]
+            [boring.frame :as frame]
             [boring.options :as opt]
             [clojure.string :as str])
   (:import (java.nio ByteBuffer)
@@ -884,121 +885,15 @@
   slash-bearing names under it (`clojure/sorted-map`, `java/period`; see
   doc/INTEROP.md).
 
-  This started as tag 39651 and was moved, because the index appears exactly
-  ONCE per file: measured, a name costs 14 bytes, which is 0.05% of a 28 KB
-  file. Against that it removes a registration obligation entirely, is
-  self-describing to a foreign reader (`cbor2` sees the string, not an
-  unregistered number), and narrows false-positive detection -- a stray file
-  must now end in the right shape AND point at tag 27 AND carry this name.
-
-  Tag 39649, shaped arrays, keeps its own number for the opposite reason: it
-  occurs PER ARRAY, and a name would add up to 35% on documents with many small
-  tables -- on a feature whose entire purpose is to shrink them."
-  "boring/index")
-
-(defn- index-frame?
-  "True for the tag-27 frame `seal-index!` appends, at file offset `start`.
-
-  Both fallback shapes count: the payload is an array, so it decodes to a
-  `TaggedLiteral` rather than an `UnknownRecord`, but `frame-name` reads either.
-
-  AUTHENTICITY, not just the name. This tested the name alone, so ANY final
-  tag-27 item called `boring/index` was silently erased from `decode-seq` --
-  including a malformed one, and including one somebody put there as data. A
-  name collision should not delete a logical item from a sequence.
-
-  The check mirrors the cheap half of what `boring.nav/read-index` does: the
-  payload must be a six-element array whose last element is the 8-byte
-  back-pointer, and that pointer must equal the offset the frame actually
-  starts at -- which it does by construction, since it doubles as the length of
-  the data section preceding it. `start` of -1 means the caller cannot supply
-  an offset (the streaming decoder, whose positions are buffer-relative across
-  refills); the shape check still applies."
-  [v ^long start]
-  (and (data/tagged-frame? v)
-       (= index-name (data/frame-name v))
-       (let [p (data/frame-payload v)]
-         (and (sequential? p)
-              (= 6 (count p))
-              (let [ptr (nth (vec p) 5)]
-                (and (bytes? ptr)
-                     (= 8 (alength ^bytes ptr))
-                     (or (neg? start)
-                         (= start
-                            (areduce ^bytes ptr i acc 0
-                                     (+ (bit-shift-left acc 8)
-                                        (bit-and (aget ^bytes ptr i) 0xFF)))))))))))
-
+  The name itself lives in `boring.frame`, with the byte prefix derived from
+  it, so the two cannot drift apart. Re-exported here because it is public API."
+  frame/index-name)
 (declare index-walk index-walk*)
 
-(def ^:private frame-prefix
-  "The exact bytes every sealed frame starts with: tag 27, a two-element array,
-  the text string `boring/index`, and the six-element payload array.
-
-  A CONSTANT, checked before anything is decoded, because the weaker gates that
-  preceded it were forgeable with nine appended bytes. `footer-start` used to
-  accept any file whose byte at n-9 was 0x48 and whose trailing pointer was in
-  range -- so appending `48 0000000000000000` to an ordinary document pointed
-  the gate at offset 0, and whatever item lived there was re-read with the
-  budgets lifted. A 3 MB tag-40 item then allocated 473 MB under
-  `{:max-items 100}`, and a sealed file with four items appended lost them
-  silently.
-
-  Forging THIS means writing a real frame header at the offset the file names,
-  which is the thing the retry exists to handle."
-  (byte-array (map unchecked-byte
-                   [0xd8 0x1b 0x82 0x6c 0x62 0x6f 0x72 0x69 0x6e 0x67
-                    0x2f 0x69 0x6e 0x64 0x65 0x78 0x86])))
-
-(defn- frame-prefix-at?
-  "Whether `bs` carries `frame-prefix` at `off`."
-  [^bytes bs ^long off]
-  (let [fp ^bytes frame-prefix
-        n (alength fp)]
-    (and (some? bs) (>= off 0) (<= (+ off n) (alength bs))
-         (loop [i 0]
-           (cond (= i n) true
-                 (= (aget bs (+ off i)) (aget fp i)) (recur (inc i))
-                 :else false)))))
-
-(defn- footer-start
-  "Where a genuine index footer begins in `bs`, or -1.
-
-  `seal-index!` ends every sealed file with a byte string of exactly 8 bytes --
-  `0x48` and the offset the frame itself starts at -- so the footer announces
-  its own position and that position is checkable without decoding anything.
-  Reading it here, once, is what lets the decoder know which item is the footer
-  BEFORE it tries to read it."
-  ^long [^bytes bs]
-  (let [n (alength bs)]
-    (if (or (< n 9) (not= 0x48 (bit-and (aget bs (- n 9)) 0xff)))
-      -1
-      ;; SHIFTS, not `(+ (* acc 256) b)`. Clojure's arithmetic is checked, so
-      ;; the top bit of an eight-byte pointer -- which any file can carry, and
-      ;; a corrupt one certainly can -- raised a raw ArithmeticException from
-      ;; inside a function whose whole job is to decide whether to trust the
-      ;; bytes. The range test below is what rejects a nonsense pointer.
-      (let [p (loop [i 0 acc 0]
-                (if (= i 8) acc
-                    (recur (inc i)
-                           (bit-or (bit-shift-left acc 8)
-                                   (bit-and (aget bs (+ (- n 8) i)) 0xff)))))]
-        ;; The pointer is also the length of the data section, so it must land
-        ;; inside the file and leave room for the frame it points at.
-        ;; AND THE FRAME MUST END AT THE FILE'S END. Checking the prefix and
-        ;; the pointer is not enough: concatenate two sealed batches of equal
-        ;; length and the second file's pointer names an offset inside the
-        ;; FIRST batch that also carries the prefix, so `decode-seq` stopped
-        ;; there and returned 40 of 82 items with no error, while every other
-        ;; reader -- `decode-seq-from`, `nav/items`, a bare Reader loop, and
-        ;; ClojureScript -- returned 82. Silent data loss, and mine.
-        ;;
-        ;; `nav/read-index*` has always enforced this. The sequence decoder got
-        ;; a weaker approximation of it for the fourth time; this is the check
-        ;; itself rather than another proxy for it.
-        (if (and (>= p 0) (< p (- n 9)) (frame-prefix-at? bs p)
-                 (= n (.skipFrom (Reader. bs) p)))
-          p -1)))))
+;; `index-frame?`, `frame-prefix`, `frame-prefix-at?` and `footer-start` lived
+;; here, and ClojureScript had a fourth, weaker copy of the first. They are one
+;; namespace now -- `boring.frame` -- for the reasons its docstring records: the
+;; weakest copy returned 40 of 82 items from a valid file.
 
 (defn- index-walk
   "Walk the value at `p`, returning where it ENDS, and accumulating index nodes
@@ -1497,7 +1392,7 @@
                                 ;; this item's start and nothing follows, the
                                 ;; rest of the input is the footer and the
                                 ;; sequence is over. Nothing is materialised.
-                                (if (and (frame-prefix-at? (:buf @state)
+                                (if (and (frame/prefix-at? (:buf @state)
                                                            (long (:last-good @state)))
                                          (not (refill!)))
                                   {:frame true}
@@ -1520,7 +1415,7 @@
                           ;; stream too, not just the buffer -- `.atEnd` only
                           ;; means the current chunk is exhausted, so a refill
                           ;; that succeeds proves the frame was not last.
-                          (if (and (index-frame? (:ok v) -1) (.atEnd r) (not (refill!)))
+                          (if (and (frame/index-frame? (:ok v) -1) (.atEnd r) (not (refill!)))
                             nil
                             (cons (:ok v) (step))))
                       (refill!) (step)
@@ -1591,8 +1486,8 @@
                ;; at the final position; `readFrom` does not move `position`,
                ;; so `atEnd` cannot be consulted here.
                (identical? ::index-frame v) nil
-               (and (.atEnd r) (index-frame? v start)) nil
-               :else (cons v (step frame-at))))))) (footer-start bs)))))
+               (and (.atEnd r) (frame/index-frame? v start)) nil
+               :else (cons v (step frame-at))))))) (frame/footer-start bs)))))
 
 ;; ## Optional hasch integration, activated if hasch is present
 ;;
