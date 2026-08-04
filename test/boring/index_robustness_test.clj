@@ -1335,3 +1335,70 @@
         (is (< (* 4 with) without)
             (str "an indexed nth must do far less walking: " with " vs " without))
         (is (< with 20) (str "and be bounded by the stride: " with))))))
+
+(deftest the-two-index-builders-agree
+  (testing "boring builds an index two ways -- the writer captures nodes while
+            encoding (`write-indexed!`, `write-seq!`), and a byte walk derives
+            them afterwards (`encode-indexed`, `build-index`). They are ~450
+            lines of duplicated algorithm, and the one cross-platform defect
+            that reached HEAD this cycle was the two copies of the byte walk
+            disagreeing about a flag. Two builders disagreeing about node
+            offsets would be worse than any single damaged-index case, because
+            it would mean the format has two readings.
+
+            Asserted as BYTE IDENTITY of the whole sealed file, which subsumes
+            the node comparison and cannot pass by both being empty -- the node
+            counts are asserted non-trivial below."
+    (let [o {:profile :canonical}
+          capture (fn [v opts] (let [w (boring/writer 65536 o)
+                                     out (ByteArrayOutputStream.)]
+                                 (boring/write-indexed! w v out (merge o opts))
+                                 (.toByteArray out)))
+          walk (fn [v opts] (boring/encode-indexed v (merge o opts)))
+          nodes (fn [^bytes bs]
+                  (let [p (long (#'boring.frame/footer-start bs))]
+                    (count (vec (nth (boring.data/frame-payload
+                                      (.readFrom (Reader. bs) p)) 1)))))]
+      (doseq [[label v expect-nodes]
+              [["flat map"    (into {} (for [i (range 40)] [(format "k%02d" i) i])) 1]
+               ["vec of maps" (vec (for [i (range 30)] {"a" i "b" (str i)}))        1]
+               ["nested"      {"L1" (into {} (for [i (range 20)]
+                                               [(format "m%02d" i)
+                                                {"L3" (vec (range 20))}]))}       21]
+               ["map of vecs" (into {} (for [i (range 20)]
+                                         [(format "v%02d" i) (vec (range 20))]))  21]]
+              stride [4 16]]
+        (let [c (capture v {:index stride :index-min 4})
+              w (walk v {:index stride :index-min 4})]
+          (is (= (seq c) (seq w))
+              (str label " at stride " stride ": the two builders must agree byte for byte"))
+          (is (= expect-nodes (nodes w))
+              (str label ": and the index must be non-trivial -- " expect-nodes " nodes"))
+          (is (= (nav/value (nav/source c o)) (nav/value (nav/source (boring/encode v o) o)))
+              (str label ": and both must read back as the plain encoding")))))))
+
+(deftest indexed-and-unindexed-agree-across-shapes
+  (testing "the correctness spine: for every container shape, stride and
+            profile, the indexed answer must equal the unindexed one for EVERY
+            key and element. Swept rather than sampled, because every index
+            defect this cycle was found by an audit constructing a case the
+            suite did not contain."
+    (doseq [n [1 2 15 16 17 64]
+            stride [1 2 16 64]
+            profile [:canonical :clojure]]
+      (let [o (cond-> {:profile profile} (= profile :clojure) (assoc :stringref false))
+            m (into {} (for [i (range n)] [(format "k%04d" i) i]))
+            ix (nav/source (boring/encode-indexed m (assoc o :index stride :index-min 1)) o)
+            pl (nav/source (boring/encode m o) o)]
+        (doseq [k (keys m)]
+          (is (= (some-> (get ix k) nav/value) (some-> (get pl k) nav/value))
+              (str "map n=" n " stride=" stride " " profile " key " k)))
+        (is (nil? (some-> (get ix "absent") nav/value))
+            (str "map n=" n " stride=" stride " " profile ": and an absent key stays absent")))
+      (let [o (cond-> {:profile profile} (= profile :clojure) (assoc :stringref false))
+            v (vec (range n))
+            ix (nav/source (boring/encode-indexed v (assoc o :index stride :index-min 1)) o)
+            pl (nav/source (boring/encode v o) o)]
+        (dotimes [i n]
+          (is (= (nav/value (nth ix i)) (nav/value (nth pl i)))
+              (str "vec n=" n " stride=" stride " " profile " idx " i)))))))

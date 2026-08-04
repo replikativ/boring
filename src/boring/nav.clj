@@ -283,8 +283,17 @@
 
     indexed + sorted   binary search the node's anchors comparing ENCODED key
                        bytes, then walk at most `stride`-1 entries. O(log n).
-    indexed            jump anchor to anchor, walking only within one stride --
-                       still never touching a value.
+    indexed            jump anchor to anchor, walking only within one stride.
+                       Still never touches a VALUE -- but measured, it does
+                       the same total work as the scan, because without key
+                       order you must try each anchor's stride until the key
+                       turns up. The index does not accelerate an unsorted map
+                       lookup and cannot: 200 keys under the default profile
+                       cost 40 000 skips indexed and 40 000 unindexed, at every
+                       stride from 1 to 1000. It buys file layout, not speed,
+                       here. Sorted keys (`:canonical`, `:archival`) are what
+                       make the branch above reachable, and arrays index
+                       positionally under any profile.
     unindexed          walk every entry, which is what this always did.
 
   All three return the same offset. The index only decides how much is walked."
