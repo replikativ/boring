@@ -231,8 +231,16 @@
               [-1 (int-array [-1]) (int-array [3])
                [(byte-array (map unchecked-byte [0 4 4]))] [false]]]]]
       (let [bs (crafted payload)]
-        (is (= 4 (count (into [] (nav/items bs opts))))
-            (str label ": must scan"))
+        ;; THREE, not four. The frame stays metadata even when its payload is
+        ;; unusable: detection and usability are separate questions, and
+        ;; detection has already succeeded here -- prefix, pointer, ends at
+        ;; EOF. Answering both with one `nil` meant a file with a genuine,
+        ;; byte-verified footer lost its `:data-end` along with its anchors,
+        ;; so `items` walked past the data section and republished the footer
+        ;; as a trailing data item: `nav/items` reporting 41 where `decode-seq`
+        ;; reported 40 on the same bytes.
+        (is (= 3 (count (into [] (nav/items bs opts))))
+            (str label ": must scan the DATA, and stop at the frame"))
         (is (= [1 2 3] (mapv #(get % "x")
                              (filter map? (into [] (map nav/value) (nav/items bs opts)))))
             (str label ": and the data must read back unchanged"))))))
@@ -660,7 +668,9 @@
                           out)
         (let [bs (.toByteArray out)
               seen (into [] (map nav/value) (nav/items bs opts))]
-          (is (= 4 (count seen)) "refused, so it scans and the frame shows as data")
+          ;; THREE: refused as an INDEX, still recognised as a frame. See the
+          ;; note in `a-payload-whose-parts-disagree-is-refused`.
+          (is (= 3 (count seen)) "refused, so it scans -- and stops at the frame")
           (is (= [1 2 3] (mapv #(get % "x") (filter map? seen)))
               "and every item reads back as itself, not its neighbour"))))))
 
@@ -972,3 +982,128 @@
             "nav and decode-seq report the same number of items")
         (is (= 2 (count (nav/items bad)))
             "namely two -- the data and the thing that is not a frame")))))
+
+;; ---------------------------------------------------------------- audit 9
+;;
+;; Three findings, all the same class: a plausible WRONG ANSWER out of a
+;; damaged-but-consistent index, with no exception anywhere and `decode` of the
+;; same bytes returning the truth throughout.
+
+(defn- body-len ^long [^bytes sealed] (long (#'boring.frame/footer-start sealed)))
+
+(deftest a-footer-from-another-file-is-not-trusted
+  (testing "Splice one sealed file's data section under another's footer -- same
+            byte length, different item boundaries. That is an interrupted
+            append and a retry, or a restore taking the body from one snapshot
+            and the tail from another. Every gate passed: prefix present,
+            pointer in range, frame ends at EOF, anchors ascend and sit in
+            range, anchor[0] = 0. `nav` used the index and handed back
+            neighbouring records -- `nth 16` returned the string \"gaaaa\",
+            `nth 32` returned the record written at 32 minus 9 -- while
+            `decode-seq` over the same bytes was correct throughout, so two
+            code paths in one application disagreed about the file.
+
+            Nothing pinned the FAR end of a node. Now the last anchor plus the
+            items it covers must land exactly on the data section's end."
+    (let [a-vs (mapv #(hash-map :id % :name (str "aaaa-" %)) (range 40))
+          A (seal a-vs opts)
+          want (body-len A)
+          short-recs (mapv #(hash-map :id % :n (str "b" %)) (range 40))
+          ;; A filler string sized so the two data sections match to the byte.
+          k (first (filter #(= want (body-len (seal (conj short-recs
+                                                          (apply str (repeat % \x)))
+                                                    opts)))
+                           (range 1 512)))
+          B (seal (conj short-recs (apply str (repeat k \x))) opts)
+          spliced (byte-array (concat (take want (seq A)) (drop want (seq B))))]
+      (testing "the control: the splice really did produce a file whose footer
+                the byte-level gate accepts, so what follows is about the index
+                and not about the file being malformed"
+        (is (some? k) "a filler length exists that matches the data sections")
+        (is (= want (body-len B)) "and both data sections are the same length")
+        (is (= want (#'boring.frame/footer-start spliced))
+            "the spliced file's footer is located and accepted"))
+      (testing "and every reader agrees with what was written"
+        (is (= 40 (count (boring/decode-seq spliced))))
+        (is (= 40 (count (nav/items spliced))))
+        (is (= a-vs (mapv nav/value (nav/items spliced))))))))
+
+(deftest the-item-total-must-match-the-data-section
+  (testing "`Items.count` returns the frame's total verbatim and `nth` bounds
+            against it, but nothing compared it with the data: the slot-length
+            rule `want = 1 + (cnt-1)/stride` cannot see a change anywhere
+            inside a whole stride. One flipped bit made `count` report 501 for
+            a 500-item file; deflating the total left ten written records
+            present in the file, returned by `decode-seq`, and unreachable
+            through `count`/`nth`.
+
+            Swept over every byte of the frame rather than the one that was
+            found, because the finding is about the rule and not about a byte."
+    (let [vs (mapv #(hash-map :id % :name (str "r" %)) (range 200))
+          bs (seal vs opts)
+          p (long (body-len bs))
+          n (alength ^bytes bs)]
+      (testing "the control: undamaged, the index loads and is used"
+        (is (some? (:offsets (#'boring.nav/read-index (#'boring.nav/nav-of bs {}))))
+            "the honest index is still accepted -- the new check is not a veto")
+        (is (= 200 (count (nav/items bs)))))
+      (testing "and no single-byte change to the frame makes nav and decode-seq
+                disagree about how many items the file holds"
+        (let [disagreements
+              (for [i (range p n)
+                    :let [c (aclone ^bytes bs)
+                          _ (aset-byte c i (unchecked-byte (bit-xor (aget ^bytes bs i) 0x01)))
+                          d (try (count (boring/decode-seq c)) (catch Throwable _ :err))
+                          v (try (count (nav/items c)) (catch Throwable _ :err))]
+                    :when (and (number? d) (number? v) (not= d v))]
+                [i d v])]
+          (is (empty? disagreements)
+              (str "frame bytes that make nav disagree with decode-seq: "
+                   (vec (take 5 disagreements)))))))))
+
+(deftest a-lookup-miss-is-re-derived-by-walking
+  (testing "Validation proves the FIRST anchor is a real entry and that the
+            anchors ascend and sit in range. It cannot prove a MIDDLE one is an
+            entry boundary without walking the container, which is the work the
+            index exists to avoid. So a middle anchor off by one byte made the
+            bounded walk start mid-item and report a PRESENT key as absent:
+            eight of forty, measured, from a single changed byte, while
+            `decode` of the same bytes returned the true forty-entry map.
+
+            A negative from the index is now re-derived by the honest walk,
+            which costs only on genuine misses and makes this namespace's
+            promise -- a stale index falls back to walking and returns the same
+            answer -- true for a DAMAGED one too."
+    (let [m (into {} (for [i (range 40)] [(format "k%02d" i) i]))
+          o {:profile :canonical}
+          bs (boring/encode-indexed m (assoc o :index 4 :index-min 4))
+          ;; The node's anchors are 2, 22, 42, 62 ... so its deltas are
+          ;; 02 14 14 14 ... Move anchor[2] one byte forward and put the next
+          ;; delta back, so every OTHER anchor -- including the last, which the
+          ;; end check pins -- is untouched.
+          needle (byte-array (map unchecked-byte [0x02 0x14 0x14 0x14 0x14 0x14]))
+          at (first (for [i (range (body-len bs) (- (alength ^bytes bs) (alength needle)))
+                          :when (every? #(= (aget ^bytes bs (+ i %)) (aget needle %))
+                                        (range (alength needle)))]
+                      i))
+          damaged (let [c (aclone ^bytes bs)]
+                    (aset-byte c (+ at 2) (unchecked-byte 0x15))
+                    (aset-byte c (+ at 3) (unchecked-byte 0x13))
+                    c)]
+      (testing "the control, and it is the part that matters: the damaged index
+                is still ACCEPTED and still USED, with the moved anchor visible
+                in the slot the reader loaded. Without this the test could pass
+                by the index being rejected, which would prove nothing about
+                the lookup path"
+        (is (some? at) "the slot's delta bytes were found")
+        (let [ix (#'boring.nav/read-index (#'boring.nav/nav-of damaged o))]
+          (is (some? (:slots ix)) "the damaged index is accepted")
+          (is (= [2 22 43 62 82 102] (vec (take 6 (first (:slots ix)))))
+              "and anchor[2] really is one byte off")))
+      (testing "yet every present key still reads back correctly"
+        (let [src (nav/source damaged o)]
+          (doseq [i (range 40)]
+            (is (= i (some-> (get src (format "k%02d" i)) nav/value))
+                (format "k%02d" i)))))
+      (testing "and an absent key is still absent"
+        (is (nil? (get (nav/source damaged o) "nope")))))))

@@ -17,6 +17,7 @@
   (:require [ab :refer [ab]]
             [boring.core :as boring]
             [boring.data]
+            [boring.frame]
             [boring.mmap :as mmap]
             [boring.nav :as nav])
   (:import (java.io File FileOutputStream)
@@ -413,8 +414,13 @@
         build (fn ^bytes [stride]
                 (let [w (boring/writer 65536 seq-opts)
                       o (java.io.ByteArrayOutputStream.)]
-                  (boring/write-seq! w vs o (cond-> seq-opts
-                                              stride (assoc :index stride)))
+                  ;; `:index 0`, not "omit the option". `write-seq!` INDEXES
+                  ;; BY DEFAULT, so the unindexed baseline built by omitting
+                  ;; `:index` was itself indexed at stride 16 -- which is why
+                  ;; this table reported 0.00% overhead at stride 16 and
+                  ;; NEGATIVE overhead above it, and why the "no index" seek
+                  ;; row was really a stride-16 seek.
+                  (boring/write-seq! w vs o (assoc seq-opts :index (or stride 0)))
                   (.toByteArray o)))
         ^bytes plain-bs (build nil)
         plain (alength plain-bs)]
@@ -432,8 +438,12 @@
             idx (- (alength bs) plain)
             ;; the slot as it sits on the wire, BEFORE expansion -- its class is
             ;; the width, since the CBOR element type is what declares it
+            ;; Read the frame WHERE IT IS, not as a trailing item of
+            ;; `decode-seq` -- which recognises it as metadata and does not
+            ;; yield it. This line predates that and had been broken since.
             slot (nth (nth (boring.data/frame-payload
-                            (last (vec (boring/decode-seq bs seq-opts)))) 3) 0)
+                            (.readFrom (Reader. ^bytes bs)
+                                       (long (#'boring.frame/footer-start bs)))) 3) 0)
             width (condp instance? slot
                     (Class/forName "[B") "u8 bytes"
                     (Class/forName "[S") "sint16"

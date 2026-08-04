@@ -246,8 +246,14 @@
                                    [0 0 0 0 0 0 (bit-shift-right data-len 8) data-len]))])
           _ (boring/write-to! w bogus o)
           bs (.toByteArray o)]
-      (is (= 4 (count (read-items bs)))
-          "scans, so the bogus frame comes back as data -- no exception")
+      ;; THREE, not four. A frame whose payload is unusable is still a FRAME:
+      ;; detection -- prefix, pointer, ends at EOF -- has already succeeded, and
+      ;; detection is what establishes where the data ends. Answering "are these
+      ;; anchors usable" and "where does the data end" with one `nil` conflated
+      ;; them, so a file with a genuine footer lost its data boundary along with
+      ;; its anchors and `items` republished the footer as a trailing data item.
+      (is (= 3 (count (read-items bs)))
+          "scans the data, and still stops at the frame -- no exception")
       (testing "and the CONTROL: the same pointer arithmetic with a usable
                 payload IS detected, so the case above fails in expansion
                 rather than never getting that far"

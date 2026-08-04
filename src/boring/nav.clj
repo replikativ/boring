@@ -87,16 +87,19 @@
   is also what lets the index be sparse: an unindexed container simply is not
   found, and the caller walks."
   ^long [^Nav nav ^long off]
-  (if-let [idx (.idx nav)]
-    (let [^longs cs (:containers idx)]
-      (loop [lo 0 hi (dec (alength cs))]
+  ;; `:containers`, not the index itself. A detected frame whose PAYLOAD is
+  ;; unusable now yields `{:data-end ptr}` alone -- the two questions are
+  ;; answered separately, see `read-index*` -- so an index can be present and
+  ;; carry no nodes at all.
+  (if-let [^longs cs (some-> ^Nav nav .idx :containers)]
+    (loop [lo 0 hi (dec (alength cs))]
         (if (> lo hi)
           -1
           (let [mid (quot (+ lo hi) 2)
                 c (aget cs mid)]
             (cond (= c off) mid
                   (< c off) (recur (inc mid) hi)
-                  :else (recur lo (dec mid)))))))
+                  :else (recur lo (dec mid))))))
     -1))
 
 (defn- probe-for
@@ -306,7 +309,29 @@
         ;; anchor covers the remainder. Walking a full stride from it ran off
         ;; the end of the container and into whatever followed -- found by the
         ;; missing-key case, where the search lands past the final anchor.
-        (letfn [(span [^long a] (min stride (- n (* a stride))))]
+        (letfn [(span [^long a] (min stride (- n (* a stride))))
+                ;; A MISS FROM THE INDEX IS NOT AN ANSWER, it is a hint that
+                ;; did not pay off.
+                ;;
+                ;; Validation proves the FIRST anchor is a real entry and that
+                ;; the anchors ascend and sit in range; it cannot prove a
+                ;; middle one is an entry boundary without walking the
+                ;; container, which is the work the index exists to avoid. A
+                ;; middle anchor off by one byte therefore made the bounded
+                ;; walk start mid-item and report a present key as absent:
+                ;; measured, eight of forty present keys came back `nil` from a
+                ;; single changed byte, while `decode` of the same bytes
+                ;; returned the true forty-entry map.
+                ;;
+                ;; So a negative answer is re-derived by the honest walk. That
+                ;; makes this namespace's promise -- "a missing or stale index
+                ;; falls back to walking and returns the same answer" -- true
+                ;; for a DAMAGED one as well, which it was not. The cost lands
+                ;; only on genuine misses, where an honest answer requires the
+                ;; walk anyway: trusting an index for a NEGATIVE is exactly
+                ;; what damage makes unsound.
+                (confirm [^long hit]
+                  (if (neg? hit) (scan-map r (.headEndAt r off) n probe) hit))]
           (if (nth (:sorted idx) ns)
             ;; Sorted keys: binary search the anchors, then a bounded walk.
             ;;
@@ -318,24 +343,26 @@
             ;; `get`. Found by mutating every byte of a real indexed document
             ;; and requiring that no lookup ever throws an untyped exception.
             (let [lim (long (or (:data-end idx) (.size r)))]
-              (loop [lo 0 hi (dec m)]
-                (if (> lo hi)
-                  (let [anchor (max 0 (min (dec m) hi))]
-                    (scan-map r (aget slot anchor) (span anchor) probe))
-                  (let [mid (quot (+ lo hi) 2)
-                        q (long (aget slot mid))]
-                    (if (or (neg? q) (>= q lim))
-                      -1                       ; a damaged anchor: report a miss
-                      (let [c (.compareItemToBytes r q probe)]
-                        (cond (zero? c) (skip r q)
-                              (neg? c) (recur (inc mid) hi)
-                              :else (recur lo (dec mid)))))))))
+              (confirm
+               (loop [lo 0 hi (dec m)]
+                 (if (> lo hi)
+                   (let [anchor (max 0 (min (dec m) hi))]
+                     (scan-map r (aget slot anchor) (span anchor) probe))
+                   (let [mid (quot (+ lo hi) 2)
+                         q (long (aget slot mid))]
+                     (if (or (neg? q) (>= q lim))
+                       -1                      ; a damaged anchor: report a miss
+                       (let [c (.compareItemToBytes r q probe)]
+                         (cond (zero? c) (skip r q)
+                               (neg? c) (recur (inc mid) hi)
+                               :else (recur lo (dec mid))))))))))
             ;; Unsorted: still jump anchor to anchor rather than entry to entry.
-            (loop [a 0]
-              (if (>= a m)
-                -1
-                (let [hit (scan-map r (aget slot a) (span a) probe)]
-                  (if (>= hit 0) hit (recur (inc a))))))))))))
+            (confirm
+             (loop [a 0]
+               (if (>= a m)
+                 -1
+                 (let [hit (scan-map r (aget slot a) (span a) probe)]
+                   (if (>= hit 0) hit (recur (inc a)))))))))))))
 
 (defn- nth-item
   "Offset of element `idx` of the array at `off`, or -1.
@@ -767,7 +794,54 @@
                                   (if (and (> v prev) (<= 0 v) (< v ptr)
                                            (or (neg? c) (> v c)))
                                     (recur (inc k) v)
-                                    false)))))))
+                                    false))))
+                            ;; AND THE FAR END, which nothing pinned.
+                            ;;
+                            ;; Every check above is about the START of the node
+                            ;; and about the anchors being tidy among
+                            ;; themselves. None of them says the node describes
+                            ;; THIS data. Two measured consequences:
+                            ;;
+                            ;;   Splice one sealed file's data section under
+                            ;;   another's footer of the same byte length but
+                            ;;   different item boundaries -- an interrupted
+                            ;;   append and a retry, a restore taking the body
+                            ;;   from one snapshot and the tail from another.
+                            ;;   Every gate passed. `nth items 16` returned the
+                            ;;   string "gaaaa", `nth 32` returned the record
+                            ;;   written at 32-9, and `decode-seq` over the same
+                            ;;   bytes was correct throughout, so two code paths
+                            ;;   in one application disagreed about the file.
+                            ;;
+                            ;;   The item total was never compared with the
+                            ;;   data at all -- the slot-length rule
+                            ;;   `want = 1 + (cnt-1)/stride` cannot see a change
+                            ;;   anywhere inside a whole stride. One flipped bit
+                            ;;   made `count` report 501 for a 500-item file;
+                            ;;   deflating it left ten written records present
+                            ;;   in the file, returned by `decode-seq`, and
+                            ;;   unreachable through `count`/`nth`.
+                            ;;
+                            ;; The check is exact and costs at most one stride
+                            ;; of skips per node, never a walk of the container:
+                            ;; the slot-length rule above already forces
+                            ;; `remaining` into [1, stride]. From the last
+                            ;; anchor, stepping over the items it covers must
+                            ;; land EXACTLY on the node's end -- the data
+                            ;; section's end for the sequence, the container's
+                            ;; own end otherwise.
+                            (let [m (alength a)]
+                              (or (zero? m)
+                                  (let [covered (* st (dec m))
+                                        remaining (- cnt covered)
+                                        per (if (and (not (neg? c)) (= MAJOR-MAP (.majorAt r c)))
+                                              2 1)
+                                        n (* per remaining)
+                                        want-end (if (neg? c) ptr (skip r c))]
+                                    (and (pos? remaining)
+                                         (= want-end
+                                            (loop [k 0 p (long (aget a (dec m)))]
+                                              (if (= k n) p (recur (inc k) (skip r p))))))))))))
                    (range (alength containers)))]
           (when ok?
             {:stride st
@@ -856,7 +930,20 @@
                        ;; tells the real one from an earlier one. Checked after
                        ;; the tag probes, which are cheap and reject faster.
                        (= n (skip r ptr)))
-              (index-payload r ptr))))))))
+              ;; TWO QUESTIONS, TWO ANSWERS. "Where does the data end" and "are
+              ;; these anchors usable" are different, and returning one `nil`
+              ;; for both conflated them: a file with a genuine, byte-verified
+              ;; footer whose PAYLOAD failed validation lost its `:data-end`
+              ;; too, so `items` walked past the data section and republished
+              ;; the footer as a trailing data item -- `nav/items` reporting 41
+              ;; where `decode-seq` reported 40 on the same bytes.
+              ;;
+              ;; Detection is what establishes `:data-end`, and detection has
+              ;; already succeeded by the time we are here: the prefix matched,
+              ;; the pointer is in range, and the frame ends exactly at EOF.
+              ;; An unusable payload means SCAN, and scanning still has to stop
+              ;; in the right place.
+              (merge {:data-end ptr} (index-payload r ptr)))))))))
 
 (deftype Items [^Nav nav idx]
   clojure.lang.Seqable
