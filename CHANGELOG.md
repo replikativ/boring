@@ -29,6 +29,15 @@ here.
 - `trim!` — give a reused writer back what one exceptional job grew. Every growth
   in a writer is otherwise one-way, which is what makes reuse allocation-free.
 - `boring.mmap` — navigate a memory-mapped file without reading it into the heap.
+- `{:trust-index :ignore}` — `boring.nav` skips a sealed index and scans. A
+  chosen index can misdirect a lookup within the blob it arrived with, which
+  matters when you verify one part of a document and act on another; see
+  [doc/SECURITY.md](doc/SECURITY.md).
+- `boring.hasch` is now IN THE JAR. It was an alias-only source path, so the
+  namespace this changelog already advertised was simply absent from the
+  artifact — and its absence is silent: with hasch present and this
+  integration missing, two different record types and a plain map all
+  content-address to the same uuid.
 - `:profile :archival` — sorted map keys AND fixed-width floats. That combination
   was previously unreachable: `:canonical` locks the float width and `:interop`
   locks the key order, so the one thing a portable database dump needs could not
@@ -39,6 +48,47 @@ here.
 - [doc/STORAGE.md](doc/STORAGE.md).
 
 ### Changed
+
+- **BREAKING, wire format: a record's type name is now `namespace/Name` as
+  WRITTEN**, where it was the munged JVM class name (`my_ns.MyRecord`). A
+  record written by 0.1.10 or earlier decodes as an `UnknownRecord` under this
+  release — silently, since an unrecognised tag-27 name is a legitimate value
+  rather than an error. Re-register the old name alongside the new one if you
+  have such data:
+
+      (-> (boring/tag-registry)
+          (boring/register-record "my_ns.MyRecord" map->MyRecord)   ; old
+          (boring/register-record "my-ns/MyRecord" map->MyRecord))  ; new
+
+  Two flaws are fixed by this, and neither was ClojureScript's. Clojure munges
+  `-` to `_` when it builds a record's class name, so the JVM had LOST the
+  namespace as written while ClojureScript's `pr-str` still had it — and boring
+  munged ClojureScript down to match, discarding information one platform still
+  had so it could agree with the one that had lost it. The munge is invertible
+  by looking the namespace up rather than guessing, so both platforms now carry
+  the true name and agree, which they never did. And a dot cannot say where a
+  namespace ends (`a.b.c.D` splits two ways), while a slash is legal in
+  neither part — and is what boring's own reserved names already use:
+  `clojure/sorted-map`, `java/period`.
+
+  A record whose type name reached the wire through a `write-fn` you supplied
+  is unaffected; only the derived name changed.
+
+- **An unknown option key within one edit of a real one is now refused**, with
+  the suggestion: `{:max-item 5}` raises `:boring/bad-option` naming
+  `:max-items`. Keys unlike any option — `:konserve/version` — still pass
+  untouched, so threading your own map through keeps working.
+
+- `Items.nth`'s 2-arity throws out of range, as `Indexed` specifies and as
+  `Cursor.nth` already did. The 3-arity not-found form is unchanged.
+
+- ClojureScript `write-seq!` writes with `:stringref false`, matching the JVM's
+  indexed default, so its output is navigable by `boring.nav`. Use
+  `encode-into!` in a loop if you want the compression instead.
+
+- ClojureScript `:instant-type` takes a FUNCTION of epoch milliseconds — plug
+  in `cljc.java-time`, `tick`, or your own — where it was previously accepted
+  and ignored. Omitted, a `js/Date` comes back as before.
 
 - `write-seq!` **indexes by default** (stride 16). Files it wrote before this
   release remain readable; files it writes now carry a trailing index item that

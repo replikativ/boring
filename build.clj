@@ -117,7 +117,7 @@
                 :lib lib
                 :version version
                 :basis @basis
-                :src-dirs ["src"]
+                :src-dirs ["src" "src-hasch"]
                 :scm {:url "https://github.com/replikativ/boring"
                       :connection "scm:git:git://github.com/replikativ/boring.git"
                       :developerConnection "scm:git:ssh://git@github.com/replikativ/boring.git"
@@ -142,7 +142,16 @@
                  [:developers
                   [:developer
                    [:name "Christian Weilbach"]]]]})
-  (b/copy-dir {:src-dirs [class-dir "src"] :target-dir jar-dir})
+  ;; `src-hasch` IS SHIPPED. It was an `:extra-paths` alias only, so
+  ;; `boring.hasch` -- which the CHANGELOG lists as a feature and which
+  ;; konserve and datahike are the named consumers of -- was simply absent from
+  ;; the jar. The failure is silent rather than a missing-namespace error: with
+  ;; hasch on the classpath and boring's integration missing, two different
+  ;; record types and a plain map all content-address to the SAME uuid.
+  ;;
+  ;; It loads only when hasch is present -- that is what the namespace is
+  ;; built for -- so shipping it costs a consumer without hasch nothing.
+  (b/copy-dir {:src-dirs [class-dir "src" "src-hasch"] :target-dir jar-dir})
   ;; The legal files belong INSIDE the artifact. The README directs consumers
   ;; to both and NOTICE is part of the distribution terms, but neither was
   ;; shipped -- a jar is what a consumer actually receives.

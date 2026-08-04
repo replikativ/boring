@@ -80,7 +80,7 @@ to identical bytes:
 
 (def registry
   (-> (boring/tag-registry)
-      (boring/register-record "my.ns.Point" map->Point)))
+      (boring/register-record "my.ns/Point" map->Point)))
 ```
 
 The wire name is `boring.data/record-type-name` of an instance: on the JVM the
@@ -90,8 +90,12 @@ registration serves data written on either platform**.
 A handful of tag-27 names are reserved by boring for types CBOR cannot
 otherwise distinguish — `clojure/sorted-map`, `clojure/sorted-set`,
 `clojure/queue`, `clojure/with-meta`, `clojure/char`, `java/period`. They carry
-a slash, which a JVM class name never does, so your record can never collide
-with one by accident. If you want one of those names for yourself, take it: the
+a slash separating the owning runtime from the type — and so, since this
+release, does every record name: `my-ns/MyRecord`. The old claim here was that
+a slash made collision impossible; it does not any more, and the honest
+statement is narrower. A collision needs a record named `sorted-map` in a
+namespace named `clojure`, which nothing writes by accident, and the registry
+wins anyway. If you want one of those names for yourself, take it: the
 registry is consulted **before** the built-in markers, both when reading and
 when writing. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
@@ -123,7 +127,7 @@ file with a reader conditional only around the *type* being registered:
                            #?(:clj java.net.URI :cljs js/URL)
                            #?(:clj str :cljs #(.-href %))
                            #?(:clj #(java.net.URI. %) :cljs #(js/URL. %)))
-      (boring/register-record "my.ns.Point" map->Point)))
+      (boring/register-record "my.ns/Point" map->Point)))
 ```
 
 Thread the return value. On the JVM an earlier design mutated in place, which

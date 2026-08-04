@@ -185,10 +185,17 @@ than a caller error.
 
 ### Reserved tag-27 names
 
-Tag 27 carries `[type-name, argument]`. Records use their class name; these
-names are reserved for types CBOR cannot otherwise distinguish. They carry a
-**slash**, which a JVM class name never does, so a user record can never
-collide with one. The prefix names the runtime that owns the type.
+Tag 27 carries `[type-name, argument]`. A record uses its own name —
+`namespace/Name`, as written — and these names are reserved for types CBOR
+cannot otherwise distinguish. The prefix names the runtime that owns the type.
+
+Both now carry a **slash**, so the old guarantee here — that a slash made
+collision impossible, because a JVM class name never contained one — no longer
+holds and has been removed rather than quietly left standing. What remains
+true is weaker and still sufficient: colliding needs a record named
+`sorted-map` in a namespace named `clojure`, and a caller's registry is
+consulted before the built-in markers in both directions, so taking one of
+these names deliberately works.
 
 | name | argument | without it |
 |---|---|---|

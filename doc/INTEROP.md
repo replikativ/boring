@@ -55,8 +55,8 @@ below.
 
 Tag 27 is "serialised language-independent object with type name and
 constructor arguments". boring uses it for your records — the type name is the
-record's class name — and also for a handful of types CBOR has no tag for,
-under names carrying a **slash**, which a JVM class name never does:
+record's own `namespace/Name`, as written — and also for a handful of types
+CBOR has no tag for, under names carrying the same **slash**:
 
 | name | argument | why it is not just the bare value |
 |---|---|---|
