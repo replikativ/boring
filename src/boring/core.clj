@@ -1025,9 +1025,14 @@
                 ;; A map pair costs at least two bytes and an array element at
                 ;; least one, so anything larger than that cannot be present
                 ;; however the rest of the document is arranged.
+                ;; `>` against a HALVED budget rather than a doubled count.
+                ;; `(* 2 n)` is checked arithmetic, so a map declaring 2^63-1
+                ;; pairs overflowed and threw a raw ArithmeticException out of
+                ;; the guard whose job is to make this input typed -- 37 of
+                ;; 60000 fuzz probes, and introduced by the guard itself.
                 _ (let [avail (- (.size r) (long (.headEndAt r p)))
-                        need (if map? (* 2 n) n)]
-                    (when (> need avail)
+                        budget (if map? (quot avail 2) avail)]
+                    (when (> n budget)
                       (throw (ex-info (str "boring: container at " p " declares " n
                                            (if map? " pairs" " elements")
                                            " but only " avail " bytes remain")
