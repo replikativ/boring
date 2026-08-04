@@ -189,9 +189,67 @@ public final class TagRegistry {
     public clojure.lang.IFn readerFor(long tag) { return readers.get(tag); }
     public clojure.lang.IFn recordCtor(String name) { return recordCtors.get(name); }
 
-    /** Wire name for `cls` — the registered override, else its class name. */
+    /**
+     * Wire name for `cls` — the registered override, else its TRUE Clojure
+     * name, with the namespace un-munged.
+     *
+     * Clojure builds a record's class name with `namespace-munge`, which is
+     * `(.replace (str ns) \- \_)`, so `(defrecord My-Rec ...)` in `my-test-ns`
+     * becomes the class `my_test_ns.My-Rec`. ClojureScript has no such step:
+     * its `pr-str` reports `#my-test-ns.My-Rec{...}`, the name as written. So
+     * the JVM was the lossy side, and boring used to "fix" that by munging
+     * ClojureScript down to match — throwing away information the browser
+     * still had, to agree with a platform that had lost it.
+     *
+     * The munge is invertible by lookup rather than by guessing: scan the
+     * loaded namespaces for the one whose munged form is this package. A
+     * record instance's namespace is loaded by construction, so the lookup
+     * always has its answer.
+     *
+     * AMBIGUITY, and how it is resolved: `my-ns` and `my_ns` both munge to
+     * `my_ns`. A namespace whose name already equals the package wins, since
+     * it needs no inversion; failing that a single candidate is taken; and
+     * anything else falls back to the class name rather than guessing. In
+     * practice `my_ns` as a Clojure namespace is vanishingly rare.
+     *
+     * SLASH, not dot, between namespace and name. A dot is ambiguous -- given
+     * `a.b.c.D` you cannot tell whether the namespace is `a.b.c` or `a.b`
+     * without guessing -- while `/` is legal in neither part, so the split is
+     * exact. It is also the separator boring's own reserved tag-27 names
+     * already use: `clojure/sorted-map`, `java/period`, `boring/index`.
+     *
+     * Cached per class — the scan is O(loaded namespaces) and would otherwise
+     * run per encoded record.
+     */
     public String recordName(Class<?> cls) {
         String n = recordNames.get(cls);
-        return n != null ? n : cls.getName();
+        if (n != null) return n;
+        String c = trueNames.get(cls);
+        if (c == null) { c = unmungedName(cls); trueNames.put(cls, c); }
+        return c;
+    }
+
+    private static final java.util.concurrent.ConcurrentHashMap<Class<?>, String> trueNames =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static String unmungedName(Class<?> cls) {
+        String cn = cls.getName();
+        int i = cn.lastIndexOf('.');
+        if (i <= 0) return cn;
+        String pkg = cn.substring(0, i), simple = cn.substring(i + 1);
+        if (pkg.indexOf('_') < 0) return pkg + "/" + simple;   // nothing was munged
+        try {
+            Object nss = clojure.lang.RT.var("clojure.core", "all-ns").invoke();
+            clojure.lang.IFn nsName = clojure.lang.RT.var("clojure.core", "ns-name");
+            String only = null; int hits = 0;
+            for (Object ns : (Iterable<?>) clojure.lang.RT.seq(nss)) {
+                String name = nsName.invoke(ns).toString();
+                if (name.equals(pkg)) return pkg + "/" + simple;  // exact: no inversion
+                if (name.replace('-', '_').equals(pkg)) { only = name; hits++; }
+            }
+            return (hits == 1 ? only : pkg) + "/" + simple;
+        } catch (Throwable t) {
+            return pkg + "/" + simple;                 // never fail an encode over a name
+        }
     }
 }

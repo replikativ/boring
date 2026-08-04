@@ -9,11 +9,7 @@
   ;; clojure.core's. Without this exclusion every downstream build — konserve,
   ;; kabel, datahike — carries two :redef warnings, which is how real warnings
   ;; get lost.
-  (:refer-clojure :exclude [decimal? rational?])
-  ;; ClojureScript only -- the JVM branch of `record-type-name` uses
-  ;; `.getName`. Required unconditionally, clj-kondo reported it unused (it
-  ;; reads .cljc with the :clj reader) and the lint gate stayed red.
-  #?(:cljs (:require [clojure.string :as str])))
+  (:refer-clojure :exclude [decimal? rational?]))
 
 ;; ## Simple values (major type 7)
 ;;
@@ -236,20 +232,32 @@
      (.write w "]")))
 
 (defn record-type-name
-  "The canonical wire name for a record type, identical on both platforms.
+  "The canonical wire name for a record type: the name as WRITTEN, on both
+  platforms.
 
-  On the JVM this is the class name, which already munges `-` to `_`. On
-  ClojureScript the constructor's `.name` is MINIFIED under `:advanced`
-  (a record printed as `#my.ns.P{...}` reports a type name of `Vg`), so the
-  name is taken from `pr-str`, where the compiler embeds it as a string
-  constant that survives minification — and then munged the same way, which is
-  `incognito`'s convention and the reason it has one."
+  Nothing is munged. ClojureScript's `pr-str` reports the name as written
+  (`#my-test-ns.My-Rec{...}`), and on the JVM `boring.TagRegistry` inverts
+  Clojure's `namespace-munge` by looking the namespace up rather than guessing
+  — see its `recordName`. This used to munge ClojureScript DOWN to the JVM's
+  lossy form, discarding information the browser still had in order to agree
+  with a platform that had lost it. Every lossy step breaks a symmetry, and
+  this one was not forced.
+
+  On ClojureScript the name has to come from `pr-str` rather than the
+  constructor's `.name`, which is MINIFIED under `:advanced` — a record printed
+  as `#my.ns.P{...}` reports a type name of `Vg`. `pr-str` carries it as a
+  string constant the compiler embeds, which survives minification.
+
+  SLASH separates namespace from name. A dot is ambiguous -- `a.b.c.D` could
+  split either way -- and `/` is legal in neither part. It is also what boring's
+  own reserved tag-27 names already use: `clojure/sorted-map`, `java/period`."
   [x]
-  #?(:clj (.getName (class x))
+  #?(:clj (.recordName org.replikativ.boring.TagRegistry/EMPTY (class x))
      :cljs (let [s (pr-str x)
                  i (.indexOf s "{")]
              (if (and (pos? i) (= "#" (subs s 0 1)))
-               (str/replace (subs s 1 i) "-" "_")
+               (let [n (subs s 1 i) dot (.lastIndexOf n ".")]
+                 (if (pos? dot) (str (subs n 0 dot) "/" (subs n (inc dot))) n))
                (str (type x))))))
 
 ;; ## Decimal and rational stand-ins for ClojureScript

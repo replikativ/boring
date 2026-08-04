@@ -171,7 +171,7 @@
       (is (data/unknown-record? (:ok back))
           (str "unregistered record should decode to UnknownRecord, got "
                (pr-str (:ok back))))
-      (is (= "boring.conformance_test.ConfPoint" (data/record-type (:ok back))))
+      (is (= "boring.conformance-test/ConfPoint" (data/record-type (:ok back))))
       (is (= {:x 3 :y 4} (data/record-fields (:ok back)))))))
 
 (deftest unknown-record-behaves-like-the-record-it-stands-for
@@ -188,7 +188,7 @@
       (is (= 9 (:z (assoc ur :z 9))))
       (testing "with defrecord equality semantics, not map equality"
         (is (not= ur {:x 3 :y 4}))
-        (is (= ur (data/unknown-record "boring.conformance_test.ConfPoint"
+        (is (= ur (data/unknown-record "boring.conformance-test/ConfPoint"
                                        {:x 3 :y 4})))))))
 
 (deftest unknown-record-passthrough-is-byte-identical
@@ -202,9 +202,9 @@
   (testing "the JVM class name and the name ClojureScript derives must be the
             same string, or a record written on one platform is unreadable on
             the other even with a registration"
-    (is (= "boring.conformance_test.ConfPoint"
+    (is (= "boring.conformance-test/ConfPoint"
            (data/record-type-name (->ConfPoint 1 2))))
-    (is (= "boring.conformance_test.ConfEvent"
+    (is (= "boring.conformance-test/ConfEvent"
            (data/record-type-name (->ConfEvent 1 2 3))))))
 
 (deftest registered-records-round-trip-as-themselves
@@ -213,9 +213,9 @@
     ;; into any other test regardless of the order clojure.test picks — which
     ;; is exactly why the process-global default was removed.
     (let [reg (-> (boring/tag-registry)
-                  (boring/register-record "boring.conformance_test.ConfPoint"
+                  (boring/register-record "boring.conformance-test/ConfPoint"
                                           map->ConfPoint)
-                  (boring/register-record "boring.conformance_test.ConfEvent"
+                  (boring/register-record "boring.conformance-test/ConfEvent"
                                           map->ConfEvent))
           opts {:registry reg}
           p (->ConfPoint 3 4)
@@ -232,7 +232,7 @@
      (testing "the JVM-only reflective convenience agrees with the portable form"
        (let [reflective (boring/register-record-class (boring/tag-registry) ConfPoint)
              explicit (boring/register-record (boring/tag-registry)
-                                              "boring.conformance_test.ConfPoint"
+                                              "boring.conformance-test/ConfPoint"
                                               map->ConfPoint)
              p (->ConfPoint 7 8)]
          (doseq [reg [reflective explicit]]

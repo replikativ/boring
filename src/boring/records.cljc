@@ -33,14 +33,12 @@
    (defn- wire-name
      "The name a record of `record-sym` in `ns-sym` carries on the wire.
 
-     Must match `boring.data/record-type-name`: the NAMESPACE segment is munged
-     and the record name is not, which is what a JVM class name does and what
-     ClojureScript's `pr-str` name is normalised to. Munging the whole string
-     -- which this did -- produced a key no wire name ever matches, so a
-     hyphenated record type looked up here was never found and came back an
-     `UnknownRecord`."
+     Must match `boring.data/record-type-name`, which munges nothing: the name
+     as written, on both platforms. Munging here produced a key no wire name
+     matches, so a record in a hyphenated namespace was never found and came
+     back an `UnknownRecord`."
      [ns-sym record-sym]
-     (str (str/replace (str ns-sym) "-" "_") "." record-sym)))
+     (str ns-sym "/" record-sym)))
 
 #?(:clj
    (defn- cljs-records
@@ -62,7 +60,13 @@
            [sym _] (ns-publics n)
            :let [s (name sym)]
            :when (str/starts-with? s "map->")
-           :when (try (Class/forName (wire-name (ns-name n) (subs s 5)))
+           ;; CLASS name here, not the wire name: `Class/forName` wants
+           ;; `my_ns.Rec` while the wire carries `my-ns/Rec`. They were the same
+           ;; string until the wire name stopped munging, and this probe then
+           ;; found no classes at all -- so `auto-registry` came back empty and
+           ;; every record decoded as an `UnknownRecord`.
+           :when (try (Class/forName (str (str/replace (str (ns-name n)) "-" "_")
+                                          "." (subs s 5)))
                       (catch Throwable _ false))]
        [(ns-name n) (symbol (subs s 5))])))
 

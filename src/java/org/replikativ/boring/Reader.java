@@ -1192,6 +1192,22 @@ public final class Reader {
     private static final java.util.concurrent.ConcurrentHashMap<String, Object> CTOR_CACHE =
         new java.util.concurrent.ConcurrentHashMap<>();
 
+    /**
+     * The JVM class name for a record wire name.
+     *
+     * A wire name is `namespace/Name` as WRITTEN -- slash because a dot cannot
+     * say where the namespace ends, and unmunged because ClojureScript has the
+     * true name and the JVM can recover it. A class name is the inverse:
+     * `namespace` munged with `-` to `_`, joined by a dot. Names with no slash
+     * are passed through, so a registered override or a foreign producer's
+     * dotted name still resolves.
+     */
+    private static String classNameOf(String wire) {
+        int i = wire.lastIndexOf('/');
+        if (i < 0) return wire;
+        return wire.substring(0, i).replace('-', '_') + "." + wire.substring(i + 1);
+    }
+
     private static Object tryConstructRecord(String name, Object fields) {
         Object cached = CTOR_CACHE.get(name);
         if (cached == null) {
@@ -1210,7 +1226,7 @@ public final class Reader {
 
     private static Object resolveRecordCreate(String name) {
         try {
-            Class<?> c = clojure.lang.RT.classForNameNonLoading(name);
+            Class<?> c = clojure.lang.RT.classForNameNonLoading(classNameOf(name));
             if (c == null || !clojure.lang.IRecord.class.isAssignableFrom(c))
                 return NOT_A_RECORD;
             java.lang.reflect.Method m =
