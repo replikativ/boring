@@ -385,12 +385,25 @@
   "Host equality first, content equality only for array-likes.
 
   `identical?` leads because boring's ident cache returns the SAME keyword
-  object for a repeated key. After a failed identity comparison, distinct
-  keywords and symbols cannot be equal within one read and skip the general
-  equality path."
+  object for a repeated key, so the overwhelmingly common case is a pointer
+  comparison and never reaches the rest.
+
+  IT IS ONLY A FAST PATH, NEVER A DECISION. A version of this skipped `=`
+  entirely once `identical?` failed for a keyword or symbol, on the theory that
+  the ident cache makes equal identifiers identical within one read. The cache
+  is BOUNDED and clears WHOLESALE at IDENT-CACHE-MAX, so that theory is false
+  the moment a map's values contain more than 4096 distinct identifiers between
+  two occurrences of the same key: `{:a 1, :zzz <5000 keywords>, :a 2}` then
+  decoded to a THREE-entry PersistentArrayMap holding `:a` twice, count 3, with
+  `(get m :a)` returning the first binding. A corrupt map, not a missed error,
+  and the same failure the `read-map-n!` comment describes for transit.
+
+  ClojureScript keywords are not globally interned the way the JVM's are, so
+  there is no equivalent invariant to lean on here. Measured worth of the
+  shortcut: about 1% on the datom workload, i.e. inside the noise."
   [a b]
   (or (identical? a b)
-      (and (not (or (keyword? a) (symbol? a))) (= a b))
+      (= a b)
       (and (array-key? a) (array-key? b)
            (= (array-content-key a) (array-content-key b)))))
 

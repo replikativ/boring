@@ -22,9 +22,10 @@ The useful changes from this investigation are deliberately narrow:
   as other large leaves, and a payload exactly as large as the staging buffer is
   written directly.
 - The CLJS writer keeps its resolved default options on reusable writers instead
-  of rebuilding and traversing an empty option map for every value. The CLJS
+  of rebuilding and traversing an empty option map for every value. ~~The CLJS
   reader avoids a redundant general equality call after identity has already
-  failed for interned keywords and symbols.
+  failed for interned keywords and symbols.~~ **Reverted on integration — it was
+  unsound. See "Integration review" below.**
 - Focused JVM and advanced-compiled Node benchmark programs were added so these
   paths can be remeasured without relying on an interactive REPL transcript.
 
@@ -100,10 +101,13 @@ the same `KeyProbe.eq` content rules used by the large-map hash path. The scan i
 bounded by the persistent array-map threshold; large maps still use the O(n)
 content-aware set.
 
-The CLJS keyword/symbol shortcut relies on an existing reader invariant: wire
+~~The CLJS keyword/symbol shortcut relies on an existing reader invariant: wire
 identifiers are interned by the reader cache, so two equal decoded keywords or
 symbols have identical object identity during the duplicate scan. Other key
-types continue through the general equality test.
+types continue through the general equality test.~~
+
+**That invariant does not hold.** The reader cache is bounded and clears
+wholesale, so the shortcut was removed on integration; see below.
 
 Reusable CLJS writers store opaque resolved options rather than accepting raw
 writer state from callers. Explicit per-call options still override those
@@ -178,3 +182,156 @@ in this change:
 - CLJS benchmark: advanced compilation of
   `bench/cljs/cljsbench/perf_worktree.cljs`, then execution under Node.
 - `git diff --check` passes.
+
+---
+
+# Integration review
+
+Reviewer: Claude. Date: 2026-08-03. Reviewed at merge commit `f17237f`
+(`Merge measured serialization performance improvements`), against the
+integration baseline `28000d0`.
+
+The investigation branch was merged into `seq-index` before this review, so
+this section records what the merge actually landed, what was verified, and one
+defect that had to be reverted before the branch can be released.
+
+## Verdict
+
+Five of the six changes are sound and are kept. One is a **correctness
+regression** and was reverted with a regression test:
+
+| Change | Verdict |
+|---|---|
+| JVM: build small maps once, scan for array keys only when one is present | **Kept** — verified |
+| JVM: skip tag-registry lookup when the registry has no writers | **Kept** |
+| JVM: big-integer magnitude through `writePayload`; payload exactly buffer-sized streams | **Kept** |
+| CLJS: pre-resolved options on reusable writers | **Kept** |
+| CLJS: `writer` 3-arity, matching the JVM's options-bearing arity | **Kept** |
+| CLJS: skip `=` for keywords/symbols after `identical?` fails | **REVERTED — produced corrupt maps** |
+
+## The defect
+
+`src/boring/reader.cljs`, `same-key?`. The merged version was:
+
+```clojure
+(or (identical? a b)
+    (and (not (or (keyword? a) (symbol? a))) (= a b))
+    ...)
+```
+
+The stated justification was that "wire identifiers are interned by the reader
+cache, so two equal decoded keywords or symbols have identical object identity
+during the duplicate scan."
+
+**The cache is bounded and clears wholesale.** `IDENT-CACHE-MAX` is 4096, and
+`ident-from-bytes` calls `.clear` on the whole cache when it is reached. Two
+occurrences of the same keyword within one map are therefore *not* guaranteed
+to be the same object: it is enough for the values between them to contain more
+than 4096 distinct identifiers. ClojureScript keywords are not globally
+interned the way the JVM's are, so there is no other invariant to fall back on.
+
+This is not merely a missed error. `dup-key?` gates the fast path in
+`read-map-small!`, which on a `false` result builds `(PersistentArrayMap. nil n
+arr nil)` — the constructor that **adopts the array without inspecting it**.
+
+Reproducer, run under advanced compilation on Node:
+
+```text
+input   {:a 1, :zzz <a map of 5000 distinct keywords>, :a 2}   (3-pair CBOR map)
+        encoded with :stringref false
+
+merged  decodes successfully to a THREE-entry PersistentArrayMap
+        count            3
+        (get m :a)       1          ; the second binding is unreachable
+        keys equal?      true
+        keys identical?  false
+
+fixed   :boring/duplicate-map-key
+control the same duplicate with no filler between the two keys: rejected in
+        both versions, which is why no existing test caught this
+```
+
+A corrupt map with a wrong `count` and an unreachable binding is exactly the
+failure the `read-map-n!` comment describes for transit's `no-check=true`, and
+it is reachable from ordinary untrusted input.
+
+## What it bought
+
+Nothing measurable. The investigation itself reported the shortcut as "about
+1% on the large datom workload ... directional rather than a precise claim".
+Two runs of the *same* fixed code through `bench/cljs/cljsbench/perf_worktree.cljs`
+in separate advanced-compiled Node processes measured `datom-maps-200`
+`decode/check` at **574.4 µs and 545.6 µs** — a 5% spread. The claimed benefit
+is below this harness's noise floor, so the trade was a correctness regression
+for an effect that cannot be measured.
+
+## Fix
+
+`same-key?` restored to `identical?` → `=` → array-content comparison. The
+docstring now records why the identity shortcut is not available, so it is not
+reintroduced.
+
+Regression test: `duplicate-detection-does-not-depend-on-decoder-cache-state` in
+`test/boring/conformance_test.cljc`. Written portably rather than CLJS-only,
+because the property — *whether a repeated key is caught must not depend on how
+many other identifiers were decoded in between* — is a conformance property, not
+a platform detail. Verified to **fail** against the merged reader and **pass**
+against the fix.
+
+## What was verified sound
+
+JVM `buildMap`, exercised directly at every branch:
+
+| Case | Result |
+|---|---|
+| small map, byte-string keys with equal content | `:boring/duplicate-map-key` |
+| small map, host-equal integer keys | `:boring/duplicate-map-key` |
+| small map, `short[]` keys with equal content | `:boring/duplicate-map-key` |
+| 9-pair map, byte-string keys with equal content (large path) | `:boring/duplicate-map-key` |
+| 9-pair all-keyword map, one key repeated | `:boring/duplicate-map-key` |
+| tag 258, two byte-equal elements | `:boring/duplicate-set-element` |
+| `{:check-duplicate-keys false}` | last-wins `{1 2}`, no error |
+| distinct byte-string keys | 2 entries, no error |
+| 200 datom-shaped maps | round-trips equal |
+
+Two properties of the new small-map path worth recording because they are what
+makes it safe:
+
+- `checkDistinctSmall` is O(n²), and it is **bounded**. Both `ARRAY_MAP_PAIRS`
+  and `ARRAY_MAP_KW_PAIRS` probe to **8** on this runtime, so the quadratic
+  branch runs over at most 8 pairs — 28 comparisons. The `allKeywordKeys` term
+  in `fits` is therefore currently redundant; it is not wrong, and it would
+  start to matter if a future runtime probed a larger keyword threshold.
+- It is reached only when `anyArrayKey` is true, or once on a map that has
+  already failed the `m.count() != n` test to recover the key for `ex-data`.
+  Ordinary keys never pay it.
+
+`checkDistinct`'s own `DUP_SCAN_MAX <= 8` pairwise branch is now unreachable
+from `buildMap` — the `fits` test intercepts everything at or below 8 — but it
+remains live for tag-258 sets, which call `checkDistinct` at any size. Not dead
+code, and worth knowing before anyone deletes it.
+
+The writer changes are behaviour-preserving by inspection: `hasWriters()` short-
+circuits a `HashMap.get` that would have returned `null`; `writePayload` at
+`len >= buf.length` streams a payload that previously grew the buffer to exactly
+its own size; and the big-integer magnitude path now takes the same route as
+every other contiguous byte payload. The CLJS registry guard is the same shape —
+`(some? (.-registry w))` in front of a `get-in` that returned `nil` anyway.
+
+## Corrections to the record above
+
+- The claim that the CLJS reader "avoids a redundant general equality call" is
+  struck; that change is not in the tree.
+- The verification counts predate this review. Current: **JVM 256 tests / 7,050
+  assertions**, **CLJS 130 tests / 1,091 assertions**, both green, plus `lint`,
+  `interop`, `fuzz`, `fuzz-cljs`, `nippy`, `hasch` and `artifact`.
+
+## Note on method
+
+The defect was not found by reading the diff, which looks reasonable, but by
+asking what makes the stated invariant true and then checking that claim against
+the code that maintains it. The cache's own comment — "Bounded, unlike the
+previous unbounded js/Map ... Clearing wholesale is crude" — is three lines above
+the lookup the shortcut depends on. A performance change that relies on an
+invariant should cite the code that enforces it; if it cannot, the invariant is
+a hypothesis.

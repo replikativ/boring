@@ -2155,3 +2155,29 @@
     (testing "and the valid shapes still decode"
       (is (= [true false] (vec (dec-hex (marker "java/boolean-array" "82f5f4")))))
       (is (= ["a"] (vec (dec-hex (marker "java/string-array" "816161"))))))))
+
+(deftest duplicate-detection-does-not-depend-on-decoder-cache-state
+  (testing "whether a repeated key is caught must not depend on how many OTHER
+            identifiers were decoded between its two occurrences. ClojureScript
+            interns identifiers in a bounded cache that clears wholesale, so a
+            shortcut that trusted `identical?` for keywords decoded
+            {:a 1, :zzz <5000 keywords>, :a 2} to a THREE-entry array map
+            holding :a twice -- a corrupt map, not a missed error"
+    (let [filler (into {} (map (fn [i] [(keyword (str "k" i)) i])) (range 5000))
+          enc    #(boring/encode % {:stringref false})
+          parts  [(c/hex->bytes "a3")                       ; map, 3 pairs
+                  (enc :a) (enc 1)
+                  (enc :zzz) (enc filler)
+                  (enc :a) (enc 2)]
+          bs     #?(:clj (let [bos (java.io.ByteArrayOutputStream.)]
+                           (doseq [^bytes p parts] (.write bos p))
+                           (.toByteArray bos))
+                    :cljs (let [total (reduce + (map #(.-length %) parts))
+                                out (js/Uint8Array. total)]
+                            (loop [ps (seq parts) off 0]
+                              (if ps
+                                (do (.set out (first ps) off)
+                                    (recur (next ps) (+ off (.-length (first ps)))))
+                                out))))]
+      (is (= :boring/duplicate-map-key
+             (err-type #(boring/decode bs {:stringref false})))))))
