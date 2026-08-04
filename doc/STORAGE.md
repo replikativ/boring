@@ -32,17 +32,33 @@ and a real limit, and it is worth knowing which one you are relying on.
 from being built — so `nav/value` at the end:
 
 ```clojure
-(require '[boring.nav :as nav])
+(require '[boring.core :as boring] '[boring.nav :as nav])
 
-(def c (nav/source bs {:stringref false}))
-(nav/value (get-in c ["customer-137" "name"]))
+(def customers (into {} (for [i (range 200)]
+                          [(str "customer-" i) {"name" (str "name-" i)}])))
+
+(def bs (boring/encode customers {:stringref false}))   ; at WRITE time
+(def c (nav/source bs))
+(nav/value (get-in c ["customer-137" "name"]))          ; => "name-137"
 ```
 
-`get-in` works because a cursor implements `ILookup`. Also implemented:
-`nth` (O(n) — see the scan/jump distinction above), `count` (O(1), the element
-count is in the head), `seq`, `reduce`, and a read-only `clojure.zip` zipper
-via `nav/zipper`. Not `IDeref`: `@` would read as a cheap field access while
-doing arbitrary decode work.
+The `{:stringref false}` is on the **encode**, and that is the whole of the
+requirement — see the constraints below. It used to sit on the `nav/source`
+call in this example, where it does nothing at all: `source` forces the option
+in both directions and ignores what the caller passed, so the same snippet over
+default-encoded bytes threw `:boring/stringref-not-navigable` while appearing
+to have already handled it.
+
+`get-in` works **for map keys** because a cursor implements `ILookup`. It does
+not descend arrays: `valAt` handles map keys and realises tags, and an array
+position falls through to the not-found value, so `(get-in c ["p" 1])` is `nil`
+rather than an error. Use `nth` on the array cursor —
+`(nav/value (nth (get c "p") 1))`.
+
+Also implemented: `nth` (O(n) — see the scan/jump distinction above), `count`
+(O(1), the element count is in the head), `seq`, `reduce`, and a read-only
+`clojure.zip` zipper via `nav/zipper`. Not `IDeref`: `@` would read as a cheap
+field access while doing arbitrary decode work.
 
 A log is a CBOR sequence, walked item by item:
 

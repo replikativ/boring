@@ -220,9 +220,10 @@ why it is worth stating. `{:incl-metadata? false}` opts out.
 
 If you need to agree byte-for-byte with a specific peer, check *which* rule it
 implements before picking. `:canonical` is RFC 8949 §4.2.1 — bytewise
-lexicographic — which is what fxamacker's `SortCoreDeterministic` and ciborium
-produce. Python's **cbor2 `canonical=True` is the older length-first rule** (RFC
-7049 §3.9), which is boring's `:canonical-rfc7049`, not its `:canonical`:
+lexicographic — which is what fxamacker's `SortCoreDeterministic` produces.
+**Both of the peers this repo actually checks against are length-first**: Python's
+cbor2 `canonical=True` and Rust ciborium's `CanonicalValue` are the older RFC
+7049 §3.9 rule, which is boring's `:canonical-rfc7049`, not its `:canonical`:
 
 ```
 {1000 "x", "a" "y"}   cbor2 canonical=True   a2 6161 6179 1903e8 6178
@@ -240,11 +241,20 @@ back a `Float` — correct for interchange, wrong for a database dump.
 `:archival` keeps the width. Pick by whether you need to agree with *other
 encoders* (`:canonical`) or to get *your own types back* (`:archival`).
 
-There is also `:canonical-rfc7049`, which uses [clj-cbor][]'s length-first key
-order instead of RFC 8949's bytewise one. It is a separate profile rather than
-an option on `:canonical`, because a signer and a verifier who disagree about a
-sub-option that does not appear in the profile name produce a mismatch nobody
-can see.
+There is also `:canonical-rfc7049`, the length-first key order — [clj-cbor][]'s,
+but calling it that understates its reach: [cbor2][] is the most widely deployed
+CBOR implementation there is and its canonical mode is this one, as is
+[ciborium][]'s. It is a separate profile rather than an option on `:canonical`,
+because a signer and a verifier who disagree about a sub-option that does not
+appear in the profile name produce a mismatch nobody can see.
+
+ciborium was listed here under the bytewise rule, and that was wrong. It was
+corrected in [COMPATIBILITY.md](doc/COMPATIBILITY.md#two-canonical-profiles)
+when `interop/rust/src/canonical.rs` compared ciborium's output against ours
+over 989 values, and the correction did not reach this page — so a reader who
+followed the README picked `:canonical` to match a ciborium peer and got a
+verification failure with nothing to point at. Two documents, one measurement,
+one of them updated.
 
 `:canonical` follows RFC 8949 §4.2 and the deterministic rules in
 [draft-ietf-cbor-serialization][cde]. It is deliberately **lossy** — a bignum
@@ -255,17 +265,42 @@ cannot both sign a document and preserve a host type the wire has no room for.
 ## Reading without decoding
 
 `boring.nav` walks encoded CBOR and builds only what you ask for — and because
-a cursor implements `ILookup`, `clojure.core/get-in` works on it directly:
+a cursor implements `ILookup`, `clojure.core/get-in` works on it directly for
+**map keys**:
 
 ```clojure
 (require '[boring.nav :as nav] '[boring.mmap :as mmap])
 
-(def c (nav/source bs {:stringref false}))
-(nav/value (get-in c ["customer-137" "name"]))   ; the other 199 are never built
+(def customers (into {} (for [i (range 200)]
+                          [(str "customer-" i) {"name" (str "name-" i)}])))
+
+;; :stringref false at WRITE time — see below; it is not optional
+(def bs (boring/encode customers {:stringref false}))
+
+(def c (nav/source bs))
+(nav/value (get-in c ["customer-137" "name"]))   ; => "name-137"
+                                                 ; the other 199 are never built
 
 (mmap/with-mmap [c "events.cbor"]                ; JDK 22+; the file need not fit in heap
   (nav/value (get-in c ["customer-137" "name"])))
 ```
+
+Two things that example is carrying, both of which used to be silent:
+
+**The write is where `:stringref false` belongs.** boring writes stringref by
+default, and a stringref is an index into a table built from every preceding
+string, so a cursor holding only an offset cannot resolve one — `nav/source`
+refuses such a document with `:boring/stringref-not-navigable`. Passing
+`{:stringref false}` to `nav/source` does not help: it forces that option
+anyway, in both directions, so the caller's value is ignored. This snippet used
+to pass it there, over bytes the README's own encode example had written *with*
+stringref, and so it threw the very error it looked like the fix for.
+
+**`get-in` descends maps, not arrays.** `Cursor`'s `valAt` handles map keys and
+realises tags; an array position falls through to the not-found value, so
+`(get-in c ["p" 1])` is `nil` where `(get-in (boring/decode bs) ["p" 1])` is
+`20`. No error — the arity does not have one to give. Use `nth` on the array
+cursor: `(nav/value (nth (get c "p") 1))`.
 
 Against decode-then-`get-in`: **21×** for one leaf, **~1400×** for `count`
 (O(1) — the element count is in the head), and **~290×** to locate a 1 MiB
