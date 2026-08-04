@@ -2795,3 +2795,24 @@
       (doseq [hex ["83010203" "a201020304"]]
         (is (= 1 (count (boring/decode-seq (c/hex->bytes hex)))) hex)
         (is (some? (boring/build-index (c/hex->bytes hex) {:index 1 :index-min 1})) hex)))))
+
+(deftest a-declared-count-cannot-size-an-array-before-it-is-checked
+  (testing "`build-index` sizes an anchor array from a count it reads off the
+            wire. Six bytes -- `ba 7fffffff 01`, a map declaring 2^31-1 pairs --
+            therefore asked for a long[] of that many entries and gave
+            `OutOfMemoryError` out of a public entry point documented for
+            \"a file somebody else wrote\". `Reader.checkCount` has always
+            guarded the decoder against exactly this; the index walk sizes an
+            array from a wire count too and never got the same guard."
+    (doseq [[label hex] [["map declaring 2^31-1 pairs"    "ba7fffffff01"]
+                         ["array declaring 2^31-1 items"  "9a7fffffff01"]
+                         ["map declaring 2^64-1 pairs"    "bbffffffffffffffff01"]]]
+      (testing label
+        (is (contains? #{:boring/bad-count :boring/truncated-input}
+                       (err-type #(boring/build-index (c/hex->bytes hex)
+                                                      {:index 1 :index-min 1}))))))
+    (testing "the control: a container whose count IS backed by bytes still
+              indexes, so the guard rejects the lie and not the shape"
+      (doseq [hex ["83010203" "a201020304"]]
+        (is (some? (boring/build-index (c/hex->bytes hex) {:index 1 :index-min 1}))
+            hex)))))

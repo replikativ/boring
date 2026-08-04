@@ -1006,7 +1006,26 @@
             ;; then copied every stride-th element into a second array -- so a
             ;; document of small maps allocated one throwaway array per map and
             ;; threw it away, which is why raising :index-min barely helped.
-          (let [keep? (>= n min-entries)
+          (let [;; THE DECLARED COUNT IS CHECKED AGAINST THE BYTES THAT
+                ;; REMAIN, before anything is sized from it. `ba 7fffffff 01`
+                ;; -- six bytes -- declares 2^31-1 map pairs, and `m` below
+                ;; then asked for a long[] of that many entries:
+                ;; `OutOfMemoryError` out of a public entry point, on bytes
+                ;; somebody else wrote. `Reader.checkCount` has always done
+                ;; this for the decoder; the index walk sizes an array from a
+                ;; wire count too and was never given the same guard.
+                ;;
+                ;; A map pair costs at least two bytes and an array element at
+                ;; least one, so anything larger than that cannot be present
+                ;; however the rest of the document is arranged.
+                _ (let [avail (- (.size r) (long (.headEndAt r p)))
+                        need (if map? (* 2 n) n)]
+                    (when (> need avail)
+                      (throw (ex-info (str "boring: container at " p " declares " n
+                                           (if map? " pairs" " elements")
+                                           " but only " avail " bytes remain")
+                                      {:type :boring/bad-count :count n :offset p}))))
+                keep? (>= n min-entries)
                 m (if keep?
                       ;; An empty container needs no anchors. The `(max n 1)`
                       ;; this replaces yielded ONE for n=0, and the loop never

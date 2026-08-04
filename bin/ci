@@ -171,6 +171,14 @@ stage_interop () {
     # the IDENTICAL octet sequence for a canonical encoding. A reader can be
     # wrong in the same direction as the writer and the round trip still
     # closes; two independent encoders agreeing byte for byte cannot.
+    #
+    # REGENERATED FIRST, and that is the whole gate. The fixture carries
+    # boring's bytes, so a checked-in one turns this into a test of cbor2
+    # against a frozen snapshot -- it cannot fail on a boring regression, which
+    # is the only regression it exists to catch. Found by asking the question
+    # this project keeps having to ask: can this test fail?
+    run interop-fixture clojure -Sdeps '{:paths ["src" "interop" "target/classes"]}' \
+        -M -m gen-canonical-fixture
     run interop-canonical python3 interop/test_canonical_bytes.py
   else
     echo "\u2500\u2500\u25b6 interop-python"
