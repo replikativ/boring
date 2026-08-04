@@ -717,8 +717,17 @@
         stride (index-opt opts :index default-index-stride)
         packed (vec (map-indexed (fn [i s] (delta-slot s (max 0 (nth containers i))))
                                  slots))]
+    ;; TYPED ARRAYS, not plain vectors. `boring.nav/read-index*` requires
+    ;; `containers` and `counts` to arrive as int arrays -- tag 78 on the wire
+    ;; -- and silently IGNORES an index whose shape it does not recognise. So
+    ;; the first version of this produced a frame the JVM accepted as a
+    ;; trailing item and then discarded, and my acceptance test passed because
+    ;; nav fell back to scanning: it proved the bytes were harmless, never that
+    ;; the index was used. Same class as the vacuous budget tests.
     (encode (data/unknown-record index-name
-                                 [stride (vec containers) (vec counts) packed (vec sorted)
+                                 [stride (js/Int32Array.from (clj->js containers))
+                                  (js/Int32Array.from (clj->js counts))
+                                  packed (vec sorted)
                                   (long->8-bytes data-len)])
             (assoc (or opts {}) :stringref false))))
 
