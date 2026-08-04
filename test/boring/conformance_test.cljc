@@ -2535,3 +2535,49 @@
     (doseq [o ["+18:00" "-18:00" "+17:59" "Z"]]
       (is (not= :boring/bad-tag-content
                 (err-type #(boring/decode (tag0-bytes (str "2020-01-01T00:00:00" o))))) o))))
+
+(defn- tag32-bytes
+  "`32(s)` as platform bytes, letting the encoder do the UTF-8."
+  [s]
+  (c/hex->bytes (str "d820" (c/bytes->hex (boring/encode s {:stringref false})))))
+
+(deftest tag-32-agrees-with-the-jvm-on-unicode
+  (testing "`java.net.URI` accepts non-ASCII but refuses Unicode whitespace and
+            controls. Allowing all of U+0080-U+FFFF to fix the ASCII cases
+            traded eleven agreements for eleven disagreements the other way"
+    (doseq [cp [0x00A0 0x2000 0x3000 0x0085 0x0001 0x007F]]
+      (is (= :boring/bad-tag-content
+             (err-type #(boring/decode (tag32-bytes (str "a" (char cp) "b")))))
+          (str "U+" cp))))
+  (testing "while ordinary non-ASCII stays legal on both"
+    (doseq [cp [0x00E9 0x4E2D 0xFEFF 0x200B]]
+      (is (not= :boring/bad-tag-content
+                (err-type #(boring/decode (tag32-bytes (str "a" (char cp) "b")))))
+          (str "U+" cp)))))
+
+#?(:clj
+   (deftest streaming-decode-reads-borings-own-default-output
+     (testing "`decode-seq` got the footer budget retry and the streaming arity
+               did not, so the path documented for dumps larger than the heap
+               still could not read back what `write-seq!` writes by default"
+       (let [o (java.io.ByteArrayOutputStream.)]
+         (boring/write-seq! (boring/writer 4096)
+                            (vec (for [i (range 500)]
+                                   {:e i :a :n/x :v (str "v" i) :t i :added true})) o)
+         (let [bs (.toByteArray o)]
+           (doseq [opts [{} {:max-depth 3} {:max-depth 4} {:max-items 700}
+                         {:max-items 1000} {:chunk-size 64}]]
+             (is (= 500 (count (boring/decode-seq-from
+                                (java.io.ByteArrayInputStream. bs) opts)))
+                 (pr-str opts))))))))
+
+#?(:clj
+   (deftest a-corrupt-back-pointer-does-not-throw-out-of-the-footer-probe
+     (testing "`footer-start` built the pointer with checked arithmetic, so any
+               file whose last eight bytes have the top bit set raised a raw
+               ArithmeticException from the function whose job is to decide
+               whether to trust those bytes"
+       (let [bs (byte-array (concat (seq (c/hex->bytes "01"))
+                                    [(unchecked-byte 0x48)]
+                                    (repeat 8 (unchecked-byte 0xff))))]
+         (is (not= :boring/bad-option (err-type #(doall (boring/decode-seq bs)))))))))

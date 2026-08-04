@@ -1353,7 +1353,16 @@
          ;; while the JVM decoded it. Matching the other platform is the point;
          ;; a stricter grammar that only one side enforces is the defect this
          ;; check was added to remove.
-         (when-not (re-matches #"(?:[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=-￿]|%[0-9A-Fa-f]{2})*" v)
+         ;; Non-ASCII yes, but NOT Unicode whitespace or controls.
+         ;; `java.net.URI` accepts `e-acute` and CJK and refuses U+00A0,
+         ;; U+2000, U+3000, U+0085 and the C1 controls, so admitting all of
+         ;; U+0080-U+FFFF traded eleven agreements for eleven disagreements
+         ;; in the other direction.
+         (when-not (re-matches (js/RegExp.
+                                (str "^(?:[A-Za-z0-9\\-._~:/?#\\[\\]@!$&'()*+,;=]"
+                                     "|[^\\u0000-\\u009F\\u00A0\\u1680\\u2000-\\u200A"
+                                     "\\u2028\\u2029\\u202F\\u205F\\u3000]"
+                                     "|%[0-9A-Fa-f]{2})*$")) v)
            (err :boring/bad-tag-content
                 (str "boring: tag 32 content is not a valid URI: " v)
                 {:tag 32 :value v}))

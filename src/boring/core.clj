@@ -1112,9 +1112,16 @@
   (let [n (alength bs)]
     (if (or (< n 9) (not= 0x48 (bit-and (aget bs (- n 9)) 0xff)))
       -1
+      ;; SHIFTS, not `(+ (* acc 256) b)`. Clojure's arithmetic is checked, so
+      ;; the top bit of an eight-byte pointer -- which any file can carry, and
+      ;; a corrupt one certainly can -- raised a raw ArithmeticException from
+      ;; inside a function whose whole job is to decide whether to trust the
+      ;; bytes. The range test below is what rejects a nonsense pointer.
       (let [p (loop [i 0 acc 0]
                 (if (= i 8) acc
-                    (recur (inc i) (+ (* acc 256) (bit-and (aget bs (+ (- n 8) i)) 0xff)))))]
+                    (recur (inc i)
+                           (bit-or (bit-shift-left acc 8)
+                                   (bit-and (aget bs (+ (- n 8) i)) 0xff)))))]
         ;; The pointer is also the length of the data section, so it must land
         ;; inside the file and leave room for the frame it points at.
         (if (and (>= p 0) (< p (- n 9))) p -1)))))
@@ -1608,13 +1615,45 @@
                               ;; to be rethrown if it cannot, rather than
                               ;; reporting every malformed document as a
                               ;; truncation.
-                              (if (#{:boring/truncated-input :boring/bad-count}
-                                   (:type (ex-data e)))
+                              (cond
+                                (#{:boring/truncated-input :boring/bad-count}
+                                 (:type (ex-data e)))
                                 {:need-more e}
-                                (throw e)))
+                                ;; BORING'S OWN FOOTER, here too. `decode-seq`
+                                ;; gained this and the streaming arity did not,
+                                ;; so `write-seq!`'s default output still could
+                                ;; not be read back through the path documented
+                                ;; for dumps larger than the heap.
+                                ;;
+                                ;; There is no file length to check a
+                                ;; back-pointer against on a stream, so the gate
+                                ;; is END OF INPUT instead: retry from where this
+                                ;; item began, with the budgets lifted, and
+                                ;; accept the result only if it is a genuine
+                                ;; frame AND nothing follows it. A budget error
+                                ;; is definitive -- more bytes cannot make a
+                                ;; value shallower -- so retrying immediately is
+                                ;; sound where retrying a truncation is not.
+                                (#{:boring/max-depth-exceeded
+                                   :boring/max-items-exceeded} (:type (ex-data e)))
+                                (let [at (long (:last-good @state))
+                                      sd (.-maxDepth r) sm (.-maxItems r) sn (.-items r)]
+                                  (set! (.-maxDepth r) (int (max sd 32)))
+                                  (set! (.-maxItems r) 0)
+                                  (let [fv (try (.readFrom r at)
+                                                (catch clojure.lang.ExceptionInfo _ nil)
+                                                (finally
+                                                  (set! (.-maxDepth r) (int sd))
+                                                  (set! (.-maxItems r) sm)
+                                                  (set! (.-items r) sn)))]
+                                    (if (and (some? fv) (index-frame? fv -1) (not (refill!)))
+                                      {:frame true}
+                                      (throw e))))
+                                :else (throw e)))
                             (catch IndexOutOfBoundsException e
                               {:need-more e}))]
                     (cond
+                      (contains? v :frame) nil
                       (contains? v :ok)
                       (do (vswap! state assoc :last-good (.position r))
                           ;; See `decode-seq`: the trailing index frame is
