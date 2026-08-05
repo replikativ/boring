@@ -125,7 +125,27 @@
   a value that might be mistaken for the original."
   [x]
   (data/unknown-record "boring/unencodable"
-                       {:type #?(:clj (.getName (class x)) :cljs (str (type x)))
+                       {:type #?(:clj (.getName (class x))
+                                 ;; `(str (type x))` is the constructor's
+                                 ;; COMPILED SOURCE on ClojureScript -- for
+                                 ;; `(atom 1)` it is
+                                 ;; `function He(){this.state=1;...}`. Unbounded,
+                                 ;; different in every build, and it leaks
+                                 ;; implementation into a placeholder that gets
+                                 ;; WRITTEN TO STORAGE. It also defeats
+                                 ;; `:archival`, whose whole point is that two
+                                 ;; dumps of the same value compare equal.
+                                 ;;
+                                 ;; The constructor's `.name` is minified under
+                                 ;; `:advanced` and so is not stable across
+                                 ;; builds either -- but it is SHORT and it does
+                                 ;; not embed source. There is no stable type
+                                 ;; name on this platform; the placeholder says
+                                 ;; what it can rather than pasting a function
+                                 ;; body into the wire.
+                                 :cljs (let [t (type x)
+                                             n (some-> t .-name)]
+                                         (if (and n (seq n)) n "unknown")))
                         :repr (pr-str x)}))
 
 (defn fallback-fn
