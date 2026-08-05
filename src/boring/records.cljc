@@ -33,10 +33,12 @@
    (defn- wire-name
      "The name a record of `record-sym` in `ns-sym` carries on the wire.
 
-     Must match `boring.data/record-type-name`, which munges `-` to `_` so the
-     JVM class name and the ClojureScript `pr-str` name agree."
+     Must match `boring.data/record-type-name`, which munges nothing: the name
+     as written, on both platforms. Munging here produced a key no wire name
+     matches, so a record in a hyphenated namespace was never found and came
+     back an `UnknownRecord`."
      [ns-sym record-sym]
-     (str/replace (str ns-sym "." record-sym) "-" "_")))
+     (str ns-sym "/" record-sym)))
 
 #?(:clj
    (defn- cljs-records
@@ -58,7 +60,13 @@
            [sym _] (ns-publics n)
            :let [s (name sym)]
            :when (str/starts-with? s "map->")
-           :when (try (Class/forName (wire-name (ns-name n) (subs s 5)))
+           ;; CLASS name here, not the wire name: `Class/forName` wants
+           ;; `my_ns.Rec` while the wire carries `my-ns/Rec`. They were the same
+           ;; string until the wire name stopped munging, and this probe then
+           ;; found no classes at all -- so `auto-registry` came back empty and
+           ;; every record decoded as an `UnknownRecord`.
+           :when (try (Class/forName (str (str/replace (str (ns-name n)) "-" "_")
+                                          "." (subs s 5)))
                       (catch Throwable _ false))]
        [(ns-name n) (symbol (subs s 5))])))
 
@@ -103,12 +111,19 @@
      and there is no runtime `resolve` -- and performs no lookup driven by wire
      content on either platform.
 
-         (def registry (boring/auto-registry))
+         (require '[boring.records :as records] '[boring.core :as boring])
+
+         (def registry (records/auto-registry))
          (boring/decode bs {:registry registry})
+
+     THIS NAMESPACE, not `boring.core`. These two lines read `boring/auto-registry`
+     for a while, and `boring/` is the alias this codebase's docs give
+     `boring.core` everywhere else -- where `(resolve 'boring.core/auto-registry)`
+     is nil. doc/EXTENDING.md had it right the whole time.
 
      `prefix` is a literal string, for narrowing to your own namespaces:
 
-         (boring/auto-registry \"my.app\")
+         (records/auto-registry \"my.app\")
 
      A literal rather than a predicate function on purpose: the macro would
      have to `eval` a function to apply it at expansion time, and during
@@ -132,7 +147,7 @@
      ([] `(auto-registry ""))
      ([prefix]
       (assert (string? prefix)
-              "boring/auto-registry takes a literal namespace prefix string")
+              "boring.records/auto-registry takes a literal namespace prefix string")
       (let [cljs?   (some? (:ns &env))
             pairs   (if cljs?
                       (cljs-records @@(requiring-resolve 'cljs.env/*compiler*))

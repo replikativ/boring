@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+#
+# Does any test DEPEND on each index path?
+#
+# The offset index is a pure optimisation: same answers, fewer steps. So an
+# assertion about a returned value cannot tell a live index from a dead one --
+# the scan returns the same value. That is not a theoretical worry. Measured on
+# this branch, the whole index could be switched off and 7576 of 7580
+# assertions still passed, and disabling each path individually gave:
+#
+#     index load        4 tests noticed
+#     Items.nth         1
+#     lookup-map        0      <-- the `get-in` acceleration the README leads with
+#     nth-item          0
+#
+# Both bare paths turned out to carry defects that agents found and the suite
+# could not. This makes that measurement a gate rather than a thing somebody
+# remembers to re-run: each mutation replaces one index branch with the scan --
+# which is CORRECT behaviour, so any test that fails is a test that genuinely
+# depends on the index being consulted.
+#
+# One mutant is not enough. "Some test notices when the whole index dies" is a
+# far weaker statement than "each path has a test that depends on it", and the
+# first would have passed while two paths were bare.
+#
+# Usage: bin/index-mutants
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+TARGET=src/boring/nav.clj
+BACKUP=$(mktemp)
+cp "$TARGET" "$BACKUP"
+restore () { cp "$BACKUP" "$TARGET"; }
+trap restore EXIT
+
+# The index namespaces only. The full suite OOMs when run repeatedly, and these
+# are where an index assertion would live.
+NSES="-n boring.index-robustness-test -n boring.seq-index-test -n boring.writer-index-test"
+
+FAILED=()
+
+check () {
+  local label="$1" old="$2" new="$3"
+  restore
+  python3 - "$old" "$new" <<'PY' || { echo "   PATTERN MISSING — the mutation no longer applies; update bin/index-mutants"; exit 1; }
+import sys
+p='src/boring/nav.clj'; s=open(p).read()
+old,new=sys.argv[1],sys.argv[2]
+if old not in s: sys.exit(1)
+open(p,'w').write(s.replace(old,new,1))
+PY
+  local n
+  n=$(timeout 1800 clojure -J-Xmx2g -M:test $NSES 2>&1 | grep -oE '[0-9]+ failures' | tail -1 | grep -oE '^[0-9]+')
+  n=${n:-0}
+  printf "   %-34s %s test(s) depend on it\n" "$label" "$n"
+  if [ "$n" -eq 0 ]; then FAILED+=("$label"); fi
+}
+
+echo "──▶ index-mutants"
+check "index load"            "          (when ok?" "          (when (and ok? false)"
+check "Items.nth anchors"     "(if-not (anchor-sound? nav offsets stride anchor)" "(if-not true"
+check "lookup-map (map key)"  "    (if (or (neg? ns) (zero? (alength ^longs (nth (:slots idx) ns))))" "    (if true"
+check "nth-item (array elem)" "        (if (neg? ns)" "        (if true"
+restore
+
+if [ ${#FAILED[@]} -ne 0 ]; then
+  echo
+  echo "   FAILED — no test depends on: ${FAILED[*]}"
+  echo "   That path can be deleted with the suite still green. Add a test that"
+  echo "   asserts the WORK done (see boring.nav/skips), not just the answer."
+  exit 1
+fi
+echo "   ok — every index path has a test that depends on it"

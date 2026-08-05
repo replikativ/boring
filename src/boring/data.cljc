@@ -9,11 +9,7 @@
   ;; clojure.core's. Without this exclusion every downstream build — konserve,
   ;; kabel, datahike — carries two :redef warnings, which is how real warnings
   ;; get lost.
-  (:refer-clojure :exclude [decimal? rational?])
-  ;; ClojureScript only -- the JVM branch of `record-type-name` uses
-  ;; `.getName`. Required unconditionally, clj-kondo reported it unused (it
-  ;; reads .cljc with the :clj reader) and the lint gate stayed red.
-  #?(:cljs (:require [clojure.string :as str])))
+  (:refer-clojure :exclude [decimal? rational?]))
 
 ;; ## Simple values (major type 7)
 ;;
@@ -72,6 +68,22 @@
 ;; not care whether a read handler was installed. It follows defrecord's
 ;; equality semantics — equal to another UnknownRecord of the same type with
 ;; the same fields, NOT equal to a bare map with those fields.
+;;
+;; That last clause holds ON THE JVM ONLY. On ClojureScript `=` between an
+;; UnknownRecord and a map is ASYMMETRIC: `(= u {:a 1})` is false and
+;; `(= {:a 1} u)` is TRUE. This is a deftype satisfying IMap, so cljs `map?` is
+;; true of it while `record?` is false, and cljs's `equiv-map` excludes only
+;; REAL records — so the map's own `-equiv` accepts it. `hash` disagrees in
+;; both directions either way, so set membership follows whichever side you put
+;; it on: `(contains? #{u} {:a 1})` is true and `(contains? #{{:a 1}} u)` is
+;; false. Measured, same expression on both platforms:
+;;
+;;   [(= u {:a 1}) (= {:a 1} u) (= (hash u) (hash {:a 1}))
+;;    (contains? #{{:a 1}} u) (contains? #{u} {:a 1})]
+;;   JVM   [false false false false false]
+;;   CLJS  [false true  false false true ]
+;;
+;; Do not rely on `=` between an UnknownRecord and a map in portable code.
 ;;
 ;; It does NOT assert that the sender used `defrecord`, and cannot: tag 27
 ;; carries no such bit, a registered write handler may emit a map payload for
@@ -174,6 +186,22 @@
        (-pr-writer [_ w _] (-write w (str "#boring/record [" rtype " " (pr-str rfields) "]")))]))
 
 (defn unknown-record
+  "A tag-27 frame carrying a wire type name and a FIELD MAP.
+
+  `fields` is a map. That is the contract, not an accident of the constructor
+  being permissive: a record is a named product of fields, tag 27 is CBOR's
+  \"serialised language-independent object with type name and constructor
+  arguments\", and the reader reconstructs one by looking the name up and
+  handing it the map.
+
+  A non-map payload encodes and decodes as valid CBOR, but it comes back a
+  tagged literal rather than an `UnknownRecord` -- so
+  `(= v (decode (encode v)))` is false for it. The bytes are stable and
+  nothing is lost from the wire; what does not survive is the claim that this
+  was a record, because with no field map it was not one. boring's own index
+  frame is the exception that proves the rule: its payload is an array, it is
+  read by `boring.frame` rather than by the record path, and it is deliberately
+  not reconstructed as a record."
   ([type fields] (UnknownRecord. type fields nil))
   ([type fields m] (UnknownRecord. type fields m)))
 
@@ -204,20 +232,32 @@
      (.write w "]")))
 
 (defn record-type-name
-  "The canonical wire name for a record type, identical on both platforms.
+  "The canonical wire name for a record type: the name as WRITTEN, on both
+  platforms.
 
-  On the JVM this is the class name, which already munges `-` to `_`. On
-  ClojureScript the constructor's `.name` is MINIFIED under `:advanced`
-  (a record printed as `#my.ns.P{...}` reports a type name of `Vg`), so the
-  name is taken from `pr-str`, where the compiler embeds it as a string
-  constant that survives minification — and then munged the same way, which is
-  `incognito`'s convention and the reason it has one."
+  Nothing is munged. ClojureScript's `pr-str` reports the name as written
+  (`#my-test-ns.My-Rec{...}`), and on the JVM `boring.TagRegistry` inverts
+  Clojure's `namespace-munge` by looking the namespace up rather than guessing
+  — see its `recordName`. This used to munge ClojureScript DOWN to the JVM's
+  lossy form, discarding information the browser still had in order to agree
+  with a platform that had lost it. Every lossy step breaks a symmetry, and
+  this one was not forced.
+
+  On ClojureScript the name has to come from `pr-str` rather than the
+  constructor's `.name`, which is MINIFIED under `:advanced` — a record printed
+  as `#my.ns.P{...}` reports a type name of `Vg`. `pr-str` carries it as a
+  string constant the compiler embeds, which survives minification.
+
+  SLASH separates namespace from name. A dot is ambiguous -- `a.b.c.D` could
+  split either way -- and `/` is legal in neither part. It is also what boring's
+  own reserved tag-27 names already use: `clojure/sorted-map`, `java/period`."
   [x]
-  #?(:clj (.getName (class x))
+  #?(:clj (.recordName org.replikativ.boring.TagRegistry/EMPTY (class x))
      :cljs (let [s (pr-str x)
                  i (.indexOf s "{")]
              (if (and (pos? i) (= "#" (subs s 0 1)))
-               (str/replace (subs s 1 i) "-" "_")
+               (let [n (subs s 1 i) dot (.lastIndexOf n ".")]
+                 (if (pos? dot) (str (subs n 0 dot) "/" (subs n (inc dot))) n))
                (str (type x))))))
 
 ;; ## Decimal and rational stand-ins for ClojureScript
@@ -283,6 +323,24 @@
     (tagged-literal? x) (str (:tag x))
     :else (throw (ex-info "boring: not a tag-27 frame"
                           {:type :boring/not-a-frame :value x}))))
+
+(defn frame-for
+  "The value an unregistered tag-27 frame decodes to: `name` and `payload` in
+  whichever carrier the payload's SHAPE calls for.
+
+  Public because `:on-unknown-record` hands you the two pieces and uses what
+  you return, so a handler that only wants to warn needs the default rule to
+  return -- and reimplementing it is how the two would drift. Both readers
+  apply exactly this.
+
+  The choice is by payload shape and never by a claim about the sender: tag 27
+  carries no record/non-record bit and could not, since its content is
+  `[type-name, *constructor-args]`."
+  [name payload]
+  (if (map? payload)
+    (unknown-record name payload)
+    #?(:clj (clojure.lang.TaggedLiteral/create (symbol name) payload)
+       :cljs (tagged-literal (symbol name) payload))))
 
 (defn frame-payload
   "The payload of an unregistered tag-27 frame: a field map for an

@@ -157,6 +157,18 @@
                  (.pattern ^java.util.regex.Pattern b))]
         :cljs [(and (regexp? a) (regexp? b)) (= (.-source a) (.-source b))])
 
+    ;; A tagged literal is neither sequential nor a map, so it fell straight
+    ;; through to `=` -- and `=` on a form holding primitive arrays is IDENTITY.
+    ;; So two decodes of the SAME bytes compared unequal, which is how a
+    ;; property test that compares two readers reported a disagreement where
+    ;; there was none. The docstring already promised nested structures; this
+    ;; was one it did not reach.
+    ;; `TaggedValue` needs no branch: it is a defrecord, so the map branch
+    ;; below reaches it and recurses into `:value`. A tagged LITERAL is not a
+    ;; map and has no other branch to fall into.
+    (and (tagged-literal? a) (tagged-literal? b))
+    (and (= (:tag a) (:tag b)) (equiv? (:form a) (:form b)))
+
     (and (map? a) (map? b))
     (and (= (count a) (count b))
          (every? (fn [[k v]] (and (contains? b k) (equiv? v (get b k)))) a))

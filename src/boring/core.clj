@@ -10,6 +10,7 @@
   Options (all optional):
 
     :profile        :clojure (default) | :interop | :archival | :canonical
+                    | :canonical-rfc7049
     :float-policy   :preserve-width (default) | :shortest
     :stringref      true (default under :clojure) | false
 
@@ -17,7 +18,7 @@
   :float-policy exists because datahike's dumps must not narrow a double to a
   float -- the class, not just the value, has to survive.
 
-  The four profiles answer four different questions:
+  The five profiles answer five different questions:
 
     :clojure    round-trip fidelity within Clojure, smallest bytes.
     :interop    can any conformant CBOR reader read this? (no extensions)
@@ -25,13 +26,21 @@
                 types survive? (sorted keys + fixed-width floats)
     :canonical  do these bytes agree octet-for-octet with other canonical
                 encoders? (RFC 8949 4.2.2, which narrows floats)
+    :canonical-rfc7049
+                do they agree with a clj-cbor peer? (length-first key order,
+                RFC 7049 3.9 -- which is also what Python cbor2's
+                `canonical=True` and Rust ciborium produce)
 
   :archival and :canonical are NOT the same and cannot be: RFC determinism
   requires the shortest float form, which discards the Double/Float
   distinction. Pick by which of the two you actually need."
   (:require [boring.data :as data]
+            [boring.errors :refer [with-decode-errors]]
+            [boring.frame :as frame]
+            [boring.options :as opt]
             [clojure.string :as str])
-  (:import (org.replikativ.boring Reader TagRegistry Writer)))
+  (:import (java.nio ByteBuffer)
+           (org.replikativ.boring Reader TagRegistry Writer)))
 
 (set! *warn-on-reflection* true)
 
@@ -57,123 +66,29 @@
 ;; determinism — you cannot both sign a document and keep a JVM type
 ;; distinction the wire has no room for. Use :clojure or :interop when
 ;; round-trip type fidelity matters more than a stable byte sequence.
-(def ^:private profile-defaults
-  {:clojure   {:stringref true  :float-policy :preserve-width :canonical false
-               :canonical-order :rfc8949}
-   :interop   {:stringref false :float-policy :preserve-width :canonical false
-               :shapes false :canonical-order :rfc8949}
-   ;; :archival differs from :interop in exactly one bit -- sorted map keys --
-   ;; and from :canonical in exactly one -- float width. That is not an accident:
-   ;; determinism and type identity are separate axes, and RFC 8949's
-   ;; deterministic profile happens to pin both. A dump that must outlive the
-   ;; database wants sorted keys (so two exports diff clean and one can be signed)
-   ;; AND fixed-width floats (so a Double does not come back a Float). Before this
-   ;; profile existed that combination was unreachable: :canonical locks
-   ;; :float-policy and :interop locks :canonical, so the one thing datahike's
-   ;; dumps actually need could not be said. It does NOT claim RFC deterministic
-   ;; conformance -- that name belongs to :canonical alone.
-   :archival  {:stringref false :float-policy :preserve-width :canonical true
-               :shapes false :canonical-order :rfc8949}
-   :canonical {:stringref false :float-policy :shortest       :canonical true
-               :shapes false :canonical-order :rfc8949}
-   ;; clj-cbor's length-first key order (RFC 7049 3.9), as its own profile
-   ;; rather than a knob on :canonical.
-   ;;
-   ;; It was a free option, so `{:profile :canonical :canonical-order :rfc7049}`
-   ;; produced non-RFC-8949 bytes under the name the README gives the signing
-   ;; profile -- `{1000 :x, "a" :y}` begins a219 under one and a261 under the
-   ;; other. A signer and a verifier who disagree about a sub-option that does
-   ;; not appear in the profile name produce a mismatch nobody can see. Naming
-   ;; it makes the choice impossible to make by accident.
-   :canonical-rfc7049 {:stringref false :float-policy :shortest :canonical true
-                       :shapes false :canonical-order :rfc7049}})
-
-;; Keys a profile DEFINES. Passing a conflicting value asks for two
-;; incompatible things at once, and the previous behaviour was to silently
-;; honour the user's -- so `{:profile :canonical :stringref true}` emitted the
-;; stringref extension from the profile whose entire purpose is agreement with
-;; other implementations, and `{:profile :canonical :canonical false}` turned
-;; determinism off while still calling itself canonical.
-;;
-;; `:canonical` is locked in EVERY profile: it is not a user knob, it is what
-;; `:profile :canonical` MEANS. Accepting it separately gave two ways to say
-;; the same thing that could disagree.
-;;
-;; `:stringref` stays free under :clojure -- kabel legitimately turns it off
-;; while keeping the default profile -- and `:float-policy` stays free under
-;; :interop, where either width is legal CBOR that every reader understands.
-(def ^:private profile-locked
-  {:clojure           #{:canonical :canonical-order}
-   :interop           #{:canonical :canonical-order :stringref :shapes}
-   ;; Everything is locked, as under :canonical: both bits are what the profile
-   ;; MEANS. `:float-policy :shortest` here would just be :canonical spelled
-   ;; oddly, and `:canonical false` would just be :interop -- two more ways to
-   ;; say things that already have names.
-   :archival          #{:canonical :canonical-order :stringref :shapes :float-policy}
-   :canonical         #{:canonical :canonical-order :stringref :shapes :float-policy}
-   :canonical-rfc7049 #{:canonical :canonical-order :stringref :shapes :float-policy}})
-
-;; Allocation-free unless there IS a conflict.
-;;
-;; This runs on EVERY encode and decode. The first version built a sorted-set
-;; through `into` whatever the input, so the overwhelmingly common call --
-;; `(encode v)` with no opts at all, which cannot conflict with anything --
-;; paid for a reduction and a set allocation to discover that. Measured at
-;; +11% on small-map encode, where total work is 0.3 us and an allocation is a
-;; visible fraction of it.
-(defn- check-profile-conflicts! [profile base opts]
-  (let [conflicts (when (seq opts)
-                    (reduce (fn [acc k]
-                              (if (and (contains? opts k)
-                                       (not= (get opts k) (get base k)))
-                                (conj (or acc []) k)
-                                acc))
-                            nil
-                            (profile-locked profile)))]
-    (when (seq conflicts)
-      (throw (ex-info (str "boring: " (pr-str (vec conflicts))
-                           " cannot be overridden under the " profile
-                           " profile -- the profile defines "
-                           (pr-str (select-keys base conflicts)))
-                      {:type :boring/incompatible-options
-                       :profile profile
-                       :conflicts (vec conflicts)
-                       :profile-values (select-keys base conflicts)})))))
-
-;; The resolved options for `(encode v)` / `(decode bs)`, computed once.
-;; nil opts is the dominant call shape and always resolves to the same map.
-(def ^:private default-opts
-  {:stringref true :float-policy :preserve-width :canonical false
-   :canonical-order :rfc8949})
-
-;; Error `:type`s are :boring/-qualified, NOT ::-qualified. `::foo` in this
-;; namespace expands to :boring.core/foo, while ClojureScript's core.cljs spells
-;; the same conditions :boring/foo -- so a portable `catch` dispatching on
-;; :type matched on exactly one platform. Every other error in the codebase
-;; already used :boring/.
-(declare resolve-opts*)
-
-(defn- resolve-opts
-  [opts]
-  (if (nil? opts)
-    default-opts
-    (resolve-opts* opts)))
-
-(defn- resolve-opts*
-  [opts]
-  (let [profile (get opts :profile :clojure)
-        base (or (profile-defaults profile)
-                 (throw (ex-info "boring: unknown profile"
-                                 {:type :boring/unknown-profile :profile profile})))
-        _ (check-profile-conflicts! profile base opts)
-        merged (merge base (dissoc opts :profile))]
-    merged))
+;; Profiles, validation and resolution live in `boring.options`, shared with
+;; ClojureScript -- see that namespace for why. These are the names this file
+;; used before the move; keeping them means the change is a deletion here
+;; rather than a rewrite of every call site.
+(def ^:private default-opts opt/default-opts)
+(def ^:private resolve-opts opt/resolve-opts)
 
 (defn writer
   "Create a reusable Writer. Not thread-safe; one per thread or per loop.
 
-  With `opts`, they are resolved ONCE here and used by every 2-arity
-  `encode-into!` / `encode-buffered!` / `write-to!` on this writer. Prefer this
+  `initial-size` is a BYTE COUNT for the internal buffer, not an options map.
+  There is no `(writer opts)` arity, so `(writer {:stringref false})` -- the
+  natural thing to type, and the shape `boring.nav` pushes callers toward --
+  is a raw `ClassCastException` from the `^long` hint rather than anything
+  typed. Write `(writer 256 {:stringref false})`.
+
+  With `opts`, they are resolved ONCE here and used by every no-options arity
+  on this writer: `encode-into!`, `encode-buffered!`, `write-to!`,
+  `write-to-buffer!`, `write-seq!`, `write-indexed!` and `seal-index!`. All
+  seven, which is worth listing rather than gesturing at -- the 3-arity
+  `write-seq!` resolved nil instead for a while, so a writer built
+  `(writer n {:stringref false})` silently emitted stringref through that one
+  entry point. Prefer this
   to passing the same map on every call: `resolve-opts` merges the caller's map
   over the profile defaults, which allocates ~230-300 B per call. On a log
   event that is the difference between 452 and 220 heap bytes, and it bites
@@ -204,41 +119,35 @@
   An API that is documented as the fast path has to accept the same
   configuration as the slow one."
   (^Reader [^bytes bs] (Reader. bs))
-  (^Reader [^bytes bs opts] (configure-reader! (Reader. bs) (resolve-opts opts))))
+  (^Reader [^bytes bs opts] (configure-reader! (Reader. bs) (opt/check-opts opts))))
 
-(defn unencodable
+(def unencodable
   "The default `:encode-fallback` placeholder: a tag-27 frame naming the type
   that could not be encoded, with its `pr-str`.
 
   Readable by any CBOR implementation, and obviously a placeholder rather than
   a value that might be mistaken for the original."
-  [x]
-  (data/unknown-record "boring/unencodable"
-                       {:type (.getName (class x)) :repr (pr-str x)}))
+  opt/unencodable)
 
-(defn- encode-fallback-fn
-  "`:encode-fallback` is `nil` (throw, the default), `:placeholder` for
-  `unencodable`, or a function of the offending value returning a replacement."
-  [fb]
-  (cond
-    (nil? fb) nil
-    (= :placeholder fb) unencodable
-    (ifn? fb) fb
-    :else (throw (ex-info "boring: :encode-fallback must be nil, :placeholder, or a function"
-                          {:type :boring/bad-option :value fb}))))
+;; `float-policy!`, `encode-fallback-fn`, `max-depth-opt`, `max-items-opt` and
+;; `index-opt` used to live here, each validating its option at the point the
+;; option was READ. That is why the answers disagreed: whether an option was
+;; checked depended on which code path ran. `boring.options/resolve-opts`
+;; checks all of them, once, at the one point every entry point passes through,
+;; so everything below can simply `get` a value it knows is legal.
 
 (defn- configure!
   ^Writer [^Writer w opts]
   (set! (.-stringref w) (boolean (:stringref opts)))
   (set! (.-inclMetadata w) (boolean (get opts :incl-metadata? true)))
-  (set! (.-preserveWidth w) (= :preserve-width (:float-policy opts)))
+  (set! (.-preserveWidth w) (= :preserve-width (get opts :float-policy :preserve-width)))
   (set! (.-canonical w) (boolean (:canonical opts)))
   (set! (.-legacyCanonicalOrder w) (= :rfc7049 (:canonical-order opts)))
   (set! (.-shapes w) (boolean (:shapes opts)))
   (set! (.-permitReservedSimpleValues w)
         (boolean (:permit-reserved-simple-values opts)))
   (set! (.-maxDepth w) (int (get opts :max-depth 1024)))
-  (set! (.-encodeFallback w) (encode-fallback-fn (:encode-fallback opts)))
+  (set! (.-encodeFallback w) (opt/fallback-fn (:encode-fallback opts)))
   ;; ALWAYS set, never `when-let`. A reusable writer kept the previous call's
   ;; registry: after one `encode-into!` with a custom registry, the next call
   ;; on the same writer with default options still used it, so a handler meant
@@ -276,6 +185,20 @@
       (-> (boring/tag-registry)
           (boring/register-tag 40001 java.net.URI str #(java.net.URI. %))))"
   ^TagRegistry [^TagRegistry reg tag cls write-fn read-fn]
+  ;; INTEGER, checked here rather than left to `(long tag)`. That coercion
+  ;; TRUNCATES: `1.5` registered a handler under tag 1 -- a different tag than
+  ;; the caller named, silently. `TagRegistry.checkTag` never saw the 1.5,
+  ;; because by then it was a long. Found by a test written for the
+  ;; ClojureScript half of the same defect.
+  ;; RANGE TOO, not only integrality. `(long tag)` on a bignum past
+  ;; Long/MAX_VALUE raises a raw IllegalArgumentException -- untyped, out of the
+  ;; registration API, for the one tag number a caller is most likely to reach
+  ;; for when testing the boundary. CBOR's tag domain is [0, 2^64-1]; this API
+  ;; takes a long and says so rather than truncating.
+  (when-not (and (integer? tag) (<= (bigint tag) (bigint Long/MAX_VALUE)))
+    (throw (ex-info (str "boring: tag numbers are integers no greater than "
+                         Long/MAX_VALUE "; got " (pr-str tag))
+                    {:type :boring/bad-tag-number :tag tag})))
   ;; Explicit lets rather than cond->: the threaded intermediate would lose its
   ;; type hint and each .with* call would reflect.
   (let [^TagRegistry r (if (and cls write-fn)
@@ -347,7 +270,13 @@
   minifies constructor names — use `register-record` there (and in `.cljc`).
 
   Pass `wire-name` to override the name used on the wire, in both directions."
-  (^TagRegistry [reg cls] (register-record-class reg cls (.getName ^Class cls)))
+  ;; THE SAME WIRE NAME EVERY OTHER PATH WRITES. This defaulted to the raw
+  ;; class name, so a type registered through here went on the wire as
+  ;; `my_ns.My-Rec` while `encode` of the same type wrote `my-ns/My-Rec` --
+  ;; two names for one type inside one version, which is worse than either
+  ;; name being wrong. `TagRegistry.recordName` is the one place that decides.
+  (^TagRegistry [reg cls]
+   (register-record-class reg cls (.recordName TagRegistry/EMPTY ^Class cls)))
   (^TagRegistry [^TagRegistry reg cls wire-name]
    (let [n (.getName ^Class cls)
          idx (.lastIndexOf n ".")
@@ -374,7 +303,32 @@
   w)
 
 (defn encode
-  "Encode `v` to a fresh byte[]."
+  "Encode `v` to a fresh byte[]: ONE CBOR data item, and never anything else.
+
+  This is the interchange primitive. The bytes are `application/cbor`, any CBOR
+  reader in any language consumes them whole, and nothing is appended -- an
+  index frame would make the result stop being a single well-formed item (RFC
+  8949 3, \"still has bytes remaining after the outermost encoded item\").
+
+  IF YOU ARE STORING RATHER THAN SENDING, you probably want one of:
+
+  - `write-seq!` for many values -- a CBOR sequence (RFC 8742), indexed by
+    default, so `boring.nav/items` and `boring.mmap` can seek into it instead
+    of scanning. Reaching the last of 200k items: 10.6 ms unindexed, 1-2 us
+    indexed.
+  - `encode-indexed` for ONE large value you will navigate into. Same idea, and
+    the result is a two-item sequence rather than a single item.
+
+  Neither is a better `encode`; they produce a different artifact. The reason
+  this is not an option here is that `:index` would silently change what the
+  return value IS -- one item becomes a sequence, `application/cbor` becomes
+  `application/cbor-seq` -- which is a change of kind, not of setting.
+
+  Note the size trade, which runs the other way: indexing forces
+  `:stringref false`, because `boring.nav` cannot resolve a string reference
+  from an offset. On a value holding many similar records that costs about 2x.
+  Under a compressor it is noise -- zstd reaches 37x where stringref reaches
+  2.09x -- so see doc/STORAGE.md before optimising this by hand."
   (^bytes [v] (encode v nil))
   (^bytes [v opts]
    (let [o (resolve-opts opts)]
@@ -399,10 +353,20 @@
   hako reaches for with off-heap segments; on-heap gets there too as long as
   nobody insists on a freshly-allocated byte[] per message.
 
-  The buffer is overwritten by the next encode. Do not retain it."
-  (^long [^Writer w v] (.position ^Writer (write-root! w v (writer-opts w))))
+  The buffer is overwritten by the next encode. Do not retain it.
+
+  The borrow is RECORDED on the writer, so `trim!` -- which replaces the buffer
+  with a fresh, zeroed one -- refuses rather than pulling it out from under
+  you. It used to do exactly that, and `{:id 7 :name \"hello\"}` came back as
+  25 zero bytes that `decode` read as the integer 0."
+  (^long [^Writer w v]
+   (let [n (.position ^Writer (write-root! w v (writer-opts w)))]
+     (set! (.-borrowed w) true)
+     n))
   (^long [^Writer w v opts]
-   (.position ^Writer (write-root! w v (resolve-opts opts)))))
+   (let [n (.position ^Writer (write-root! w v (resolve-opts opts)))]
+     (set! (.-borrowed w) true)
+     n)))
 
 (defn buffer
   "The writer's internal buffer. Valid bytes are [0, count) where `count` is
@@ -420,37 +384,171 @@
   ^bytes [^Writer w]
   (.buffer w))
 
+(defn trim!
+  "Give a reused writer back everything one exceptional job grew. Returns the
+  bytes of buffer released.
+
+  Every growth in a writer is one-way — the byte buffer, the stringref symbol
+  table, and the index-capture arrays all keep their PEAK size for the life of
+  the writer. That is what makes reuse allocation-free, and it is the right
+  default. It is also why a pooled writer that once encoded a 200 MB value pins
+  a 256 MB buffer forever afterwards while it goes back to 200-byte datoms.
+
+  Explicit rather than automatic, and that is the whole design: shrinking on a
+  heuristic would put back exactly the per-message allocation reuse exists to
+  remove. Call it after a known-large job — not in a loop.
+
+  Throws `:boring/bad-argument` in TWO states, and the second is the likelier
+  one. Mid-stream, where the buffer still holds bytes that have not reached the
+  sink. And after `encode-buffered!`, whose bytes live in the buffer this
+  replaces -- so `(do (encode-buffered! w v) (trim! w))` refuses, which is the
+  documented allocation-free loop and therefore exactly where a caller thinks
+  to reclaim a peak. The way out is to consume the borrow first:
+  `write-to!`, `write-to-buffer!` or `encode-into!` all end it, and the next
+  `encode` clears it too. The Java message names the recovery; only this
+  docstring was short.
+
+  A trimmed writer is otherwise a usable writer, in whatever state `reset`
+  would leave it."
+  ^long [^Writer w]
+  (.trim w))
+
+(defn- write-to-resolved!
+  "`write-to!` with options already resolved."
+  ^long [^Writer w v ^java.io.OutputStream out o]
+  (.beginStream w out)
+  (try
+    (write-root! w v o)
+    (.endStream w)
+    (catch Throwable t
+      ;; Detach WITHOUT flushing: whatever already reached `out` stays there,
+      ;; but the tail still in the buffer is half a value and must not follow it.
+      (.abortStream w)
+      (throw t))))
+
 (defn write-to!
   "Encode `v` into `w` and write its bytes straight to `out`, with no
-  intermediate array."
+  intermediate array and in BOUNDED MEMORY.
+
+  The writer's buffer is a chunk, not the whole encoding: when it fills, its
+  contents go to `out` and encoding continues. So the memory a value needs is
+  the buffer size you chose at `(writer n opts)`, not the size of the value.
+  Encoding a 1 GB structure used to grow the buffer to 1 GB -- a second copy of
+  something you already hold -- and now costs 64 KB or whatever you asked for.
+
+  Two consequences worth knowing:
+
+  - **Writes are not atomic.** Once a chunk has gone to `out` it cannot be
+    recalled, so a value that throws part-way leaves a partial prefix on the
+    stream. nippy's `freeze-to-out!` documents the same property for the same
+    reason. If you need all-or-nothing, stage into a `ByteArrayOutputStream`.
+  - **Large byte and text strings bypass the chunk.** A caller's byte array is
+    handed directly to `out`, avoiding both buffer growth and a second memory
+    copy. Text first allocates its complete UTF-8 representation, so it halves
+    peak memory rather than making it constant. Primitive typed arrays and
+    pinned indexed-map keys can still grow the writer buffer.
+
+  Returns the byte count."
+  ;; RESOLVED ONCE, by whichever arity was called -- the 3-arity's options come
+  ;; from the writer and `writer-opts` has already resolved them and stripped
+  ;; `:profile`. Delegating one arity to the other would re-resolve and throw
+  ;; `:boring/incompatible-options` for the sorting profiles, which is exactly
+  ;; the bug `write-seq!`'s 3-arity carried.
   ([^Writer w v ^java.io.OutputStream out]
-   (let [n (encode-buffered! w v)]
-     (.write out (.buffer w) 0 (int n))
-     n))
+   (write-to-resolved! w v out (writer-opts w)))
   ([^Writer w v ^java.io.OutputStream out opts]
+   (write-to-resolved! w v out (resolve-opts opts))))
+
+(defn write-to-buffer!
+  "Encode `v` into `w` and copy its bytes into `bb`, returning the count.
+
+  The NIO sibling of `write-to!`, for a channel, a socket or anything else that
+  wants a `ByteBuffer` rather than an `OutputStream`. Writes at the buffer's
+  current position and advances it; throws `BufferOverflowException` if `v` does
+  not fit, which is the caller's cue to flush.
+
+  ON THAT OVERFLOW THE BORROW IS LEFT SET. This function ends the borrow
+  `encode-buffered!` records, but the `.put` that throws happens first and the
+  clearing `set!` is not in a `finally` -- so a writer that has just overflowed
+  a `ByteBuffer` refuses `trim!` with `:boring/bad-argument` until something
+  else consumes it. Any later `encode` clears it, and so does a retry of this
+  call into a larger buffer, so the recovery is the thing you were going to do
+  anyway; it is worth knowing only if you flush by trimming.
+
+  This exists because hand-rolling it is a trap rather than because it is
+  clever. The two-line version --
+
+      (let [n (encode-buffered! w v)] (.put bb (buffer w) 0 n))
+
+  -- goes REFLECTIVE unless every one of `bb`, the array and the int is hinted,
+  and reflection here costs 22 KB per call against this function's ~0. Nothing
+  fails; throughput just quietly collapses, and an allocation profile is the
+  only place it shows up. Measured on a 40-byte value: 0 bytes/op into a heap
+  buffer, 57 into a direct one, and 11 ns for the copy itself (312 ns/op
+  against 301 for encode alone).
+
+  There is no zero-copy version of this and there does not need to be. The copy
+  is a bulk `memcpy` of a few dozen bytes; encoding is 27x its cost."
+  (^long [^Writer w v ^ByteBuffer bb]
+   (let [n (encode-buffered! w v)]
+     (.put bb ^bytes (.buffer w) 0 (int n))
+     (set! (.-borrowed w) false)          ; copied out -- see the 4-arity
+     n))
+  (^long [^Writer w v ^ByteBuffer bb opts]
    (let [n (encode-buffered! w v opts)]
-     (.write out (.buffer w) 0 (int n))
+     (.put bb ^bytes (.buffer w) 0 (int n))
+     ;; The bytes are IN THE CALLER'S BUFFER now, so the borrow
+     ;; `encode-buffered!` records is over. Left set, it made `trim!`
+     ;; permanently unreachable after the documented allocation-free loop --
+     ;; a guard against silent corruption turning into a guard against the
+     ;; feature it was protecting.
+     (set! (.-borrowed w) false)
      n)))
 
-(defmacro ^:private with-decode-errors
-  "Reading past the end of the buffer surfaces as an ArrayIndexOutOfBounds from
-  deep in the decode loop — the exact thing datahike's dump requirements ask us
-  not to do. Converting at the boundary keeps the hot path free of per-read
-  bounds checks while still giving callers a typed error."
-  [& body]
-  `(try
-     ~@body
-     (catch IndexOutOfBoundsException e#
-       (throw (ex-info "boring: input ended mid-value (truncated or malformed)"
-                       {:type :boring/truncated-input} e#)))))
+(defn- bytes!
+  "The input, or a typed error. `(Reader. nil)` is a raw NullPointerException,
+  and doc/SECURITY.md's third guarantee says none escapes -- `nav/source` was
+  the only read path that honoured it for a nil argument. A nil here is a
+  caller mistake rather than bad data, but the guarantee does not distinguish
+  and a caller's `catch ExceptionInfo` should not have to either."
+  ^bytes [bs entry]
+  (when (nil? bs)
+    (throw (ex-info (str "boring: " entry " needs a byte array, got nil")
+                    {:type :boring/bad-argument :entry entry})))
+  bs)
 
-(defn- configure-reader!
+(defn ^:no-doc configure-reader!
+  "Apply decode options to a Reader. Public only so `boring.nav` can apply the
+  SAME options its docstrings promise -- it realises values through this reader,
+  so a differently-configured one would decode differently from `decode`.
+  Not part of the supported API."
   ^Reader [^Reader r opts]
   (set! (.-tolerateUnknownTags r) (boolean (get opts :tolerate-unknown-tags true)))
-  (set! (.-instantAsDate r) (not= :instant (get opts :instant-type :date)))
+  ;; Passed through as-is: `:fallback`, `:error`, or a function of
+  ;; [name payload]. The Reader distinguishes them, and deliberately does NOT
+  ;; use `ifn?` to do it -- see `Reader.onUnknownRecord`.
+  (set! (.-onUnknownRecord r) (get opts :on-unknown-record :fallback))
+  (let [it (get opts :instant-type :date)]
+    ;; A FUNCTION is legal on both platforms -- see `Reader.instantFn`. This
+    ;; honoured only the two keywords, so a portable caller passing a
+    ;; constructor got their type on ClojureScript and a `Date` here.
+    ;; NOT bare `ifn?`: a keyword satisfies it, so `:date` and `:instant`
+    ;; were invoked as constructors and every instant decoded to nil.
+    (set! (.-instantFn r) (when-not (#{:date :instant} it) it))
+    (set! (.-instantAsDate r) (not= :instant it)))
   (set! (.-fullDateAsSqlDate r) (= :sql-date (get opts :date-type :local-date)))
   (set! (.-maxDepth r) (int (get opts :max-depth 1024)))
+  ;; 0 = unlimited, which is the default. See Reader.maxItems for why the budget
+  ;; counts ITEMS rather than bytes.
+  (set! (.-maxItems r) (long (get opts :max-items 0)))
   (set! (.-validateUtf8 r) (boolean (get opts :validate-utf8 true)))
+  ;; WIRED, having been documented and then never applied. doc/SECURITY.md
+  ;; describes `:check-duplicate-keys false` as the way to turn duplicate
+  ;; rejection off; the Java field existed and defaulted to true, but no entry
+  ;; point ever set it, so the option was silently ignored and a duplicate map
+  ;; still threw with it set. A documented safety control that does nothing is
+  ;; worse than one that does not exist.
+  (set! (.-checkDuplicateKeys r) (boolean (get opts :check-duplicate-keys true)))
   (set! (.-autoConstructRecords r)
         (boolean (get opts :auto-construct-records? false)))
   ;; ALWAYS set, never `when-let` -- see `configure!`.
@@ -466,10 +564,32 @@
 
   `:tolerate-unknown-tags` (default true) makes an unregistered tag surface as
   a `boring.data/TaggedValue`; false makes it an error, which is the closed-reader
-  behaviour datahike's dump requirements ask for."
+  behaviour datahike's dump requirements ask for.
+
+  `:on-unknown-record` is the same choice for a tag-27 NAME no registry
+  resolves — `:fallback` (default) for the `UnknownRecord`/`TaggedLiteral`
+  carrier, `:error` for `:boring/unregistered-record`, or `(fn [name payload])`
+  whose return value is used:
+
+      ;; records or nothing
+      (boring/decode bs {:registry reg :on-unknown-record :error})
+
+      ;; warn and carry on -- `frame-for` is the default rule, so a handler
+      ;; that only wants to log does not reimplement it
+      (boring/decode bs {:on-unknown-record
+                         (fn [nm payload]
+                           (log/warn \"unregistered record\" nm)
+                           (boring.data/frame-for nm payload))})
+
+  The default is lossless passthrough, which is why the carrier exists: a relay
+  must be able to carry a type it has no constructor for. `:error` is for the
+  opposite case — a registration that can never match is otherwise SILENT, and
+  a record simply arrives as an `UnknownRecord`. Reserved marker names
+  (`clojure/char`, `java/period`, …) are known names and never reach this."
   ([^bytes bs] (decode bs nil))
   ([^bytes bs opts]
-   (with-decode-errors (.read (configure-reader! (Reader. bs) opts)))))
+   (with-decode-errors (.read (configure-reader! (Reader. (bytes! bs "decode"))
+                                                 (opt/check-opts opts))))))
 
 (defn decode-with
   "Decode using a reusable Reader.
@@ -478,10 +598,10 @@
   reader keeps whatever it was last configured with, which is what makes the
   two-arity form fast and also what makes it a state-leak hazard across
   tenants -- pass opts unless the reader is yours alone."
-  ([^Reader r ^bytes bs] (.reset r bs) (with-decode-errors (.read r)))
+  ([^Reader r ^bytes bs] (.reset r (bytes! bs "decode-with")) (with-decode-errors (.read r)))
   ([^Reader r ^bytes bs opts]
    (.reset r bs)
-   (configure-reader! r (resolve-opts opts))
+   (configure-reader! r (opt/check-opts opts))
    (with-decode-errors (.read r))))
 
 ;; ## Streaming (datahike's dump requirements)
@@ -496,19 +616,889 @@
 ;; depends on everything before it, so the chunk must be read from the start and
 ;; cannot be split. Not implemented; chunk size is the knob for that tradeoff.
 
+(declare seal-index! seal-index-with! scan-index scan-into! nodes->index
+         build-index write-seq-resolved!)
+
+(defn encode-indexed
+  "Encode `v` and seal an index onto it, returning a byte[].
+
+  The result is a two-item CBOR sequence -- the value, then the index -- so
+  `decode` still returns the value and any CBOR reader consumes both. Pass it
+  to `boring.nav/source` and lookups inside large containers become jumps.
+
+  UNLESS NOTHING CLEARS `:index-min`, in which case there is no index and the
+  result is the PLAIN ENCODING, one item: `(alength (encode-indexed [1 2 3]))`
+  is 4, the same 4 bytes `(encode [1 2 3] {:stringref false})` gives, and
+  `decode-seq` sees one item rather than two. Nothing is lost and every reader
+  still reads it -- but a caller who branches on \"is this a sequence\" cannot
+  assume. `write-indexed!` and the ClojureScript `encode-indexed` both state
+  this; the sentence above used to be unconditional here only.
+
+  `:index` is the stride (default 16) and `:index-min` the smallest container
+  worth a node (default 16). Sorted map keys -- `:canonical` or `:archival` --
+  additionally allow binary search; without them a lookup still jumps anchor to
+  anchor rather than entry to entry.
+
+  `:index 0` is the documented OFF switch on `write-seq!` and `write-indexed!`,
+  and `boring.options`' own validator message says so for every entry point
+  (\"0 turns indexing off\"). HERE IT IS A `:boring/bad-option`, and so is it on
+  `build-index`, because an `encode-indexed` that does not index is just
+  `encode` -- silently returning an unindexed single item would change what the
+  return value IS, from a two-item sequence to one item. Call `encode` instead.
+
+  `:stringref false` IS FORCED, because the sentence above would otherwise be
+  false by default. The default profile writes stringref, and `boring.nav`
+  categorically refuses a stringref document -- a stringref is an index into a
+  table built from every preceding string, which a cursor holding only an offset
+  cannot resolve. So `(nav/source (encode-indexed v))` threw
+  `:boring/stringref-not-navigable` on the very shape this function's docstring
+  recommends. Every test passed `{:stringref false}` or a sorting profile, so the
+  advertised default was the one path never exercised.
+
+  An index exists to be navigated; producing one that cannot be is not a
+  trade-off worth offering -- so an EXPLICIT `:stringref true` is now REFUSED
+  with `:boring/incompatible-options` rather than honoured. It used to be
+  honoured, producing a file whose index `boring.nav` refuses outright, which
+  is the same silent-useless-output this function's siblings already reject:
+  `write-seq!` and `write-indexed!` have raised on that combination all along.
+  Three functions, one rule, and this was the one that did not follow it."
+  (^bytes [v] (encode-indexed v nil))
+  (^bytes [v opts]
+   (when (true? (:stringref opts))
+     (throw (ex-info (str "boring: :stringref true cannot be combined with an index -- "
+                          "boring.nav cannot resolve string references from an offset, "
+                          "so the index would be unusable. Drop one of the two.")
+                     {:type :boring/incompatible-options :stringref true})))
+   (let [opts (if (contains? opts :stringref) opts (assoc opts :stringref false))
+         ^bytes body (encode v opts)
+         idx (build-index body opts)]
+     (if-not idx
+       body
+       (let [w (writer (max 1024 (alength body)) opts)
+             out (java.io.ByteArrayOutputStream. (+ (alength body) 256))]
+         (.write out body)
+         (seal-index! w out idx (alength body) (resolve-opts opts))
+         (.toByteArray out))))))
+
+(def ^:const default-index-stride
+  "Stride `write-seq!` indexes at unless told otherwise. See its docstring for
+  why a sequence is indexed by default and a single `encode`d value never is."
+  16)
+
 (defn write-seq!
   "Encode each value in `values` to `out` as consecutive top-level CBOR items.
-  Returns the number of bytes written. Constant memory: one value at a time,
-  through the writer's own buffer, with no intermediate array per item."
-  (^long [^Writer w values ^java.io.OutputStream out] (write-seq! w values out nil))
+  Returns the number of bytes written. Bounded memory for the DATA: one value at
+  a time, streamed, with byte and text payloads larger than the buffer going
+  straight to `out` rather than growing it.
+
+  NOT constant overall, and the difference matters at scale. Index capture is
+  O(anchors + indexed containers) and is held until the frame is sealed; the
+  frame itself is buffered while it is built; and `:canonical` stages every map
+  key and set element to sort them. An earlier version of this docstring said
+  `constant memory` flatly, which was false for the default indexed path. See
+  doc/STORAGE.md.
+
+  What the writer grew, it KEEPS -- buffer, symbol table and index arrays all
+  hold their peak for the life of the writer, which is what makes reuse
+  allocation-free. `trim!` is the way back after one exceptional job.
+
+  A sequence cannot be indexed past `Integer/MAX_VALUE` items: the frame carries
+  item counts in an int32 array, and widening that would change the wire format
+  of every file for a limit no in-memory container can reach anyway. The writer
+  refuses AT that item -- `:boring/index-too-large` -- rather than wrapping the
+  count and sealing a footer that describes the wrong thing. Write such a
+  sequence with `:index 0`.
+
+  `:index N` seals the sequence with an offset index covering every Nth item,
+  so `boring.nav/items` can jump to an item instead of skipping to it -- O(1)
+  rather than O(n). N is the stride, and it is the size/speed knob: a lookup
+  scans up to N-1 items, while every entry costs one to four bytes depending on
+  how far apart the anchors fall, since offsets are stored as deltas in the
+  narrowest typed array that holds them. On 200k ~37-byte items, stride 1 costs
+  2.7% of the file and stride 16 costs 0.34% for roughly 14x the seek.
+
+  IT DEFAULTS TO 16. `:index 0` turns it off. A sequence is the shape people
+  memory-map, and an unindexed one cannot be seeked into at all -- reaching the
+  last of 200k items costs 10.6 ms and faults in the whole file, against 1-2 us
+  at stride 16. Since offsets are only knowable after the fact, a file written
+  without an index can never gain one without a rewrite, so the default has to
+  be the useful one or the feature is unreachable for anyone who did not plan
+  ahead. It is close to free: +4.3% write time, +0.06% size on 50k ~200-byte
+  records, and -1.5% from the `:stringref false` it forces, netting SMALLER.
+
+  Unlike `encode`, this changes nothing about what the bytes ARE. A sequence is
+  already `application/cbor-seq` (RFC 8742), where extra items are expected;
+  appending a frame to a single `encode`d value would make it stop being a
+  single well-formed CBOR item, which is why that is not done and will not be.
+
+  `:index-min` (default 16) is a SEPARATE knob and gates CONTAINER nodes, not
+  the frame: a map or array with fewer than that many entries gets no node of
+  its own. Raising it ABOVE the largest container but NO HIGHER THAN the item
+  count gives an index over the ITEMS ONLY -- the right shape for a log you
+  seek into but do not navigate within. Measured on 100 items of 40-entry maps
+  (`{:k0 0 ... :k39 39}`): 34 167 bytes at the default, 32 861 with
+  `:index-min 41`, against 32 800 unindexed. The frame is one node of 100
+  counts; the default's is 101 nodes.
+
+  BOTH BOUNDS MATTER, and this paragraph used to state only the first --
+  \"raising it to a number no container reaches\", illustrated with 20 items at
+  `:index-min 1000`. That configuration produces NO INDEX AT ALL, which is the
+  opposite of items-only, and it contradicted the paragraph below. Measured:
+  20 items, 6873 bytes at the default and 6560 with `:index-min 1000`, with no
+  frame in the second.
+
+  It DOES decide whether a short sequence gets a frame at all. The sequence is
+  itself a node, so the same threshold applies to it: fewer than `:index-min`
+  items and no container clearing the bar means no frame and no ~37 bytes. This
+  paragraph used to promise the opposite -- \"always costs ~37 bytes\" -- which
+  stopped being true when `encode-indexed` and `write-seq!` were made to agree.
+
+  `:index` FORCES `:stringref false`. `boring.nav` cannot resolve a string
+  reference from an offset alone -- a stringref indexes a table built from every
+  preceding string -- so the two options describe incompatible documents, and
+  honouring both produced an index that nothing could read. Passing
+  `:stringref true` alongside `:index` throws `:boring/incompatible-options`
+  rather than silently dropping one. This costs nothing on a sequence: the
+  stringref table resets per top-level item, so on 50k ~200-byte records
+  stringref is a 1.5% size LOSS, where on the same data as one large value it is
+  a 2.1x win. Sequences are the shape that wants an index and the shape that
+  does not want stringref, which is a happier coincidence than it sounds.
+
+  The index goes at the END, which is what makes it compatible with appending:
+  offsets are only known after the items are written, so a leading index would
+  mean buffering the whole sequence in memory. ZIP's central directory and
+  Parquet's footer are at the end for the same reason. See `seal-index!` if you
+  are writing items incrementally rather than from a seq."
+  ;; The 3-arity uses the WRITER'S options, like `write-to!` and
+  ;; `encode-into!`. It resolved nil instead, so a writer built
+  ;; `(writer n {:stringref false})` -- the setting a navigable file requires --
+  ;; silently emitted stringref output through this one entry point, and
+  ;; `boring.nav` then refused to read the result.
+  ;;
+  ;; RESOLVED ONCE, by whichever arity was called. Delegating the 3-arity to the
+  ;; 4-arity re-resolved options `writer-opts` had ALREADY resolved and stripped
+  ;; `:profile` from, so `resolve-opts` saw `:canonical` without the profile
+  ;; that licenses it and threw `:boring/incompatible-options` for `:archival`,
+  ;; `:canonical` and `:canonical-rfc7049` -- three of five profiles, on a
+  ;; public entry point. `encode-into!` passes `(writer-opts w)` straight to
+  ;; `write-root!` without re-resolving; this now follows that model rather than
+  ;; merely citing it.
+  ;; INDEXING FORCES `:stringref false`, for the reason spelled out on
+  ;; `encode-indexed`: `boring.nav` categorically refuses a stringref document,
+  ;; because a stringref is an index into a table built from every preceding
+  ;; string and a cursor holding only an offset cannot resolve it.
+  ;;
+  ;; Without this, `(write-seq! w items out {:index 16})` under the default
+  ;; profile built the index, wrote the frame, charged for both -- and produced
+  ;; a file `nav/items` then rejected with `:boring/stringref-not-navigable`.
+  ;; The index was unreachable by construction. `encode-indexed` had already
+  ;; been fixed for exactly this; this entry point had not.
+  ;;
+  ;; An EXPLICIT `:stringref true` alongside `:index` throws rather than being
+  ;; overridden in silence -- the two options cannot both be honoured, so the
+  ;; caller has to choose. The 3-arity cannot distinguish an explicit `true`
+  ;; from the profile default (it sees already-resolved options), so there it
+  ;; is forced; that is why the 4-arity is the one that can complain.
+  (^long [^Writer w values ^java.io.OutputStream out]
+   (let [o (writer-opts w)
+         stride (long (get o :index default-index-stride))]
+     (write-seq-resolved! w values out
+                          (cond-> o (pos? (long stride)) (assoc :stringref false))
+                          stride (long (get o :index-min 16)))))
   (^long [^Writer w values ^java.io.OutputStream out opts]
-   (let [o (resolve-opts opts)]
-     (reduce (fn [^long total v]
-               (let [n (long (.position ^Writer (write-root! w v o)))]
-                 (.write out (.buffer w) 0 (int n))
-                 (+ total n)))
-             0
-             values))))
+   ;; RESOLVED FIRST, because resolution is what validates. `:index` was read
+   ;; and coerced with `long` off the RAW map here, so `{:index "x"}` was a raw
+   ;; ClassCastException out of this line -- the exact defect the option
+   ;; validator says it closed, reintroduced by reading the option before the
+   ;; gate rather than after it.
+   ;;
+   ;; The `:stringref` test below still reads the raw map, and must: a resolved
+   ;; map carries the profile's `:stringref true`, so testing the resolved one
+   ;; would refuse every default indexed write.
+   (let [o (resolve-opts opts)
+         stride (long (get o :index default-index-stride))]
+     (when (and (pos? (long stride)) (true? (:stringref opts)))
+       (throw (ex-info (str "boring: :stringref true cannot be combined with :index -- "
+                            "boring.nav cannot resolve string references from an offset, "
+                            "so the index would be unusable. Drop one of the two.")
+                       {:type :boring/incompatible-options
+                        :stringref true :index stride})))
+     (write-seq-resolved! w values out
+                          (cond-> o
+                            (pos? (long stride)) (assoc :stringref false))
+                          stride (long (get o :index-min 16))))))
+
+(defn- write-seq-resolved!
+  "`write-seq!` with options already resolved. See the note on its 3-arity."
+  [^Writer w values ^java.io.OutputStream out o stride min-entries]
+  (let [stride (long stride)
+        min-entries (long min-entries)
+        indexing? (pos? stride)
+         ;; Container nodes are captured BY THE WRITER as it encodes, not by
+         ;; walking the bytes afterwards. The writer already knows the offset it
+         ;; is about to write to and a container's entry count before emitting
+         ;; it, so the nodes fall out of encoding. Walking instead cannot beat
+         ;; ~31% of encode time however it is written, because CBOR containers
+         ;; are element-counted and stepping over a subtree means walking it.
+         ;;
+         ;; `build-index` still exists and is still the reference implementation
+         ;; -- it is the only way to index bytes somebody else wrote, and
+         ;; `boring.writer-index-test` pins the two against each other.
+         ;; `setIndex` starts a fresh capture; `idxBase` moves the base between
+         ;; items without discarding what the earlier ones recorded.
+        _ (when indexing? (.setIndex ^Writer w (int stride) (int min-entries) 0))
+        ;; STREAMED, not encode-then-copy. The writer holds one chunk rather
+        ;; than one whole item, so an item larger than the buffer no longer
+        ;; grows it -- which is the difference between a sequence of ordinary
+        ;; records and a sequence whose items are themselves large.
+        ;;
+        ;; `idxBase` is gone from this path. It existed to tell the writer where
+        ;; the current item starts so recorded offsets came out file-relative;
+        ;; `flushed` now tracks exactly that and spans items, so setting both
+        ;; would double-count. `idxOffset` adds the two and relies on only one
+        ;; being non-zero.
+        _ (.beginStream ^Writer w out)
+        total (try
+                (doseq [v values]
+                  ;; The item's own offset, taken BEFORE `write-root!` resets
+                  ;; the writer. `totalWritten` is flushed + the unflushed tail
+                  ;; of the previous item, which is exactly where this one
+                  ;; begins.
+                  (when indexing? (.idxItem ^Writer w (.totalWritten ^Writer w)))
+                  (write-root! w v o))
+                (.endStream ^Writer w)
+                (catch Throwable t
+                   ;; Capture off on the way out, or a writer whose encode threw
+                   ;; stays in capture mode with a stale base -- and every later
+                   ;; `encode-into!` or unindexed `write-seq!` on that
+                   ;; (deliberately long-lived) writer keeps allocating and
+                   ;; retaining a node per container, invisibly and forever.
+                   ;;
+                   ;; `abortStream` rather than `endStream`: bytes already sent
+                   ;; cannot be recalled, but the half-item still in the buffer
+                   ;; must not follow them onto the stream.
+                  (.abortStream ^Writer w)
+                  (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
+                  (throw t)))]
+    (if (and indexing?
+             ;; NO FRAME WHEN THERE IS NOTHING TO INDEX. `:index-min` gates
+             ;; container nodes; the sequence node is a container too (at the
+             ;; sentinel offset -1), so the same threshold decides whether it is
+             ;; worth one. Without this a three-item sequence paid ~46 bytes for
+             ;; an index that could only ever point at its own three items --
+             ;; and since `write-seq!` indexes by DEFAULT, every small sequence
+             ;; anyone wrote would have carried it.
+             ;;
+             ;; `encode-indexed` has always behaved this way: `build-index`
+             ;; returns nil when no node clears the threshold, and the body is
+             ;; returned unsealed. This makes the two agree.
+             (or (>= (long (.idxItemTotal ^Writer w)) min-entries)
+                 (pos? (alength ^longs (.idxContainers ^Writer w)))))
+      (let [^longs cs (.idxContainers ^Writer w)
+            ^ints ns (.idxCounts ^Writer w)
+            sl (.idxSlots ^Writer w)
+            so (.idxSorted ^Writer w)
+            m (alength cs)
+             ;; The sequence itself is a node at the sentinel offset -1: it has
+             ;; no container header on the wire, but it behaves like one, and a
+             ;; sentinel keeps a single uniform node list rather than two. It
+             ;; sorts first, and the writer's own nodes are already ascending --
+             ;; it claims each node's slot when it writes the container's head,
+             ;; and a pre-order walk visits containers in increasing offset --
+             ;; so prepending is all the ordering that is needed.
+            ;; OFFSETS ARE 64-BIT in memory; `seal-index!` narrows them on the
+            ;; wire when they fit, so a file under 2 GiB is byte-identical to
+            ;; what it was before the widening.
+            containers (long-array (inc m))
+            counts (int-array (inc m))]
+        (aset containers 0 (long -1))
+        (aset counts 0 (int (.idxItemTotal ^Writer w)))
+        (System/arraycopy cs 0 containers 1 m)
+        (System/arraycopy ns 0 counts 1 m)
+        (let [items (.idxItemOffsets ^Writer w)]
+          (.setIndex ^Writer w (int 0) (int 0) 0)   ; capture off again
+          (+ total
+             (long (seal-index!
+                    w out
+                    {:stride stride
+                     :containers containers
+                     :counts counts
+                     :slots (into [items] sl)
+                     :sorted (into [false] so)}
+                    total
+                    o)))))
+      ;; Capture must go off on THIS path too. It is switched on above whenever
+      ;; `indexing?`, and the skip branch is now reachable with it on -- a
+      ;; writer left in capture mode keeps allocating and retaining a node per
+      ;; container on every later call, invisibly and forever. Same failure the
+      ;; catch clause above exists to prevent.
+      (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
+          total))))
+
+(defn- write-indexed-resolved!
+  "`write-indexed!` with options already resolved.
+
+  No `^long` return hint: Clojure only supports primitive fns up to four args
+  and this takes six."
+  [^Writer w v ^java.io.OutputStream out o stride min-entries]
+  (let [stride (long stride)
+        indexing? (pos? stride)
+        _ (when indexing? (.setIndex ^Writer w (int stride) (int min-entries) 0))
+        _ (.beginStream ^Writer w out)
+        total (try
+                (write-root! w v o)
+                (.endStream ^Writer w)
+                (catch Throwable t
+                  (.abortStream ^Writer w)
+                  (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
+                  (throw t)))]
+    (if (and indexing? (pos? (alength ^longs (.idxContainers ^Writer w))))
+      ;; NO SENTINEL NODE HERE, unlike `write-seq!`. That node stands for the
+      ;; sequence itself so `nav/items` can seek between top-level items; this
+      ;; writes ONE value, which `nav/source` navigates into. Adding a node for
+      ;; a sequence of one would claim a shape the file does not have.
+      (let [containers (.idxContainers ^Writer w)
+            counts (.idxCounts ^Writer w)
+            sl (.idxSlots ^Writer w)
+            so (.idxSorted ^Writer w)]
+        (.setIndex ^Writer w (int 0) (int 0) 0)
+        (+ total
+           (long (seal-index! w out
+                              {:stride stride :containers containers :counts counts
+                               :slots (vec sl) :sorted (vec so)}
+                              total o))))
+      (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
+          total))))
+
+(defn write-indexed!
+  "Stream ONE value to `out` and seal it with a container index, in bounded
+  memory. Returns the byte count.
+
+  The single-value counterpart of `write-seq!`, and the streaming counterpart
+  of `encode-indexed`. Where `encode-indexed` builds the whole byte array and
+  then WALKS it to derive the index -- two full copies of the document in
+  memory, plus a second pass over every byte -- this captures the index nodes
+  as the writer emits them, so the DATA streams in bounded memory.
+
+  Index capture is not bounded: it is O(anchors + indexed containers), held
+  until the frame is sealed, and the frame is buffered while it is built. On a
+  100 000-element vector at `{:index 1 :index-min 1}` that is real -- a 64-byte
+  writer grows to about 131 KB during sealing even though the body streamed.
+  An earlier version of this said it `never holds more than one chunk`, which
+  was false.
+
+  The result is a two-item CBOR sequence: the value, then the index frame. So
+  `decode` still returns the value, `decode-seq` hides the frame, and a foreign
+  reader consumes both. Hand it to `boring.nav/source` and lookups inside large
+  containers become jumps.
+
+  Same rules as `write-seq!`: `:index` is the stride (default 16), `:index-min`
+  the smallest container worth a node (default 16), `:stringref false` is forced
+  because `boring.nav` cannot resolve a string reference from an offset, and an
+  explicit `:stringref true` alongside `:index` throws rather than one silently
+  winning. No frame is written when no container clears the threshold.
+
+  Note the size trade: on a value holding many similar records, giving up
+  stringref costs about 2x. See doc/STORAGE.md -- under a compressor it is
+  noise, but uncompressed it is not."
+  (^long [^Writer w v ^java.io.OutputStream out]
+   (let [o (writer-opts w)
+         stride (long (get o :index default-index-stride))]
+     (write-indexed-resolved! w v out
+                              (cond-> o (pos? (long stride)) (assoc :stringref false))
+                              stride (long (get o :index-min 16)))))
+  (^long [^Writer w v ^java.io.OutputStream out opts]
+   ;; RESOLVED FIRST, because resolution is what validates. `:index` was read
+   ;; and coerced with `long` off the RAW map here, so `{:index "x"}` was a raw
+   ;; ClassCastException out of this line -- the exact defect the option
+   ;; validator says it closed, reintroduced by reading the option before the
+   ;; gate rather than after it.
+   ;;
+   ;; The `:stringref` test below still reads the raw map, and must: a resolved
+   ;; map carries the profile's `:stringref true`, so testing the resolved one
+   ;; would refuse every default indexed write.
+   (let [o (resolve-opts opts)
+         stride (long (get o :index default-index-stride))]
+     (when (and (pos? (long stride)) (true? (:stringref opts)))
+       (throw (ex-info (str "boring: :stringref true cannot be combined with :index -- "
+                            "boring.nav cannot resolve string references from an offset, "
+                            "so the index would be unusable. Drop one of the two.")
+                       {:type :boring/incompatible-options
+                        :stringref true :index stride})))
+     (write-indexed-resolved! w v out
+                              (cond-> o
+                                (pos? (long stride)) (assoc :stringref false))
+                              stride (long (get o :index-min 16))))))
+
+(def ^:const index-name
+  "Tag-27 type name for a sequence/container index. See doc/SHAPES.md.
+
+  A NAME under tag 27, not a tag number of its own. Tag 27 is CBOR's registered
+  extension point for exactly this -- \"serialised language-independent object
+  with type name and constructor arguments\" -- and boring already reserves
+  slash-bearing names under it (`clojure/sorted-map`, `java/period`; see
+  doc/INTEROP.md).
+
+  The name itself lives in `boring.frame`, with the byte prefix derived from
+  it, so the two cannot drift apart. Re-exported here because it is public API."
+  frame/index-name)
+(declare index-walk index-walk*)
+
+;; `index-frame?`, `frame-prefix`, `frame-prefix-at?` and `footer-start` lived
+;; here, and ClojureScript had a fourth, weaker copy of the first. They are one
+;; namespace now -- `boring.frame` -- for the reasons its docstring records: the
+;; weakest copy returned 40 of 82 items from a valid file.
+
+(defn- index-walk
+  "Walk the value at `p`, returning where it ENDS, and accumulating index nodes
+  into `acc` on the way back up.
+
+  Returning the end offset is the whole trick. The previous version called
+  `skipFrom` on each entry, and `skipFrom` is O(subtree) -- so every level
+  re-walked everything beneath it and the scan was O(n^2) in nesting depth,
+  measured at 486 ns/byte against a plain skip's 1.3-2. Here each byte is
+  visited once: the descent that finds a container's end also collects its
+  children's offsets, so the node is a by-product of a walk that had to happen.
+
+  Tags are DESCENDED THROUGH, indexing their payload. The tag is a marker; the
+  structure beneath it is ordinary CBOR, and much of what boring emits is
+  tag-wrapped -- a set is tag 258 around an array, a record is tag 27 around
+  [name, map], a shaped array is tag 39649 around [keys, rows]. Skipping them
+  would leave exactly those uncovered.
+
+  It is also close to free: `skipFrom` on a tag walks the whole subtree anyway,
+  so descending touches the same bytes and differs only in allocating nodes for
+  the large containers it finds. Whether `boring.nav` can USE a node inside a
+  tag is a separate question -- it realises tags opaquely today, because a
+  tag's reader is an arbitrary function -- but the offsets describe the wire,
+  and the wire is what they describe accurately either way."
+  [^Reader r p stride min-entries base ^java.util.ArrayList acc]
+  (index-walk* r p stride min-entries base acc 0))
+
+(defn- frame-payload-array?
+  "Is the container at `p` the 2-element `[name, args]` array of a TAG-27 FRAME?
+
+  If it is, it gets no index node. `boring.nav` never descends a tag
+  structurally, so a node for this array can never be used -- and the writer's
+  index capture does not emit one, so emitting it here made the byte walk and
+  the writer disagree about the same value: 306 bytes against 295 for a
+  40-entry `sorted-map` at `:index-min 2`, containers `[2 22]` against `[22]`.
+  The contents are still descended into and still get their nodes; it is only
+  the wrapper that is dropped.
+
+  `q0` is where the tag chain started and `p` where it ended, so the whole
+  check costs nothing for an untagged container -- which is nearly all of them,
+  and why the chain is re-walked here rather than threaded out of the loop that
+  collapsed it. It needs `:index-min` <= 2 to be reachable at all; the default
+  of 16 is why this was never seen."
+  [^Reader r q0 p mj n]
+  (and (= mj 4) (= 2 (long n)) (not= (long p) (long q0))
+       (= 27 (long (loop [q (long q0) t -1]
+                     (if (= 6 (.majorAt r q))
+                       (recur (long (.headEndAt r q)) (long (.headArgAt r q)))
+                       t))))))
+
+(defn- index-walk*
+  [^Reader r p stride min-entries base ^java.util.ArrayList acc depth]
+  ;; CONTAINER nesting is bounded too, not only the tag chain. `build-index` is
+  ;; public and documented for "a file somebody else wrote", and ~1.2 KB of
+  ;; `81 81 81 ...` was a StackOverflowError where `decode` on the same bytes
+  ;; gives :boring/max-depth-exceeded. These positional reads never touch the
+  ;; Reader's own depth, so its limit does not reach here.
+  ;; 200, well below where the stack actually gives out, and NOT the decoder's
+  ;; 1024. Two lessons are baked into that number.
+  ;;
+  ;; This is a Clojure recursion; its frames are fat enough that an isolated
+  ;; measurement put the limit between 600 and 800 on a default -Xss. A bound of
+  ;; 512 looked safe against that and was FLAKY IN THE SUITE -- roughly one run
+  ;; in three -- because the test runner and preceding tests have already spent
+  ;; stack, so the real headroom is smaller than any isolated measurement of it.
+  ;; A bound calibrated against the best case is not a bound.
+  ;;
+  ;; The StackOverflowError catch in `build-index` is a backstop, not the
+  ;; mechanism: catching one is unreliable, since the handler itself needs stack
+  ;; to construct the exception and can overflow again. The deterministic check
+  ;; has to fire first, so it is set where it comfortably does.
+  ;;
+  ;; A document nested deeper than this therefore DECODES but cannot be INDEXED.
+  ;; Said in `build-index`'s docstring rather than left to be discovered.
+  (when (> (long depth) 200)
+    (throw (ex-info (str "boring: nesting deeper than the index walk's bound (200)."
+                         " This document can be decoded but not indexed.")
+                    {:type :boring/max-depth-exceeded :max-depth 200})))
+  (let [p (long p) stride (long stride) min-entries (long min-entries) base (long base)
+        ;; A CHAIN OF TAGS IS CONSUMED ITERATIVELY. Recursing once per tag
+        ;; overflowed the stack on `c0 c0 c0 ... 00` -- legal CBOR, and reachable
+        ;; from the public `build-index` on bytes somebody else wrote, so a
+        ;; 20 000-byte input was a StackOverflowError rather than a typed error.
+        ;; The comment this replaces claimed the recursion was bounded by the
+        ;; decoder's maxDepth; it is not, because these positional reads do not
+        ;; touch the Reader's depth at all. `Reader.skipStructural` had the same
+        ;; defect and was fixed the same way.
+        ;;
+        ;; Collapsing the chain is equivalent to recursing through it: a tag's
+        ;; extent IS its payload's extent, so the payload's end is the value's.
+        q0 (long p)
+        p (long (loop [q p]
+                  (if (= 6 (.majorAt r q)) (recur (long (.headEndAt r q))) q)))
+        mj (.majorAt r p)]
+    (if-not (or (= mj 4) (= mj 5))
+      (.skipFrom r p)
+      (let [n (.headArgAt r p)
+            map? (= mj 5)]
+        (if (neg? n)
+          (.skipFrom r p)                       ; indefinite length: not indexable
+            ;; Only containers we will KEEP get an array, and it holds one entry
+            ;; per ANCHOR rather than one per entry. The old version allocated
+            ;; `(int-array n)` for every container before testing `min-entries`,
+            ;; then copied every stride-th element into a second array -- so a
+            ;; document of small maps allocated one throwaway array per map and
+            ;; threw it away, which is why raising :index-min barely helped.
+          (let [;; THE DECLARED COUNT IS CHECKED AGAINST THE BYTES THAT
+                ;; REMAIN, before anything is sized from it. `ba 7fffffff 01`
+                ;; -- six bytes -- declares 2^31-1 map pairs, and `m` below
+                ;; then asked for a long[] of that many entries:
+                ;; `OutOfMemoryError` out of a public entry point, on bytes
+                ;; somebody else wrote. `Reader.checkCount` has always done
+                ;; this for the decoder; the index walk sizes an array from a
+                ;; wire count too and was never given the same guard.
+                ;;
+                ;; A map pair costs at least two bytes and an array element at
+                ;; least one, so anything larger than that cannot be present
+                ;; however the rest of the document is arranged.
+                ;; `>` against a HALVED budget rather than a doubled count.
+                ;; `(* 2 n)` is checked arithmetic, so a map declaring 2^63-1
+                ;; pairs overflowed and threw a raw ArithmeticException out of
+                ;; the guard whose job is to make this input typed -- 37 of
+                ;; 60000 fuzz probes, and introduced by the guard itself.
+                _ (let [avail (- (.size r) (long (.headEndAt r p)))
+                        budget (if map? (quot avail 2) avail)]
+                    (when (> n budget)
+                      (throw (ex-info (str "boring: container at " p " declares " n
+                                           (if map? " pairs" " elements")
+                                           " but only " avail " bytes remain")
+                                      {:type :boring/bad-count :count n :offset p}))))
+                keep? (and (>= n min-entries)
+                           (not (frame-payload-array? r q0 p mj n)))
+                m (if keep?
+                      ;; An empty container needs no anchors. The `(max n 1)`
+                      ;; this replaces yielded ONE for n=0, and the loop never
+                      ;; wrote it, leaving a phantom offset pointing at the
+                      ;; document's start. Same defect as Writer.anchorCount.
+                    (cond (<= n 0) 0
+                          (= stride 1) n
+                          :else (inc (quot (dec n) stride)))
+                    0)
+                kept (when keep? (long-array m))
+                  ;; EVERY adjacent key pair decides `sorted`, not the anchors.
+                  ;; Comparing the anchor sample was unsound and returned WRONG
+                  ;; ANSWERS: `sorted` licenses a binary search that then scans
+                  ;; only the stride it lands in, which is valid only if the
+                  ;; whole container is ordered. At the default stride a 20-key
+                  ;; map has two anchors, so an unordered map was marked sorted
+                  ;; about half the time and present keys came back nil.
+                srt (when (and keep? map?) (doto (boolean-array 1) (aset 0 true)))
+                end (loop [i 0 q (long (.headEndAt r p)) prev -1]
+                      (if (= i n)
+                        q
+                        (do (when (and keep? (zero? (rem i stride)))
+                              (aset ^longs kept (quot i stride) (long q)))
+                            (when (and srt (aget ^booleans srt 0) (>= (long prev) 0)
+                                       (>= (.compareItemsAt r (long prev) q) 0))
+                              (aset ^booleans srt 0 false))
+                            ;; index-walk*, CARRYING THE DEPTH. Calling the
+                            ;; 6-arg wrapper here reset it to 0 at every level,
+                            ;; so the bound never fired and the only thing
+                            ;; stopping a deep document was the
+                            ;; StackOverflowError catch -- which is exactly the
+                            ;; unreliable path the bound exists to front-run,
+                            ;; and which made the test flaky rather than the
+                            ;; code safe.
+                            (recur (inc i)
+                                   (long (index-walk*
+                                          r
+                                          (if map?
+                                            (long (index-walk* r q stride min-entries base acc
+                                                               (inc (long depth))))
+                                            q)
+                                          stride min-entries base acc (inc (long depth))))
+                                   q))))]
+            (when keep?
+                ;; Decided on RAW offsets, before `base` is folded in: the
+                ;; Reader is positioned over this item's own buffer.
+              (let [sorted (boolean (and srt (aget ^booleans srt 0)))]
+                ;; No `base` rebasing here. `scan-into!` is reached only from
+                ;; `scan-index`, always with base 0, and the branch that used to
+                ;; rebase carried an `^ints` hint that has been wrong since
+                ;; `kept` widened to a long[] -- so it was dead code that would
+                ;; have thrown a ClassCastException had anything reached it.
+                (.add acc [(int (+ base p)) (int n) kept sorted])))
+            end))))))
+
+(defn- scan-into!
+  "Append index nodes for [start, end) onto `acc`, and return nothing.
+
+  Split out when `write-seq!` still called it once per item -- it no longer
+  walks at all, the writer captures the index while encoding, and the only
+  caller now is `scan-index` via `build-index`, always with `base` 0. The
+  reasoning below is kept because it is why the split exists.
+
+  Separate from `scan-index` because that caller invoked it once PER ITEM, and
+  the result-shaping `scan-index` does -- a sort, four sequence traversals and a
+  map -- is per-sequence work. Doing it per item allocated an ArrayList, two
+  lazy seqs, two vectors and a four-entry map for every item in the log, almost
+  always to describe zero nodes, since a typical record's containers sit below
+  `:index-min`. That scaffolding, not the byte walk, was the bulk of indexing's
+  write cost: `skipFrom` and `skipValue` together were 2% of the profile."
+  [^Reader r start end stride min-entries base ^java.util.ArrayList acc]
+  (loop [p (long start)]
+    (when (< p (long end))
+      (recur (long (index-walk r p stride min-entries base acc)))))
+  nil)
+
+(defn- nodes->index
+  "Shape accumulated nodes into the map `seal-index!` takes. Once per sequence."
+  [^java.util.ArrayList acc]
+  (let [idx (vec (sort-by first acc))]
+    {:containers (long-array (map #(nth % 0) idx))
+     :counts (int-array (map #(nth % 1) idx))
+     :slots (mapv #(nth % 2) idx)
+     :sorted (mapv #(nth % 3) idx)}))
+
+(defn- scan-index
+  "Index nodes for every container of at least `min-entries` entries in
+  [start, end).
+
+  A node is the byte offsets of a container's entries. With those, reaching
+  entry i is a jump rather than a walk: arrays index positionally in O(1), and
+  maps whose keys are sorted binary-search in O(log n) without decoding a key.
+
+  Derived by walking encoded bytes rather than by hooking the writer -- so the
+  writer's hot path is untouched, and any already-encoded value can be indexed
+  after the fact: re-index after a compaction, or index a file somebody else
+  wrote.
+
+  Recursion depth is the document's nesting depth, which the decoder already
+  bounds at maxDepth."
+  [^Reader r start end stride min-entries base]
+  (let [acc (java.util.ArrayList.)]
+    (scan-into! r start end stride min-entries base acc)
+    (nodes->index acc)))
+
+(defn build-index
+  "Index nodes for the containers inside already-encoded `bs`.
+
+  `opts` may carry `:index` (the stride, default 16) and `:index-min` (skip
+  containers smaller than this, default 16).
+
+  `:index-min` is the DOMINANT size knob, and 2 was a bad default. Real data is
+  mostly small containers, and each one costs a container offset, a count, a
+  typed-array slot and a flag whether or not it is worth searching. On 2 000
+  records of two fields each, indexing every container cost **76%** of the file
+  and indexing only containers of 8+ cost **1.3%** -- for a FASTER lookup,
+  because the smaller index also fits in cache. A container of a handful of
+  entries is already found in well under a microsecond by walking it.
+
+  Returns a map ready for `seal-index!`, or nil if nothing was worth indexing."
+  ([^bytes bs] (build-index bs nil))
+  ([^bytes bs opts]
+   ;; RESOLVED, like every other public entry point, even though nothing here
+   ;; encodes. It read `:index` its own way -- `(if (and i (pos? (long i))) i 16)`
+   ;; -- so `:index 0`, the documented off switch, silently became stride 16;
+   ;; `:index 1.5` became stride 1; `:index -1` became 16; and `:index "x"` was
+   ;; a raw ClassCastException. Going through the one gate is what makes that
+   ;; class of drift impossible rather than fixed.
+   (let [opts (resolve-opts opts)
+         r (Reader. (bytes! bs "build-index"))
+         stride (let [i (long (get opts :index default-index-stride))]
+                  ;; 0 means "no index" everywhere else, and building an index
+                  ;; with no index is not a thing this function can do -- it
+                  ;; used to silently substitute 16, so the documented off
+                  ;; switch produced a LARGER file than omitting the option.
+                  ;; Naming `encode` is more use than a stride nobody asked for.
+                  (when (zero? i)
+                    (throw (ex-info (str "boring: :index 0 turns indexing off, which "
+                                         "build-index cannot do; use `encode` instead")
+                                    {:type :boring/bad-option :option :index :value 0})))
+                  i)
+         min-entries (long (get opts :index-min 16))
+         idx (try
+               (scan-index r 0 (alength bs) stride min-entries 0)
+               (catch StackOverflowError _
+                 ;; The depth bound above is deterministic, but it is calibrated
+                 ;; against a default stack; a smaller -Xss can still reach the
+                 ;; real limit first. A public entry point that takes bytes
+                 ;; somebody else wrote may not answer with an Error.
+                 (throw (ex-info "boring: index walk ran out of stack; this document is too deeply nested to index"
+                                 {:type :boring/max-depth-exceeded}))))]
+     (when (pos? (alength ^longs (:containers idx)))
+       (assoc idx :stride stride)))))
+
+(defn- delta-slot
+  "A slot's entry offsets, as deltas in the narrowest typed array that holds them.
+
+  Offsets inside a container ascend, so consecutive differences are small and
+  nearly uniform while the absolutes are large and unbounded. That is the whole
+  saving: on 50 000 ~66-byte log records the per-item deltas span 60..67, which
+  is a byte, against int32 absolutes reaching into the millions.
+
+  Widths, narrowest first -- a byte string (no tag at all), sint16 (tag 77),
+  sint32 (tag 78). Every one of these already round-trips through the codec, so
+  this adds NO format surface: the CBOR tag is the width declaration, which is
+  why there is no per-entry flag of the kind Postgres needs for its JEntry
+  array. Postgres reads offsets in place out of a TOAST'd datum; we materialise
+  the index once, so we can afford a representation that must be expanded.
+
+  The 0x7FFF bound, rather than 0xFFFF: tag 77 is SIGNED, and taking the last
+  32 KiB of range back would mean masking on read for a band that only opens up
+  when anchors are 32 KiB apart. Deltas that large take int32, which is what
+  they would have cost anyway.
+
+  `base` is what the first delta is measured from: the container's own offset,
+  or 0 for the sequence node. So slot[0] is a header width rather than a file
+  position, which keeps the first entry as narrow as the rest.
+
+  Falls back to int32 on a negative delta. That cannot arise from a walk --
+  entries ascend and no CBOR item is zero bytes -- but the narrow encodings
+  cannot represent one, so the check is what makes that an assumption about the
+  walk rather than about the file."
+  [^longs offs ^long base]
+  (let [n (alength offs)
+        d (long-array n)]
+    (loop [i 0 prev base mn Long/MAX_VALUE mx Long/MIN_VALUE]
+      (if (= i n)
+        (cond
+          (or (zero? n) (and (>= mn 0) (<= mx 0xFF)))
+          (let [b (byte-array n)]
+            (dotimes [k n] (aset-byte b k (unchecked-byte (aget d k))))
+            b)
+
+          (and (>= mn 0) (<= mx 0x7FFF))
+          (let [s (short-array n)]
+            (dotimes [k n] (aset-short s k (unchecked-short (aget d k))))
+            s)
+
+          (and (>= mn Integer/MIN_VALUE) (<= mx Integer/MAX_VALUE))
+          (let [a (int-array n)]
+            (dotimes [k n] (aset-int a k (unchecked-int (aget d k))))
+            a)
+
+          ;; sint64 (tag 79), the fourth tier. Only reachable when two anchors
+          ;; are more than 2 GiB apart, which needs items that large -- but the
+          ;; tier costs nothing to have, because the CBOR tag declares the width
+          ;; and a narrower slot is still emitted whenever one fits.
+          :else d)
+        (let [v (aget offs i)
+              delta (- v prev)]
+          (aset d i delta)
+          (recur (inc i) v (min mn delta) (max mx delta)))))))
+
+(defn- long->8-bytes* ^bytes [^long v]
+  (let [b (byte-array 8)]
+    (dotimes [i 8] (aset-byte b i (unchecked-byte (bit-shift-right v (* 8 (- 7 i))))))
+    b))
+
+(defn seal-index!
+  "Write an index item to `out`, sealing everything written before it.
+
+  `index` comes from `build-index`; `data-len` is how many bytes precede this
+  item, which is also where it begins. The item is:
+
+      tag 27 [ `boring/index`,
+               [ stride, containers, counts, slots, sorted, <8-byte data-len> ] ]
+
+  `containers` are the byte offsets of every indexed container, sorted, so a
+  reader binary-searches them. `slots` holds each container's entry offsets and
+  `sorted` says whether that container's keys ascend -- recorded rather than
+  inferred, because the encoding profile is not on the wire.
+
+  Slots go out as DELTAS, in the narrowest typed array that holds them (see
+  `delta-slot`), and a reader expands them back to absolutes once when it loads
+  the index. An int32 slot is therefore deltas too, not absolutes -- the two are
+  indistinguishable on the wire, which is why this had to land before the format
+  was published rather than after.
+
+  The trailing element is a byte string of exactly 8 bytes, so it always encodes
+  as `0x48` plus 8: a sealed file ends with 9 predictable bytes however large
+  the index is. That is how it is found, since CBOR cannot be parsed backwards.
+
+  Those 9 bytes are ordinary CBOR, not a magic trailer. The file stays a valid
+  sequence that any reader consumes -- it just sees one extra tagged item.
+
+  The pointer verifies as well as locates: it is both where the index starts and
+  how long the data is, so a reader that seeks there and does not find a tag-27
+  frame named `boring/index` knows the index is stale and scans instead."
+  ([^Writer w ^java.io.OutputStream out index data-len]
+   ;; The writer's options were resolved when the writer was built, so this
+   ;; arity is already past the gate.
+   (if (nil? index) 0 (seal-index-with! w out index data-len (writer-opts w))))
+  ([^Writer w ^java.io.OutputStream out index data-len opts]
+   ;; RESOLVED, like every other public entry point. This was the one that was
+   ;; not: every option reached `configure!` unchecked, so `{:float-policy
+   ;; :nope}` silently selected :shortest, `{:encode-fallback :placehodler}`
+   ;; installed the keyword as the fallback function, and `{:max-depth "5"}`
+   ;; left as a raw ClassCastException. The frame itself carries no floats and
+   ;; no maps, so no wire corruption was reachable through it -- but a public
+   ;; entry point that accepts garbage and fails untyped is exactly what the
+   ;; option gate exists to make impossible, and `boring.options` claims in its
+   ;; own docstring that resolution is the one thing every entry point does.
+   ;; NIL IS THE DOCUMENTED "nothing was worth indexing" from `build-index`,
+   ;; and the two are documented as a pair -- so the pairing NPE'd on any
+   ;; document whose containers all sat below `:index-min`, which is the
+   ;; common case for small values. Sealing nothing writes nothing.
+   (if (nil? index)
+     0
+     (seal-index-with! w out index data-len (resolve-opts opts)))))
+
+(defn- seal-index-with!
+  [^Writer w ^java.io.OutputStream out index data-len opts]
+  (letfn [(emit! [item]
+            ;; `write-root!`, not `write-to!`: `opts` here are ALREADY RESOLVED,
+            ;; and write-to!'s 3-arity resolves again -- which throws for every
+            ;; profile that locks a key, the same double-resolution trap as
+            ;; `write-seq!`'s 3-arity.
+            (let [n (long (.position ^Writer (write-root! w item opts)))]
+              (.write out (.buffer w) 0 (int n))
+              n))]
+    (let [{:keys [stride ^longs containers counts slots sorted]} index
+          ;; NARROWEST TYPE THAT HOLDS THEM, exactly as the slot deltas do. A
+          ;; file whose offsets fit in int32 emits int32 and is byte-identical
+          ;; to what it was before offsets became 64-bit; one that does not
+          ;; promotes to sint64, and the CBOR tag tells a reader which it got.
+          wire-containers (if (and (pos? (alength containers))
+                                   (let [mx (areduce containers i m Long/MIN_VALUE
+                                                     (max m (aget containers i)))
+                                         mn (areduce containers i m Long/MAX_VALUE
+                                                     (min m (aget containers i)))]
+                                     (or (< mx Integer/MIN_VALUE) (> mx Integer/MAX_VALUE)
+                                         (< mn Integer/MIN_VALUE) (> mn Integer/MAX_VALUE))))
+                            containers
+                            (let [a (int-array (alength containers))]
+                              (dotimes [i (alength containers)]
+                                (aset-int a i (unchecked-int (aget containers i))))
+                              a))
+          packed (vec (map-indexed
+                       (fn [i s]
+                       ;; The sequence node's sentinel offset is -1, and a file
+                       ;; position is never negative: its deltas start from 0.
+                         (delta-slot s (max 0 (long (aget containers (int i))))))
+                       slots))
+          item (data/unknown-record
+                index-name
+                [(long stride) wire-containers counts packed (vec sorted)
+                 (long->8-bytes* (long data-len))])]
+    ;; The frame goes out under the SAME options as the data it describes.
+    ;; `write-to!`'s 2-arity resolves the WRITER's options instead, so
+    ;; `write-seq!`'s 4-arity wrote the data with the caller's opts and the
+    ;; footer with the writer's -- and with a plain `(writer 4096)` that meant
+    ;; the frame was emitted inside a stringref namespace, which `nav` refuses
+    ;; to recognise. The index was then silently dead (27x slower lookups) AND
+    ;; the frame came back as a phantom trailing data item in every log.
+    ;;
+    ;; Invisible to every test and doc example, because all of them happen to
+    ;; build the writer with the same options they pass.
+    ;;
+      (emit! item))))
 
 (defn- grow ^bytes [^bytes buf ^long need]
   (if (>= (alength buf) need)
@@ -524,10 +1514,29 @@
   no symmetric read path -- `decode-seq`'s own docstring conceded the chunking
   workaround. This is that workaround, done once and correctly.
 
-  Bounded memory means bounded by the LARGEST SINGLE ITEM plus the chunk size,
-  not by the stream. That is the real limit and it is not a compromise: an item
-  has to fit in memory to be a Clojure value at all, so streaming can only ever
-  mean a sequence of items -- which is exactly what a datahike dump is.
+  Bounded memory means bounded by the LARGEST SINGLE ITEM, not by the stream.
+  That is the real limit and it is not a compromise: an item has to fit in
+  memory to be a Clojure value at all, so streaming can only ever mean a
+  sequence of items -- which is exactly what a datahike dump is.
+
+  The CONSTANT on that bound is several, not one, and this used to say \"plus
+  the chunk size\" as though it were one. `refill!` ends with
+  `(.reset r (Arrays/copyOf buf new-limit))`: `Reader.reset` has no
+  `(byte[], off, len)` form, so every refill allocates a full second copy of a
+  buffer `grow` has already doubled to hold the largest item. Measured as
+  bytes allocated per byte of file, over 32 MiB of byte-string items, with
+  `decode-seq` on the same bytes in the same run as the control:
+
+      item size    decode-seq-from     decode-seq (control)
+      1 MiB              3.2x                 1.00x
+      4 MiB              3.6x                 1.00x
+     16 MiB              5.5x                 1.00x
+
+  Linear in the file, not quadratic -- I looked for that specifically -- but
+  rising with item size, because the copied buffer tracks the largest item
+  rather than the chunk. ClojureScript's refill hands its reader
+  `(.subarray buf 0 new-limit)` -- a view over the same storage, not a copy --
+  so it pays the buffer's growth and nothing on top of it.
 
   The reader's hot path is untouched. Refilling happens between items, not
   inside `u8()`, so this costs nothing when decoding from a byte array.
@@ -536,10 +1545,16 @@
   time. The caller owns the stream and should close it."
   ([^java.io.InputStream in] (decode-seq-from in nil))
   ([^java.io.InputStream in opts]
-   (let [o     (resolve-opts opts)
+   (let [o     (opt/check-opts opts)
+         ;; `:chunk-size 0` silently returned an EMPTY sequence for non-empty
+         ;; input -- data loss with no error -- and a negative value was a raw
+         ;; NegativeArraySizeException. Checked in `boring.options` now, with
+         ;; every other option, so this is the only entry point that reads it
+         ;; rather than the only one that validates it.
          chunk (int (get opts :chunk-size 65536))
          r     (Reader. (byte-array 0))
-         state (volatile! {:buf (byte-array chunk) :limit 0 :last-good 0 :eof? false})]
+         state (volatile! {:buf (byte-array chunk) :limit 0 :last-good 0 :base 0
+                           :eof? false})]
      (configure-reader! r o)
      ;; `last-good` is the offset just past the last COMPLETE item, not the
      ;; reader's current position. A failed read leaves the position somewhere
@@ -548,7 +1563,7 @@
      ;; would compact a negative number of bytes. Rewind to the last item.
      (letfn [(refill!
                []
-               (let [{:keys [^bytes buf ^long limit ^long last-good eof?]} @state
+               (let [{:keys [^bytes buf ^long limit ^long last-good eof? ^long base]} @state
                      rest-len (- limit last-good)
                      _ (when (pos? last-good)
                          (System/arraycopy buf last-good buf 0 rest-len))
@@ -560,15 +1575,42 @@
                          -1
                          (.read in buf (int rest-len) (int (- (alength buf) rest-len))))
                      new-limit (if (pos? n) (+ rest-len n) rest-len)]
+                 ;; `base` is how many bytes were discarded by earlier
+                 ;; compactions, so `base + last-good` is a position in the
+                 ;; FILE rather than in the current buffer. Without it the
+                 ;; streaming reader had no absolute offset at all, so it
+                 ;; passed -1 to `index-frame?` -- which by construction skips
+                 ;; the back-pointer test. Concatenate two sealed files and the
+                 ;; trailing frame's pointer is relative to the second one, so
+                 ;; it is stale for the whole; `decode-seq` and `nav` both
+                 ;; publish it as data, and this reader silently deleted it.
+                 ;; 123, 123, 122 on the same bytes.
                  (vreset! state {:buf buf :limit new-limit :last-good 0
+                                 :base (+ base last-good)
                                  :eof? (or eof? (neg? n))})
                  (.reset r (java.util.Arrays/copyOf buf (int new-limit)))
                  (pos? n)))
              (step []
                (lazy-seq
                 (if-not (.atEnd r)
-                  (let [v (try
-                            {:ok (.readNext r)}
+                  (let [;; CAPTURED BEFORE THE READ. `last-good` is advanced to
+                        ;; the position AFTER the item in the `:ok` branch
+                        ;; below, and the frame test runs after that -- so
+                        ;; reading it there gives the frame's END, and the
+                        ;; back-pointer comparison failed on every genuine
+                        ;; sealed file. 60 items came back 61.
+                        item-start (+ (long (:base @state)) (long (:last-good @state)))
+                        v (try
+                            ;; The boundary goes around the READ and nothing
+                            ;; else, so the retry logic below sees typed errors
+                            ;; and dispatches on `:type` exactly as it does for
+                            ;; the ones the reader raises itself. Wrapped
+                            ;; outside the retry it would convert a truncation
+                            ;; into a hard failure; wrapped here a stack
+                            ;; overflow arrives as `:boring/max-depth-exceeded`
+                            ;; -- which this path already knows is definitive,
+                            ;; since more bytes cannot make a value shallower.
+                            {:ok (with-decode-errors (.readNext r))}
                             (catch clojure.lang.ExceptionInfo e
                               ;; From INSIDE the reader, "the buffer ends
                               ;; mid-item" and "the document declares an
@@ -581,16 +1623,69 @@
                               ;; to be rethrown if it cannot, rather than
                               ;; reporting every malformed document as a
                               ;; truncation.
-                              (if (#{:boring/truncated-input :boring/bad-count}
-                                   (:type (ex-data e)))
+                              (cond
+                                (#{:boring/truncated-input :boring/bad-count}
+                                 (:type (ex-data e)))
                                 {:need-more e}
-                                (throw e)))
+                                ;; BORING'S OWN FOOTER, here too. `decode-seq`
+                                ;; gained this and the streaming arity did not,
+                                ;; so `write-seq!`'s default output still could
+                                ;; not be read back through the path documented
+                                ;; for dumps larger than the heap.
+                                ;;
+                                ;; There is no file length to check a
+                                ;; back-pointer against on a stream, so the gate
+                                ;; is END OF INPUT instead: retry from where this
+                                ;; item began, with the budgets lifted, and
+                                ;; accept the result only if it is a genuine
+                                ;; frame AND nothing follows it. A budget error
+                                ;; is definitive -- more bytes cannot make a
+                                ;; value shallower -- so retrying immediately is
+                                ;; sound where retrying a truncation is not.
+                                (#{:boring/max-depth-exceeded
+                                   :boring/max-items-exceeded} (:type (ex-data e)))
+                                ;; SKIPPED, NOT DECODED -- see `decode-seq`.
+                                ;; Reading the footer under lifted budgets is
+                                ;; what let a forged frame allocate 102 MB
+                                ;; there; the streaming arity had the same
+                                ;; shape. If the seventeen frame bytes are at
+                                ;; this item's start and nothing follows, the
+                                ;; rest of the input is the footer and the
+                                ;; sequence is over. Nothing is materialised.
+                                (if (and (frame/prefix-at? (:buf @state)
+                                                           (long (:last-good @state)))
+                                         (not (refill!)))
+                                  {:frame true}
+                                  (throw e))
+                                :else (throw e)))
+                            ;; Kept behind the boundary, not in front of it:
+                            ;; everything the reader itself raises is typed by
+                            ;; the wrap above, so this now only catches an
+                            ;; out-of-bounds from `refill!`'s own array
+                            ;; arithmetic. Rare, and still a "need more" rather
+                            ;; than a decode failure.
                             (catch IndexOutOfBoundsException e
                               {:need-more e}))]
                     (cond
+                      (contains? v :frame) nil
                       (contains? v :ok)
                       (do (vswap! state assoc :last-good (.position r))
-                          (cons (:ok v) (step)))
+                          ;; See `decode-seq`: the trailing index frame is
+                          ;; metadata, not an item. Here "final" needs the
+                          ;; stream too, not just the buffer -- `.atEnd` only
+                          ;; means the current chunk is exhausted, so a refill
+                          ;; that succeeds proves the frame was not last.
+                          ;; THE ITEM'S OWN FILE OFFSET, not -1. `index-frame?`
+                          ;; treats -1 as "the caller cannot supply one" and
+                          ;; skips the back-pointer test entirely -- the only
+                          ;; check that tells a frame describing THIS file from
+                          ;; one carried in from another. `base + last-good` is
+                          ;; that offset; `last-good` was captured before this
+                          ;; item was read, so it is where the item starts.
+                          (if (and (frame/index-frame? (:ok v) item-start)
+                                   (.atEnd r) (not (refill!)))
+                            nil
+                            (cons (:ok v) (step))))
                       (refill!) (step)
                       ;; Out of data and still incomplete. The retained
                       ;; exception is rethrown as-is when it is already typed,
@@ -620,23 +1715,43 @@
   heap."
   ([^bytes bs] (decode-seq bs nil))
   ([^bytes bs opts]
-   (let [r (Reader. bs)]
-     (set! (.-tolerateUnknownTags r) (boolean (get opts :tolerate-unknown-tags true)))
-     (set! (.-instantAsDate r) (not= :instant (get opts :instant-type :date)))
-     (set! (.-fullDateAsSqlDate r) (= :sql-date (get opts :date-type :local-date)))
-     (set! (.-maxDepth r) (int (get opts :max-depth 1024)))
-     (set! (.-validateUtf8 r) (boolean (get opts :validate-utf8 true)))
-     (set! (.-autoConstructRecords r)
-           (boolean (get opts :auto-construct-records? false)))
-     (set! (.-registry r) (or (:registry opts) TagRegistry/EMPTY))
-     ((fn step []
+   ;; This inlined `configure-reader!` -- nine `set!`s in the same order, which
+   ;; happened to still match. A copy that agrees today is a copy that can stop
+   ;; agreeing tomorrow, silently, since nothing compares them.
+   (let [opts (opt/check-opts opts)
+         r (configure-reader! (Reader. (bytes! bs "decode-seq")) opts)]
+     ((fn step [^long frame-at]
         (lazy-seq
          (when-not (.atEnd r)
             ;; Each item opens a fresh stringref namespace, so the reader's
             ;; per-message state must be cleared between items — but not its
             ;; ident cache, which is a pure function of bytes.
-           (let [v (with-decode-errors (.readNext r))]
-             (cons v (step))))))))))
+           (let [start (.position r)
+                 ;; THE FOOTER IS NOT DECODED AT ALL. It is being SKIPPED, not
+                 ;; used, so reading its value was never necessary -- and reading
+                 ;; it under lifted budgets is what made a forged frame a bomb:
+                 ;; the prefix gate ran first, then the payload was materialised,
+                 ;; and `index-frame?` only judged the result afterwards. A file
+                 ;; whose frame slot held a nested-array payload allocated 102 MB
+                 ;; under `{:max-items 100}` and returned its two honest items
+                 ;; with no error.
+                 ;;
+                 ;; If the file's own back-pointer names this offset and the
+                 ;; seventeen frame bytes are here, the rest of the file is the
+                 ;; footer by construction. Stopping is the whole answer, and it
+                 ;; allocates nothing whatever the payload claims to be.
+                 footer? (= start frame-at)
+                 v (when-not footer? (with-decode-errors (.readNext r)))]
+             ;; THE INDEX FRAME IS NOT AN ITEM. `write-seq!` indexes by default,
+             ;; so without this every caller of `decode-seq` would find a
+             ;; phantom `#boring/index [...]` after their data. It is dropped
+             ;; only in the final position, which is the only place `seal-index!`
+             ;; can put it -- a frame of that name anywhere else is somebody
+             ;; else's data and stays visible.
+             (cond
+               footer? nil
+               (and (.atEnd r) (frame/index-frame? v start)) nil
+               :else (cons v (step frame-at))))))) (frame/footer-start bs)))))
 
 ;; ## Optional hasch integration, activated if hasch is present
 ;;
@@ -660,7 +1775,19 @@
 (defonce ^{:doc "True if the optional hasch integration is active."}
   hasch-integration?
   (try
+    ;; HASCH ITSELF IS PROBED FIRST, not `boring.hasch`. The catch below reads
+    ;; as "the integration namespace is absent", and that was the same thing
+    ;; only while `boring/hasch.cljc` was missing from the jar -- which it was,
+    ;; silently, in every release. Shipping it made the two different: the
+    ;; require now FINDS the namespace and fails inside it on `hasch.benc`,
+    ;; wrapped in a Compiler$CompilerException that neither catch matches, so
+    ;; `(require 'boring.core)` threw for every consumer without hasch.
+    ;;
+    ;; Probing the optional dependency directly is what the comment above
+    ;; always claimed this did.
+    (require 'hasch.benc)
     (require 'boring.hasch)
     true
     (catch java.io.FileNotFoundException _ false)
-    (catch ClassNotFoundException _ false)))
+    (catch ClassNotFoundException _ false)
+    (catch Exception _ false)))

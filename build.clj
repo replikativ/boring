@@ -117,7 +117,7 @@
                 :lib lib
                 :version version
                 :basis @basis
-                :src-dirs ["src"]
+                :src-dirs ["src" "src-hasch"]
                 :scm {:url "https://github.com/replikativ/boring"
                       :connection "scm:git:git://github.com/replikativ/boring.git"
                       :developerConnection "scm:git:ssh://git@github.com/replikativ/boring.git"
@@ -142,7 +142,16 @@
                  [:developers
                   [:developer
                    [:name "Christian Weilbach"]]]]})
-  (b/copy-dir {:src-dirs [class-dir "src"] :target-dir jar-dir})
+  ;; `src-hasch` IS SHIPPED. It was an `:extra-paths` alias only, so
+  ;; `boring.hasch` -- which the CHANGELOG lists as a feature and which
+  ;; konserve and datahike are the named consumers of -- was simply absent from
+  ;; the jar. The failure is silent rather than a missing-namespace error: with
+  ;; hasch on the classpath and boring's integration missing, two different
+  ;; record types and a plain map all content-address to the SAME uuid.
+  ;;
+  ;; It loads only when hasch is present -- that is what the namespace is
+  ;; built for -- so shipping it costs a consumer without hasch nothing.
+  (b/copy-dir {:src-dirs [class-dir "src" "src-hasch"] :target-dir jar-dir})
   ;; The legal files belong INSIDE the artifact. The README directs consumers
   ;; to both and NOTICE is part of the distribution terms, but neither was
   ;; shipped -- a jar is what a consumer actually receives.
@@ -168,9 +177,21 @@
                          segment-source-class " — release must be built on "
                          "JDK 22+ (this is " build-jdk ")")
                     {:build-jdk build-jdk})))
-  (let [{:keys [exit]} (clojure.java.shell/sh "bin/check-artifact")]
+  ;; `--release`, AND with BORING_VERSION set to the version actually being
+  ;; published. Without the flag `check-artifact` checks whatever the working
+  ;; tree builds and its snapshot guard is unreachable, so a guard written to
+  ;; refuse publishing a SNAPSHOT could never fire on the one path that
+  ;; publishes. The flag also needs the variable, which CI does not set -- the
+  ;; version is computed here from the revision count -- so it is passed
+  ;; explicitly rather than hoped for.
+  (let [{:keys [exit out err]}
+        (clojure.java.shell/sh "bin/check-artifact" "--release"
+                               :env (assoc (into {} (System/getenv))
+                                           "BORING_VERSION" version))]
     (when-not (zero? exit)
-      (throw (ex-info "boring: refusing to deploy, bin/check-artifact failed" {}))))
+      (println out) (println err)
+      (throw (ex-info "boring: refusing to deploy, bin/check-artifact --release failed"
+                      {:version version}))))
   (dd/deploy {:installer :remote
               :artifact jar-file
               :pom-file (b/pom-path {:lib lib :class-dir jar-dir})}))

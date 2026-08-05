@@ -83,21 +83,33 @@ public final class Reader {
     /** Offset within the array {@link #arrayFor} returned. */
     private int scratchOff;
 
-    /**
-     * Scratch for buildMap's duplicate-key hashes, reused across maps.
-     *
-     * A fresh int[n] per map is invisible in a timing benchmark and obvious in
-     * an allocation one: decoding 200 five-key maps allocated 200 arrays.
-     *
-     * Safe as a field despite nested maps: buildMap runs only after every value
-     * of its map has been read, so an inner map's check completes before the
-     * outer map's begins, and nothing in it calls back into read().
-     */
-    private int[] dupHashes = new int[16];
-
     /** Unknown tags surface as TaggedValue rather than throwing. DATAHIKE-
      *  REQUIREMENTS.md §7 wants strict-by-default; set false for that. */
     public boolean tolerateUnknownTags = true;
+
+    /**
+     * `:on-unknown-record` — what to do with a tag-27 name nothing recognises:
+     * the keyword {@code :fallback} (the default), the keyword {@code :error},
+     * or an {@code IFn} of [name payload] whose return value is used.
+     *
+     * <p>Held as Object and dispatched on identity against the two keywords,
+     * NOT by an {@code instanceof IFn} test — a Clojure keyword implements
+     * IFn, so a keyword-first design that tested callability would invoke
+     * {@code :fallback} as a function. That confusion already shipped once on
+     * this branch: {@code :date} and {@code :instant} were invoked as instant
+     * constructors and every instant decoded to null, silently, because
+     * invoking a keyword is legal.
+     *
+     * <p>Only consulted for a name nothing recognises. boring's own reserved
+     * markers ({@code clojure/char}, {@code java/period}, …) are KNOWN names
+     * and never reach it, even on a platform lacking the type behind one.
+     */
+    static final clojure.lang.Keyword KW_FALLBACK =
+        clojure.lang.Keyword.intern("fallback");
+    static final clojure.lang.Keyword KW_ERROR =
+        clojure.lang.Keyword.intern("error");
+
+    public Object onUnknownRecord = KW_FALLBACK;
 
     /** Which JVM type tag 1004 produces. LocalDate is the modern type and the
      *  default; java.sql.Date exists for code still on the JDBC type. */
@@ -106,6 +118,21 @@ public final class Reader {
     /** Which JVM type tag 0/1 produces. CBOR has one time concept; Date (ms)
      *  and Instant (ns) are a JVM distinction the wire cannot carry. */
     public boolean instantAsDate = true;
+
+    /**
+     * A caller-supplied constructor for tag 0 and tag 1, or null.
+     *
+     * `:instant-type` accepts a FUNCTION on both platforms -- ClojureScript
+     * has one time type, so a caller wanting `cljc.java-time` or `tick` values
+     * supplies the constructor rather than boring depending on js-joda. The
+     * option spec allowed it on the JVM too and only ClojureScript honoured
+     * it, so a portable `.cljc` caller passing one options map got their type
+     * in a browser and a `java.util.Date` on the server: the silent
+     * cross-platform divergence the option was changed to remove.
+     *
+     * Takes epoch milliseconds, matching the ClojureScript side.
+     */
+    public clojure.lang.IFn instantFn;
 
     public TagRegistry registry = TagRegistry.EMPTY;
 
@@ -139,6 +166,131 @@ public final class Reader {
      */
     public int maxDepth = 1024;
 
+    /**
+     * Cumulative decoded-ITEM budget, or 0 for unlimited (the default).
+     *
+     * `maxDepth` bounds how DEEP a document goes and `checkCount` bounds each
+     * container against the bytes that remain, but nothing bounded the TOTAL --
+     * so a valid document could amplify further than doc/SECURITY.md claimed.
+     *
+     * ITEMS, not bytes, because heap tracks OBJECT COUNT rather than payload
+     * size. Measured, wire bytes to retained heap:
+     *
+     *   1 MB byte string          1.0x    one array, whatever its size
+     *   long[] typed array        1.0x
+     *   array of distinct ints    6.5x    one boxed Long per element
+     *   short strings             7.8x
+     *   map of 50 000 entries    11.7x
+     *   many 2-element vectors   23.1x    the worst shape found
+     *
+     * The pattern is the point, and it is why a byte budget would be the wrong
+     * instrument: bulk payloads do not amplify at all, while a ONE-BYTE
+     * container head that becomes an object is the worst case. Amplification
+     * tracks how many objects the document asks for, so that is what to count.
+     */
+    public long maxItems = 0;
+
+    /** Items charged so far. Public so the sequence decoders and `boring.nav`
+     *  can save and restore it around reading boring's OWN index frame, which
+     *  must not spend the caller's budget. */
+    public long items;
+
+    /** Whether `v` parses as an ordinary RFC 3339 instant. Used to validate the
+     *  non-leap part of a leap-second timestamp before preserving it. */
+    private static boolean parsesAsInstant(String v) {
+        try {
+            java.time.OffsetDateTime.parse(v);
+            return true;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /**
+     * RFC 3339 5.6 `date-time`, as a grammar rather than as whatever the host
+     * parser tolerates. Kept character-for-character in step with the regex in
+     * `boring.reader`'s tag-0 handler: the two platforms must agree on which
+     * documents exist before they can agree on what they mean.
+     *
+     * Ranges are checked here where they are cheap and unambiguous (hour 00-23,
+     * minute 00-59, second 00-60 for the leap second); the calendar itself --
+     * whether 2020-02-30 exists -- is left to the date parser below, which is
+     * the thing that actually knows.
+     */
+    private static final java.util.regex.Pattern RFC3339 =
+        java.util.regex.Pattern.compile(
+            "\\d{4}-\\d{2}-\\d{2}[Tt]"
+            + "(?:[01]\\d|2[0-3]):[0-5]\\d:(?:[0-5]\\d|60)"
+            + "(?:\\.\\d{1,9})?"
+            + "(?:[Zz]|[+-](?:(?:0\\d|1[0-7]):[0-5]\\d|18:00))");
+
+    /**
+     * RFC 3339 5.6 `full-date`, for tag 1004.
+     *
+     * `LocalDate.parse` is a java.time parser and accepts java.time's expanded
+     * years, so `1004("+10000-01-01")` decoded to a LocalDate here and was
+     * refused on ClojureScript. The same defect tag 0 had, in the tag next to
+     * it, missed because a reproducer used an 11-byte length header for a
+     * 12-character string and so tested a truncated string instead.
+     */
+    private static final java.util.regex.Pattern RFC3339_DATE =
+        java.util.regex.Pattern.compile("\\d{4}-\\d{2}-\\d{2}");
+
+    /** `:60` in the seconds field -- valid RFC 3339, unrepresentable as an Instant. */
+    private static boolean isLeapSecond(String v) {
+        return secondsColon(v) >= 0;
+    }
+
+    /** Index of the colon before the SECONDS field, or -1. */
+    private static int secondsColon(String v) {
+        int i = v.indexOf(':');
+        if (i < 0) return -1;
+        int j = v.indexOf(':', i + 1);
+        return (j >= 0 && j + 2 < v.length()
+                && v.charAt(j + 1) == '6' && v.charAt(j + 2) == '0') ? j : -1;
+    }
+
+    /**
+     * The timestamp with its leap second lowered to :59, for validation only.
+     *
+     * ONE occurrence, at a known index -- `String.replace(":60", ":59")` is
+     * GLOBAL, so it repaired an impossible minute or UTC offset on the way past
+     * and then validated the repair. `2016-12-31T23:60:60Z` (minute 60) and
+     * `2016-12-31T23:59:60+00:60` (offset minute 60) were both preserved as
+     * inert tag-0 values; ClojureScript's `.replace` takes only the first
+     * occurrence and rejected all of them, so this was a parser differential on
+     * top of accepting impossible dates.
+     */
+    private static String withoutLeapSecond(String v, int j) {
+        return v.substring(0, j + 1) + "59" + v.substring(j + 3);
+    }
+
+    /**
+     * Charge `n` items at once, for host objects a decoder BUILDS rather than
+     * reads.
+     *
+     * `countItem` is called from `read()`, so it only ever sees things that
+     * arrived as their own data item. A tag-40 payload arrives as ONE byte
+     * string and is then expanded into one host object per element, which is
+     * exactly the amplification the budget exists to bound and exactly what it
+     * could not see: a 500 018-byte document declaring dimensions
+     * [500000, 1, 1] built 71 MB of nested vectors -- 149x -- with
+     * `{:max-items 100}` set and honoured.
+     */
+    private void countItems(long n) {
+        if (maxItems > 0 && (items += n) > maxItems)
+            throw Err.of("max-items-exceeded",
+                "boring: decoded more than " + maxItems + " items",
+                "max-items", maxItems);
+    }
+
+    private void countItem() {
+        if (maxItems > 0 && ++items > maxItems)
+            throw Err.of("max-items-exceeded",
+                "boring: decoded more than " + maxItems + " items",
+                "max-items", maxItems);
+    }
+
     private int depth;
 
     private static final VarHandle SHORT_LE =
@@ -162,6 +314,13 @@ public final class Reader {
         static final clojure.lang.IFn MAKE_TAGGED;
         static final Object UNDEFINED;
         static final clojure.lang.IFn MAKE_UNKNOWN_RECORD;
+        /**
+         * The shape rule for an unresolvable tag-27 frame, shared with
+         * ClojureScript and public so an `:on-unknown-record` handler that
+         * only wants to warn can return the default rather than reimplement
+         * it — which is how the two would drift apart.
+         */
+        static final clojure.lang.IFn FRAME_FOR;
 
         static {
             try {
@@ -171,6 +330,7 @@ public final class Reader {
                 MAKE_TAGGED = clojure.lang.RT.var("boring.data", "tagged-value");
                 UNDEFINED = clojure.lang.RT.var("boring.data", "undefined").deref();
                 MAKE_UNKNOWN_RECORD = clojure.lang.RT.var("boring.data", "unknown-record");
+                FRAME_FOR = clojure.lang.RT.var("boring.data", "frame-for");
             } catch (Exception e) {
                 throw new ExceptionInInitializerError(e);
             }
@@ -248,6 +408,7 @@ public final class Reader {
     }
 
     private void resetState() {
+        items = 0;
         this.reused = true;
         this.depth = 0;
         srActive = false;
@@ -326,31 +487,81 @@ public final class Reader {
                 pos += n;
                 return;
             }
+            // SKIP'S BOUND IS ABOUT STACK, NOT SEMANTICS. See enterSkip().
+            //
+            // Three attempts tried to make this agree with `read` exactly, and
+            // each broke a different value: charging for tags refused `#{}`;
+            // not charging for empty containers accepted `(sorted-map)` where
+            // decode refused; charging per container refuses a SHAPED ARRAY,
+            // whose reader consumes the outer, keys, rows and row heads inline
+            // and charges only for the tag.
+            //
+            // That last one generalises: a tag reader that parses its payload
+            // inline charges nothing for the containers inside it, while a
+            // generic skip must recurse into them. The gap is unbounded -- three
+            // levels per nested shaped array -- so no constant slack closes it
+            // and no amount of case analysis will. Mirroring `read` is not a
+            // reachable goal for a generic walker.
             case 4: {
-                enter();
-                try {
-                    if (info == 31) { while (!consumeBreak()) skipStructural(); }
-                    else { int n = checkCount(arg(info), 1);
-                           for (int i = 0; i < n; i++) skipStructural(); }
-                } finally { exit(); }
+                if (info == 31) {
+                    enterSkip();
+                    try { while (!consumeBreak()) skipStructural(); } finally { skipDepth--; }
+                    return;
+                }
+                int n = checkCount(arg(info), 1);
+                if (n == 0) return;
+                enterSkip();
+                try { for (int i = 0; i < n; i++) skipStructural(); } finally { skipDepth--; }
                 return;
             }
             case 5: {
-                enter();
-                try {
-                    if (info == 31) {
-                        while (!consumeBreak()) { skipStructural(); skipStructural(); }
-                    } else {
-                        int n = checkCount(arg(info), 2);
-                        for (int i = 0; i < n; i++) { skipStructural(); skipStructural(); }
-                    }
-                } finally { exit(); }
+                if (info == 31) {
+                    enterSkip();
+                    try { while (!consumeBreak()) { skipStructural(); skipStructural(); } }
+                    finally { skipDepth--; }
+                    return;
+                }
+                int n = checkCount(arg(info), 2);
+                enterSkip();
+                try { for (int i = 0; i < n; i++) { skipStructural(); skipStructural(); } }
+                finally { skipDepth--; }
                 return;
             }
-            case 6:
+            case 6: {
+                // A TAG CHAIN IS CONSUMED ITERATIVELY, and bounded by its
+                // length. `c0 c0 c0 ... 00` is legal CBOR, and recursing once
+                // per tag overflowed the stack -- the DoS maxDepth exists to
+                // prevent, and the one nesting it did not bound.
+                //
+                // The obvious fix, charging each tag to the depth budget like
+                // `read` does, was WRONG and the property test caught it:
+                // several tag readers parse their payload's head inline without
+                // calling enter() -- `readTagged(258)` reads the set's array
+                // that way -- so read charges for the tag but not the container
+                // under it, while a mirrored skip charged for both. `#{}` was
+                // then refused at a depth decode accepted, and navigation
+                // rejects documents that decode fine. Mirroring read's
+                // accounting case by case is not maintainable; there are as
+                // many rules as there are tag readers.
+                //
+                // Bounding the chain instead is safe by construction: it can
+                // only ever make skip LAXER than read, never stricter, so a
+                // decodable document always skips. And it removes the stack
+                // recursion outright rather than capping it.
                 arg(info);
+                int chain = 1;
+                while (true) {
+                    int h2 = u8();
+                    if ((h2 >>> 5) != 6) { pos--; break; }    // not a tag: put it back
+                    if (++chain > skipLimit())
+                        throw Err.of("max-depth-exceeded",
+                            "boring: tag chain longer than the skip bound ("
+                            + skipLimit() + ")", "max-depth", (long) skipLimit());
+                    arg(h2 & 0x1F);
+                }
                 skipStructural();
                 return;
+            }
             default:                       // major 7: arg() covers the width
                 if (info == 31)
                     throw Err.of("unexpected-break",
@@ -393,18 +604,81 @@ public final class Reader {
         finally { pos = save; }
     }
 
-    /** Offset just past the whole value at `p`. */
-    public long skipFrom(long p) {
-        long save = pos;
-        try { pos = p; skipValue(); return pos; }
-        finally { pos = save; }
+    /**
+     * BEST-EFFORT concurrent-use detector, not a lock.
+     *
+     * A Reader is single-threaded, and `boring.nav` shares one across every
+     * cursor from a source -- so two threads navigating one source produced
+     * silently WRONG documents: 200 parallel passes gave 6 plausible-but-wrong
+     * answers and no exception at all. Every signal on nav's surface says
+     * otherwise (a "read-only" namespace, a reducible, a deliberately shared
+     * mmap arena), so the failure had to become loud.
+     *
+     * Deliberately NOT thread affinity: building a cursor on one thread and
+     * using it on another, without overlap, is a legitimate handoff that
+     * affinity would reject -- pushing callers back to rebuilding a Nav, which
+     * costs 145 us against a fork's 175 ns.
+     *
+     * Non-volatile on purpose. A volatile write on every positional read would
+     * cost more than the bug does, and this only has to catch overlap often
+     * enough to name it. A smoke alarm, not a mutex: `boring.nav/fork` is the
+     * fix and doc/SECURITY.md states the rule.
+     */
+    private boolean busy = false;
+
+    private RuntimeException concurrentUse() {
+        return Err.of("concurrent-use",
+            "boring: this Reader was used from two threads at once. A boring.nav"
+            + " source is single-threaded -- call boring.nav/fork for a per-thread"
+            + " view, which shares the decoded index.");
     }
 
-    /** Decode the value at `p`. Does not disturb the caller's position. */
+    /**
+     * Offset just past the whole value at `p`.
+     *
+     * Restores `depth` as well as `pos`. These positional entry points are the
+     * navigator's whole interface to the Reader, and it calls them on values
+     * that may legitimately fail -- a probe into a malformed index, a
+     * too-deep subtree. Leaving depth raised made the NEXT, unrelated call
+     * fail too.
+     */
+    /**
+     * How many structural skips this reader has performed.
+     *
+     * Exists so a test can tell whether the OFFSET INDEX was actually
+     * consulted. The index is a pure optimisation -- same answers, fewer
+     * steps -- so no assertion about the RESULT can distinguish a live index
+     * from a dead one, and measuring it by wall clock is flaky. Per-path
+     * mutation showed the consequence: `lookup-map`'s and `nth-item`'s indexed
+     * branches could both be deleted outright with the whole suite still
+     * green, and both later turned out to carry defects nothing had found.
+     *
+     * A plain field increment on a path that already does a bounds-checked
+     * walk; measured at the noise floor.
+     */
+    public long skips;
+
+    public long skipFrom(long p) {
+        if (busy) throw concurrentUse();
+        skips++;
+        busy = true;
+        long save = pos; int d = depth, sd = skipDepth;
+        try { pos = p; skipDepth = 0; skipValue(); return pos; }
+        finally { pos = save; depth = d; skipDepth = sd; busy = false; }
+    }
+
+    /** Decode the value at `p`. Does not disturb the caller's position or depth. */
     public Object readFrom(long p) {
-        long save = pos;
-        try { pos = p; return read(); }
-        finally { pos = save; }
+        if (busy) throw concurrentUse();
+        busy = true;
+        // `items` is saved and CLEARED, like depth. A positional read is an
+        // independent lookup -- `boring.nav` shares one Reader across every
+        // one of them -- so without this two navigations consumed each other's
+        // budget and the tenth `get` on a large document failed because of the
+        // nine before it.
+        long save = pos; int d = depth; long it = items;
+        try { pos = p; items = 0; return read(); }
+        finally { pos = save; depth = d; items = it; busy = false; }
     }
 
     /**
@@ -417,14 +691,67 @@ public final class Reader {
      */
     public boolean bytesEqualAt(long p, byte[] probe) {
         int n = probe.length;
-        if (p < 0 || p + n > limit) return false;
+        if (p < 0 || n > limit - p) return false;   // no overflow-prone addition
         for (int i = 0; i < n; i++) if (sb(p + i) != probe[i]) return false;
         return true;
     }
 
+    /**
+     * Lexicographic comparison of the ENCODED items at `a` and `b`.
+     *
+     * RFC 8949 §4.2.1 orders canonical map keys by their encoded bytes, so a
+     * navigator can binary-search a sorted map without decoding a single key.
+     * Bytewise, with the shorter encoding first when one is a prefix of the
+     * other.
+     */
+    public int compareItemsAt(long a, long b) {
+        long an = skipFrom(a) - a, bn = skipFrom(b) - b;
+        long n = Math.min(an, bn);
+        for (long i = 0; i < n; i++) {
+            int x = b(a + i), y = b(b + i);
+            if (x != y) return x < y ? -1 : 1;
+        }
+        return Long.compare(an, bn);
+    }
+
+    /** Same ordering, against an already-encoded probe. */
+    public int compareItemToBytes(long p, byte[] probe) {
+        long pn = skipFrom(p) - p;
+        long n = Math.min(pn, probe.length);
+        for (long i = 0; i < n; i++) {
+            int x = b(p + i), y = probe[(int) i] & 0xFF;
+            if (x != y) return x < y ? -1 : 1;
+        }
+        return Long.compare(pn, probe.length);
+    }
+
     /** Copy the bytes in [start, end) out. Used to lift a blob or stage a span. */
+    /** Slots for `n` key/value pairs, refusing a product that cannot be an array. */
+    private static int kvSlots(int n) {
+        long slots = (long) n * 2;
+        if (slots > Integer.MAX_VALUE - 8)
+            throw Err.of("bad-count",
+                "boring: a map of " + n + " pairs needs " + slots
+                + " slots, more than one array can hold");
+        return (int) slots;
+    }
+
+    /**
+     * Bytes in [start, end). RANGE-CHECKED, because these are a public Java
+     * entry point: `(int)(end - start)` on a reversed or out-of-range pair was
+     * a raw NegativeArraySizeException or ArrayIndexOutOfBoundsException rather
+     * than the typed failure the rest of the reader promises.
+     */
     public byte[] bytesBetween(long start, long end) {
-        return freshBytes(start, (int) (end - start));
+        if (start < 0 || end < start || end > limit)
+            throw Err.of("bad-range",
+                "boring: byte range [" + start + ", " + end + ") is not within"
+                + " [0, " + limit + ")");
+        long n = end - start;
+        if (n > Integer.MAX_VALUE - 8)
+            throw Err.of("bad-range",
+                "boring: byte range of " + n + " is larger than one array can hold");
+        return freshBytes(start, (int) n);
     }
 
     /** True if this document opens a stringref namespace at its root. */
@@ -458,6 +785,16 @@ public final class Reader {
     public Object readNext() {
         this.reused = true;
         depth = 0;
+        // A FRESH ITEM BUDGET PER TOP-LEVEL ITEM. `items` used to carry across
+        // them, so a CBOR sequence spent one cumulative budget for the whole
+        // file -- and because `reset()` on a streaming refill DOES clear it,
+        // acceptance depended on the chunk size: the same five items decoded at
+        // :chunk-size 2 and failed at 65536. A limit whose meaning changes with
+        // an unrelated buffering knob cannot be the right one.
+        //
+        // Per-item matches what the streaming API already promises: retained
+        // memory is bounded by the largest single item, not by the file.
+        items = 0;
         srActive = false;
         if (srCount > 0) {
             java.util.Arrays.fill(srStrings, 0, srCount, null);
@@ -483,9 +820,30 @@ public final class Reader {
     // null check that predicts perfectly, and it keeps the byte[] path on
     // plain array loads.
 
-    /** Unsigned byte at an absolute offset. */
+    /**
+     * Unsigned byte at an absolute offset.
+     *
+     * The explicit limit check is what makes a POSITIONAL read report
+     * `:boring/truncated-input` like every other read, instead of a raw
+     * ArrayIndexOutOfBoundsException. `read` gets typed truncation from its own
+     * checks; `skipStructural` and the `*At` accessors had none, so the same
+     * corrupted byte gave `decode` a typed error and `boring.nav` an untyped
+     * one -- 415 of 5360 mutations of an UNINDEXED document, so this is the
+     * navigator's contract with damaged data, not anything to do with the index.
+     *
+     * The array bound was always checked here; only by the JVM, and only to
+     * throw the wrong type. Measured at no cost: the JIT can prove its own
+     * check redundant once this one dominates it.
+     */
     private int b(long p) {
+        if (p < 0 || p >= limit) throw truncated(p);
         return (arr != null ? arr[(int) p] : src.at(p)) & 0xFF;
+    }
+
+    private RuntimeException truncated(long p) {
+        return Err.of("truncated-input",
+            "boring: read past the end of the input at offset " + p
+            + " (size " + limit + ")");
     }
 
     /** Signed byte. The ident hash below folds raw bytes, so it must stay signed
@@ -495,14 +853,17 @@ public final class Reader {
     }
 
     private int s16(long p) {
+        if (p < 0 || p + 2 > limit) throw truncated(p);
         return (arr != null ? (short) SHORT_BE.get(arr, (int) p) : src.i16(p)) & 0xFFFF;
     }
 
     private int s32(long p) {
+        if (p < 0 || p + 4 > limit) throw truncated(p);
         return arr != null ? (int) INT_BE.get(arr, (int) p) : src.i32(p);
     }
 
     private long s64(long p) {
+        if (p < 0 || p + 8 > limit) throw truncated(p);
         return arr != null ? (long) LONG_BE.get(arr, (int) p) : src.i64(p);
     }
 
@@ -545,11 +906,48 @@ public final class Reader {
         return new String(a, scratchOff, n, cs);
     }
 
+    /** Recursion depth of the CURRENT skipStructural walk. Reset by skipFrom. */
+    private int skipDepth = 0;
+
+    /**
+     * The bound on skip recursion -- a STACK bound, deliberately not `maxDepth`.
+     *
+     * `maxDepth` is a semantic limit that `read` applies, and skip cannot
+     * reproduce read's accounting: a tag reader that consumes its payload's
+     * containers inline charges nothing for them, while a generic walker must
+     * recurse. Shaped arrays cost three such levels each, and they nest, so the
+     * discrepancy is unbounded and no constant slack closes it.
+     *
+     * Making skip stricter than read is the failure that matters -- navigation
+     * then refuses a document that decodes -- so skip is deliberately LAXER:
+     * never below 1024, and above that whatever the caller allowed read. It
+     * exists only to keep a pathological document from exhausting the stack,
+     * which is what `read` gets from maxDepth as a side effect. A document read
+     * cannot handle without overflowing its own stack is not one skip needs to
+     * accept.
+     */
+    private int skipLimit() { return Math.max(maxDepth, 1024); }
+
+    private void enterSkip() {
+        if (++skipDepth > skipLimit())
+            throw Err.of("max-depth-exceeded",
+                "boring: nesting deeper than the skip bound (" + skipLimit() + ")",
+                "max-depth", (long) skipLimit());
+    }
+
     private void enter() {
-        if (++depth > maxDepth)
+        // Check BEFORE incrementing. `++depth > maxDepth` left depth raised on
+        // the throwing path, and only array/map have a `finally { exit(); }` to
+        // unwind it -- so a rejected read permanently consumed a level of the
+        // budget on a Reader that callers reuse. Two positional reads later, a
+        // perfectly shallow value was refused because of an earlier one that
+        // failed. `boring.nav` shares one Reader across every lookup, so this
+        // reached the navigation path.
+        if (depth + 1 > maxDepth)
             throw Err.of("max-depth-exceeded",
                 "boring: nesting deeper than maxDepth (" + maxDepth + ")",
                 "max-depth", (long) maxDepth);
+        depth++;
     }
 
     private void exit() { depth--; }
@@ -648,10 +1046,39 @@ public final class Reader {
      * IllegalArgumentException -- a raw JVM exception through the typed-error
      * contract -- so the shape is checked before it is handed over.
      */
+    /**
+     * The same content, but never null -- for the markers that cast to List and
+     * call size()/toArray(). `seqableContent` admits nil because nil IS seqable
+     * in Clojure, which is right for the callers that seq it and wrong for the
+     * ones that dereference it: `27(["java/boolean-array", null])` was a raw
+     * NullPointerException out of a well-formed frame, against the typed-only
+     * guarantee doc/SECURITY.md makes.
+     */
+    private static java.util.List listMarkerContent(Object argument, String name) {
+        Object c = seqableContent(argument, name);
+        if (!(c instanceof java.util.List))
+            throw Err.of("bad-tag-content",
+                "boring: " + name + " must wrap a list, got "
+                + (c == null ? "nil" : c.getClass().getSimpleName()), "tag", 27L);
+        return (java.util.List) c;
+    }
+
     private static Object seqableContent(Object argument, String name) {
+        // A LIST OR A SET, not anything Seqable. `Seqable` admits maps and
+        // records, and `RT.seq` of a map yields MAP ENTRIES -- so
+        // `27(["clojure/sorted-set", simple(172)])` decoded to `#{[:n 172]}`
+        // and `27(["clojure/sorted-set", {1: 2}])` to `#{[1 2]}`: a silently
+        // WRONG VALUE built out of a payload that is not an array at all.
+        //
+        // Sets are admitted because ClojureScript's `seq-content` admits them
+        // (`sequential?` or `set?`), and a map is not `sequential?` there --
+        // so this was also the lenient half of a parser differential.
+        //
+        // null still passes: `RT.seq(null)` is an empty collection on both
+        // platforms, and that parity predates this.
         if (argument == null
                 || argument instanceof java.util.List
-                || argument instanceof clojure.lang.Seqable)
+                || argument instanceof java.util.Set)
             return argument;
         throw Err.of("bad-tag-content",
             "boring: " + name + " must wrap an array, got "
@@ -812,6 +1239,22 @@ public final class Reader {
     private static final java.util.concurrent.ConcurrentHashMap<String, Object> CTOR_CACHE =
         new java.util.concurrent.ConcurrentHashMap<>();
 
+    /**
+     * The JVM class name for a record wire name.
+     *
+     * A wire name is `namespace/Name` as WRITTEN -- slash because a dot cannot
+     * say where the namespace ends, and unmunged because ClojureScript has the
+     * true name and the JVM can recover it. A class name is the inverse:
+     * `namespace` munged with `-` to `_`, joined by a dot. Names with no slash
+     * are passed through, so a registered override or a foreign producer's
+     * dotted name still resolves.
+     */
+    private static String classNameOf(String wire) {
+        int i = wire.lastIndexOf('/');
+        if (i < 0) return wire;
+        return wire.substring(0, i).replace('-', '_') + "." + wire.substring(i + 1);
+    }
+
     private static Object tryConstructRecord(String name, Object fields) {
         Object cached = CTOR_CACHE.get(name);
         if (cached == null) {
@@ -830,7 +1273,7 @@ public final class Reader {
 
     private static Object resolveRecordCreate(String name) {
         try {
-            Class<?> c = clojure.lang.RT.classForNameNonLoading(name);
+            Class<?> c = clojure.lang.RT.classForNameNonLoading(classNameOf(name));
             if (c == null || !clojure.lang.IRecord.class.isAssignableFrom(c))
                 return NOT_A_RECORD;
             java.lang.reflect.Method m =
@@ -866,6 +1309,43 @@ public final class Reader {
      */
     private static final int KW_SYMREF_PREFIX = 0xD827D819;
 
+    private TagRegistry identFastPathFor;
+    private boolean identFastPathOk;
+
+    /**
+     * Whether the five-byte identifier shortcut may be taken at all.
+     *
+     * It returns an interned identifier WITHOUT reaching `readTagged`, which is
+     * where `registry.readerFor(tag)` is consulted -- so a caller who
+     * registered a reader for tag 39 or tag 25 had it silently ignored for the
+     * five-byte form and honoured for `D8 27 D9 0019 00`, the same value under
+     * a wider stringref index. Acceptance depended on which legal encoding the
+     * producer chose, and ClojureScript honoured the override for both.
+     *
+     * That is exactly the defect the comment on `readTagged` says was fixed
+     * ("registering a reader for a tag boring knows natively was SILENTLY
+     * IGNORED"); the optimisation reintroduced it for the one tag a consumer
+     * with its own symbol type is most likely to override.
+     *
+     * Cached against the registry's IDENTITY rather than recomputed: the field
+     * is public and assigned directly, so there is no setter to hook, and a
+     * reference compare plus a boolean is what the hot path can afford.
+     */
+    private boolean identFastPath() {
+        // Tag 25 is NOT tested here, and that is deliberate rather than an
+        // omission. It is a structural tag -- stringref is how the format
+        // encodes repetition, not a value type -- and `TagRegistry` now refuses
+        // to register a reader for it at all, so there is nothing to bypass.
+        // The clause that used to be here could not have an effect: the slow
+        // path reads tag 25 inside tag 39 by hand too, so disabling the
+        // shortcut changed nothing.
+        if (registry != identFastPathFor) {
+            identFastPathFor = registry;
+            identFastPathOk = registry.readerFor(39) == null;
+        }
+        return identFastPathOk;
+    }
+
     /**
      * Hot entry point; the rest of the dispatch lives in readGeneral().
      *
@@ -876,11 +1356,13 @@ public final class Reader {
      * harmless and keeps the hot path readable, not because it bought speed.
      */
     public Object read() {
+        countItem();
         int b0 = b(pos);
 
         // Repeated keyword/symbol: D8 27 D8 19 <idx>
         if (b0 == 0xD8 && pos + 4 < limit
-                && s32(pos) == KW_SYMREF_PREFIX) {
+                && s32(pos) == KW_SYMREF_PREFIX
+                && identFastPath()) {
             int idx = b(pos + 4);
             if (idx < 24) {                       // inline uint: byte IS the index
                 pos += 5;
@@ -975,7 +1457,11 @@ public final class Reader {
             case 5: {                                       // map
                 if (info == 31) { enter(); try { return readIndefiniteMap(); } finally { exit(); } }
                 int n = checkCount(arg(info), 2);
-                Object[] kvs = new Object[n * 2];
+                // CHECKED before narrowing: `checkCount(n, 2)` can pass for an
+                // n whose `n * 2` overflows signed int on a source larger than
+                // 2 GiB, which was a raw NegativeArraySizeException. Even
+                // below that, the product may exceed any usable heap.
+                Object[] kvs = new Object[kvSlots(n)];
                 enter();
                 try {
                     for (int i = 0; i < n; i++) {
@@ -1000,7 +1486,34 @@ public final class Reader {
                     case 21: return Boolean.TRUE;
                     case 22: return null;                   // null
                     case 23: return Data.UNDEFINED;              // NOT nil — distinct value
-                    case 24: return Data.MAKE_SIMPLE.invoke(Long.valueOf(u8()));
+                    // `f8 00` .. `f8 1f` are REJECTED. RFC 8949 3.3: "An encoder
+                    // MUST NOT issue two-byte sequences that start with 0xf8 ...
+                    // and continue with a byte less than 0x20 (32 decimal). Such
+                    // sequences are not well-formed." That last sentence makes
+                    // this a well-formedness rule binding on the DECODER too, not
+                    // the encoder-only rule it reads as at first glance --
+                    // Appendix C's pseudocode calls fail(), and Appendix F.1
+                    // enumerates f800/f801/f818/f81f among the not-well-formed.
+                    //
+                    // This was once accepted here, on the grounds that Appendix A
+                    // lists `f818` as decodable simple(24). It does not: that row
+                    // is RFC 7049's, deleted from RFC 8949 by Erratum 5917. The
+                    // vector in test/boring/vectors.cljc had outlived its spec.
+                    //
+                    // Rejecting is also the majority behaviour -- jackson,
+                    // fxamacker, node-cbor, cbor2-JS, and cbor2-Python's 6.x
+                    // rewrite all refuse it. Of those that accept, ciborium and
+                    // cbor-x decode `f814` as plain `false`, laundering a
+                    // malformed encoding into a valid-looking value.
+                    case 24: {
+                        int sv = u8();
+                        if (sv < 32)
+                            throw Err.of("malformed-simple-value",
+                                "boring: two-byte simple value 0x" + Integer.toHexString(sv)
+                                    + " is not well-formed (RFC 8949 3.3 reserves f8 00..f8 1f)",
+                                "value", (long) sv);
+                        return Data.MAKE_SIMPLE.invoke(Long.valueOf(sv));
+                    }
                     case 25: return readHalf();
                     case 26: return Float.intBitsToFloat((int) u32());
                     case 27: return Double.longBitsToDouble(u64());
@@ -1083,13 +1596,11 @@ public final class Reader {
     /**
      * Build a map from an interleaved k/v array, rejecting duplicate keys.
      *
-     * `RT.map` does this via `createWithCheck`, whose O(n^2) loop calls
-     * `Util.equiv` on every pair. For boxed numbers that lands in
-     * `Numbers.equal`'s category dispatch, measured at 96 ns for a 5-pair map
-     * (34 ns keyword keys, 118 ns string keys) — 10-37% of decode time.
-     *
-     * Prefiltering on hash makes the comparison nearly free: distinct keys
-     * almost never collide, so `equiv` runs only for genuine candidates.
+     * Small maps are built once through createAsIfByAssoc and rejected when
+     * the resulting count is smaller than the declared pair count. Array keys
+     * get a bounded content scan because host maps compare them by identity.
+     * Large maps use the content-aware HashSet path below. This avoids a
+     * HashSet plus one wrapper per key on every five-key datom map.
      *
      * The check is kept rather than dropped because differing duplicate-key
      * behaviour between implementations is a parser-differential attack
@@ -1133,43 +1644,241 @@ public final class Reader {
         return true;
     }
 
-    /** Would the runtime itself represent this map as a PersistentArrayMap? */
-    private static boolean fitsArrayMap(Object[] kvs, int n) {
-        if (n <= ARRAY_MAP_PAIRS) return true;
-        return n <= ARRAY_MAP_KW_PAIRS && allKeywordKeys(kvs, n);
+    /**
+     * A map key or set element wrapped so that ARRAYS compare by CONTENT.
+     *
+     * Host array equality is identity on the JVM, so two content-equal
+     * `short[]` keys -- or `byte[]`, or a tag-40 payload -- were two distinct
+     * keys, and a document with duplicate CBOR keys decoded to a map with more
+     * entries than the wire described. doc/SECURITY.md says duplicate detection
+     * compares encoded key bytes; for everything but byte strings it did not.
+     *
+     * Wrapping also replaces the two O(n^2) pair scans this used to do -- one
+     * of them specifically for byte-string keys, and unbounded above the
+     * array-map threshold, which made it attacker-controlled work on read. A
+     * HashSet of these is one pass.
+     *
+     * Non-array keys delegate to Clojure's own hasheq/equiv, so `1` and `1.0`
+     * stay distinct per RFC 8949 5.6.1 and a stringref-resolved string still
+     * collides with its literal spelling -- which comparing raw encoded bytes
+     * would have missed.
+     */
+    private static final class KeyProbe {
+        final Object k;
+        private final int hash;
+        KeyProbe(Object k) { this.k = k; this.hash = hashOf(k); }
+
+        private static int hashOf(Object o) {
+            if (o instanceof byte[])    return java.util.Arrays.hashCode((byte[]) o);
+            if (o instanceof short[])   return java.util.Arrays.hashCode((short[]) o);
+            if (o instanceof int[])     return java.util.Arrays.hashCode((int[]) o);
+            if (o instanceof long[])    return java.util.Arrays.hashCode((long[]) o);
+            if (o instanceof double[])  return java.util.Arrays.hashCode((double[]) o);
+            if (o instanceof float[])   return java.util.Arrays.hashCode((float[]) o);
+            if (o instanceof char[])    return java.util.Arrays.hashCode((char[]) o);
+            if (o instanceof boolean[]) return java.util.Arrays.hashCode((boolean[]) o);
+            if (o instanceof Object[])  return java.util.Arrays.deepHashCode((Object[]) o);
+            return clojure.lang.Util.hasheq(o);
+        }
+
+        private static boolean eq(Object a, Object b) {
+            if (a instanceof byte[] && b instanceof byte[])
+                return java.util.Arrays.equals((byte[]) a, (byte[]) b);
+            if (a instanceof short[] && b instanceof short[])
+                return java.util.Arrays.equals((short[]) a, (short[]) b);
+            if (a instanceof int[] && b instanceof int[])
+                return java.util.Arrays.equals((int[]) a, (int[]) b);
+            if (a instanceof long[] && b instanceof long[])
+                return java.util.Arrays.equals((long[]) a, (long[]) b);
+            if (a instanceof double[] && b instanceof double[])
+                return java.util.Arrays.equals((double[]) a, (double[]) b);
+            if (a instanceof float[] && b instanceof float[])
+                return java.util.Arrays.equals((float[]) a, (float[]) b);
+            if (a instanceof char[] && b instanceof char[])
+                return java.util.Arrays.equals((char[]) a, (char[]) b);
+            if (a instanceof boolean[] && b instanceof boolean[])
+                return java.util.Arrays.equals((boolean[]) a, (boolean[]) b);
+            if (a instanceof Object[] && b instanceof Object[])
+                return java.util.Arrays.deepEquals((Object[]) a, (Object[]) b);
+            // A COMPARATOR FAILURE IS "NOT EQUAL", not an exception.
+            //
+            // `Util.equiv` on a sorted collection runs its comparator, and a
+            // sorted map decoded from the wire can be asked to compare itself
+            // with anything at all -- so a 32-byte document whose map has a
+            // `clojure/sorted-map` frame and an ordinary map as its two keys
+            // threw a raw ClassCastException out of `decode`, untyped,
+            // undisableable by `:check-duplicate-keys false`, and through
+            // `decode-seq` and `nav/value` as well. It also broke honest round
+            // trips: `{(sorted-map "a" 1) :x, {:b 1} :y}` encodes and then
+            // fails to decode. ClojureScript accepted the same bytes, so one
+            // document was a crash on one platform and a value on the other.
+            //
+            // Two values whose comparators cannot relate them are, for the
+            // purpose of duplicate detection, distinct -- which is the answer
+            // the caller needs and the one CBOR's data-item equality implies.
+            try {
+                return clojure.lang.Util.equiv(a, b);
+            } catch (ClassCastException e) {
+                return false;
+            }
+        }
+
+        @Override public int hashCode() { return hash; }
+        @Override public boolean equals(Object o) {
+            return o instanceof KeyProbe && eq(k, ((KeyProbe) o).k);
+        }
+    }
+
+    /** Below this, a pairwise scan beats a hash set: at most 28 comparisons and
+     *  NOTHING allocated, against a HashSet plus a KeyProbe per key.
+     *
+     *  Not a guess -- measured. Hashing every map unconditionally cost 16% of
+     *  datom-maps-200 decode (56.9 -> 66.0 us, against an unchanged hako in the
+     *  same A/B run), because a datom map is five keys and the allocation
+     *  dominates the comparisons it saves. Small maps are the common case by a
+     *  wide margin, so the threshold is where the work goes. */
+    private static final int DUP_SCAN_MAX = 8;
+
+    /** Content-aware, and O(n) above the threshold. Throws on the first
+     *  duplicate.
+     *
+     *  The quadratic branch is BOUNDED, which is what makes it safe: the pair
+     *  scan this replaced ran over maps of any size, so a large map was
+     *  attacker-controlled work on read. */
+    private void checkDistinct(Object[] kvs, int n, int stride, String what, String errType) {
+        if (n <= DUP_SCAN_MAX) {
+            for (int i = 1; i < n; i++) {
+                Object a = kvs[i * stride];
+                for (int j = 0; j < i; j++)
+                    if (KeyProbe.eq(a, kvs[j * stride]))
+                        throw Err.of(errType, "boring: duplicate " + what + ": " + a,
+                                     "key", a);
+            }
+            return;
+        }
+        java.util.HashSet<KeyProbe> seen = new java.util.HashSet<>(Math.max(4, n * 2));
+        for (int i = 0; i < n; i++) {
+            Object k = kvs[i * stride];
+            if (!seen.add(new KeyProbe(k)))
+                throw Err.of(errType, "boring: duplicate " + what + ": " + k, "key", k);
+        }
+    }
+
+    /**
+     * The keys of a tag-39649 shape, which must be distinct.
+     *
+     * Same two-tier strategy as `checkDistinct` -- a pairwise scan while `n` is
+     * small, a hashed pass past that, so the work is never attacker-controlled
+     * O(n^2) -- but stride 1 over a key-only array, and a `bad-tag-content`
+     * error carrying the tag, which is what ClojureScript raises for the same
+     * document.
+     */
+    private static void checkShapeKeys(Object[] keys, int n) {
+        if (n <= DUP_SCAN_MAX) {
+            for (int i = 1; i < n; i++)
+                for (int j = 0; j < i; j++)
+                    if (KeyProbe.eq(keys[i], keys[j])) throw duplicateShapeKey(keys[i]);
+            return;
+        }
+        java.util.HashSet<KeyProbe> seen = new java.util.HashSet<>(Math.max(4, n * 2));
+        for (int i = 0; i < n; i++)
+            if (!seen.add(new KeyProbe(keys[i]))) throw duplicateShapeKey(keys[i]);
+    }
+
+    private static RuntimeException duplicateShapeKey(Object k) {
+        return Err.of("bad-tag-content",
+            "boring: shaped array has a duplicate key: " + k, "tag", 39649L, "key", k);
+    }
+
+    private static boolean anyArrayKey(Object[] kvs, int n) {
+        for (int i = 0; i < n; i++) {
+            Object k = kvs[i * 2];
+            if (k != null && k.getClass().isArray()) return true;
+        }
+        return false;
+    }
+
+    /** Allocation-free content check for maps whose size is bounded by the
+     * array-map threshold. Called only when at least one key is an array; for
+     * ordinary keys createAsIfByAssoc already performs the needed equality. */
+    private static void checkDistinctSmall(Object[] kvs, int n) {
+        for (int i = 0; i < n; i++) {
+            for (int j = i + 1; j < n; j++) {
+                if (KeyProbe.eq(kvs[i * 2], kvs[j * 2])) {
+                    Object k = kvs[i * 2];
+                    throw Err.of("duplicate-map-key",
+                        "boring: duplicate map key: " + k, "key", k);
+                }
+            }
+        }
     }
 
     private Object buildMap(Object[] kvs, int n) {
         if (n == 0) return clojure.lang.PersistentArrayMap.EMPTY;
-        if (checkDuplicateKeys && n > 1) {
-            if (fitsArrayMap(kvs, n)) {
-                if (dupHashes.length < n) dupHashes = new int[Math.max(n, dupHashes.length * 2)];
-                final int[] hashes = dupHashes;
-                for (int i = 0; i < n; i++) hashes[i] = clojure.lang.Util.hasheq(kvs[i * 2]);
-                for (int i = 0; i < n; i++) {
-                    for (int j = i + 1; j < n; j++) {
-                        if (hashes[i] == hashes[j]
-                                && clojure.lang.Util.equiv(kvs[i * 2], kvs[j * 2])) {
-                            throw Err.of("duplicate-map-key", "boring: duplicate map key: " + kvs[i * 2], "key", kvs[i * 2]);
-                        }
-                    }
-                }
-            } else {
-                // Above the array-map threshold the hash map's own build does
-                // an O(n) check already — but it raises Clojure's
-                // IllegalArgumentException, which is untyped as far as our
-                // callers are concerned. Fuzzing surfaced it.
-                try {
-                    return clojure.lang.PersistentHashMap.createWithCheck(kvs);
-                } catch (IllegalArgumentException e) {
-                    throw Err.of("duplicate-map-key",
-                        "boring: " + e.getMessage());
-                }
+        final boolean fits = n <= ARRAY_MAP_PAIRS
+            || (n <= ARRAY_MAP_KW_PAIRS && allKeywordKeys(kvs, n));
+        if (fits) {
+            // Build once. For ordinary keys the resulting count is the
+            // duplicate check, avoiding a HashSet and one KeyProbe allocation
+            // per key on every small map. Array identity is the one exception,
+            // handled by a bounded, allocation-free content scan.
+            if (checkDuplicateKeys && n > 1 && anyArrayKey(kvs, n))
+                checkDistinctSmall(kvs, n);
+            clojure.lang.IPersistentMap m;
+            try {
+                m = clojure.lang.PersistentArrayMap.createAsIfByAssoc(kvs);
+            } catch (ClassCastException e) {
+                // `createAsIfByAssoc` compares keys with Clojure equality, which
+                // runs a SORTED collection's comparator -- and a sorted map
+                // decoded from the wire can be asked to compare itself with
+                // anything. A 32-byte document whose map holds a
+                // `clojure/sorted-map` frame and an ordinary map as its two keys
+                // therefore threw a raw ClassCastException out of `decode`:
+                // untyped, not suppressed by `:check-duplicate-keys false`,
+                // reaching `decode-seq` and `nav/value` too, and accepted
+                // without complaint on ClojureScript -- one document, a crash on
+                // one platform and a value on the other. It also broke honest
+                // round trips of maps a caller can build in Clojure today.
+                //
+                // The hash map compares only on a hash COLLISION, so it builds
+                // the same value without asking two unrelated collections to
+                // order themselves. Falling back is not a degradation: above the
+                // array-map threshold this is the representation anyway.
+                //
+                // THE DUPLICATE CHECK STILL RUNS. The first version of this
+                // returned here directly, so a map carrying one sorted key
+                // stopped being checked at all: `{sorted-map: .., {1 1}: .., 1:
+                // .., 1: ..}` decoded to a three-entry map with the default
+                // `:check-duplicate-keys true`, while the same duplicate without
+                // the sorted key threw. A fallback that also drops a documented
+                // guarantee is a second defect wearing the first one's clothes.
+                if (checkDuplicateKeys && n > 1)
+                    checkDistinct(kvs, n, 2, "map key", "duplicate-map-key");
+                return clojure.lang.PersistentHashMap.create(kvs);
             }
+            if (checkDuplicateKeys && m.count() != n) {
+                checkDistinctSmall(kvs, n); // finds the key for typed ex-data
+                throw Err.of("duplicate-map-key", "boring: duplicate map key");
+            }
+            return m;
         }
-        if (fitsArrayMap(kvs, n)) {
-            return new clojure.lang.PersistentArrayMap(kvs);
+        if (checkDuplicateKeys) {
+            // The large path stays one-pass and content-aware; unlike the old
+            // pair scan, its work is not attacker-controlled O(n^2).
+            checkDistinct(kvs, n, 2, "map key", "duplicate-map-key");
         }
+        // WITH THE CHECK OFF, LAST-WINS -- never a corrupt map.
+        //
+        // `new PersistentArrayMap(kvs)` ADOPTS the array without inspecting it,
+        // so duplicate keys produced a map with two equal keys: `count` said 2
+        // and `get` returned the first, which is not a valid Clojure map and is
+        // the same defect class as adopting an oversized vector tail. RFC 8949
+        // 5.6 offers three approaches -- reject, keep one, or hand duplicates to
+        // the application -- and a corrupt host map is none of them.
+        //
+        // `createAsIfByAssoc` is last-wins, matching what the hash-map branch
+        // below has always done, so the two sizes now agree instead of
+        // differing at the array-map threshold.
         return clojure.lang.PersistentHashMap.create(kvs);
     }
 
@@ -1202,6 +1911,120 @@ public final class Reader {
                 "boring: tag " + tag + " content must be a " + size + "-element array",
                 "tag", (long) tag);
         return (java.util.List) o;
+    }
+
+    /** `:tag`/`:value` of a `boring.data.TaggedValue`, looked up rather than cast.
+     *  The record is defined in Clojure, which compiles AFTER this class, so
+     *  `instanceof` is not available here -- `ILookup` is. */
+    private static final clojure.lang.Keyword KW_TAG = clojure.lang.Keyword.intern("tag");
+    private static final clojure.lang.Keyword KW_VALUE = clojure.lang.Keyword.intern("value");
+
+    /**
+     * A vector from a fully-populated array, valid at ANY length.
+     *
+     * `PersistentVector.adopt(Object[])` takes its argument as the vector's
+     * TAIL, so it is only correct through 32 elements. Past that the result is
+     * a vector with a plausible `count` whose root is null: `nth` throws
+     * NullPointerException below index 32 and returns the wrong element above
+     * it. Decoding SUCCEEDS and hands back a corrupt structure, which is worse
+     * than any rejection -- a caller has no way to notice.
+     *
+     * The array reader has always had the cutoff (see case 4). Two newer paths
+     * -- wide uint64 typed arrays and tag-40 reconstruction -- called `adopt`
+     * unconditionally, so this is the shared helper all three now use rather
+     * than a rule each site has to remember.
+     */
+    private static clojure.lang.IPersistentVector vectorFromArray(Object[] items) {
+        if (items.length == 0) return PersistentVector.EMPTY;
+        if (items.length <= 32) return PersistentVector.adopt(items);
+        ITransientCollection tv = PersistentVector.EMPTY.asTransient();
+        for (Object o : items) tv = tv.conj(o);
+        return (clojure.lang.IPersistentVector) tv.persistent();
+    }
+
+    /** A Number as an exact BigInteger, or null if it is not integral.
+     *
+     *  `longValue()` narrows silently, which is how a tag-1002 key of 2^64+1
+     *  became 1 and aliased the base key. Every integral CBOR type this reader
+     *  produces is covered; a float or anything else returns null. */
+    private static java.math.BigInteger exactInteger(Object o) {
+        if (o instanceof clojure.lang.BigInt) return ((clojure.lang.BigInt) o).toBigInteger();
+        if (o instanceof java.math.BigInteger) return (java.math.BigInteger) o;
+        if (o instanceof Long || o instanceof Integer
+            || o instanceof Short || o instanceof Byte)
+            return java.math.BigInteger.valueOf(((Number) o).longValue());
+        return null;
+    }
+
+    /** 10^e for the small e RFC 9581's decimal scale factors use. */
+    private static long pow10(int e) {
+        long r = 1;
+        while (e-- > 0) r *= 10;
+        return r;
+    }
+
+    /** A tag-258 set, with the duplicate-element check both content paths need.
+     *  Maps reject duplicate keys as an anti-differential measure; sets used to
+     *  collapse them silently. Same rule, same reason. */
+    private clojure.lang.IPersistentSet makeSet(Object[] items, int n) {
+        if (n == 0) return PersistentHashSet.EMPTY;
+        // CONTENT-AWARE, like map keys. `PersistentHashSet.create` compares
+        // arrays by identity, so tag 258 holding two content-equal byte strings
+        // came back as a two-element set -- more elements than the wire
+        // describes, and the same defect the map path had.
+        if (checkDuplicateKeys && n > 1)
+            checkDistinct(items, n, 1, "tag 258 element", "duplicate-set-element");
+        clojure.lang.IPersistentSet set = PersistentHashSet.create(items);
+        if (checkDuplicateKeys && set.count() != n)
+            throw Err.of("duplicate-set-element",
+                "boring: tag 258 declared " + n + " elements but "
+                + set.count() + " are distinct", "declared", (long) n);
+        return set;
+    }
+
+    /** One element of a tag-40 payload, which may be a typed array or a CBOR array. */
+    private static Object elementAt(Object flat, int i) {
+        if (flat instanceof java.util.List) return ((java.util.List) flat).get(i);
+        return java.lang.reflect.Array.get(flat, i);
+    }
+
+    /** Nested vectors for a tag-40 payload of any dimensionality, row-major.
+     *
+     *  `count` is the number of elements in the block starting at `offset`, so
+     *  each level divides rather than re-multiplying the remaining shape. The
+     *  product was range-checked against the payload length before the first
+     *  call, which is what makes the indexing here total. */
+    private static Object nestDims(Object flat, int[] shape, int total) {
+        // ITERATIVE, deliberately. This recursed once per DIMENSION, and the
+        // dimensions are a flat array, so :max-depth never charged for them: a
+        // structurally shallow 20 KB item declaring 20 000 dimensions of 1 blew
+        // the host stack on both platforms, with no ex-data. RFC 8746 does not
+        // bound dimensionality, so the count cannot just be capped at some
+        // arbitrary number -- it has to be built without recursion.
+        //
+        // Necessary but not sufficient: the RESULT is still nested as deeply as
+        // there are dimensions, so `=` or `hash` on it would overflow later in
+        // the CALLER. The dimension count is charged against :max-depth at the
+        // call site for that, which is what the budget is for.
+        int k = shape.length;
+        int inner = shape[k - 1];
+        Object[] level = new Object[total / inner];
+        for (int g = 0; g < level.length; g++) {
+            Object[] row = new Object[inner];
+            for (int i = 0; i < inner; i++) row[i] = elementAt(flat, g * inner + i);
+            level[g] = vectorFromArray(row);
+        }
+        for (int d = k - 2; d >= 0; d--) {
+            int len = shape[d];
+            Object[] next = new Object[level.length / len];
+            for (int o = 0; o < next.length; o++) {
+                Object[] grp = new Object[len];
+                System.arraycopy(level, o * len, grp, 0, len);
+                next[o] = vectorFromArray(grp);
+            }
+            level = next;
+        }
+        return level[0];
     }
 
     private static java.math.BigInteger integerContent(Object o, int tag) {
@@ -1302,8 +2125,16 @@ public final class Reader {
                 for (int i = 0; i < n; i++) a[i] = (short) (b[off + i] & 0xFF);
                 return a; }
             case 72: {                              // sint8
-                byte[] a = new byte[n];
-                System.arraycopy(b, off, a, 0, n);
+                // short[], though `byte` holds -128..127 exactly and is the
+                // narrower primitive. byte[] is OVERLOADED on the write side:
+                // it is how a plain CBOR byte string decodes, so it re-encodes
+                // as major type 2. A peer that sent an ARRAY OF THREE SIGNED
+                // INTEGERS got a BYTE STRING back -- the only typed array that
+                // changed the CBOR data model rather than merely widening.
+                // Widening to short[] costs a byte per element and keeps it an
+                // array (tag 77 on the way out).
+                short[] a = new short[n];
+                for (int i = 0; i < n; i++) a[i] = b[off + i];
                 return a; }
             case 65: case 69: {                     // uint16 BE / LE
                 int[] a = new int[n];
@@ -1326,19 +2157,49 @@ public final class Reader {
                 for (int i = 0; i < n; i++) a[i] = (int) INT_BE.get(b, off + (i << 2));
                 return a; }
             case 67: case 71: {                     // uint64 BE / LE
-                long[] a = new long[n];
+                // Above 2^63 a uint64 has no lossless long, and handing back the
+                // negative that the bits happen to spell would be a wrong value.
+                // boring used to REFUSE the whole array for it -- conforming RFC
+                // 8746 input rejected because of a host-type limit, and rejected
+                // DATA-DEPENDENTLY, so the same producer's tag 67 worked until
+                // the day a value crossed 2^63.
+                //
+                // Scanned first so the common case still returns a primitive
+                // long[] with no boxing; only an array that actually needs the
+                // width pays for a vector of BigInt, which is what a CBOR bignum
+                // decodes to everywhere else in this reader.
+                boolean wide = false;
                 for (int i = 0; i < n; i++) {
                     long u = tag == 67 ? (long) LONG_BE.get(b, off + (i << 3))
                                        : (long) LONG_LE.get(b, off + (i << 3));
-                    // Above 2^63 a uint64 has no lossless long. Refuse rather than
-                    // hand back a negative number that silently is not the value.
-                    if (u < 0)
-                        throw Err.of("bad-tag-content",
-                            "boring: uint64 element " + i + " exceeds Long/MAX_VALUE",
-                            "tag", (long) tag);
-                    a[i] = u;
+                    if (u < 0) { wide = true; break; }
                 }
-                return a; }
+                if (!wide) {
+                    long[] a = new long[n];
+                    for (int i = 0; i < n; i++)
+                        a[i] = tag == 67 ? (long) LONG_BE.get(b, off + (i << 3))
+                                         : (long) LONG_LE.get(b, off + (i << 3));
+                    return a;
+                }
+                // CHARGED, because THIS branch is the one that amplifies. A
+                // primitive long[] above is one object for the whole payload --
+                // 1.0x, which is what doc/SECURITY.md's table says about typed
+                // arrays. A vector of boxed BigInt is one object per element:
+                // 1 MB of `ff` bytes under tag 67 retained 11 MB, 12.5x, with
+                // `{:max-items 100}` set and honoured. The budget must see the
+                // objects the decoder BUILDS, and it could not see these because
+                // the payload arrived as a single byte string.
+                countItems(n);
+                Object[] w = new Object[n];
+                for (int i = 0; i < n; i++) {
+                    long u = tag == 67 ? (long) LONG_BE.get(b, off + (i << 3))
+                                       : (long) LONG_LE.get(b, off + (i << 3));
+                    w[i] = u >= 0
+                        ? (Object) Long.valueOf(u)
+                        : clojure.lang.BigInt.fromBigInteger(
+                              new java.math.BigInteger(Long.toUnsignedString(u)));
+                }
+                return vectorFromArray(w); }
             case 75: {                              // sint64 BE
                 long[] a = new long[n];
                 for (int i = 0; i < n; i++) a[i] = (long) LONG_BE.get(b, off + (i << 3));
@@ -1446,8 +2307,25 @@ public final class Reader {
                 // pure waste for an identifier we have already seen, and short
                 // keywords never get a stringref index to spare us.
                 int th = u8();
-                if ((th >>> 5) != 3)
-                    throw Err.of("bad-tag-content", "boring: tag 39 must wrap a text string, got major " + (th >>> 5));
+                if ((th >>> 5) != 3 || (th & 0x1F) == 31) {
+                    // NOT AN ERROR. IANA registers tag 39's data item as
+                    // "multiple", and the defining spec (lucas-clemente/
+                    // cbor-specs id.md) says it "can be applied to multiple
+                    // types to indicate that the tagged object has identifier
+                    // semantics". Throwing here failed the WHOLE DOCUMENT over
+                    // a foreign identifier boring simply has no mapping for;
+                    // carrying it as an inert TaggedValue is the same
+                    // degradation every other uninterpreted tag gets.
+                    //
+                    // An indefinite-length text string lands here too (the head
+                    // read above only recognises the definite form), and must
+                    // still become an identifier -- hence the String case
+                    // rather than a blanket TaggedValue.
+                    pos = save;
+                    Object v = read();
+                    if (v instanceof String) return internIdent((String) v);
+                    return Data.MAKE_TAGGED.invoke(Long.valueOf(39), v);
+                }
                 int n = checkCount(arg(th & 0x1F), 1);
                 long start = pos;
                 // Validated exactly as readTextRaw does. This path reads the
@@ -1471,23 +2349,34 @@ public final class Reader {
                 return ident;
             }
             case 258: {                                      // set
+                long save258 = pos;
                 int h = u8();
                 if ((h >>> 5) != 4)
                     throw Err.of("bad-tag-content",
                         "boring: tag 258 must wrap an array, got major " + (h >>> 5),
                         "tag", 258L);
+                if ((h & 0x1F) == 31) {
+                    // INDEFINITE-LENGTH ARRAY. Tag 258 is registered against
+                    // "array", and 3.2.2 makes the indefinite form an array;
+                    // neither the registration nor cbor-sets-spec restricts it.
+                    // Hand-rolling the head rejected `d9 0102 9f ... ff` with
+                    // :boring/reserved-info -- conforming input refused, under
+                    // an error that was also wrong, since ai 31 is not reserved
+                    // for major type 4. Route it through the ordinary reader,
+                    // as tags 2/3/27/30 already do.
+                    pos = save258;
+                    Object content = read();
+                    if (!(content instanceof java.util.List))
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 258 must wrap an array", "tag", 258L);
+                    java.util.List cl = (java.util.List) content;
+                    return makeSet(cl.toArray(), cl.size());
+                }
                 int n = checkCount(arg(h & 0x1F), 1);
                 if (n == 0) return PersistentHashSet.EMPTY;
                 Object[] items = new Object[n];
                 for (int i = 0; i < n; i++) items[i] = read();
-                clojure.lang.IPersistentSet set = PersistentHashSet.create(items);
-                // Maps reject duplicate keys as an anti-differential measure;
-                // sets silently collapsed them. Same rule, same reason.
-                if (checkDuplicateKeys && set.count() != n)
-                    throw Err.of("duplicate-set-element",
-                        "boring: tag 258 declared " + n + " elements but "
-                        + set.count() + " are distinct", "declared", (long) n);
-                return set;
+                return makeSet(items, n);
             }
             case 2:                                          // positive bignum
             case 3: {                                        // negative bignum
@@ -1503,6 +2392,56 @@ public final class Reader {
             }
             case 0: {                                        // RFC 3339 string
                 String v = stringContent(read(), 0);
+                // RFC 3339's `date-fullyear` is exactly four digits. There is
+                // no expanded-year production in the grammar, and RFC 8949
+                // 3.4.1 defers to RFC 3339 -- but `Instant.parse` accepts
+                // java.time's own `+10000-01-01T00:00:00Z` extension, so the
+                // JVM took a document ClojureScript's grammar refuses. Rejected
+                // here rather than left to the parser, since the parser is the
+                // thing being too generous.
+                // RFC 3339 5.6's grammar, enforced where java.time is looser
+                // than it. `Instant.parse` is a java.time parser, not an RFC
+                // 3339 one, and the three places it differs all let a document
+                // through that ClojureScript refuses:
+                //
+                //   expanded years   `+10000-01-01T00:00:00Z`  (no such production)
+                //   empty secfrac    `...T00:00:00.Z`          (time-secfrac = "." 1*DIGIT)
+                //   hour 24          `...T24:00:00Z`           (time-hour = 00-23, and
+                //                                               it silently ROLLED FORWARD
+                //                                               to the next day)
+                if (!RFC3339.matcher(v).matches())
+                    throw Err.of("bad-tag-content",
+                        "boring: tag 0 content is not a valid RFC 3339 instant: " + v,
+                        "tag", 0L, "value", v);
+                // A LEAP SECOND is preserved rather than normalised.
+                //
+                // RFC 3339 permits `time-second = 60`, and `Instant.parse`
+                // accepts the spelling but silently rewrites it to :59 -- so
+                // "2016-12-31T23:59:60Z" and "...:59Z" decoded to the SAME
+                // instant, losing a distinction the wire carried. ClojureScript
+                // mostly rejects the spelling outright, so the platforms
+                // disagreed too.
+                //
+                // Neither host type can hold a leap second, so the choice is
+                // reject or preserve. Preserve, as an inert TaggedValue -- the
+                // same treatment f128 gets for the same reason: boring does not
+                // discard what it cannot represent, it hands it back
+                // untouched. Silently normalising was the one option that loses
+                // data without saying so.
+                //
+                // VALIDATED FIRST, not merely recognised. This returned as soon
+                // as it found `:60` after the second colon, before the real date
+                // parser ever ran -- so `9999-99-99T99:99:60Z` was accepted and
+                // preserved. Preserving a legal leap second does not make an
+                // impossible month, day, hour or minute legal.
+                //
+                // The check is the ordinary parser on a copy with `:60` replaced
+                // by `:59`: everything except the leap second itself has to be a
+                // real timestamp. If that fails, control falls through to the
+                // normal tag-0 path, which reports the malformed date.
+                int lsColon = secondsColon(v);
+                if (lsColon >= 0 && parsesAsInstant(withoutLeapSecond(v, lsColon)))
+                    return Data.MAKE_TAGGED.invoke(Long.valueOf(0), v);
                 java.time.Instant t;
                 try {
                     t = java.time.Instant.parse(v);
@@ -1512,6 +2451,7 @@ public final class Reader {
                         "tag", 0L, "value", v);
                 }
                 try {
+                    if (instantFn != null) return instantFn.invoke(t.toEpochMilli());
                     return instantAsDate ? java.util.Date.from(t) : t;
                 } catch (java.time.DateTimeException | ArithmeticException | IllegalArgumentException e) {
                     throw Err.of("bad-tag-content",
@@ -1545,6 +2485,7 @@ public final class Reader {
                         "boring: tag 1 epoch out of range: " + v, "tag", 1L, "value", v);
                 }
                 try {
+                    if (instantFn != null) return instantFn.invoke(t.toEpochMilli());
                     return instantAsDate ? java.util.Date.from(t) : t;
                 } catch (java.time.DateTimeException | ArithmeticException | IllegalArgumentException e) {
                     throw Err.of("bad-tag-content",
@@ -1580,6 +2521,23 @@ public final class Reader {
                         "boring: shaped array needs at least one key", "tag", 39649L);
                 Object[] keys = new Object[n];
                 for (int i = 0; i < n; i++) keys[i] = read();
+                // THE SHAPE'S KEYS ARE CHECKED ONCE, HERE, AND UNCONDITIONALLY.
+                //
+                // Distinctness used to fall out of building each row's map, so
+                // it inherited two properties that do not belong to it. With
+                // ZERO ROWS nothing was built and nothing was checked --
+                // `d99ae1 82 82 0101 80` decoded to `[]` here and
+                // `:boring/bad-tag-content` on ClojureScript. And it was gated
+                // on `:check-duplicate-keys`, which is an option about MAP
+                // CONTENT: with it off, `39649([[1,1],[[1,2]]])` decoded to
+                // `[{1 2}]` here and was refused there.
+                //
+                // Repeated keys make the shape itself meaningless -- the row
+                // values have nowhere distinct to land -- so it is a property
+                // of the tag content, not of the maps that come out of it, and
+                // no decode option should be able to turn it off. That is what
+                // ClojureScript has always done.
+                checkShapeKeys(keys, n);
 
                 int rh = u8();
                 if ((rh >>> 5) != 4)
@@ -1601,7 +2559,11 @@ public final class Reader {
                     // Interleave straight into the map's backing array — the
                     // keys are already decoded and interned, so there is no
                     // per-row key work at all.
-                    Object[] kvs = new Object[n * 2];
+                    // CHECKED before narrowing: `checkCount(n, 2)` can pass for an
+                // n whose `n * 2` overflows signed int on a source larger than
+                // 2 GiB, which was a raw NegativeArraySizeException. Even
+                // below that, the product may exceed any usable heap.
+                Object[] kvs = new Object[kvSlots(n)];
                     for (int i = 0; i < n; i++) {
                         kvs[i * 2] = keys[i];
                         kvs[i * 2 + 1] = read();
@@ -1646,16 +2608,41 @@ public final class Reader {
                             // built a map whose keys were entries -- which still had
                             // the right TYPE and so passed a type check, while being
                             // unequal to the input and in the wrong order.
+                            //
+                            // Wrapped, because the default comparator throws a
+                            // raw ClassCastException on keys it cannot order --
+                            // "Default comparator requires nil, Number, or
+                            // Comparable" -- and a SINGLE BYTE FLIP reaches it:
+                            // change one key's head to 0xF8 and an ordinary
+                            // document becomes a sorted-map of simple values.
+                            // That was 8502 of 8872 untyped throwables in an
+                            // exhaustive single-byte sweep, and it escaped
+                            // `decode`, `decode-seq` and `nav/value` alike.
+                            // Random-byte fuzzing never builds a tag-27 frame
+                            // carrying a valid name, which is why it survived.
                             Object m2 = clojure.lang.PersistentTreeMap.EMPTY;
-                            for (Object o : ((java.util.Map) argument).entrySet()) {
-                                java.util.Map.Entry e2 = (java.util.Map.Entry) o;
-                                m2 = ((clojure.lang.Associative) m2).assoc(e2.getKey(), e2.getValue());
+                            try {
+                                for (Object o : ((java.util.Map) argument).entrySet()) {
+                                    java.util.Map.Entry e2 = (java.util.Map.Entry) o;
+                                    m2 = ((clojure.lang.Associative) m2).assoc(e2.getKey(), e2.getValue());
+                                }
+                            } catch (ClassCastException e) {
+                                throw Err.of("bad-tag-content",
+                                    "boring: clojure/sorted-map keys are not mutually"
+                                    + " comparable (" + e.getMessage() + ")");
                             }
                             return m2;
                         }
                         case "clojure/sorted-set":
-                            return clojure.lang.PersistentTreeSet.create(
-                                clojure.lang.RT.seq(seqableContent(argument, "clojure/sorted-set")));
+                            // Same hazard, same one-byte reach: see sorted-map.
+                            try {
+                                return clojure.lang.PersistentTreeSet.create(
+                                    clojure.lang.RT.seq(seqableContent(argument, "clojure/sorted-set")));
+                            } catch (ClassCastException e) {
+                                throw Err.of("bad-tag-content",
+                                    "boring: clojure/sorted-set elements are not mutually"
+                                    + " comparable (" + e.getMessage() + ")");
+                            }
                         case "clojure/with-meta": {
                             java.util.List l2 = listContent(argument, 27, 2);
                             Object m = l2.get(0), v2 = l2.get(1);
@@ -1709,7 +2696,7 @@ public final class Reader {
                                 cause instanceof Throwable ? (Throwable) cause : null);
                         }
                         case "java/boolean-array": {
-                            java.util.List l2 = (java.util.List) seqableContent(argument, "java/boolean-array");
+                            java.util.List l2 = listMarkerContent(argument, "java/boolean-array");
                             boolean[] a = new boolean[l2.size()];
                             for (int i = 0; i < a.length; i++) {
                                 Object o = l2.get(i);
@@ -1723,7 +2710,7 @@ public final class Reader {
                         case "java/char-array":
                             return stringContent(argument, 27).toCharArray();
                         case "java/string-array": {
-                            java.util.List l2 = (java.util.List) seqableContent(argument, "java/string-array");
+                            java.util.List l2 = listMarkerContent(argument, "java/string-array");
                             String[] a = new String[l2.size()];
                             for (int i = 0; i < a.length; i++) {
                                 Object o = l2.get(i);
@@ -1735,13 +2722,14 @@ public final class Reader {
                             return a;
                         }
                         case "java/object-array": {
-                            java.util.List l2 = (java.util.List) seqableContent(argument, "java/object-array");
+                            java.util.List l2 = listMarkerContent(argument, "java/object-array");
                             return l2.toArray();
                         }
                         case "java/period": {
                             String ps = stringContent(argument, 27);
+                            java.time.Period p;
                             try {
-                                return java.time.Period.parse(ps);
+                                p = java.time.Period.parse(ps);
                             } catch (java.time.format.DateTimeParseException e) {
                                 // Wrapped: java.time's own exception is not an
                                 // ex-info, so a caller catching ExceptionInfo
@@ -1751,6 +2739,37 @@ public final class Reader {
                                     "boring: java/period is not an ISO-8601 period: " + ps,
                                     "tag", 27L);
                             }
+                            // CANONICAL FORM ONLY, and this is the definition
+                            // of it rather than a restatement: accept exactly
+                            // the spellings we would emit.
+                            //
+                            // `Period.parse` is much looser than `toString` --
+                            // it takes lower case, a leading sign, per-part
+                            // signs, weeks and leading zeros -- but a `Period`
+                            // holds years, months and days and NO spelling, so
+                            // everything else is unstorable. Measured over 25
+                            // legal inputs, 8 came back as different bytes than
+                            // they went in: P1W -> P7D, -P1D -> P-1D, +P1D ->
+                            // P1D, P1Y0M -> P1Y, P00001D -> P1D, P1Y1W1D ->
+                            // P1Y8D, P0Y0M0D -> P0D, p1d -> P1D. boring keys
+                            // content by bytes (see boring.hasch), so a decode
+                            // that silently respells is a changed address for
+                            // an unchanged value.
+                            //
+                            // Nothing legitimate is lost: boring's own writer
+                            // emits `Period.toString()`, and `java/period` is
+                            // boring's reserved name, so no other producer
+                            // writes it. Same trade as refusing RFC 3339
+                            // offsets past +/-18:00 -- conforming input
+                            // refused, deliberately, so the two platforms
+                            // agree. ClojureScript spells the same rule as a
+                            // regex; `period-domains-agree` holds them level.
+                            if (!p.toString().equals(ps))
+                                throw Err.of("bad-tag-content",
+                                    "boring: java/period is not a canonical ISO-8601"
+                                    + " period: " + ps + " (canonically " + p + ")",
+                                    "tag", 27L);
+                            return p;
                         }
                         case "clojure/queue": {
                             Object q = clojure.lang.PersistentQueue.EMPTY;
@@ -1785,15 +2804,23 @@ public final class Reader {
                 // Anything else becomes a clojure.lang.TaggedLiteral, which
                 // offers :tag and :form and never promises map-ness, so the
                 // same operations fail as ordinary "not a map" errors.
-                if (argument instanceof java.util.Map) {
-                    if (autoConstructRecords) {
-                        Object built = tryConstructRecord(name, argument);
-                        if (built != null) return built;
-                    }
-                    return Data.MAKE_UNKNOWN_RECORD.invoke(name, argument);
+                if (argument instanceof java.util.Map && autoConstructRecords) {
+                    Object built = tryConstructRecord(name, argument);
+                    if (built != null) return built;
                 }
-                return clojure.lang.TaggedLiteral.create(
-                    clojure.lang.Symbol.intern(name), argument);
+                // `:on-unknown-record`, and this is the ONLY place it applies:
+                // every earlier return above resolved the name, through the
+                // registry or a reserved marker. Auto-construction is tried
+                // first, so a policy of :error fires only when nothing at all
+                // could build the type.
+                if (onUnknownRecord == KW_ERROR)
+                    throw Err.of("unregistered-record",
+                        "boring: no record constructor registered for \"" + name
+                        + "\" and :on-unknown-record is :error",
+                        "tag", 27L);
+                if (onUnknownRecord != KW_FALLBACK && onUnknownRecord != null)
+                    return ((clojure.lang.IFn) onUnknownRecord).invoke(name, argument);
+                return Data.FRAME_FOR.invoke(name, argument);
             }
             case 1002: {                                     // duration, RFC 9581 4
                 Object v = read();
@@ -1801,7 +2828,91 @@ public final class Reader {
                     throw Err.of("bad-tag-content", "boring: tag 1002 must wrap a map",
                                  "tag", 1002L);
                 java.util.Map m = (java.util.Map) v;
-                Object sec = m.get(1L), nano = m.get(-9L);
+                // RFC 9581's map rules, ENFORCED rather than assumed.
+                //
+                // Both numbers used to go through longValue(), which silently
+                // TRUNCATED: `{1 1.5}` is a perfectly valid one-and-a-half
+                // second duration and decoded as one second. A wrong value is
+                // the worst outcome available here, and the writer's own
+                // `{1 seconds, -9 nanos}` subset hid it because round trips
+                // never produce the other forms.
+                //
+                // The rules below are the RFC's. What boring does not represent
+                // -- decimal-fraction and bigfloat bases (keys 4 and 5), and
+                // the scaled-fraction keys other than -9 -- is REFUSED with a
+                // typed error naming the key, rather than reported as "no base
+                // value" or ignored. Refusing a conforming form we cannot carry
+                // losslessly is honest; truncating it is not.
+                Object sec = m.get(1L);
+                Object nano = null;
+                // PRESENCE IS A FLAG OF ITS OWN, not `nano != null`. A CBOR
+                // null decodes to Clojure nil, so a scaled-fraction key with a
+                // NULL value left `nano` null and the whole key silently
+                // degraded to "no fraction present":
+                //
+                //   d903ea a2 01 05 28 f6            {1: 5, -9: null}  -> PT5S
+                //   d903ea a3 01 05 28 f6 22 01      {1: 5, -9: null, -3: 1}
+                //                                                      -> PT5.001S
+                //
+                // The second one is worse than a bad value: RFC 9581 3.3 says
+                // "MUST NOT contain more than one of these keys", and the check
+                // below never fired because the first key had not registered.
+                // ClojureScript refused both. Now so does this: a present key
+                // with a non-integer value reaches "fraction must be an
+                // integer" instead of being dropped.
+                boolean fracSeen = false;
+                int fracScale = 0;                  // 3, 6, 9, 12, 15 or 18
+                for (Object k : m.keySet()) {
+                    // A TEXT KEY IS ELECTIVE and skipped -- see the negative-key
+                    // note below; RFC 9581 3 groups the two together.
+                    if (!(k instanceof Number)) continue;
+                    // EXACT, not narrowed. `longValue()` wrapped, so a key of
+                    // 2^64+1 came out as 1 and ALIASED the base key -- an
+                    // unknown critical key evading the rule that is supposed to
+                    // reject it. A key too wide for a long is by definition one
+                    // we do not implement: unsigned means critical (error),
+                    // negative means elective (ignore).
+                    java.math.BigInteger kb = exactInteger(k);
+                    if (kb == null || kb.bitLength() > 63) {
+                        if (kb != null && kb.signum() < 0) continue;   // elective
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 has unknown critical key " + k, "tag", 1002L);
+                    }
+                    long kk = kb.longValueExact();
+                    if (kk == 4 || kk == 5)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 base key " + kk + " (decimal fraction /"
+                            + " bigfloat) is not a form boring represents", "tag", 1002L);
+                    // Unsigned keys are CRITICAL in RFC 9581: a reader that does
+                    // not understand one must fail rather than ignore it.
+                    if (kk >= 0 && kk != 1)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 has unknown critical key " + kk, "tag", 1002L);
+                    if (kk == -3 || kk == -6 || kk == -9
+                        || kk == -12 || kk == -15 || kk == -18) {
+                        // RFC 9581 3.3: "Each extended time data item MUST NOT
+                        // contain more than one of these keys."
+                        if (fracSeen)
+                            throw Err.of("bad-tag-content",
+                                "boring: tag 1002 has more than one decimally scaled"
+                                + " fraction key", "tag", 1002L);
+                        fracSeen = true;
+                        fracScale = (int) -kk;
+                        nano = m.get(k);
+                    }
+                    // EVERY OTHER NEGATIVE KEY IS IGNORED, which RFC 9581 3
+                    // requires: "For negative integer keys and text string values
+                    // of the key, implementations MUST ignore key/value pairs they
+                    // do not understand; these keys are 'elective', as the
+                    // extended time as a whole is still usable without the
+                    // information they carry".
+                    //
+                    // boring threw on all of them. That refused conforming
+                    // durations outright -- `{1: 5, -1: 0}` (timescale UTC, the
+                    // DEFAULT) and `{1: 5, -13: ...}` among them -- and inverted
+                    // a MUST while the comment above claimed "the rules below are
+                    // the RFC's". The unsigned half was right and stays.
+                }
                 if (sec == null)
                     throw Err.of("bad-tag-content",
                                  "boring: tag 1002 has no base value (key 1)", "tag", 1002L);
@@ -1811,17 +2922,130 @@ public final class Reader {
                 if (!(sec instanceof Number))
                     throw Err.of("bad-tag-content",
                                  "boring: tag 1002 base value must be a number", "tag", 1002L);
-                if (nano != null && !(nano instanceof Number))
+                boolean fracBase = (sec instanceof Double) || (sec instanceof Float);
+                // A BIGNUM base is checked, not narrowed. The float case was
+                // fixed and this one was not: `longValue()` on a BigInteger
+                // wraps silently, so a 20-digit second count came back as
+                // PT2157299897625622H45M19S -- a wrong Duration from valid
+                // input, which is the same defect the fractional case had.
+                // Any integral type WIDER than long, whichever class carries it:
+                // a CBOR bignum decodes to clojure.lang.BigInt here, not
+                // java.math.BigInteger, so checking one class missed the case
+                // entirely -- which is how the first attempt at this fix still
+                // returned PT2157299897625622H45M19S.
+                if (!fracBase && !(sec instanceof Long) && !(sec instanceof Integer)
+                    && !(sec instanceof Short) && !(sec instanceof Byte)) {
+                    java.math.BigInteger bi;
+                    try { bi = new java.math.BigInteger(sec.toString()); }
+                    catch (NumberFormatException e) {
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 base value is not an integer", "tag", 1002L);
+                    }
+                    if (bi.bitLength() >= 64)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 base value " + bi
+                            + " does not fit a java.time.Duration", "tag", 1002L);
+                    sec = Long.valueOf(bi.longValueExact());
+                }
+                if (!fracSeen) {
+                    if (!fracBase)
+                        return java.time.Duration.ofSeconds(((Number) sec).longValue());
+                    // A fractional base with no scaled fraction: exact, or refused.
+                    double d = ((Number) sec).doubleValue();
+                    if (Double.isNaN(d) || Double.isInfinite(d))
+                        throw Err.of("bad-tag-content",
+                                     "boring: tag 1002 base value is not finite", "tag", 1002L);
+                    // EXACT OR REFUSED, which is what the comment always said
+                    // and the arithmetic did not do. `Math.round` plus a 1e-9
+                    // tolerance ACCEPTED 5.0e-10 and rounded it to one
+                    // nanosecond -- a value the tolerance was meant to catch,
+                    // since its whole error is below the threshold -- and the
+                    // final `(long) secs` SATURATED, so 1.0e20 came back as
+                    // Long.MAX_VALUE seconds instead of being refused.
+                    //
+                    // BigDecimal.valueOf uses Double.toString, i.e. the
+                    // shortest decimal that round-trips, so this asks "is the
+                    // value as written a whole number of nanoseconds". 1.5 and
+                    // 0.1 are; 5.0e-10 is not. `new BigDecimal(double)` would
+                    // use the exact binary value and reject 0.1, which is too
+                    // strict for a duration somebody actually wrote down.
+                    java.math.BigDecimal nanosDec =
+                        java.math.BigDecimal.valueOf(d).movePointRight(9);
+                    java.math.BigInteger totalNanos;
+                    try {
+                        totalNanos = nanosDec.toBigIntegerExact();
+                    } catch (ArithmeticException e) {
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 base value " + d
+                            + " is not representable to nanosecond precision", "tag", 1002L);
+                    }
+                    java.math.BigInteger[] qr = totalNanos.divideAndRemainder(
+                        java.math.BigInteger.valueOf(1000000000L));
+                    if (qr[0].bitLength() > 63)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 base value " + d
+                            + " does not fit a java.time.Duration", "tag", 1002L);
+                    return java.time.Duration.ofSeconds(qr[0].longValueExact(),
+                                                        qr[1].longValueExact());
+                }
+                // With a scaled fraction present, RFC 9581 requires an INTEGER
+                // base and an UNSIGNED fraction. Both were accepted and
+                // truncated before.
+                if (fracBase)
                     throw Err.of("bad-tag-content",
-                                 "boring: tag 1002 fraction must be a number", "tag", 1002L);
-                return java.time.Duration.ofSeconds(((Number) sec).longValue(),
-                                                    nano == null ? 0 : ((Number) nano).longValue());
+                        "boring: tag 1002 base value must be an integer when a"
+                        + " scaled fraction is present", "tag", 1002L);
+                if (!(nano instanceof Number) || nano instanceof Double || nano instanceof Float)
+                    throw Err.of("bad-tag-content",
+                                 "boring: tag 1002 fraction must be an integer", "tag", 1002L);
+                java.math.BigInteger fb = exactInteger(nano);
+                if (fb == null || fb.bitLength() > 63)
+                    throw Err.of("bad-tag-content",
+                        "boring: tag 1002 fraction " + nano
+                        + " does not fit a java.time.Duration", "tag", 1002L);
+                long fv = fb.longValueExact();
+                if (fv < 0)
+                    throw Err.of("bad-tag-content",
+                        "boring: tag 1002 fraction " + fv + " must be unsigned", "tag", 1002L);
+                // SCALED TO NANOSECONDS. -3 is milliseconds (Java time), -6
+                // microseconds (old UNIX), -9 nanoseconds (new UNIX) -- all three
+                // exact in a Duration, and boring used to refuse two of them.
+                long nn;
+                if (fracScale <= 9) {
+                    long mul = pow10(9 - fracScale);
+                    if (fv > 999999999L / mul)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 fraction " + fv + "e-" + fracScale
+                            + " is a second or more", "tag", 1002L);
+                    nn = fv * mul;
+                } else {
+                    // -12/-15/-18 are picoseconds and finer. Accepted when they
+                    // land on a whole nanosecond, refused otherwise: a Duration
+                    // has no room below 1 ns, and silently dropping the remainder
+                    // would be the truncation this tag handler exists to prevent.
+                    long div = pow10(fracScale - 9);
+                    if (fv % div != 0)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 fraction " + fv + "e-" + fracScale
+                            + " is finer than the nanosecond a java.time.Duration holds",
+                            "tag", 1002L);
+                    nn = fv / div;
+                    if (nn > 999999999L)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 1002 fraction " + fv + "e-" + fracScale
+                            + " is a second or more", "tag", 1002L);
+                }
+                return java.time.Duration.ofSeconds(((Number) sec).longValue(), nn);
             }
             case 1004: {                                     // full-date, RFC 8943
                 Object v = read();
                 if (!(v instanceof String))
                     throw Err.of("bad-tag-content",
                                  "boring: tag 1004 must wrap an RFC 3339 full-date string",
+                                 "tag", 1004L);
+                if (!RFC3339_DATE.matcher((String) v).matches())
+                    throw Err.of("bad-tag-content",
+                                 "boring: tag 1004 content is not a full-date: " + v,
                                  "tag", 1004L);
                 try {
                     java.time.LocalDate d = java.time.LocalDate.parse((String) v);
@@ -1871,30 +3095,109 @@ public final class Reader {
                     throw Err.of("bad-tag-content",
                         "boring: tag 40 first element must be a dimensions array", "tag", 40L);
                 java.util.List dims = (java.util.List) dimsRaw;
-                if (dims.size() != 2)
+                // ANY DIMENSIONALITY. RFC 8746 3.1.1 describes "an array ... of
+                // dimensions, which are unsigned integers distinct from zero"
+                // and never bounds how many. Demanding exactly two rejected the
+                // RFC's own 3-D examples -- conforming input, refused.
+                if (dims.isEmpty())
                     throw Err.of("bad-tag-content",
-                        "boring: only 2-dimensional tag 40 arrays are supported, got "
-                        + dims.size() + " dimensions", "tag", 40L);
-                int rows = ((Number) dims.get(0)).intValue();
-                int cols = ((Number) dims.get(1)).intValue();
+                        "boring: tag 40 dimensions array must not be empty", "tag", 40L);
+                // TYPES CHECKED BEFORE THEY ARE USED. Casting the dimensions
+                // straight to Number and asking `Array.getLength` for the
+                // payload's length let a WELL-FORMED tag with wrong-shaped
+                // content escape as a raw ClassCastException or
+                // IllegalArgumentException -- contradicting doc/SECURITY.md's
+                // typed-failure guarantee. The byte fuzzer rarely builds a
+                // valid tag around invalid content, which is the limitation
+                // that document already names.
+                int nd = dims.size();
+                // The decoded value nests once per dimension, so the dimension
+                // COUNT is nesting and belongs to the same budget. Without this
+                // a flat dims array bought unbounded nesting for free, and a
+                // 20 KB item declaring 20 000 dimensions blew the host stack.
+                if (depth + nd > maxDepth)
+                    throw Err.of("max-depth-exceeded",
+                        "boring: tag 40 with " + nd + " dimensions nests deeper than "
+                        + maxDepth, "tag", 40L, "depth", (long) nd);
+                int[] shape = new int[nd];
+                long total = 1;
+                for (int i = 0; i < nd; i++) {
+                    Object d = dims.get(i);
+                    if (!(d instanceof Number) || d instanceof Double || d instanceof Float
+                        || (d instanceof java.math.BigInteger
+                            && ((java.math.BigInteger) d).bitLength() > 31)
+                        // clojure.lang.BigInt, NOT just BigInteger: a CBOR
+                        // bignum decodes to the former, so checking only the
+                        // latter let longValue() narrow 2^64+1 to 1.
+                        || (d instanceof clojure.lang.BigInt
+                            && ((clojure.lang.BigInt) d).bitLength() > 31))
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 40 dimensions must be integers", "tag", 40L);
+                    long dv = ((Number) d).longValue();
+                    // "distinct from zero" is the RFC's wording, so 0 is not a
+                    // conforming dimension -- and boring already declines to
+                    // EMIT a zero-row matrix as tag 40 for the same reason.
+                    if (dv <= 0)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 40 dimension " + dv + " is not an unsigned integer "
+                            + "distinct from zero", "tag", 40L);
+                    if (dv > Integer.MAX_VALUE)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 40 dimension " + dv
+                            + " exceeds the largest array this platform can build", "tag", 40L);
+                    shape[i] = (int) dv;
+                    total *= dv;
+                    if (total > Integer.MAX_VALUE)
+                        throw Err.of("bad-tag-content",
+                            "boring: tag 40 dimensions " + dims
+                            + " exceed the largest array this platform can build", "tag", 40L);
+                }
                 Object flat = l.get(1);
-                if (rows < 0 || cols < 0)
-                    throw Err.of("bad-tag-content", "boring: negative tag 40 dimension",
-                                 "tag", 40L);
-                int declared = java.lang.reflect.Array.getLength(flat);
+                // THREE PAYLOAD SHAPES, all conforming per 3.1.1: "any one of a
+                // CBOR array of major type 4, a Typed Array, or a Homogeneous
+                // Array". boring accepted only the middle one, which is why
+                // Figure 2 of the defining RFC did not decode here.
+                if (flat instanceof clojure.lang.ILookup
+                    && Long.valueOf(41L).equals(clojure.lang.RT.get(flat, KW_TAG)))
+                    flat = clojure.lang.RT.get(flat, KW_VALUE);
+                int declared;
+                boolean typed = flat != null && flat.getClass().isArray()
+                                && !(flat instanceof Object[]);
+                if (typed) declared = java.lang.reflect.Array.getLength(flat);
+                else if (flat instanceof java.util.List) declared = ((java.util.List) flat).size();
+                else throw Err.of("bad-tag-content",
+                        "boring: tag 40 payload must be a CBOR array, a typed array or a "
+                        + "homogeneous array, got "
+                        + (flat == null ? "nil" : flat.getClass().getName()), "tag", 40L);
                 // The dimensions come from the wire and the payload length comes
                 // from the wire; if they disagree the item is malformed, and
-                // allocating rows*cols on the strength of the dimensions alone
+                // allocating the product on the strength of the dimensions alone
                 // would be an unchecked allocation.
-                if ((long) rows * cols != declared)
+                if (total != declared)
                     throw Err.of("bad-tag-content",
-                        "boring: tag 40 dimensions " + rows + "x" + cols
+                        "boring: tag 40 dimensions " + dims
                         + " do not match the " + declared + "-element payload", "tag", 40L);
-                Class<?> comp = flat.getClass().getComponentType();
-                Object out = java.lang.reflect.Array.newInstance(comp, rows, cols);
-                for (int r = 0; r < rows; r++)
-                    System.arraycopy(flat, r * cols, ((Object[]) out)[r], 0, cols);
-                return out;
+                // CHARGED BEFORE IT IS BUILT. Everything below turns one byte
+                // string into `total` host objects plus the vectors holding
+                // them, and none of that goes through `read()`, so the item
+                // budget never saw it. `total` is the element count and the
+                // nesting adds the intermediate vectors on top, which is why
+                // the charge is made here rather than per element inside
+                // nestDims: the point is to refuse BEFORE allocating.
+                countItems(total);
+                // A 2-D typed array keeps its dedicated primitive matrix type
+                // (double[][], long[][]), which is what boring writes and what
+                // `boring.core` dispatches on. Everything else -- any other
+                // dimensionality, or a plain CBOR array payload -- becomes
+                // nested vectors, the only shape that generalises.
+                if (nd == 2 && typed) {
+                    Class<?> comp = flat.getClass().getComponentType();
+                    Object out = java.lang.reflect.Array.newInstance(comp, shape[0], shape[1]);
+                    for (int r = 0; r < shape[0]; r++)
+                        System.arraycopy(flat, r * shape[1], ((Object[]) out)[r], 0, shape[1]);
+                    return out;
+                }
+                return nestDims(flat, shape, (int) total);
             }
             case 37: {                                       // UUID
                 Object v = read();

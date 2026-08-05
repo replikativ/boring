@@ -27,6 +27,16 @@ public final class Err {
                 new Object[]{K_TYPE, Keyword.intern("boring", type)}));
     }
 
+    /** With a cause, for wrapping a checked exception from a sink. The cause is
+     *  kept rather than flattened into the message so a caller can still see the
+     *  IOException that a failed write actually raised. */
+    public static ExceptionInfo of(String type, String msg, Throwable cause) {
+        return new ExceptionInfo(msg,
+            PersistentArrayMap.createAsIfByAssoc(
+                new Object[]{K_TYPE, Keyword.intern("boring", type)}),
+            cause);
+    }
+
     public static ExceptionInfo of(String type, String msg, String k1, Object v1) {
         return new ExceptionInfo(msg,
             PersistentArrayMap.createAsIfByAssoc(

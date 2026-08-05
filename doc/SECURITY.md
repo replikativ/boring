@@ -21,12 +21,52 @@ file usually already has filesystem access, so the decoder is not the weakest
 link. The kabel and konserve cases are the ones where the decoder genuinely *is*
 the boundary.
 
+## Navigating bytes you do not trust
+
+`boring.nav` reads a document without decoding it, guided by an optional
+offset index sealed into the file. **That index is data, and on an untrusted
+document it is attacker-chosen.**
+
+What a chosen index can do is narrower than it first looks: it can misdirect a
+lookup to a different place *within the same blob*. It cannot read outside the
+document, loop forever, or allocate without bound — anchors are range-checked
+and every walk is behind the typed error boundary, verified against chosen
+indexes on both heap and memory-mapped sources. And the attacker wrote every
+byte already, so a value they misdirect you to is one they could have sent
+directly.
+
+**It matters when an application verifies one part of a document and then acts
+on another.** Two `get`s can be made to resolve to overlapping regions, so you
+checked one thing and used a different one — the shape of Android's Master Key
+bug, where one ZIP entry was verified and its duplicate installed. If you
+validate a field and then navigate to a payload, that is the case to think
+about.
+
+Pass `{:trust-index :ignore}` and `nav` never reads the index; it scans, which
+is the reference implementation the indexed paths are checked against. Lookups
+cost what they would on a file with no index — measured, 301 skips against 17
+for one key in a 200-key map — and the question does not arise.
+
+Not yet built, and named here so the gap is visible rather than implied: a
+`:validate` setting that walks every anchor chain at load and refuses an index
+that does not hold together. It is measured at about one unindexed scan
+(12.2 ms on a 4.6 MB, 200 000-item file), after which lookups run at full
+speed — so it is never worse than having no index. Until it exists,
+`:trust-index` accepts only `:trusted` and `:ignore`.
+
+Two amplification paths on the `nav` side are also uncharged and unmeasured by
+this page: cursor construction in `seq`/`reduce`/`items`/`count` is not charged
+to `:max-items` at all, and the index frame decodes with the budgets
+deliberately lifted. Both are bounded by the message size, so a transport cap
+bounds them — but the multiplier has not been measured and may exceed the
+decode figures below.
+
 ## Trust boundary
 
 `decode` is the boundary.
 
 - **Untrusted**: every byte of the input.
-- **Trusted**: the handlers you install. A `register-tag!` or `register-record!`
+- **Trusted**: the handlers you install. A `register-tag` or `register-record`
   callback runs with your process's privileges and boring does not sandbox it.
   Vet what you register.
 
@@ -56,11 +96,25 @@ availability or integrity, not RCE.
 1. **Termination.** Every count is validated against remaining bytes before
    allocation; nesting is capped by `:max-depth` (default 1024); no loop depends
    on wire data for its bound.
-2. **Bounded memory**, at roughly **5× the input size** — see below; not 1×.
+2. **Bounded memory**, but the multiplier depends on the decoded SHAPE and
+   reaches **37×** on documents made of many tiny containers — see below. Bulk
+   payloads are 1×. Use `:max-items` to cap it.
 3. **Typed failure.** Every rejection is an `ex-info` with a `:type` keyword.
-   Nothing escapes as a raw `NullPointerException`, `ClassCastException`,
-   `StackOverflowError` or `OutOfMemoryError`, so a caller's
-   `catch ExceptionInfo` is sufficient.
+   Nothing escapes as a raw `NullPointerException`, `ClassCastException` or
+   `StackOverflowError`, so a caller's `catch ExceptionInfo` is sufficient.
+
+   **`OutOfMemoryError` is the exception, and is deliberately not caught.** A
+   heap exhausted by one decode is not a condition that decode can report and
+   the caller can shrug off — the JVM is in trouble process-wide, and
+   converting it would invite exactly that shrug. The bound that keeps a
+   document from getting there is `:max-items`, not a catch.
+
+   The `StackOverflowError` half is enforced at one boundary shared by every
+   read path (`boring.errors/with-decode-errors`), because it was previously
+   applied to four of six: `decode-seq-from` and `boring.nav` both leaked the
+   raw error on deeply nested input. The original is attached as the cause, so
+   a document that nests too deep stays distinguishable from a caller's own
+   recursion overflowing inside a `nav` traversal.
 
    This is a **checked** claim, not an aspiration: `boring.hostile` feeds
    malformed content to every built-in tag and asserts a typed failure on both
@@ -79,27 +133,121 @@ availability or integrity, not RCE.
 ### Guarantee 3 is empirical, not proven
 
 It is backed by 300 000 fuzz mutants over valid encodings with zero untyped
-failures, plus the CBOR WG's not-well-formed corpus (46/47, one documented
-exemption). That is evidence, not a proof. The fuzzer mutates *valid* encodings,
+failures, plus **RFC 8949 Appendix F.1 in full (94/94)** and the CBOR WG's
+not-well-formed corpus (46/47, one documented exemption).
+
+Those are two different corpora, and citing only the second overstated the
+first. The WG file is not a superset of Appendix F.1 — it was missing subkind 2
+and subkind 5 entirely, 18 of the 24 reserved additional-information bytes, 8 of
+the 10 indefinite-chunk cases, and every large-declared-length case. The
+subkind-2 gap is exactly why boring decoded `f8 18` as `simple(24)` for as long
+as it did: the corpus that would have caught it was the one not being run.
+
+That is evidence, not a proof. The fuzzer mutates *valid* encodings,
 so it explores near-valid space well and far-from-valid space poorly. Every
 round of fuzzing so far has found something; assume the next one would too.
 
 ### What "bounded memory" actually means
 
 `checkCount` requires at least one wire byte per element, but a decoded element
-costs more heap than one byte. Measured:
+costs more heap than one byte. Re-measured, wire bytes to retained heap:
 
-| input | heap |
+| input | amplification |
+|---|---:|
+| 1 MB byte string | **1.0×** |
+| `long[]` typed array (tag 79) | **1.0×** |
+| array of distinct small integers | 6.5× |
+| 100 000 short strings | 7.8× |
+| map of 50 000 entries | 15.1× |
+| 50 000 two-element vectors | 16.9× |
+| 50 000 × `[[[i]]]` | **37×** |
+| tag 40, dimensions `[500000, 1, 1]` | **149×** |
+
+**This page previously said "roughly 5×", and that was wrong by a factor of
+five.** The old table's worst case was an array of *empty* arrays, which is
+cheap precisely because empty collections return shared singletons — it had been
+64× until that fix. Empty containers are the best case, not the worst.
+
+The `long[]` row is 1.0× only while the values fit a `long`. The same tag over
+values above 2^63 has no lossless primitive form and becomes a vector of boxed
+integers — **12.5×**, measured. Tag 64 (uint8) is **2.08×** whatever its values,
+because Java has no unsigned byte and it widens to `short[]`. And wrapping any
+of them in tag 40 with dimensions over them makes one host object per element —
+149×. The tag-40 and boxed rows are now charged against `:max-items`; the
+widening one cannot be, since it is a single object.
+
+Read the shape of the table rather than any single number. **A bulk payload does
+not amplify while it stays bulk**: a megabyte byte string decodes to a megabyte.
+What amplifies is OBJECT COUNT — a one-byte container head that
+becomes a `PersistentVector` with a header, an array and slots is the worst
+per-byte case there is. So amplification tracks how many objects a document
+asks for, not how many bytes it occupies.
+
+That is also why the budget below counts items rather than bytes.
+
+### Bounding it
+
+Three limits, and they bound different things:
+
+| option | bounds |
 |---|---|
-| 2 MB array of small integers | 10 MB (**5×**) |
-| 2 MB array of empty arrays | 10 MB (**5×**) |
+| transport size limit (yours) | how many bytes arrive |
+| `:max-depth` (default 1024) | how deeply nested one value may be |
+| `:max-items` (default unlimited) | how many items a decode may produce |
 
-The second row was **121 MB (64×)** until empty collections were changed to
-return the shared singletons — every empty array had been allocating a fresh
-vector. So the multiplier is a property of the decoded shapes, and 5× is what
-the current worst known case gives, not a bound anyone has proved.
+`:max-items` is the cumulative one, and it is what actually caps heap: nothing
+else bounded the TOTAL, so a document within the size and depth limits could
+still amplify past anything documented. Set it from the table above — items are
+a good proxy for objects, and objects are what cost.
 
-**Enforce an input size limit at the transport.** boring reads what you give it.
+It counts **objects the decoder builds**, not only items it reads. That
+distinction had teeth twice. A tag-40 multi-dimensional array arrives as one
+byte string and is expanded into one host object per element, none of which
+passes through the item reader: dimensions `[500000, 1, 1]` built **71 MB** of
+nested vectors from 500,018 bytes — 149× — with `{:max-items 100}` set. A uint64
+typed array whose values exceed 2^63 has no lossless `long`, so it becomes a
+vector of boxed integers: 1 MB of `0xff` under tag 67 retained **11 MB**, 12.5×.
+Both are charged before the reconstruction is allocated.
+
+**It bounds object count, not bytes**, and one case is worth naming because it
+looks like the same thing and is not: tag 64 (uint8) decodes to a `short[]`,
+because Java has no unsigned byte. 4 MB in becomes 8 MB held — 2.08× — in a
+*single* object, which no item budget can see. Typed arrays are bounded by your
+transport size limit, not by `:max-items`.
+
+**The budget is PER TOP-LEVEL ITEM**, and per positional read in `boring.nav`.
+It is not a budget for a whole file. That is deliberate and matches what the
+streaming API promises — retained memory is bounded by the largest single item,
+not by the sequence — but it means a sequence of a million items within budget
+is a million times the budget in total, so an input size limit at the transport
+is doing real work here rather than being belt-and-braces.
+
+It used to accumulate across items, which sounds stricter and was in fact
+incoherent: `reset()` on a streaming refill cleared the counter while an
+in-memory decode did not, so the same five items decoded at `:chunk-size 2` and
+were refused at `65536`. Acceptance cannot depend on a buffering knob.
+
+Both platforms enforce it. ClojureScript accepted the option and ignored it
+until recently, so a browser or Node reader had no bound at all — if you are
+relying on this in a CLJS deployment, check the version.
+
+**Still enforce an input size limit at the transport.** boring reads what you
+give it, and `:max-items` caps the result rather than the arrival.
+
+## Malformed UTF-8
+
+By default a text string whose bytes are not valid UTF-8 is refused, with
+`:boring/invalid-utf8`. RFC 8949 §3.1 makes this the decoder's call, and
+refusing is the right default: silently substituting U+FFFD changes the value,
+and a value that differs between two readers of the same bytes is a parser
+differential.
+
+`{:validate-utf8 false}` switches to **replacement** decoding on both platforms
+— the malformed bytes become U+FFFD and the document is accepted. ClojureScript
+used to keep a fatal `TextDecoder` under this option, so the one setting that
+exists to accept such input raised an untyped host `TypeError` there while the
+JVM returned a string. Use it only for a producer you already know emits
+mis-encoded text and whose data you need anyway.
 
 ## Encode-side refusals
 
@@ -111,10 +259,76 @@ represent faithfully, rather than writing an approximation:
 | `:boring/invalid-utf16` | a string containing an unpaired surrogate — it has no UTF-8 encoding, and both platforms used to substitute silently |
 | `:boring/canonical-duplicate` | two set elements that encode identically under `:canonical` |
 | `:boring/bad-simple-value` | a simple value outside 0–255 |
-| `:boring/reserved-simple-value` | 24–31, which RFC 8949 §3.3 forbids emitting |
+| `:boring/reserved-simple-value` | 24–31, which RFC 8949 §3.3 forbids emitting — see below |
 | `:boring/incompatible-options` | an option that contradicts the profile |
 | `:boring/max-depth-exceeded` | nesting past `:max-depth`, on the write side too |
 | `:boring/unsupported-type` | a type with no encoding and no registered handler |
+| `:boring/unrepresentable-date` | a year outside 0000–9999, which RFC 3339 cannot express |
+
+### `:permit-reserved-simple-values` emits what boring rejects
+
+RFC 8949 §3.3 forbids *encoding* simple values 24–31, and its final sentence —
+"Such sequences are not well-formed" — binds the **decoder** too. boring
+enforces both: the writer refuses by default, and the reader raises
+`:boring/malformed-simple-value` for `f8 00`..`f8 1f`.
+
+`{:permit-reserved-simple-values true}` overrides the writer half. What comes
+out is **not well-formed CBOR, and boring will not read it back.** The option
+predates the decoder fix, when it could round-trip; it now exists only to
+generate a vector for a peer that is lenient about this. Do not enable it on a
+production encode path.
+
+## Duplicate map keys
+
+RFC 8949 §5.6 offers three approaches and requires that **"generic decoders
+need to document which of these three approaches they implement"**. boring
+implements the first: **a map with duplicate keys is rejected**, with
+`:boring/duplicate-map-key`. This holds for definite- and indefinite-length
+maps, on both platforms, and the same rule applies to tag-258 sets
+(`:boring/duplicate-set-element`) — a set that declares *n* elements of which
+fewer are distinct is refused rather than silently collapsed.
+
+Duplicate detection compares keys by **CBOR data-item equality**, in one pass,
+on both platforms. Host equality is used for values the host compares by value,
+and **content** equality for the ones it compares by identity — a `byte[]`,
+`short[]`, `int[]`, `long[]`, `double[]` or `float[]` on the JVM, any
+`Uint8Array` or typed array in ClojureScript. Two byte strings with the same
+bytes are one data item, so a map holding both is refused rather than decoded
+with two entries.
+
+Keys that merely *look* alike stay distinct, per §5.6.1: `1` and `1.0` are
+different keys, and so are the text string `"a"` and the byte string `h'61'`.
+
+**On ClojureScript `1` and `1.0` are the same key, and such a map is REFUSED.**
+JavaScript has one number type, so the platform cannot hold both — `a2 01 61 61
+f9 3c00 61 62` decodes to a two-entry map on the JVM and raises
+`:boring/duplicate-map-key` in a browser. Tag-258 sets behave the same way.
+This is a real parser differential across a JVM↔browser boundary and it cannot
+be removed: the alternative is collapsing two distinct keys into one silently,
+which is worse in the direction that matters. A reader that refuses is a
+reader you can reason about; a reader that quietly agrees to a different
+document is not. If you exchange CBOR with browsers, do not write maps whose
+keys differ only by numeric type — nothing boring encodes produces them.
+Comparison deliberately does **not** run on raw encoded bytes: that would miss a
+key written once as a literal string and once as a stringref, which is the same
+key.
+
+`{:check-duplicate-keys false}` turns this off, giving **last-wins** — RFC 8949
+§5.6's second approach — on both platforms and at every map size. It is the
+wrong default for anything reading untrusted input: silent last-wins is how two
+implementations end up disagreeing about what a document says, which is a
+parser differential with a signature check on the other side of it.
+
+**Residual gap, stated rather than implied.** An array *nested inside* a
+compound key is still compared by the host, so `{[h'01']: 1, [h'01']: 2}` keeps
+two entries. Both platforms have this, for the same reason and to the same
+extent, so they agree on what they accept — which is the property that matters
+most here. Closing it means a deep content-aware walk of every key, and the
+work is attacker-controlled by construction; that trade has not been made.
+
+The detection itself is **not** quadratic. It was: byte-string keys went through
+an O(n²) pair scan that was unbounded above the array-map threshold, and a
+second O(n²) scan ran over the rest. Both are gone.
 
 ## Realistic harms, in order
 
@@ -197,6 +411,27 @@ browser.
 
 - `Writer` and `Reader` are **not** thread-safe. One per thread, or one per
   loop.
+- **`boring.nav` is not thread-safe either, and this is the one that surprises
+  people.** A source owns one `Reader`, and every cursor derived from it shares
+  that Reader's mutable position and depth. Sharing one source across threads
+  does not merely throw — it can return a **plausible but wrong document**. In
+  200 parallel passes over one `items`, 6 came back silently wrong.
+
+  Nothing about the surface warns you, which is why this is stated here rather
+  than left to be inferred: the namespace is *read-only* navigation, `Items` is
+  a reducible that invites `fold`, and `boring.mmap` picks a shared arena
+  precisely so the mapping is not pinned to one thread.
+
+  Use **`boring.nav/fork`** for a per-thread view. It shares the decoded index —
+  the expensive part, 145 µs for a 20 000-item index — and replaces only the
+  Reader, at 175 ns.
+
+  A **best-effort** detector raises `:boring/concurrent-use` when it notices
+  overlapping use of one Reader. It caught 178 of those 200 passes. It is a
+  smoke alarm, not a lock: it is deliberately non-volatile so it costs nothing
+  on the hot path, and one pass in that run still returned a wrong answer
+  without tripping it. Do not rely on it to make sharing safe — `fork` is what
+  makes sharing safe.
 - There is **no process-global registry**. `tag-registry` returns an immutable
   value and every registration returns a new one, so two libraries in one JVM
   cannot register into a shared namespace and resolve by load order. An earlier
@@ -210,6 +445,40 @@ browser.
 - The `boring.data` types the writer needs are resolved once, in a lazy holder
   class whose fields are `static final`, so publication is safe by
   construction. An earlier design published them through mutable statics.
+
+- **What `fork` shares, and what that requires of you.** A fork separates parser
+  state; it deliberately does NOT copy the bytes, because copying a mapping
+  would defeat the point of mapping it. So the source itself must not change
+  while anyone is reading it:
+
+  - do not mutate a `byte[]` you have handed to `decode` or `nav`;
+  - a custom `ByteSource` must support concurrent reads;
+  - a read-only mmap stops writes *through that mapping*, not writes or
+    truncation by another descriptor or process. Map immutable files, publish
+    by atomic rename, and do not rewrite or truncate one while an arena is
+    live. Truncating mapped storage can fault at the OS level rather than
+    surfacing as a CBOR error.
+
+- **`decode-seq` and `decode-seq-from` are single-consumer.** Each closes over
+  one mutable reader, and the streaming form over an `InputStream` and a refill
+  buffer as well. Do not realise different tails concurrently or pull from
+  several workers. Clojure's `LazySeq` realisation reduces accidental overlap
+  but is not an API-level guarantee about the enclosed reader, and it does not
+  make an `InputStream` thread-safe. Detach each item first, then parallelise.
+
+- **Handlers are not re-entrant with respect to the codec that invoked them.** A
+  registered handler or `:encode-fallback` that captures and re-enters the same
+  reusable Writer or Reader will clobber its position, depth, stringref
+  namespace or scratch state. This takes an explicit closure to arrange, so it
+  is trusted-code behaviour rather than an input-driven hazard -- but it is not
+  checked, and the failure is silent corruption rather than an error.
+
+- **Registry values are immutable, handler functions are yours.** The maps are
+  final and copy-on-write, so building and publishing a registry is safe.
+  `TagRegistry.writerFor` returns an immutable holder rather than the
+  registry's own array, so a Java caller cannot rewrite a tag or function after
+  publication. The handler functions themselves are user code and must be
+  thread-safe if the registry is shared.
 
 ## Reporting
 

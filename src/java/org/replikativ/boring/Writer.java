@@ -196,10 +196,18 @@ public final class Writer {
      * with the typed arrays already emitted for the 1D case, so a matrix costs
      * one tag plus a dimensions array on top of a bulk little-endian copy.
      *
-     * Only RECTANGULAR arrays take this path. A ragged array is not a
-     * multi-dimensional array in RFC 8746's sense, so it falls back to a plain
-     * CBOR array of typed arrays -- still correct, still round-trips, just
-     * without the shape declared up front.
+     * Only RECTANGULAR arrays take this path -- including a ZERO-ROW one, which
+     * is 0x0 and whose element type is known from the array's own class. A
+     * ragged array is not a multi-dimensional array in RFC 8746's sense, so it
+     * falls back to a plain CBOR array of typed arrays.
+     *
+     * That fallback preserves the VALUES but not the type: a ragged
+     * `double[][]` decodes as a vector of `double[]`, not as `double[][]`. The
+     * comment here used to say "still round-trips", which is true of the
+     * numbers and false of the type -- the distinction this library otherwise
+     * takes care to keep. Declaring it rather than fixing it: a type-preserving
+     * frame for ragged matrices would be a private tag, and RFC 8746 has
+     * nothing to say about them.
      */
     private static final int TAG_MULTI_DIM_ROW = 40;
 
@@ -337,6 +345,282 @@ public final class Writer {
      *  encoding 4.4x slower than plain on keyword-keyed maps. */
     private Writer canonicalScratch;
 
+    // ---- container index, captured while encoding -------------------------
+    //
+    // The writer already knows every offset it is about to write to, and it
+    // knows a container's entry count before emitting a byte of it. So the
+    // index falls out of encoding rather than out of a second pass over the
+    // result, which is what `boring.core/index-walk` does. That walk cannot
+    // beat 31% of encode time no matter how it is written, because CBOR
+    // containers are element-counted and stepping over a subtree means walking
+    // it. Nothing here needs a subtree's LENGTH -- only where its entries
+    // start -- which is why the same property that makes reading expensive
+    // makes writing free.
+    //
+    // Off unless `setIndex` is called. `idxStride == 0` is the off switch and
+    // is checked once per container, never per byte.
+    //
+    // DELIBERATELY NOT inherited by `canonicalSubWriter`: a scratch writer
+    // encodes map keys into its OWN buffer, so any node it recorded would
+    // carry offsets into bytes that get copied elsewhere. See the assertion
+    // there.
+
+    private int idxStride = 0;
+    private int idxMinEntries = 16;
+    /** Added to every recorded offset, so `write-seq!` gets file offsets. */
+    private long idxBase = 0;
+
+    // NULL UNTIL AN INDEX IS ACTUALLY BUILT. These were field initialisers,
+    // so every Writer paid for them -- including the ones `encode` builds,
+    // which can never index: `encode` emits one CBOR item and refuses to
+    // append a frame, by design.
+    //
+    // Measured against the merge base on one machine, back to back: a Writer
+    // cost 9 408 bytes where it had cost 512, and `(writer 256)` went from
+    // 0.060 to 1.437 us -- 24x. That is the whole of a 3.9-5.2x regression on
+    // small-payload encode, and it is invisible on large ones because a fixed
+    // ~1.4 us disappears into an 83 us datom encode. `encode` is the primary
+    // API and the one every small message goes through.
+    //
+    // Lazily allocated at the two points that grow them, `reserveNode` and
+    // `idxItem`, both of which already run only while indexing.
+    private long[] idxOffs;
+    private int[] idxCnts;
+    private boolean[] idxSrt;
+    private long[][] idxSlots;
+
+    private static final long[] NO_LONGS = new long[0];
+    private static final int[] NO_INTS = new int[0];
+    private static final boolean[] NO_BOOLS = new boolean[0];
+    private static final Object[] NO_OBJS = new Object[0];
+    private int idxN = 0;
+
+    /**
+     * Begin (or end) a capture session. `stride` of 0 turns capture off.
+     *
+     * Discards anything captured so far. Index state deliberately survives
+     * {@link #reset()} -- `write-seq!` resets the writer once per item while
+     * the nodes accumulate across the whole sequence -- so there has to be some
+     * other point at which a fresh start is declared, and this is it. Without
+     * that, a caller who enabled capture once and then encoded many unrelated
+     * values accumulated nodes forever, with offsets from documents that no
+     * longer exist.
+     *
+     * Use {@link #idxBase(long)} to move the base between items of one
+     * sequence; that is the operation that must NOT discard.
+     */
+    public void setIndex(int stride, int minEntries, long base) {
+        this.idxStride = stride;
+        this.idxMinEntries = minEntries;
+        this.idxBase = base;
+        idxReset();
+    }
+
+    /** Move the offset base without disturbing what has been captured. */
+    public void idxBase(long base) { this.idxBase = base; }
+
+    // ---- sequence offsets -------------------------------------------------
+    //
+    // `write-seq!` also wants the offset of every Nth top-level ITEM, which it
+    // knows from its own running byte count. Two earlier homes for that list
+    // both cost more than this one:
+    //
+    //   java.util.ArrayList  boxes an Integer per item -- at stride 1 that is
+    //                        one allocation per record
+    //   a Clojure volatile   avoids the boxing and costs MORE: three volatile
+    //   holding an int[]     reads and two volatile writes per anchor, and a
+    //                        volatile write is a store barrier. Measured, this
+    //                        was slower than the boxing it replaced.
+    //
+    // A plain Java field needs neither. The writer is already the mutable thing
+    // in this picture and is not thread-safe anyway, so there is nothing for a
+    // barrier to protect.
+
+    /** Null until the first anchored item -- see the node arrays above. 8 KB
+     *  on every Writer was the largest single piece of that regression. */
+    private long[] idxSeq;
+    private int idxSeqN = 0;
+    private long idxItems = 0;
+    private int idxItemCountdown = 1;
+
+    /**
+     * A top-level item begins at `off`. Records an anchor every `stride`th one
+     * and counts them all, so the caller needs no per-item state of its own.
+     */
+    public void idxItem(long off) {
+        if (idxStride <= 0) return;
+        if (--idxItemCountdown == 0) {
+            if (idxSeq == null) idxSeq = new long[1024];
+            else if (idxSeqN == idxSeq.length)
+                idxSeq = java.util.Arrays.copyOf(idxSeq, idxSeqN * 2);
+            idxSeq[idxSeqN++] = checkedOffset(off);   // already file-relative
+            idxItemCountdown = idxStride;
+        }
+        // COUNTED AS A LONG AND REFUSED AT THE BOUNDARY, rather than wrapped.
+        //
+        // The index frame carries this count in an int32 array, alongside the
+        // per-container counts -- widening it would change the wire format of
+        // every file, for a limit no in-memory container can reach anyway. So
+        // the sequence count keeps the wire type it has and the writer stops at
+        // it, HERE, at the item that would overflow rather than at the end of a
+        // multi-hour job with a silently wrong footer.
+        //
+        // Reachable: the offsets went 64-bit precisely so files past 2 GiB
+        // work, and 2^31 items is a ~64 GB datom dump, not a theoretical bound.
+        // `:index 0` writes such a sequence with no index at all.
+        if (idxItems == Integer.MAX_VALUE)
+            throw Err.of("index-too-large",
+                "boring: a sequence index cannot describe more than "
+                + Integer.MAX_VALUE + " items; write this sequence with :index 0");
+        idxItems++;
+    }
+
+    /** How many top-level items `idxItem` has seen. Never above
+     *  {@code Integer.MAX_VALUE}: {@link #idxItem} refuses to go past it. */
+    public long idxItemTotal() { return idxItems; }
+
+    /** Offsets of every `stride`th top-level item. */
+    public long[] idxItemOffsets() {
+        return idxSeq == null ? NO_LONGS : java.util.Arrays.copyOf(idxSeq, idxSeqN);
+    }
+
+    public void idxReset() {
+        // Null the slot references, do not merely forget the count. Each slot
+        // is its own int[], so leaving them reachable pins one array per
+        // indexed container for the life of the writer -- and a writer is meant
+        // to be long-lived and reused. Same reasoning, and the same fix, as the
+        // stringref key table below.
+        if (idxSlots != null && idxN > 0)
+            java.util.Arrays.fill(idxSlots, 0, idxN, null);
+        idxN = 0;
+        idxSeqN = 0;
+        idxItems = 0;
+        idxItemCountdown = 1;
+    }
+    public int idxCount() { return idxN; }
+    // Null-safe because the backing arrays are lazy now: a writer that never
+    // indexed has none, and `idxN` is 0, so an empty result is the right
+    // answer rather than an NPE.
+    public long[] idxContainers() {
+        return idxOffs == null ? NO_LONGS : java.util.Arrays.copyOf(idxOffs, idxN);
+    }
+    public int[] idxCounts() {
+        return idxCnts == null ? NO_INTS : java.util.Arrays.copyOf(idxCnts, idxN);
+    }
+    public Object[] idxSlots() {
+        return idxSlots == null ? NO_OBJS : java.util.Arrays.copyOf(idxSlots, idxN);
+    }
+    public boolean[] idxSorted() {
+        return idxSrt == null ? NO_BOOLS : java.util.Arrays.copyOf(idxSrt, idxN);
+    }
+
+    /** Anchors an indexed container of `n` entries needs at the current stride. */
+    private int anchorCount(int n) {
+        // An EMPTY container needs no anchors. `((0 - 1) / stride) + 1` is 1 in
+        // Java, because integer division truncates toward zero -- so an empty
+        // container claimed one anchor, the loop never wrote it, and the slot
+        // kept a phantom offset of 0 that pointed at the start of the document.
+        // Only reachable with `:index-min 0`, but it is a wrong answer waiting
+        // rather than a missing optimisation.
+        if (n <= 0) return 0;
+        return idxStride == 1 ? n : ((n - 1) / idxStride) + 1;
+    }
+
+    private boolean indexing(int n) {
+        return idxStride > 0 && n >= idxMinEntries;
+    }
+
+    /**
+     * Claim this container's slot BEFORE its entries are written, and fill it
+     * after.
+     *
+     * Order is the point. A node is only complete when its container ends, so
+     * appending on completion yields post-order -- every child before its
+     * parent -- and `read-index` binary-searches the container offsets, so it
+     * needs them ascending. Claiming at the head instead makes the array
+     * pre-order, and a pre-order DFS visits containers in strictly increasing
+     * start offset: a container starts before all of its descendants, and
+     * siblings ascend. So the array comes out sorted with no sort.
+     */
+    private int reserveNode() {
+        if (idxOffs == null) {
+            idxOffs = new long[32];
+            idxCnts = new int[32];
+            idxSrt = new boolean[32];
+            idxSlots = new long[32][];
+        } else if (idxN == idxOffs.length) {
+            int m = idxN * 2;
+            idxOffs = java.util.Arrays.copyOf(idxOffs, m);
+            idxCnts = java.util.Arrays.copyOf(idxCnts, m);
+            idxSrt = java.util.Arrays.copyOf(idxSrt, m);
+            idxSlots = java.util.Arrays.copyOf(idxSlots, m);
+        }
+        return idxN++;
+    }
+
+    /**
+     * An index offset, checked to fit the int the format stores it in.
+     *
+     * The index carries offsets as int32 -- `containers` and every slot are
+     * int arrays on the wire. Past 2 GiB the cast silently produced NEGATIVE
+     * offsets, which is the worst of all outcomes: `node-slot` binary-searches
+     * `containers` and they stop ascending, sequence `nth` seeks to a negative
+     * position, and past 4 GiB offsets collide outright. Nothing warned. The
+     * back-pointer is 8 bytes and `nav` is long-clean throughout, so 2 GiB is a
+     * limit of the index alone -- and `write-seq!` is explicitly for
+     * long-running files, so it is reachable rather than theoretical.
+     *
+     * Refusing is right until the format carries wider offsets: an unindexed
+     * file is correct and a wrongly-indexed one is not.
+     */
+    /**
+     * ABSOLUTE offsets are 64-bit. They used to be capped at 2 GiB because the
+     * index stored them as int32, which made a mapping larger than that
+     * unindexable -- historically fine, and not any more.
+     *
+     * The wire is unchanged for files that do not need the range: `seal-index!`
+     * still emits int32 when every offset fits, so an existing file is
+     * byte-identical, and promotes to sint64 only when it must. That is the
+     * same narrowest-type-that-fits rule the slot deltas already use, and the
+     * CBOR tag carries the width so no flag is needed.
+     */
+    private long checkedOffset(long v) {
+        if (v < 0)
+            throw Err.of("index-offset-overflow",
+                "boring: an index offset came out negative (" + v + ")");
+        return v;
+    }
+
+    /** The current position as a FILE offset, unchecked.
+     *
+     *  Anything the index records has to be captured in these terms at the
+     *  moment it is observed. A buffer position resolved later is wrong as soon
+     *  as a flush has happened in between -- which is precisely the bug the
+     *  buffer-size equivalence property caught: a container's start was stored
+     *  as `pos` and turned into a file offset at `fillNode` time, by which point
+     *  `flushed` had moved, so the same value indexed a container at 58 with a
+     *  16-byte buffer and at 0 with a large one. */
+    private long absOffset() { return (long) pos + flushed + idxBase; }
+
+    /** A buffer-relative position as a checked, file-relative index offset.
+     *
+     *  `flushed` is what makes this work while streaming: `off` is a position in
+     *  the CURRENT chunk, and everything handed to the sink already sits in
+     *  front of it. `idxBase` does the same job for the non-streaming
+     *  `write-seq!` path, where each item is encoded whole and the base moves
+     *  between items. Exactly one of the two is ever non-zero -- a streaming
+     *  `write-seq!` leaves `idxBase` at 0 and lets `flushed` span the items. */
+    private long idxOffset(long off) { return checkedOffset(off + flushed + idxBase); }
+
+    /** `off` is a FILE offset, captured by `absOffset()` when the container
+     *  started -- not a buffer position to be resolved now. See absOffset(). */
+    private void fillNode(int slot, long off, int n, long[] anchors, boolean sorted) {
+        idxOffs[slot] = checkedOffset(off);
+        idxCnts[slot] = n;
+        idxSlots[slot] = anchors;
+        idxSrt[slot] = sorted;
+    }
+
     private static final clojure.lang.Keyword K_N =
         clojure.lang.Keyword.intern(null, "n");
     private static final clojure.lang.Keyword K_TAG =
@@ -394,8 +678,12 @@ public final class Writer {
     private int srCount;
     private int srNextIndex;
 
+    /** What {@link #trim()} goes back to. */
+    private final int initialSize;
+
     public Writer(int initialSize) {
-        this.buf = new byte[Math.max(64, initialSize)];
+        this.initialSize = Math.max(64, initialSize);
+        this.buf = new byte[this.initialSize];
         this.pos = 0;
         // 16, not 256. The table grows by rehash and a reused writer keeps
         // whatever it grew to, so the only cost of starting small is a few
@@ -416,6 +704,13 @@ public final class Writer {
 
     /** Reset for reuse. Keeps the buffer; clears the stringref namespace. */
     public void reset() {
+        borrowed = false;              // a new value: the old borrow is over
+        // WHILE STREAMING, RESET MEANS "the previous value is finished", so its
+        // tail has to reach the sink before `pos` goes to zero -- otherwise a
+        // `write-seq!` loop would silently drop the last partial chunk of every
+        // item. `flushed` deliberately survives, because it is the running file
+        // offset the index is built from and it spans items.
+        if (sink != null && pos > 0) flushChunk();
         pos = 0;
         depth = 0;
         metaWrapped = false;
@@ -435,6 +730,57 @@ public final class Writer {
         }
     }
 
+    /**
+     * Give back everything an exceptional job grew, and return the number of
+     * bytes of buffer released.
+     *
+     * A Writer is meant to be long-lived and reused, and every growth it has is
+     * one-way: the byte buffer, the stringref symbol table, and the index
+     * capture arrays all keep their PEAK size for the life of the writer. That
+     * is the right default -- it is what makes reuse allocation-free -- but a
+     * pooled writer that once encoded a 200 MB value then pins a 256 MB buffer
+     * forever while it goes back to encoding 200-byte datoms.
+     *
+     * So the policy is explicit rather than automatic: shrinking on a heuristic
+     * would reintroduce exactly the per-message allocation reuse exists to
+     * avoid. Call this after a known-large job, not in a loop.
+     *
+     * Refuses mid-stream, where `buf` holds bytes that have not reached the
+     * sink. Safe to call any other time; a trimmed writer is a usable writer.
+     */
+    public long trim() {
+        if (sink != null)
+            throw Err.of("bad-argument",
+                "boring: trim() during a stream would discard buffered bytes;"
+                + " finish the stream first");
+        // The same rule, for the same reason, one case wider. `encodeBuffered`
+        // lends the caller this buffer; replacing it underneath them is the
+        // buffered-mode twin of discarding a stream's tail.
+        if (borrowed)
+            throw Err.of("bad-argument",
+                "boring: trim() would replace a buffer that encode-buffered! has"
+                + " lent out. Copy them out first -- encode-into!,"
+                + " write-to! or write-to-buffer! all end the borrow -- or"
+                + " encode anything else on this writer, which starts a new"
+                + " one");
+        long freed = buf.length - initialSize;
+        if (freed > 0) { buf = new byte[initialSize]; pos = 0; }
+        if (srKeys.length > 16) initSymtab(16);
+        idxReset();
+        // RELEASED, not reallocated to the default size. `trim()` exists to
+        // give memory back, and the arrays are lazy now, so dropping them
+        // returns more than shrinking them and costs nothing until the next
+        // index is built. A writer that never indexes keeps holding nothing.
+        if (idxOffs != null && idxOffs.length > 32) {
+            idxOffs = null;
+            idxCnts = null;
+            idxSrt = null;
+            idxSlots = null;
+        }
+        if (idxSeq != null && idxSeq.length > 1024) idxSeq = null;
+        return Math.max(0, freed);
+    }
+
     public int position() { return pos; }
 
     /**
@@ -445,9 +791,24 @@ public final class Writer {
      * `encode-into!` exists to avoid. Contents are overwritten by the next
      * encode; do not retain.
      */
+    /**
+     * Whether the caller currently holds a BORROWED view of this buffer.
+     *
+     * `encodeBuffered` hands back a byte count and tells the caller to read the
+     * bytes out of `buffer()`; every other entry point copies them out. `pos`
+     * cannot tell the two apart -- it is non-zero after both -- and `trim()`
+     * replaces the buffer with a fresh, zeroed one. So trimming between an
+     * `encode-buffered!` and the `buffer` read it invites gave the caller 25
+     * zero bytes for `{:id 7 :name "hello"}`, which `decode` then read as the
+     * integer 0. A wrong value out of an ordinary two-call sequence, with no
+     * error anywhere.
+     */
+    public boolean borrowed;
+
     public byte[] buffer() { return buf; }
 
     public byte[] toByteArray() {
+        borrowed = false;              // copied out: the buffer is ours again
         byte[] out = new byte[pos];
         System.arraycopy(buf, 0, out, 0, pos);
         return out;
@@ -456,11 +817,124 @@ public final class Writer {
     /** Largest array this JVM will reliably allocate. */
     private static final int MAX_BUFFER = Integer.MAX_VALUE - 8;
 
+    // ---- streaming ----------------------------------------------------------
+    //
+    // With a sink attached the buffer becomes a CHUNK rather than the whole
+    // encoding: when it fills, its contents go to the sink and `pos` returns to
+    // 0. That makes the memory a document needs bounded by the buffer size
+    // instead of by the document, which is the difference between encoding a
+    // 1 GB value and holding a second copy of it.
+    //
+    // The sink is set for the duration of one call and cleared after, rather
+    // than living on the writer. `encode`, `encode-buffered!` and `buffer` all
+    // depend on the bytes still being present when they return, so a writer
+    // that could stream at any moment would quietly break them; a writer only
+    // streams while somebody is holding the other end.
+    //
+    // NOT ATOMIC: once a chunk has gone to the sink it cannot be recalled, so a
+    // value that throws part-way leaves a partial prefix on the stream. nippy's
+    // `write-typed+meta-to-out!` documents the same property for the same
+    // reason. Callers who need all-or-nothing must stage elsewhere.
+    private java.io.OutputStream sink;
+    private long flushed;
+
+    /**
+     * Depth of spans PINNED against flushing: bytes the writer will have to read
+     * back, so they must stay in the buffer until it is done with them.
+     *
+     * This is not about map keys, though they are its only user today. The
+     * general hazard while streaming is DEFERRED RESOLUTION -- observing
+     * something at one moment and resolving it at a later one, by which point a
+     * flush may have invalidated it. There were two instances:
+     *
+     *   - A container's start, captured as a buffer position and turned into a
+     *     file offset at `fillNode` time. That needs no pin: capture it
+     *     absolutely when it is observed, which `absOffset()` now does.
+     *   - The index's `sorted` flag, which compares the previous key's BYTES
+     *     with the current key's. Bytes cannot be made absolute. The previous
+     *     key is copied out (see KeyOrder); the current one is read from the
+     *     buffer, so it is pinned instead.
+     *
+     * Without the pin a key split by a flush could not be compared, the
+     * container would be marked unsorted, and -- since `sorted` is part of the
+     * index frame -- the emitted BYTES would depend on the buffer size. The
+     * buffer-size equivalence property caught exactly that.
+     *
+     * A pinned span larger than the whole buffer grows it, the same concession
+     * leaves already get: one CBOR item with a length header cannot be split
+     * across chunks.
+     */
+    private int pinDepth;
+
+    /** Attach `out` and start counting from zero.
+     *
+     *  `pos` is zeroed here, and that is not tidiness: the first `reset()` of
+     *  the stream would otherwise FLUSH whatever a previous unrelated encode
+     *  left in the buffer, prefixing the stream with somebody else's bytes. */
+    public void beginStream(java.io.OutputStream out) {
+        // `sink == null` is ALSO the writer's signal for buffered mode, so a
+        // null here did not stream and did not fail: `write-to!` returned 0,
+        // wrote nowhere, and left the encoded bytes in the private buffer.
+        // False success is the worst of the three outcomes available.
+        if (out == null)
+            throw Err.of("bad-argument", "boring: the stream sink must not be null");
+        sink = out;
+        flushed = 0;
+        pos = 0;
+        pinDepth = 0;
+    }
+
+    /** Detach WITHOUT flushing, for a write that threw. Whatever already
+     *  reached the sink stays there -- streaming is not atomic -- but the
+     *  half-written tail in the buffer must not be appended to it. */
+    public void abortStream() {
+        sink = null;
+        flushed = 0;
+        pos = 0;
+        pinDepth = 0;
+    }
+
+    /** Flush what is left and detach. Returns the total bytes handed to the sink. */
+    public long endStream() {
+        if (sink != null && pos > 0) flushChunk();
+        long n = flushed;
+        sink = null;
+        flushed = 0;
+        return n;
+    }
+
+    /** Bytes written for the current value, INCLUDING any already flushed.
+     *  `position()` stays buffer-relative because `buffer()` is indexed by it. */
+    public long totalWritten() { return flushed + pos; }
+
+    private void flushChunk() {
+        try {
+            sink.write(buf, 0, pos);
+        } catch (java.io.IOException e) {
+            throw Err.of("io-error", "boring: writing to the sink failed: " + e.getMessage(), e);
+        }
+        flushed += pos;
+        pos = 0;
+    }
+
     private void ensure(int n) {
         // `pos + n` in int wrapped negative for large values, so ensure()
         // silently skipped the grow and the following write ran off the end.
         long need = (long) pos + (long) n;
-        if (need > buf.length) grow(need);
+        if (need > buf.length) {
+            // Hand the finished prefix to the sink instead of growing. Safe at
+            // this point specifically: ensure() runs BEFORE the next n bytes are
+            // written, so everything in the buffer is a complete emitted prefix.
+            if (sink != null && pos > 0 && pinDepth == 0) {
+                flushChunk();
+                need = n;
+            }
+            // A span that cannot be handed directly to the sink (for example a
+            // pinned key or a typed-array staging span) still has to fit, so
+            // growth remains the fallback. Contiguous byte payloads bypass the
+            // chunk through writePayload instead.
+            if (need > buf.length) grow(need);
+        }
     }
 
     private void grow(long need) {
@@ -594,9 +1068,7 @@ public final class Writer {
         // zero sign byte; CBOR wants the unsigned magnitude only.
         int off = (mag.length > 1 && mag[0] == 0) ? 1 : 0;
         head(BYTES, mag.length - off);
-        ensure(mag.length - off);
-        System.arraycopy(mag, off, buf, pos, mag.length - off);
-        pos += mag.length - off;
+        writePayload(mag, off, mag.length - off);
     }
 
     private static final int TAG_DECIMAL = 4;
@@ -664,6 +1136,24 @@ public final class Writer {
      * (datahike #633).
      */
     private void writeShortestFloat(double d) {
+        // ONE representation for NaN, matching ClojureScript and RFC 8949's own
+        // examples (0xf97e00).
+        //
+        // `toHalf` carried a float NaN's payload bits and its sign through, so
+        // 7ff8000000000001 emitted f97e00 while 7ffaaaa000000000 emitted f97eaa
+        // and a negative NaN emitted f9fe00 -- three encodings of one value
+        // under the profile whose entire purpose is that the same value gives
+        // the same bytes, on every platform. ClojureScript already normalised.
+        //
+        // Nothing is lost: boring exposes no NaN-payload or signalling-NaN
+        // type, and decoding collapses every half NaN to Float.NaN, so those
+        // bits were never observable as a value distinction -- only as a
+        // determinism hole. RFC 8949 says a deterministic protocol without
+        // intentional NaN-payload support should pick one form.
+        //
+        // Only on the :shortest path. `:preserve-width` still emits the exact
+        // f64 bits, because preserving the width is what it is for.
+        if (Double.isNaN(d)) { writeF16((short) 0x7E00); return; }
         float f = (float) d;
         if (Double.compare((double) f, d) != 0) { writeF64(d); return; }
         short h = toHalf(f);
@@ -723,10 +1213,22 @@ public final class Writer {
             throw Err.of("bad-simple-value",
                 "boring: simple value must be 0-255, got " + n, "value", (long) n);
         if (n < 24) { u8(SIMPLE | n); return; }
+        // THE ESCAPE HATCH PRODUCES BYTES BORING ITSELF REJECTS. RFC 8949 3.3
+        // ends "Such sequences are not well-formed", which binds the decoder as
+        // well, so `f8 00`..`f8 1f` now raise :boring/malformed-simple-value on
+        // the way back in. The option's original justification -- byte-identical
+        // passthrough of something boring had decoded -- no longer exists, since
+        // there is no longer a decode path that produces one.
+        //
+        // Kept anyway, because an explicit opt-in named after the thing it
+        // permits is a reasonable way to generate a test vector for a lenient
+        // peer, and refusing outright would remove the only way to do it. The
+        // message says what you get rather than implying a round trip.
         if (n < 32 && !permitReservedSimpleValues) throw Err.of("reserved-simple-value",
             "boring: RFC 8949 3.3 forbids encoding simple value " + n
-            + " (0xf8 followed by a byte < 0x20); set :permit-reserved-simple-values "
-            + "to emit it anyway for byte-identical passthrough", "value", (long) n);
+            + " (0xf8 followed by a byte < 0x20), and makes such sequences not "
+            + "well-formed, so boring will not read the result back; set "
+            + ":permit-reserved-simple-values to emit it anyway", "value", (long) n);
         ensure(2);
         buf[pos] = (byte) (SIMPLE | 24);
         buf[pos + 1] = (byte) n;
@@ -769,6 +1271,14 @@ public final class Writer {
         if (!(tag instanceof Number))
             throw Err.of("bad-tag", "boring: tag must be an integer, got "
                 + (tag == null ? "nil" : tag.getClass().getSimpleName()));
+        // FRACTIONAL tags were truncated, not refused: `longValue()` turned tag
+        // 1.5 into tag 1, so `(tagged-value 1.5 0)` and `(tagged-value 1 0)`
+        // both emitted `c1 00`. A tag number is an unsigned integer; anything
+        // else is a mistake the caller should hear about, not a value to round.
+        if (tag instanceof Double || tag instanceof Float
+            || tag instanceof java.math.BigDecimal || tag instanceof clojure.lang.Ratio)
+            throw Err.of("bad-tag",
+                "boring: tag must be an integer, got " + tag);
         writeTag(((Number) tag).longValue());
     }
 
@@ -779,21 +1289,52 @@ public final class Writer {
      * required to iterate in the same order.
      */
     @SuppressWarnings("rawtypes")
+    /**
+     * A map the shaped-array encoding can represent WITHOUT LOSING ANYTHING.
+     *
+     * The shape carries keys and values and nothing else, so a map that is more
+     * than its entries cannot go in one. Records were already excluded; sorted
+     * maps and maps carrying metadata were not, and `writeShapedArray` emitted
+     * them as plain maps -- `[(sorted-map "0" 1) (sorted-map "0" 2)]` came back
+     * as two PersistentArrayMaps, and `with-meta` maps came back with their
+     * metadata gone. `=` still returned true for both, which is why the
+     * round-trip tests could not see it: the defect is in what `=` ignores.
+     *
+     * `:shapes` is an optimisation. An optimisation that silently changes the
+     * value is not one.
+     */
+    private static boolean plainMap(Object o) {
+        if (!(o instanceof Map) || o instanceof clojure.lang.IRecord) return false;
+        if (o instanceof clojure.lang.Sorted) return false;
+        return !(o instanceof clojure.lang.IObj)
+               || ((clojure.lang.IObj) o).meta() == null;
+    }
+
     private Object[] homogeneousShape(List l) {
         int rows = l.size();
         if (rows < 2) return null;               // one row cannot amortise the keys
         Object first = l.get(0);
-        if (!(first instanceof Map) || first instanceof clojure.lang.IRecord) return null;
+        if (!plainMap(first)) return null;
         Map m0 = (Map) first;
         int n = m0.size();
         if (n == 0) return null;
         Object[] keys = m0.keySet().toArray();
         for (int i = 1; i < rows; i++) {
             Object o = l.get(i);
-            if (!(o instanceof Map) || o instanceof clojure.lang.IRecord) return null;
+            if (!plainMap(o)) return null;
             Map m = (Map) o;
             if (m.size() != n) return null;
-            for (int k = 0; k < n; k++) if (!m.containsKey(keys[k])) return null;
+            // `containsKey` on a SORTED map runs its comparator, and the key it
+            // is handed comes from a different map -- so
+            // `[{false nil} (sorted-map "0" nil)]` threw a raw
+            // ClassCastException out of `encode`. A map that cannot be probed
+            // is not part of a homogeneous shape; that is an answer, not an
+            // error.
+            try {
+                for (int k = 0; k < n; k++) if (!m.containsKey(keys[k])) return null;
+            } catch (ClassCastException e) {
+                return null;
+            }
         }
         return keys;
     }
@@ -861,32 +1402,240 @@ public final class Writer {
                 + " differently. Convert to a plain map/set, or register a handler.");
     }
 
+    /**
+     * A collection's reported size disagreed with what iterating it yielded.
+     *
+     * The head is written from `size()` BEFORE the entries, so a mismatch is a
+     * malformed document either way -- a head claiming five elements with four
+     * behind it. With an index it is worse: the anchor array is sized from the
+     * same number, so an over-run walks off it, and an under-fill leaves the
+     * following item to be swallowed as the missing element. Refusing beats
+     * emitting bytes that do not decode.
+     *
+     * Reachable from a concurrently mutated map, a weakly consistent
+     * collection, or a custom `size()` that lies.
+     */
+    private void countMismatch(int declared, int actual) {
+        throw Err.of("collection-size-mismatch",
+            "boring: a collection reported " + declared + " entries and yielded "
+            + actual + ". It was probably mutated while being encoded.");
+    }
+
     private void writeSeqAsArray(clojure.lang.ISeq s, int n) {
+        long start = absOffset();
         head(ARRAY, n);
-        for (; s != null; s = s.next()) writeValue(s.first());
+        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
+        int slot = anchors != null ? reserveNode() : -1;
+        int a = 0, countdown = 1, seen = 0;
+        for (; s != null; s = s.next()) {
+            if (++seen > n) countMismatch(n, seen);
+            if (anchors != null && --countdown == 0) {
+                anchors[a++] = idxOffset(pos); countdown = idxStride;
+            }
+            writeValue(s.first());
+        }
+        if (seen != n) countMismatch(n, seen);
+        if (anchors != null) fillNode(slot, start, n, anchors, false);
+    }
+
+    /** An array of `n` elements from any Iterable, indexed if it is big enough. */
+    @SuppressWarnings("rawtypes")
+    private void writeArrayOf(Iterable it, int n) {
+        long start = absOffset();
+        head(ARRAY, n);
+        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
+        int slot = anchors != null ? reserveNode() : -1;
+        int a = 0, countdown = 1, seen = 0;
+        for (Object o : it) {
+            if (++seen > n) countMismatch(n, seen);
+            if (anchors != null && --countdown == 0) {
+                anchors[a++] = idxOffset(pos); countdown = idxStride;
+            }
+            writeValue(o);
+        }
+        if (seen != n) countMismatch(n, seen);
+        if (anchors != null) fillNode(slot, start, n, anchors, false);
     }
 
     @SuppressWarnings("rawtypes")
     private void writeRecordFields(Object fields) {
         Map m = (Map) fields;
         if (canonical) { writeMapCanonical(m); return; }
-        head(MAP, m.size());
+        int n = m.size();
+        long start = absOffset();
+        head(MAP, n);
+        // Iterated as a SEQ rather than an entrySet, so this cannot delegate to
+        // writeMapValue without changing field order on some record types.
+        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
+        int slot = anchors != null ? reserveNode() : -1;
+        boolean sorted = true;
+        int prevK0 = -1, prevK1 = -1;
+        KeyOrder ko = null;
+        int a = 0, countdown = 1;
+        // Every adjacent pair, for the reason spelled out in writeMapValue: an
+        // anchor sample does not establish that the container is ordered.
+        int seen = 0;
         for (clojure.lang.ISeq s = clojure.lang.RT.seq(fields); s != null; s = s.next()) {
             Map.Entry e = (Map.Entry) s.first();
-            writeValue(e.getKey());
+            if (++seen > n) countMismatch(n, seen);
+            if (anchors != null && --countdown == 0) {
+                anchors[a++] = idxOffset(pos); countdown = idxStride;
+            }
+            int k0 = pos;
+            long flushedAtKey = flushed;
+            pinDepth++;
+            try { writeValue(e.getKey()); } finally { pinDepth--; }
+            if (anchors != null) {
+                if (sink == null) {
+                    if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
+                        sorted = false;
+                    prevK0 = k0; prevK1 = pos;
+                } else {
+                    if (ko == null) ko = new KeyOrder();
+                    sorted = trackKey(ko, sorted, k0, flushedAtKey);
+                }
+            }
             writeValue(e.getValue());
         }
+        if (seen != n) countMismatch(n, seen);
+        if (anchors != null) fillNode(slot, start, n, anchors, sorted);
+    }
+
+    /**
+     * Bytewise comparison of two encoded items already sitting in `buf`,
+     * matching {@link Reader#compareItemsAt}: shorter first when one is a
+     * prefix of the other.
+     */
+    /**
+     * Key-order tracking that survives a flush.
+     *
+     * `cmpInBuf` compares the previous key to the current one by pointing at
+     * both in the buffer — the ONLY place anything reads emitted bytes back —
+     * and while streaming the previous key may already have gone to the sink.
+     * So in streaming mode the previous key is copied out instead of pointed
+     * at. The copy is per-container (containers nest, so this cannot be writer
+     * state) and only allocated for containers big enough to be indexed.
+     *
+     * If a single key is itself split across a flush there is nothing to compare
+     * against, and the container is marked UNSORTED. That is the conservative
+     * direction: `sorted` only ever licenses `boring.nav` to binary-search, so
+     * losing it costs a scan and can never return a wrong answer.
+     */
+    private static final class KeyOrder {
+        byte[] prev = null;
+        int prevLen = -1;
+        boolean lost = false;
+    }
+
+    /** Returns the new value of `sorted` after accounting for this key. */
+    private boolean trackKey(KeyOrder ko, boolean sorted, int k0, long flushedAtKeyStart) {
+        boolean spanned = flushed != flushedAtKeyStart;
+        if (sorted && ko.prevLen >= 0
+            && (spanned || ko.lost || cmpStashed(ko.prev, ko.prevLen, k0, pos) >= 0))
+            sorted = false;
+        if (spanned) {
+            ko.lost = true;
+            ko.prevLen = 0;
+        } else {
+            int len = pos - k0;
+            if (ko.prev == null || ko.prev.length < len) ko.prev = new byte[Math.max(len, 32)];
+            System.arraycopy(buf, k0, ko.prev, 0, len);
+            ko.prevLen = len;
+            ko.lost = false;
+        }
+        return sorted;
+    }
+
+    private int cmpStashed(byte[] a, int alen, int b0, int b1) {
+        int blen = b1 - b0;
+        int m = Math.min(alen, blen);
+        for (int i = 0; i < m; i++) {
+            int x = a[i] & 0xFF, y = buf[b0 + i] & 0xFF;
+            if (x != y) return x - y;
+        }
+        return alen - blen;
+    }
+
+    private int cmpInBuf(int a0, int a1, int b0, int b1) {
+        int an = a1 - a0, bn = b1 - b0, n = Math.min(an, bn);
+        for (int i = 0; i < n; i++) {
+            int x = buf[a0 + i] & 0xFF, y = buf[b0 + i] & 0xFF;
+            if (x != y) return x < y ? -1 : 1;
+        }
+        return Integer.compare(an, bn);
     }
 
     @SuppressWarnings("rawtypes")
     private void writeMapValue(Map m) {
         if (canonical) { writeMapCanonical(m); return; }
-        head(MAP, m.size());
+        int n = m.size();
+        long start = absOffset();
+        head(MAP, n);
+
+        // CONTENT-EQUAL BYTE-STRING KEYS are one key in CBOR (RFC 8949 5.6) and
+        // two keys on the JVM, where byte[] uses identity equality. So a
+        // perfectly valid host map -- two distinct byte[] holding the same
+        // bytes -- encoded to `a2 42 0102 6161 42 0102 6162`, a CBOR map with
+        // the same key twice, which this library's own reader now rejects.
+        //
+        // Checked only when a byte-string key is actually present, so ordinary
+        // maps pay one instanceof per key and nothing else. The canonical path
+        // catches this already, by comparing encoded keys; the ORDINARY path
+        // had no equivalent.
+        checkByteStringKeys(m, n);
+
+        if (!indexing(n)) {                     // the ordinary path
+            int seen = 0;
+            for (Object o : m.entrySet()) {
+                Map.Entry e = (Map.Entry) o;
+                if (++seen > n) countMismatch(n, seen);
+                writeValue(e.getKey());
+                writeValue(e.getValue());
+            }
+            if (seen != n) countMismatch(n, seen);
+            return;
+        }
+
+        long[] anchors = new long[anchorCount(n)];
+        int slot = reserveNode();
+        // EVERY adjacent key pair, not just the anchors.
+        //
+        // Comparing anchors was unsound and produced wrong answers, not merely
+        // missed optimisations. `sorted` licenses `lookup-map` to binary-search
+        // the anchors and then scan ONLY the stride it lands in; that is valid
+        // just when the whole container is ordered. Ascending anchors do not
+        // imply it -- they are a sample. With the default stride of 16 a map of
+        // 17-32 entries has two anchors, so an unordered map had a ~50% chance
+        // of being marked sorted, and then a present key returned nil.
+        // Measured: 105 of 200 random 20-entry maps had at least one such key.
+        //
+        // The cost is one comparison per entry over key bytes, and only for
+        // containers big enough to be indexed at all.
+        boolean sorted = true;
+        int prevK0 = -1, prevK1 = -1;
+        KeyOrder ko = null;
+        int a = 0, countdown = 1, seen = 0;
+
         for (Object o : m.entrySet()) {
             Map.Entry e = (Map.Entry) o;
-            writeValue(e.getKey());
+            if (++seen > n) countMismatch(n, seen);
+            if (--countdown == 0) { anchors[a++] = idxOffset(pos); countdown = idxStride; }
+            int k0 = pos;
+            long flushedAtKey = flushed;
+            pinDepth++;
+            try { writeValue(e.getKey()); } finally { pinDepth--; }
+            if (sink == null) {
+                if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
+                    sorted = false;
+                prevK0 = k0; prevK1 = pos;
+            } else {
+                if (ko == null) ko = new KeyOrder();
+                sorted = trackKey(ko, sorted, k0, flushedAtKey);
+            }
             writeValue(e.getValue());
         }
+        if (seen != n) countMismatch(n, seen);
+        fillNode(slot, start, n, anchors, sorted);
     }
 
     // ---- time, uuid, rational ----------------------------------------------
@@ -905,9 +1654,34 @@ public final class Writer {
      * option picks which one to produce. CBOR has one time concept; the
      * distinction is a JVM artifact.
      */
+    /** RFC 3339's `date-fullyear` is `4DIGIT`, so there is no conforming tag-0
+     *  or tag-1004 text for a year outside 0000-9999.
+     *
+     *  java.time renders those in ISO-8601's EXPANDED form -- `+12013-03-21`,
+     *  `-0001-03-21` -- which boring happily emitted and happily read back, so
+     *  round-trip tests saw nothing while a foreign reader got a string no
+     *  conforming parser accepts. The sign prefix is exactly the marker: the
+     *  4-digit form never carries one.
+     *
+     *  Refused rather than silently rerouted to tag 1. Tag 1 as a float has
+     *  ~0.5us resolution at present epochs and worse at extreme ones, so
+     *  quietly switching would trade an interop bug for a precision bug -- and
+     *  a caller who genuinely wants year 12013 can write the epoch themselves. */
+    private static String rfc3339(String s, long tag) {
+        char c0 = s.charAt(0);
+        if (c0 == '+' || c0 == '-')
+            throw Err.of("unrepresentable-date",
+                "boring: " + s + " has a year outside 0000-9999, which RFC 3339 cannot "
+                + "express, so there is no valid tag " + tag + " text for it; encode the "
+                + "epoch value yourself if you need this range", "value", s, "tag", tag);
+        return s;
+    }
+
     public void writeInstant(java.time.Instant t) {
+        String s = rfc3339(java.time.format.DateTimeFormatter.ISO_INSTANT.format(t),
+                           TAG_DATETIME);
         head(TAG, TAG_DATETIME);
-        writeString(java.time.format.DateTimeFormatter.ISO_INSTANT.format(t));
+        writeString(s);
     }
 
     public void writeUUID(java.util.UUID u) {
@@ -969,6 +1743,51 @@ public final class Writer {
         pos += a.length << 1;
     }
 
+    /**
+     * Classes the writer emits BEFORE consulting the registry, so a handler
+     * registered for one of them can never run.
+     *
+     * These are the hottest scalars, dispatched first on purpose. The registry
+     * lookup was moved above the other built-ins precisely so that an explicit
+     * registration wins -- but it cannot be moved above these without putting a
+     * map lookup in front of every string and every long.
+     *
+     * So the registration is REFUSED instead. Silently doing nothing is the one
+     * unacceptable state: the same API worked or did not depending only on
+     * which class you named, and nothing said which.
+     */
+    public static boolean isRegisterableClass(Class<?> c) {
+        return !(c == String.class || c == Long.class || c == Integer.class
+                 || c == Short.class || c == Byte.class
+                 || c == Double.class || c == Float.class
+                 || c == Boolean.class || c == byte[].class
+                 || c == clojure.lang.Keyword.class
+                 || c == clojure.lang.Symbol.class);
+    }
+
+    /**
+     * Refuse a map whose byte-string keys are content-equal. See writeMapValue.
+     * O(k^2) in the number of BYTE-STRING keys only, which is nearly always 0.
+     */
+    @SuppressWarnings("rawtypes")
+    private void checkByteStringKeys(Map m, int n) {
+        byte[][] seen = null;
+        int c = 0;
+        for (Object o : m.entrySet()) {
+            Object k = ((Map.Entry) o).getKey();
+            if (!(k instanceof byte[])) continue;
+            if (seen == null) seen = new byte[n][];
+            byte[] b = (byte[]) k;
+            for (int i = 0; i < c; i++)
+                if (java.util.Arrays.equals(seen[i], b))
+                    throw Err.of("duplicate-map-key",
+                        "boring: two map keys are byte strings with the same content,"
+                        + " which is ONE key in CBOR (RFC 8949 5.6). This map cannot"
+                        + " be encoded without producing a duplicate key.");
+            seen[c++] = b;
+        }
+    }
+
     /** Length of a primitive row, without knowing which primitive it is. */
     private static int rowLen(Object row) { return java.lang.reflect.Array.getLength(row); }
 
@@ -977,13 +1796,33 @@ public final class Writer {
      * plain array of rows.
      */
     private void writeMatrix(Object[] rows, Class<?> rowType) {
-        boolean rectangular = rows.length > 0;
-        int cols = rows.length > 0 ? rowLen(rows[0]) : 0;
-        for (Object r : rows) {
-            // A null row is not a shape, and a differing length is not a
-            // rectangle. Either way tag 40 does not apply.
-            if (r == null || rowLen(r) != cols) { rectangular = false; break; }
+        // `rows[0]` is inspected only AFTER it is known non-null. The length was
+        // read before the loop's own null check, so a null FIRST row threw a raw
+        // NullPointerException and the documented null-row fallback was
+        // unreachable for exactly the row most likely to be null.
+        boolean rectangular = rows.length > 0 && rows[0] != null;
+        int cols = rectangular ? rowLen(rows[0]) : 0;
+        if (rectangular) {
+            for (Object r : rows) {
+                // A null row is not a shape, and a differing length is not a
+                // rectangle. Either way tag 40 does not apply.
+                if (r == null || rowLen(r) != cols) { rectangular = false; break; }
+            }
         }
+        // A ZERO-ROW matrix takes the fallback, NOT tag 40.
+        //
+        // I had made it rectangular so its type survived -- and that emitted
+        // `d8 28 82 82 00 00 ...`, dimensions [0,0], which RFC 8746 3.1.1
+        // forbids: dimensions must be unsigned integers DISTINCT FROM ZERO.
+        // Our own reader accepted it, so a round-trip test blessed output that
+        // violates the registered tag's content rules -- the worst way to be
+        // wrong, because the suite says you are right.
+        //
+        // There is no standard tag-40 encoding of a zero extent, so the type is
+        // the thing that has to give. It is a 0x0 matrix: it carries no values
+        // to lose, and inventing a private tag to preserve its class would be a
+        // poor trade against emitting invalid CBOR.
+        if (cols == 0) rectangular = false;      // dims must be non-zero, both of them
         if (!rectangular) {
             head(ARRAY, rows.length);
             for (Object r : rows) writeValue(r);
@@ -996,25 +1835,31 @@ public final class Writer {
         writeLong(cols);
         // The flat payload is one typed array, so the whole matrix is a single
         // bulk copy per row rather than a value-at-a-time encode.
-        int n = rows.length * cols;
+        // long before narrowing: `rows.length * cols` could wrap negative and slip
+        // past the size check in typedArrayHeader, which takes a long.
+        long n = (long) rows.length * cols;
+        if (n > Integer.MAX_VALUE)
+            throw Err.of("value-too-large",
+                "boring: matrix of " + rows.length + "x" + cols
+                + " elements exceeds what one typed array can hold");
         if (rowType == double[].class) {
-            typedArrayHeader(TAG_ARR_F64_LE, (long) n * 8);
+            typedArrayHeader(TAG_ARR_F64_LE, n * 8);
             for (Object r : rows) { double[] d = (double[]) r;
                 for (int i = 0; i < cols; i++) { LONG_LE.set(buf, pos, Double.doubleToRawLongBits(d[i])); pos += 8; } }
         } else if (rowType == long[].class) {
-            typedArrayHeader(TAG_ARR_S64_LE, (long) n * 8);
+            typedArrayHeader(TAG_ARR_S64_LE, n * 8);
             for (Object r : rows) { long[] d = (long[]) r;
                 for (int i = 0; i < cols; i++) { LONG_LE.set(buf, pos, d[i]); pos += 8; } }
         } else if (rowType == int[].class) {
-            typedArrayHeader(TAG_ARR_S32_LE, (long) n * 4);
+            typedArrayHeader(TAG_ARR_S32_LE, n * 4);
             for (Object r : rows) { int[] d = (int[]) r;
                 for (int i = 0; i < cols; i++) { INT_LE.set(buf, pos, d[i]); pos += 4; } }
         } else if (rowType == float[].class) {
-            typedArrayHeader(TAG_ARR_F32_LE, (long) n * 4);
+            typedArrayHeader(TAG_ARR_F32_LE, n * 4);
             for (Object r : rows) { float[] d = (float[]) r;
                 for (int i = 0; i < cols; i++) { INT_LE.set(buf, pos, Float.floatToRawIntBits(d[i])); pos += 4; } }
         } else {
-            typedArrayHeader(TAG_ARR_S16_LE, (long) n * 2);
+            typedArrayHeader(TAG_ARR_S16_LE, n * 2);
             for (Object r : rows) { short[] d = (short[]) r;
                 for (int i = 0; i < cols; i++) { SHORT_LE.set(buf, pos, d[i]); pos += 2; } }
         }
@@ -1078,12 +1923,14 @@ public final class Writer {
         Writer scratch = canonicalSubWriter();
         int i = 0;
         for (Object o : s) {
+            if (i >= n) countMismatch(n, i + 1);    // staging arrays are size()d
             scratch.reset();
             scratch.writeValue(o);
             encoded[i] = scratch.toByteArray();
             items[i] = o;
             i++;
         }
+        if (i != n) countMismatch(n, i);
 
         Integer[] order = new Integer[n];
         for (int j = 0; j < n; j++) order[j] = j;
@@ -1104,8 +1951,28 @@ public final class Writer {
                     + items[order[j - 1]] + " and " + items[order[j]] + ")");
 
         head(TAG, TAG_SET);
+        long start = absOffset();                       // the array, not the tag
         head(ARRAY, n);
-        for (int j = 0; j < n; j++) writeValue(items[order[j]]);
+        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
+        int slot = anchors != null ? reserveNode() : -1;
+        int a = 0, countdown = 1;
+        for (int j = 0; j < n; j++) {
+            if (anchors != null && --countdown == 0) {
+                anchors[a++] = idxOffset(pos); countdown = idxStride;
+            }
+            // The STAGED bytes, not a second `writeValue`. Re-encoding asked a
+            // registered handler for the value twice, and a handler may be
+            // stateful or read the clock -- so the bytes that decided the sort
+            // order need not be the bytes emitted, and a canonical set could go
+            // out DESCENDING. Canonical maps already copy their staged keys;
+            // this is the same fix, and it also restores one handler call per
+            // value.
+            byte[] eb = encoded[order[j]];
+            ensure(eb.length);
+            System.arraycopy(eb, 0, buf, pos, eb.length);
+            pos += eb.length;
+        }
+        if (anchors != null) fillNode(slot, start, n, anchors, false);
     }
 
     /**
@@ -1133,7 +2000,35 @@ public final class Writer {
         scratch.permitReservedSimpleValues = this.permitReservedSimpleValues;
         scratch.inclMetadata = this.inclMetadata;
         scratch.maxDepth = this.maxDepth;
-        scratch.depthOffset = this.depth;
+        // ACCUMULATE the parent's own offset. A scratch writer made by a scratch
+        // writer -- a canonical map nested inside a canonical map key -- reset
+        // the budget to the inner parent's local depth, so nesting through key
+        // position got a fresh allowance each time.
+        scratch.depthOffset = this.depth + this.depthOffset;
+        // The claim above is "EVERY behaviour-affecting option is inherited",
+        // and this one was not: an :encode-fallback configured to rescue an
+        // unsupported value worked everywhere except in a map KEY or a set
+        // ELEMENT under :canonical, where those are pre-encoded here. The
+        // option silently did not apply exactly where the document was hardest
+        // to fix by hand.
+        scratch.encodeFallback = this.encodeFallback;
+        // And the RE-ENTRY GUARD with it. `inFallback` is what stops a fallback
+        // whose result still contains the unsupported value from recursing
+        // forever; copying the fallback without it meant every hop into a
+        // scratch writer handed back a fresh, un-guarded budget. A fallback
+        // returning a map keyed by the very object it was called for then
+        // overflowed the stack instead of raising the typed unsupported-value
+        // error -- a failure introduced by inheriting the fallback at all.
+        scratch.inFallback = this.inFallback;
+        // The index fields are the one group DELIBERATELY not inherited, and
+        // this is checked rather than commented because getting it wrong is
+        // silent: the scratch writer encodes keys into its own buffer, so any
+        // node it recorded would carry offsets into bytes that are then copied
+        // somewhere else entirely -- a plausible-looking index pointing at the
+        // wrong places, which no round-trip test would catch.
+        if (scratch.idxStride != 0)
+            throw Err.of("index-scratch-leak",
+                "boring: the canonical scratch writer must never index");
         return scratch;
     }
 
@@ -1149,6 +2044,11 @@ public final class Writer {
         int i = 0;
         for (Object o : m.entrySet()) {
             Map.Entry e = (Map.Entry) o;
+            // Checked BEFORE indexing the staging arrays, which are sized from
+            // size(): a map yielding more entries than it reported threw a raw
+            // ArrayIndexOutOfBoundsException from here rather than the typed
+            // error the other container paths give.
+            if (i >= n) countMismatch(n, i + 1);
             scratch.reset();
             scratch.writeValue(e.getKey());
             encodedKeys[i] = scratch.toByteArray();
@@ -1156,6 +2056,7 @@ public final class Writer {
             vals[i] = e.getValue();
             i++;
         }
+        if (i != n) countMismatch(n, i);
 
         Integer[] order = new Integer[n];
         for (int j = 0; j < n; j++) order[j] = j;
@@ -1164,14 +2065,55 @@ public final class Writer {
             ? compareBytesLengthFirst(encodedKeys[p], encodedKeys[q])
             : compareBytes(encodedKeys[p], encodedKeys[q]));
 
+        // Distinct keys can encode identically -- Long 1 and BigInteger.ONE
+        // both reduce to `01` -- and a map with two identical CBOR keys is
+        // output that boring's OWN decoder rejects as :boring/duplicate-map-key.
+        // Canonical SETS have always checked this; maps did not, so the same
+        // hazard produced an unreadable document instead of an error. Only
+        // reachable from a map that considers such keys distinct (an
+        // IdentityHashMap, a custom comparator), which is why it survived.
+        //
+        // The same sweep answers `sorted` below, which is why it is one loop
+        // and not two.
+        //
+        // `sorted` is the claim "these keys are in BYTEWISE ascending order",
+        // because bytewise is what `Reader.compareItemsAt` -- the comparator the
+        // navigator's binary search actually uses -- compares. Under
+        // `legacyCanonicalOrder` (:profile :canonical-rfc7049) the sort above
+        // ran LENGTH FIRST, which is a different order, so the sort's comparator
+        // is not the answer and this loop is. Reading it off the emitted key
+        // bytes is what `build-index`'s byte walk has always done; taking
+        // `!legacyCanonicalOrder` instead made the two builders disagree about
+        // the same file, which `the-two-index-builders-agree` asserts they
+        // cannot. The conservative answer is SAFE -- it only ever gives up a
+        // binary search -- but it was given up for every `:canonical-rfc7049`
+        // file, including the many whose keys are bytewise ascending anyway.
+        boolean sorted = true;
+        for (int j = 1; j < n; j++) {
+            int c = compareBytes(encodedKeys[order[j - 1]], encodedKeys[order[j]]);
+            if (c == 0)
+                throw Err.of("canonical-duplicate",
+                    "boring: two map keys encode identically under :canonical ("
+                    + keys[order[j - 1]] + " and " + keys[order[j]] + ")");
+            if (c > 0) sorted = false;
+        }
+
+        long start = absOffset();
         head(MAP, n);
+        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
+        int slot = anchors != null ? reserveNode() : -1;
+        int a = 0, countdown = 1;
         for (int j = 0; j < n; j++) {
             int k = order[j];
+            if (anchors != null && --countdown == 0) {
+                anchors[a++] = idxOffset(pos); countdown = idxStride;
+            }
             ensure(encodedKeys[k].length);
             System.arraycopy(encodedKeys[k], 0, buf, pos, encodedKeys[k].length);
             pos += encodedKeys[k].length;
             writeValue(vals[k]);
         }
+        if (anchors != null) fillNode(slot, start, n, anchors, sorted);
     }
 
     public void writeBoolean(boolean b) { u8(SIMPLE | (b ? 21 : 20)); }
@@ -1179,9 +2121,42 @@ public final class Writer {
 
     public void writeBytes(byte[] bs) {
         head(BYTES, bs.length);
-        ensure(bs.length);
-        System.arraycopy(bs, 0, buf, pos, bs.length);
-        pos += bs.length;
+        writePayload(bs, 0, bs.length);
+    }
+
+    /**
+     * A payload that is already a contiguous byte range, emitted AFTER its head.
+     *
+     * While streaming, a payload larger than the buffer goes STRAIGHT TO THE
+     * SINK instead of growing the buffer to hold it. A comment here used to
+     * claim that one CBOR item with a length header cannot be split across
+     * chunks, and that is simply wrong: a chunk boundary is a write-call
+     * boundary and has no CBOR meaning at all. The header has already been
+     * emitted and says how many bytes follow; where those bytes are handed to
+     * the OutputStream is nobody's business but ours.
+     *
+     * Concretely: a 1 MB byte array through a 64-byte writer used to leave that
+     * writer holding a 1 MiB buffer -- a second full-size copy of something the
+     * caller already had -- and now leaves it at 64 bytes.
+     *
+     * Not streaming, or small enough to fit: the ordinary buffered path, which
+     * keeps `buffer()`/`encode-buffered!` working exactly as before.
+     */
+    private void writePayload(byte[] src, int off, int len) {
+        if (sink != null && pinDepth == 0 && len >= buf.length) {
+            if (pos > 0) flushChunk();
+            try {
+                sink.write(src, off, len);
+            } catch (java.io.IOException e) {
+                throw Err.of("io-error",
+                    "boring: writing to the sink failed: " + e.getMessage(), e);
+            }
+            flushed += len;
+            return;
+        }
+        ensure(len);
+        System.arraycopy(src, off, buf, pos, len);
+        pos += len;
     }
 
     /**
@@ -1230,6 +2205,16 @@ public final class Writer {
 
     private void writeStringLiteral(String s, int slot) {
         int n = s.length();
+        // A string that cannot fit the buffer skips the speculative path
+        // entirely. Speculating means reserving the whole payload up front so
+        // the loop can bail out to writeStringSlow on the first non-ASCII
+        // character -- which is exactly the growth streaming exists to avoid,
+        // and cannot be retracted once part of it has gone to the sink.
+        // writeStringSlow streams the payload after its head.
+        if (sink != null && pinDepth == 0 && (long) n + 5 > buf.length) {
+            writeStringSlow(s, slot);
+            return;
+        }
         // Speculate ASCII: reserve worst-case-for-ASCII and bail out if wrong.
         ensure(n + 5);
         int hdrStart = pos;
@@ -1289,9 +2274,12 @@ public final class Writer {
         checkWellFormedUtf16(s);
         byte[] utf = s.getBytes(StandardCharsets.UTF_8);
         head(TEXT, utf.length);
-        ensure(utf.length);
-        System.arraycopy(utf, 0, buf, pos, utf.length);
-        pos += utf.length;
+        // Streams past the buffer, like any other payload. `getBytes` still
+        // allocates the whole UTF-8 form first, so this halves the peak rather
+        // than removing it -- an incremental CharsetEncoder would be needed for
+        // that, and is not worth the complexity until someone has a string
+        // large enough to care.
+        writePayload(utf, 0, utf.length);
         // Byte length differs from char length here, so the slot from the
         // char-length probe is still valid but the threshold uses utf.length.
         if (slot >= 0) srInsertAt(slot, s, utf.length);
@@ -1473,10 +2461,10 @@ public final class Writer {
         //
         // An explicit registration is an instruction, so it wins. Nobody can be
         // broken by this who was not already being ignored.
-        Object[] handler = registry.writerFor(c);
+        TagRegistry.TagWriter handler = registry.hasWriters() ? registry.writerFor(c) : null;
         if (handler != null) {
-            head(TAG, ((Number) handler[0]).longValue());
-            writeValue(((clojure.lang.IFn) handler[1]).invoke(x));
+            writeTag(handler.tag);                        // validated, not raw head
+            writeValue(handler.fn.invoke(x));
             return;
         }
 
@@ -1524,16 +2512,19 @@ public final class Writer {
             return;
         }
         if (c == java.time.LocalDate.class) {
+            // ISO-8601 == RFC 3339 full-date, but only inside 0000-9999; see rfc3339.
+            String s = rfc3339(x.toString(), TAG_FULL_DATE);
             head(TAG, TAG_FULL_DATE);
-            writeString(x.toString());               // ISO-8601, == RFC 3339 full-date
+            writeString(s);
             return;
         }
         if (c == java.sql.Date.class) {
             // A calendar date, not an instant: java.sql.Date's time-of-day is
             // meaningless and its toInstant() throws. Tag 1004 is the registered
             // full-date form, so it goes there rather than through tag 0.
+            String s = rfc3339(((java.sql.Date) x).toLocalDate().toString(), TAG_FULL_DATE);
             head(TAG, TAG_FULL_DATE);
-            writeString(((java.sql.Date) x).toLocalDate().toString());
+            writeString(s);
             return;
         }
         if (c == java.net.URI.class) {
@@ -1712,23 +2703,21 @@ public final class Writer {
             return;
         }
 
-        if (x instanceof Map) {
-            Map m = (Map) x;
-            if (canonical) { writeMapCanonical(m); return; }
-            head(MAP, m.size());
-            for (Object o : m.entrySet()) {
-                Map.Entry e = (Map.Entry) o;
-                writeValue(e.getKey());
-                writeValue(e.getValue());
-            }
-            return;
-        }
+        // These four delegated to inline copies of the loops in writeMapValue
+        // and writeSeqAsArray. Duplicated loops meant the index hook had to be
+        // written four more times, and the first attempt missed exactly this
+        // one -- plain Clojure maps never reached the instrumented method, so
+        // every map came back unindexed while the named method looked correct.
+        if (x instanceof Map) { writeMapValue((Map) x); return; }
         if (x instanceof Set) {
             Set s = (Set) x;
             if (canonical) { writeSetCanonical(s); return; }
             head(TAG, TAG_SET);
-            head(ARRAY, s.size());
-            for (Object o : s) writeValue(o);
+            // The node describes the ARRAY, not the tag: the byte walk descends
+            // tags and indexes the container beneath, so `start` is taken after
+            // the tag head or the two would disagree about this container's
+            // offset.
+            writeArrayOf(s, s.size());
             return;
         }
         if (x instanceof List) {
@@ -1738,18 +2727,35 @@ public final class Writer {
                 if (shape != null) { writeShapedArray(l, shape); return; }
             }
             int n = l.size();
+            long start = absOffset();
             head(ARRAY, n);
+            long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
+            int slot = anchors != null ? reserveNode() : -1;
+            int a = 0, countdown = 1, seen = 0;
             if (x instanceof java.util.RandomAccess) {
-                for (int i = 0; i < n; i++) writeValue(l.get(i));
+                // Indexed by position, so it cannot yield more or fewer than n.
+                for (int i = 0; i < n; i++) {
+                    if (anchors != null && --countdown == 0) {
+                        anchors[a++] = idxOffset(pos); countdown = idxStride;
+                    }
+                    writeValue(l.get(i));
+                }
             } else {
-                for (Object o : l) writeValue(o);
+                for (Object o : l) {
+                    if (++seen > n) countMismatch(n, seen);
+                    if (anchors != null && --countdown == 0) {
+                        anchors[a++] = idxOffset(pos); countdown = idxStride;
+                    }
+                    writeValue(o);
+                }
+                if (seen != n) countMismatch(n, seen);
             }
+            if (anchors != null) fillNode(slot, start, n, anchors, false);
             return;
         }
         if (x instanceof java.util.Collection) {
             java.util.Collection col = (java.util.Collection) x;
-            head(ARRAY, col.size());
-            for (Object o : col) writeValue(o);
+            writeArrayOf(col, col.size());
             return;
         }
         // A fallback turns "one bad field kills the document" into "one bad

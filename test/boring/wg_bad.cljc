@@ -4,6 +4,15 @@
 ;; The official CBOR working group's not-well-formed corpus. Every entry
 ;; must be REJECTED with a typed boring error. `:exempt-reason` marks entries
 ;; we deliberately accept under default options, with the reason.
+;;
+;; NOT A SUPERSET of RFC 8949 Appendix F.1 -- see boring.appendix-f, which
+;; carries the RFC's own list in full and enumerates what this file lacks.
+;; Run both; neither subsumes the other.
+;;
+;; Two entries here are inherited mislabels: the tag-0 and tag-1 date cases
+;; (`c0a1616100`, `c1a1616100`) are VALIDITY errors, not well-formedness
+;; ones. boring rejects them either way, so they are left as upstream has
+;; them rather than diverging from the corpus this file exists to mirror.
 
 (ns boring.wg-bad)
 

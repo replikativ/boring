@@ -47,3 +47,19 @@ target/release/
 .agents/
 .codex/
 .claude/
+
+# One-off probe namespaces. A reviewer or an agent with a single question
+# writes one, compiles it, answers the question and forgets it -- under bench/,
+# because that is the only source root a ClojureScript build already reaches.
+# Seven of them once shipped in one commit (probe.cljs, probe2/probe3 and their
+# mains, probe_cases, probe_fix) because somebody ran `git add -A`, and every
+# review round since has left more behind: packed_probe.clj, FfmProbe.java,
+# dsprobe, secprobe, probeaud, docprobe. Ignored by NAME rather than by
+# discipline, since discipline is what has already failed six times.
+#
+# A probe that has earned a place in the repo gets a real name, a docstring
+# saying which property it guards, and a bin/ci stage that runs it. Until it
+# has all three it is scratch, and `git add -f` is the deliberate override.
+bench/**/*probe*
+bench/**/*Probe*
+.fuzzscratch/

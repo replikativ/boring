@@ -25,6 +25,17 @@ still entirely unassigned.
 Re-verified against <https://www.iana.org/assignments/cbor-tags/tags.csv> on
 2026-07-31: 39649 unassigned, nothing assigned in 38000–39999.
 
+**Only one number is claimed.** The offset index was briefly tag 39651 and is
+now a tag-27 *name*, `boring/index` — tag 27 being CBOR's registered extension
+point for named types, needing no number of its own. That decision was measured
+rather than argued: the index occurs once per file, so a name costs 0.05%.
+
+Tag 39649 stays a number because shaped arrays occur **per array**. Measured,
+carrying them as a tag-27 name instead would add 19.6% to a document of 100
+small tables and 35.2% to one of 500 — on a feature whose whole purpose is to
+shrink exactly those. That is the rationale, recorded here because "we could
+not remember why" is a poor answer to give during registration.
+
 ## Procedure
 
 Tags 32768 and above are **First Come First Served** (RFC 8949 §9.2): no expert

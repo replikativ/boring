@@ -55,8 +55,8 @@ below.
 
 Tag 27 is "serialised language-independent object with type name and
 constructor arguments". boring uses it for your records — the type name is the
-record's class name — and also for a handful of types CBOR has no tag for,
-under names carrying a **slash**, which a JVM class name never does:
+record's own `namespace/Name`, as written — and also for a handful of types
+CBOR has no tag for, under names carrying the same **slash**:
 
 | name | argument | why it is not just the bare value |
 |---|---|---|
@@ -66,13 +66,18 @@ under names carrying a **slash**, which a JVM class name never does:
 | `clojure/with-meta` | `[meta, value]` | Clojure metadata, which has nowhere else to go |
 | `clojure/char` | a 1-character string | `(= \a "a")` is **false** in Clojure |
 | `java/period` | an ISO-8601 string, e.g. `"P1Y1M1D"` | a *date* amount; RFC 9581's tag 1002 carries *seconds* |
+| `boring/index` | `[stride, containers, counts, slots, sorted, ptr]` | a file's offset index. Pure metadata — **ignoring it is always correct** |
 
 The prefix names the runtime that owns the type. These names are **frozen** —
 they are pinned in the golden corpus, because renaming one is a silent break: a
 reader that does not recognise a name yields an ordinary value rather than
 raising.
 
-For a foreign reader, ignoring them entirely is safe and lossy in a predictable
+`boring/index` is the one you can ignore with no loss at all: it is an
+optimisation for seeking within a file, never data, and boring itself falls
+back to scanning whenever it is absent or stale.
+
+For a foreign reader, ignoring the others is safe and lossy in a predictable
 direction — a sorted map arrives as a map, a queue as an array, a char as a
 one-character string. Handling `clojure/with-meta` is worth the four lines, since
 otherwise every annotated value arrives wrapped:

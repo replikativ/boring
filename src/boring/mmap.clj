@@ -34,7 +34,7 @@
            (java.nio.channels FileChannel FileChannel$MapMode)
            (java.nio.file StandardOpenOption)
            (org.replikativ.boring ByteSource)
-           (org.replikativ.boring.ffm SegmentSource)))
+           (org.replikativ.boring.ffm SegmentSink SegmentSource)))
 
 (set! *warn-on-reflection* true)
 
@@ -42,6 +42,35 @@
   "Wrap a `MemorySegment` as a `ByteSource` the reader accepts."
   ^ByteSource [^MemorySegment seg]
   (SegmentSource/of seg))
+
+(defn segment-sink
+  "Wrap a `MemorySegment` as an `OutputStream` the writer streams into.
+
+  The write-side mirror of `segment-source`, and the answer to \"can boring
+  encode straight into off-heap memory\": yes, through the ordinary streaming
+  path, because `boring.core/write-to!` takes an `OutputStream` and this is one.
+  Each chunk becomes a single bulk copy.
+
+      (with-open [arena (java.lang.foreign.Arena/ofShared)]
+        (let [seg (.allocate arena (* 64 1024 1024))
+              snk (segment-sink seg)
+              w (boring/writer 65536 {:stringref false})]
+          (boring/write-to! w value snk {:stringref false})
+          (.written snk)))                    ; a slice of exactly the bytes
+
+  It is an `OutputStream` and not a sink type of its own because `Writer`
+  compiles at `--release 9` and cannot name a `MemorySegment`. That is the
+  constraint the two source sets exist to preserve, and keeping the writer's
+  sink an OutputStream is what lets the streaming encoder reach off-heap memory
+  without breaking it.
+
+  WRITING TO A MAPPED SEGMENT IS USUALLY THE WRONG CHOICE -- see doc/STORAGE.md:
+  appending 200 000 items costs 130 ms through a `BufferedOutputStream` and
+  171 ms through a mapping, because a mapping faults per page while `write(2)`
+  hands the kernel one prepared buffer. Reach for this when a native peer will
+  read the bytes, or when a mapping is open anyway; not as a faster file writer."
+  ^java.io.OutputStream [^MemorySegment seg]
+  (SegmentSink/of seg))
 
 (defn mmap-segment
   "Map `file` read-only into `arena`. The segment is valid until the arena
@@ -66,9 +95,46 @@
   references wrongly."
   ([file] (mmap-source file nil))
   ([file opts]
-   (let [arena (Arena/ofShared)
-         seg (mmap-segment file arena)]
-     [(nav/source (segment-source seg) opts) arena])))
+   ;; The arena is CLOSED if anything after it throws. It owns the mapping, and
+   ;; the caller only learns about it through the return value -- so a failure
+   ;; in `mmap-segment` (a missing file, a permissions error) or in the cursor
+   ;; construction (`boring.nav` refuses a stringref document) leaked the
+   ;; mapping with no handle left to close it.
+   (let [arena (Arena/ofShared)]
+     (try
+       (let [seg (mmap-segment file arena)]
+         [(nav/source (segment-source seg) opts) arena])
+       (catch Throwable t
+         (.close ^java.lang.AutoCloseable arena)
+         (throw t))))))
+
+(defn mmap-items
+  "Map `file` as a CBOR SEQUENCE and return `[items arena]`, where `items` is
+  what `boring.nav/items` returns -- seqable, reducible, `nth`-able.
+
+  `mmap-source` is the single-value shape: it hands back a cursor at the root,
+  which is wrong for a file of many top-level items. This is the other one, and
+  it is the shape a log actually has. If the sequence was sealed with an index
+  (`write-seq!` with `:index N`), `nth` uses it here exactly as it does on the
+  heap -- which is the combination this whole feature is for: seek into a large
+  file without faulting in the pages you skipped.
+
+  Same rules as `mmap-source`: the caller closes the arena, nothing derived from
+  it may escape, and the file must have been written `{:stringref false}`."
+  ([file] (mmap-items file nil))
+  ([file opts]
+   ;; The arena is CLOSED if anything after it throws. It owns the mapping, and
+   ;; the caller only learns about it through the return value -- so a failure
+   ;; in `mmap-segment` (a missing file, a permissions error) or in the cursor
+   ;; construction (`boring.nav` refuses a stringref document) leaked the
+   ;; mapping with no handle left to close it.
+   (let [arena (Arena/ofShared)]
+     (try
+       (let [seg (mmap-segment file arena)]
+         [(nav/items (segment-source seg) opts) arena])
+       (catch Throwable t
+         (.close ^java.lang.AutoCloseable arena)
+         (throw t))))))
 
 (defmacro with-mmap
   "Map `file`, bind `binding` to a root cursor, and close the arena after.

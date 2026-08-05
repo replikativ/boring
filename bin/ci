@@ -153,6 +153,15 @@ stage_hasch () {
 }
 
 stage_cljs () {
+  # DELETED FIRST. `run` records a failure and carries on, so a failed compile
+  # left the PREVIOUS run's target/cljs-test.js in place and `cljs-tests`
+  # happily ran it -- reporting ok, with the old test count, against code that
+  # does not compile. Observed: a broken docstring in reader.cljs failed
+  # cljs-compile while cljs-tests passed 178 tests from a stale build.
+  #
+  # Removing the artifact rather than gating on the compile's exit status,
+  # because it also catches a compile that "succeeds" and writes nothing.
+  rm -f target/cljs-test.js
   run cljs-compile clojure -M:cljs-deps -m cljs.main \
       -co '{:language-in :ecmascript-next}' -O advanced -t node \
       -o target/cljs-test.js -c cljsbench.runner
@@ -164,9 +173,45 @@ stage_cljs () {
 # nice-to-have. Counts are kept modest enough to run on every push.
 # The reference readers in interop/ are documentation that EXECUTES. A snippet
 # in a markdown file rots silently; this one breaks the build.
+# Not in `all`: it runs the index suite four times over, which is minutes. It
+# is the gate that proves the index tests DEPEND on the index, so it belongs in
+# CI proper rather than in a local `bin/ci` run.
+stage_index_mutants () {
+  run index-mutants bin/index-mutants
+}
+
 stage_interop () {
   if python3 -c "import cbor2" 2>/dev/null; then
     run interop-python python3 interop/test_read_boring.py
+    # A stronger claim than "cbor2 can read us": that boring and cbor2 emit
+    # the IDENTICAL octet sequence for a canonical encoding. A reader can be
+    # wrong in the same direction as the writer and the round trip still
+    # closes; two independent encoders agreeing byte for byte cannot.
+    #
+    # REGENERATED FIRST, and that is the whole gate. The fixture carries
+    # boring's bytes, so a checked-in one turns this into a test of cbor2
+    # against a frozen snapshot -- it cannot fail on a boring regression, which
+    # is the only regression it exists to catch. Found by asking the question
+    # this project keeps having to ask: can this test fail?
+    run interop-fixture clojure -Sdeps '{:paths ["src" "interop" "target/classes"]}' \
+        -M -m gen-canonical-fixture
+    # The regenerated fixture must MATCH the committed one. Two different
+    # failures hide in the gap, and both were live:
+    #
+    #   - the generator is not reproducible. It was not: `order-mixed-majors`
+    #     was a 9-entry map literal -- one past the array-map threshold, so a
+    #     PersistentHashMap -- with a byte-array key, which hashes by IDENTITY.
+    #     Its slot moved every JVM run, so the fixture came out different every
+    #     time and every `bin/ci` run silently dirtied the tree.
+    #   - the committed fixture is STALE against the current encoder, which the
+    #     header of gen_canonical_fixture.clj says must never happen and which
+    #     nothing checked.
+    #
+    # Neither shows up in the checkers below, because they read the file that
+    # was just written. Without this the requirement was documentation.
+    run interop-fixture-committed \
+        git diff --exit-code -- interop/canonical_fixture.cbor
+    run interop-canonical python3 interop/test_canonical_bytes.py
   else
     echo "\u2500\u2500\u25b6 interop-python"
     echo "   SKIPPED - python3 cbor2 not installed (pip install cbor2)"
@@ -179,7 +224,14 @@ stage_interop () {
 stage_interop_rust () {
   if command -v cargo >/dev/null 2>&1; then
     run interop-rust cargo run --quiet --manifest-path interop/rust/Cargo.toml \
-        -- interop/fixture.cbor
+        --bin read-boring -- interop/fixture.cbor
+    # A THIRD independent encoder over the canonical corpus. Two encoders
+    # agreeing cannot see a mistake they share, and boring and cbor2 do share
+    # one: both flatten every NaN to f97e00, which the Python gate is
+    # structurally unable to notice. ciborium does not, and says so.
+    run interop-canonical-rust cargo run --quiet \
+        --manifest-path interop/rust/Cargo.toml \
+        --bin canonical-bytes -- interop/canonical_fixture.cbor
   elif [ -n "${CI:-}" ]; then
     echo "──▶ interop-rust"
     echo "   FAILED — cargo missing, and CI must not skip a required reader"
@@ -203,10 +255,32 @@ stage_fuzz () {
 }
 
 stage_fuzz_cljs () {
+  # Same stale-artifact hole as stage_cljs, and it fired in the same run:
+  # fuzz-cljs-compile FAILED and fuzz-cljs reported ok, fuzzing the previous
+  # build.
+  rm -f target/cljs-fuzz.js
   run fuzz-cljs-compile clojure -M:cljs-deps -m cljs.main \
       -co '{:language-in :ecmascript-next}' -O advanced -t node \
       -o target/cljs-fuzz.js -c cljsbench.fuzz
   run fuzz-cljs node target/cljs-fuzz.js 50000
+
+  # `skip-from` must land exactly where `read!` lands. A skip one byte off
+  # yields an offset into the middle of an item, which reads back as a
+  # plausible WRONG VALUE rather than an error -- and the index this branch
+  # adds is built entirely out of these offsets, so it is the property the
+  # whole feature rests on.
+  #
+  # It lives here rather than in stage_cljs because it is randomised (20 000
+  # generated values per run), and it needed no CircleCI change: the `fuzz`
+  # job already invokes `bin/ci fuzz-cljs`.
+  #
+  # It existed in bench/ for this entire branch and NOTHING RAN IT -- not a
+  # stage, not a compile target, not required by the runner.
+  rm -f target/cljs-skipprop.js
+  run skipprop-compile clojure -M:cljs-deps -m cljs.main \
+      -co '{:language-in :ecmascript-next}' -O advanced -t node \
+      -o target/cljs-skipprop.js -c cljsbench.skipprop
+  run skipprop node target/cljs-skipprop.js
 }
 
 ensure_classes
@@ -217,6 +291,7 @@ case "${1:-all}" in
   nippy)     stage_nippy ;;
   hasch)     stage_hasch ;;
   interop)   stage_interop; stage_interop_rust ;;
+  mutants)   stage_index_mutants ;;
   artifact)  stage_artifact ;;
   lint)      stage_lint ;;
   fuzz)      stage_fuzz ;;

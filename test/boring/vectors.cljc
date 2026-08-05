@@ -58,7 +58,13 @@
    {:hex "f6" :value nil :roundtrip true}
    {:hex "f7" :value :undefined :roundtrip true :diag "undefined"}
    {:hex "f0" :value [:simple 16] :roundtrip true :diag "simple(16)"}
-   {:hex "f818" :value [:simple 24] :roundtrip true :diag "simple(24)" :encode-forbidden true :encode-forbidden-reason "RFC 8949 3.3: an encoder MUST NOT issue two-byte sequences that start with 0xf8 and continue with a byte less than 0x20. Simple value 24 is decodable but not encodable; the vector predates RFC 8949."}
+   ;; `f818` / simple(24) DELIBERATELY ABSENT. It was carried here as an
+   ;; Appendix A vector that boring could decode but not encode. It is not an
+   ;; RFC 8949 Appendix A vector: that row is RFC 7049's, deleted by Erratum
+   ;; 5917, and RFC 8949's table jumps from simple(16) straight to simple(255).
+   ;; RFC 8949 3.3 makes `f8 00`..`f8 1f` NOT WELL-FORMED, so the correct
+   ;; behaviour is to reject it on decode -- see boring.hostile, which pins the
+   ;; four values Appendix F.1 enumerates.
    {:hex "f8ff" :value [:simple 255] :roundtrip true :diag "simple(255)"}
    {:hex "c074323031332d30332d32315432303a30343a30305a" :value [:instant "2013-03-21T20:04:00Z"] :roundtrip true :diag "0(\"2013-03-21T20:04:00Z\")"}
    {:hex "c11a514b67b0" :value [:instant "2013-03-21T20:04:00Z"] :roundtrip true :diag "1(1363896240)" :encoding-differs true :encoding-differs-reason "source uses tag 1 (epoch); boring writes instants as tag 0 (RFC 3339), which is lossless where a float epoch is not. Decodes to the same instant."}

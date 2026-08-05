@@ -114,8 +114,15 @@ jobs:
           command: |
             sudo apt-get update -qq
             sudo apt-get install -y -qq python3-pip
-            pip3 install --user --break-system-packages cbor2 \
-              || pip3 install --user cbor2
+            # FLOORED at 5.5, where cbor2 renamed its pure-Python modules to
+            # _decoder/_encoder/_types. Unpinned, this image resolved something
+            # older and `interop-canonical` died with `cannot import name
+            # _decoder`, while a 5.8.0 workstation was green.
+            # test_canonical_bytes.py accepts both layouts now; the floor is
+            # here so the C-extension/pure-Python PAIR this gate compares is a
+            # known one rather than whatever the image happens to resolve.
+            pip3 install --user --break-system-packages 'cbor2>=5.5,<6' \
+              || pip3 install --user 'cbor2>=5.5,<6'
             if ! command -v cargo >/dev/null 2>&1; then
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
                 | sh -s -- -y --profile minimal --default-toolchain stable
@@ -183,6 +190,26 @@ jobs:
           command: bin/ci fuzz-cljs
       - store-logs
 
+  # The gate that proves the index tests DEPEND on the index: it damages the
+  # index in known ways and requires the suite to go red for each. Without it,
+  # a test that passes whether or not the index is used still passes, and the
+  # whole feature could be dead code behind a green suite.
+  #
+  # Its own job because it runs the index suite four times over, which is
+  # minutes -- which is also why `bin/ci` deliberately leaves it out of `all`,
+  # with a comment saying it "belongs in CI proper rather than in a local
+  # bin/ci run". It was never added here, so it belonged nowhere and had never
+  # run: not locally, not in CI.
+  mutants:
+    executor: clj-node
+    steps:
+      - checkout
+      - restore-deps
+      - run:
+          name: Index mutation gate
+          command: bin/ci mutants
+      - store-logs
+
 workflows:
   build-and-test:
     jobs:
@@ -204,6 +231,7 @@ workflows:
       - cljs
       - interop
       - fuzz
+      - mutants
       - tools/format:
           context: docker-deploy
           requires:
@@ -213,14 +241,18 @@ workflows:
       # and refuses to publish a jar that fails it, so the gate is on the
       # publish path and not merely on the test path.
       #
-      # CHECK BEFORE THE NEXT RELEASE: `tools/deploy` runs on the ORB's
-      # executor, not on one declared here, and `clj -T:build deploy` now
-      # refuses to publish a jar without SegmentSource -- which a JDK older
-      # than 22 cannot build. If the orb's image is JDK 21, the release will
-      # fail this gate. That is the correct failure (better than silently
-      # shipping a jar whose boring.mmap cannot load) but it needs the orb's
-      # JDK confirmed, or the orb call pinned to a 22+ image, before merging to
-      # main. It was not verifiable from the machine this was written on.
+      # ORB JDK: CONFIRMED 22+, so this needs no pin. `tools/deploy` runs on
+      # the ORB's executor rather than one declared here, and `clj -T:build
+      # deploy` refuses a jar without SegmentSource, which a JDK older than 22
+      # cannot build. That gate landed in febbd40 and was, for a while, an
+      # open question here.
+      #
+      # It is answered: 0.1.9 and 0.1.10 are both on Clojars, both contain
+      # org/replikativ/boring/ffm/SegmentSource.class, and that class file
+      # reports major version 0x42 = 66 = Java 22. The orb built and published
+      # it twice. Checked by downloading the released jars, not by reading
+      # config -- which is why the earlier note stayed open, since it was
+      # written before either release existed.
       - tools/deploy:
           context:
             - clojars-deploy

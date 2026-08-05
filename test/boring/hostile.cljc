@@ -39,7 +39,10 @@
    ["tag30-zero-denom" "d81e820100"]
    ["tag37-wrong-len" "d8254400000000"]
    ["tag37-not-bytes" "d8256178"]
-   ["tag39-not-text" "d82701"]
+   ;; `tag39-not-text` ("d82701") DELIBERATELY REMOVED. IANA registers tag 39's
+   ;; data item as "multiple", so integer content is conforming and now
+   ;; degrades to an inert TaggedValue rather than failing the document.
+
    ["tag0-not-text" "c001"]
    ["tag0-bad-date" "c06a6e6f742d612d64617465"]
    ["tag1-not-number" "c16178"]
@@ -50,6 +53,11 @@
    ["tag40-bad-arity" "d8288101"]
    ["tag40-dims-not-nums" "d828828161784400000000"]
    ["tag40-flat-not-arr" "d828828102627879"]
+   ;; DIMS OF ARITY 2, so the payload check is actually reached. The case above
+   ;; has a 1-element dims array, so it tripped the dimensionality check and
+   ;; never touched the payload -- which is how ClojureScript's `.-length` /
+   ;; `.subarray` on a text string escaped as a raw TypeError.
+   ["tag40-text-payload" "d8288282010363616263"]
    ["tag40-dim-mismatch" "d828828109d84e480000000000000000"]
    ["tag258-not-array" "d9010201"]
    ["tag1002-not-map" "d903ea01"]
@@ -76,4 +84,20 @@
    ["shaped-bad-arity" "d99ae18101"]
    ["shaped-keys-not-arr" "d99ae1820180"]
    ["shaped-row-not-arr" "d99ae18281616b8101"]
-   ["shaped-row-arity" "d99ae18281616b81820102"]])
+   ["shaped-row-arity" "d99ae18281616b81820102"]
+
+   ;; RFC 8949 3.3: "An encoder MUST NOT issue two-byte sequences that start
+   ;; with 0xf8 ... and continue with a byte less than 0x20 (32 decimal). Such
+   ;; sequences are not well-formed." The final sentence binds the DECODER --
+   ;; Appendix C's pseudocode calls fail(), and these four are precisely the
+   ;; ones Appendix F.1 enumerates as not-well-formed simple values.
+   ;;
+   ;; boring accepted all of these until now, on the strength of an Appendix A
+   ;; vector that does not exist in RFC 8949 (it is RFC 7049's, removed by
+   ;; Erratum 5917). Worth pinning rather than merely fixing: the two
+   ;; implementations that accept `f814` -- ciborium and cbor-x -- decode it as
+   ;; plain `false`, turning a malformed encoding into a valid-looking value.
+   ["simple-2byte-00" "f800"]
+   ["simple-2byte-01" "f801"]
+   ["simple-2byte-14" "f814"]                 ; would alias onto `false`
+   ["simple-2byte-1f" "f81f"]])

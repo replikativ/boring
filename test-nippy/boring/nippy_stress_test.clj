@@ -25,9 +25,15 @@
 ;; Java's ObjectInputStream a permanent CVE source -- so a record needs the
 ;; receiver to opt in by naming the constructor. nippy's equivalent is its
 ;; thaw allowlist; this is the same decision made at registration time.
+;; `namespace/Name`, not the dotted class name. This registration said
+;; `taoensso.nippy.StressRecord` and stopped matching when the wire name became
+;; the record's true Clojure name -- the breaking change CHANGELOG.md documents
+;; with this exact migration. The failure is quiet in the shape that matters:
+;; no error, just a StressRecord coming back as an `UnknownRecord`, which is
+;; what a consumer who misses the migration will see.
 (def registry
   (-> (boring/tag-registry)
-      (boring/register-record "taoensso.nippy.StressRecord"
+      (boring/register-record "taoensso.nippy/StressRecord"
                               #(nippy/map->StressRecord %))))
 
 (def opts {:registry registry})

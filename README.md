@@ -8,11 +8,38 @@
 **Fast, portable serialization for Clojure and ClojureScript — in a format the
 rest of the world can already read.**
 
-Clojure's serialization story is split three ways. [nippy][] and [hako][] are
-fast and JVM-only. [fressian][] is portable across Clojure but speaks to no
-other language. [transit][] speaks to other languages, but it is slower, and
-its own README — in the [Java][transit-java], [Clojure][transit-clj] and
-[ClojureScript][transit-cljs] implementations alike — says what it is for:
+Clojure is a hosted language on purpose. Rich Hickey could have built a Lisp
+with its own runtime and its own everything, and chose not to, because a
+language that only talks to itself is a silo no matter how good it is. That
+decision is why Clojure has libraries, deployment stories and a job market.
+
+The community made the opposite decision about serialization, and mostly did
+not notice. [nippy][] and [hako][] are fast and JVM-only. [fressian][] is
+portable across Clojure and speaks to no other language. [transit][] was
+explicitly designed for reach — that part is not a criticism — but in practice
+its reach is Clojure, ClojureScript and a short list of ports, several of them
+unmaintained, against a specification still at 0.8.
+
+**The argument for reach is stronger for data than it ever was for code**,
+because code runs in a world you control and data does not. When you write
+bytes to IO you are writing to an *open* world: the consumer may be rewritten
+in another language, or be another team, or be a cache that some later service
+reads, or be nobody at all for five years. This is the same argument Clojure
+already makes about maps — open, extensible, not closing over what you happen
+to know today, not encoding constraints into the data that the data does not
+need. A format that can only be read by re-running your code encodes the
+biggest constraint of all.
+
+And data outlives code. It outlives the application, usually the platform, and
+often the ability to run the program that wrote it. A durable format is a bet
+that someone can still read your bytes when your build no longer resolves. That
+is a reason not to invent a format lightly — and to assume your format's reach
+will exceed what you can currently imagine for it, even when every consumer is
+internal and known today.
+
+[transit][]'s own README — in the [Java][transit-java], [Clojure][transit-clj]
+and [ClojureScript][transit-cljs] implementations alike — is honest about which
+bet it is making:
 
 > Transit is intended primarily as a wire protocol for transferring data
 > between applications. If storing Transit data durably, readers and writers
@@ -20,25 +47,40 @@ its own README — in the [Java][transit-java], [Clojure][transit-clj] and
 > migrating/transforming/re-storing that data when and if the transit format
 > changes.
 
-The libraries are at 1.x; the [specification][transit-format] is at 0.8. That
-is a reasonable position for a wire protocol and a poor one for an archive —
-and an archive is what [datahike][] needed, which is why boring exists.
+That is a reasonable position for a wire protocol and a poor one for an
+archive — and an archive is what [datahike][] needed, which is why boring
+exists.
 
-Every one of those options trades reach for speed, or speed for reach, or
-durability for either.
+boring takes the reach: it is [CBOR][rfc8949] — **IETF STD 94**, a full
+Internet Standard since December 2020, with [implementations in 26
+languages][cbor-impls], its own IANA tag registry and a standard diagnostic
+notation. It is the format with the widest
+reach that can still carry edn faithfully: keywords, symbols, sets, ratios,
+records, metadata. A foreign reader gets your data as ordinary CBOR whether or
+not it knows what a keyword is.
 
-boring takes the reach: it is [CBOR][rfc8949], an IETF standard with
-implementations in 26 languages. On the JVM it gives up nothing for it — it
-beats nippy on every payload we measure and trades wins with [hako][]. On
-ClojureScript it is always smaller on the wire than transit, faster on the
+**The usual trade is that reach costs speed. Here it does not.** On the JVM
+boring beats nippy on every payload we measure and trades wins with [hako][].
+On ClojureScript it is always smaller on the wire than transit, faster on the
 datom-shaped data it was built for, and slower on generic data — see
 [Performance](doc/PERFORMANCE.md), which says exactly where.
+
+Getting there did not require changing a single byte of CBOR. Where boring
+needed more, it grew *inside* the format rather than around it: string
+deduplication is [stringref](doc/COMPATIBILITY.md), a registered CBOR extension; the offset index
+that makes a memory-mapped file navigable is an ordinary tagged item at the end
+of the file, which every other CBOR reader simply skips. A file boring writes
+stays a file `cbor2` and `cbor.me` can read.
+
+So: use CBOR by default, and reach for something else only when you have a
+reason you would still defend in five years, to whoever is holding your data
+then.
 
 ```clojure
 (require '[boring.core :as boring])
 
 (boring/encode {:user/name "Ada" :scores [99 100] :tags #{:x :y}})
-;; => #object["[B" ...]  49 bytes
+;; => #object["[B" ...]  58 bytes
 
 (boring/decode *1)
 ;; => {:user/name "Ada", :scores [99 100], :tags #{:x :y}}
@@ -85,9 +127,11 @@ is the winner. Regenerate with `clojure -M:bench -m published`.
 | str-maps-200 | encode | **23.17** | 25.48 | 23.31 | 36.50 |
 | str-maps-200 | decode | 22.63 | **13.77** | 23.20 | 38.86 |
 
-Against nippy that is a win on all twelve cells. Against [hako][] — an
-experimental codec built for speed, and the fastest thing in this table — it is
-mixed.
+Against nippy that is a win on **every encode cell**, plus the two large map
+payloads on decode — `datom-maps-200` by 2.5×, `str-maps-200` by 1.6×. The four
+small decode cells trade places with nippy run to run; treat them as equal.
+Against [hako][] — an experimental codec built for speed, and the fastest thing
+in this table — it is mixed.
 
 **Read that table with its tier in mind.** It calls a fresh codec per message,
 which is matched across all four libraries but is *not* how hako is meant to be
@@ -113,9 +157,9 @@ nippy's filter, nippy's timing loop), round-trip µs and bytes:
 | `pr-str` + `read-string` | 5 369 | 15 880 |
 | nippy/lzma2 | 9 079 | 3 888 |
 
-Raw, boring is 1.6× nippy/fast. Compressed — which is what a storage layer
-actually writes — boring+zstd matches nippy's default round-trip time at
-**1.7× smaller**. Only nippy/lzma2 goes smaller, at 8× the time.
+Raw, boring is about 1.5× nippy/fast. Compressed — which is what a storage
+layer actually writes — boring+zstd is **1.7× smaller** at within 10% of
+nippy's default round-trip time. Only nippy/lzma2 goes smaller, at 8× the time.
 
 **Where it loses.** hako is faster on deeply nested maps (and 1.4× smaller
 there), 2.4× faster decoding a plain vector of integers, and marginally ahead
@@ -173,8 +217,25 @@ why it is worth stating. `{:incl-metadata? false}` opts out.
 (boring/encode v {:profile :clojure})    ; default — compact, Clojure-native
 (boring/encode v {:profile :interop})    ; no extensions; maximally portable
 (boring/encode v {:profile :archival})   ; stable bytes AND host types — dumps
-(boring/encode v {:profile :canonical})  ; RFC 8949 §4.2; agrees with cbor2 et al
+(boring/encode v {:profile :canonical})  ; RFC 8949 §4.2 bytewise key order
 ```
+
+If you need to agree byte-for-byte with a specific peer, check *which* rule it
+implements before picking. `:canonical` is RFC 8949 §4.2.1 — bytewise
+lexicographic — which is what fxamacker's `SortCoreDeterministic` produces.
+**Both of the peers this repo actually checks against are length-first**: Python's
+cbor2 `canonical=True` and Rust ciborium's `CanonicalValue` are the older RFC
+7049 §3.9 rule, which is boring's `:canonical-rfc7049`, not its `:canonical`:
+
+```
+{1000 "x", "a" "y"}   cbor2 canonical=True   a2 6161 6179 1903e8 6178
+                      :canonical-rfc7049     a2 6161 6179 1903e8 6178   ← same
+                      :canonical             a2 1903e8 6178 6161 6179   ← differs
+```
+
+The two coincide for keys sharing a major type, which is nearly all Clojure
+data — so this bites exactly the mixed-key-type case, and only ever at a
+signature boundary. See [COMPATIBILITY.md](doc/COMPATIBILITY.md#two-canonical-profiles).
 
 `:archival` and `:canonical` both sort map keys; they differ on floats.
 `:canonical` implements RFC 8949 §4.2.2 shortest-form, so a `Double` may come
@@ -182,11 +243,20 @@ back a `Float` — correct for interchange, wrong for a database dump.
 `:archival` keeps the width. Pick by whether you need to agree with *other
 encoders* (`:canonical`) or to get *your own types back* (`:archival`).
 
-There is also `:canonical-rfc7049`, which uses [clj-cbor][]'s length-first key
-order instead of RFC 8949's bytewise one. It is a separate profile rather than
-an option on `:canonical`, because a signer and a verifier who disagree about a
-sub-option that does not appear in the profile name produce a mismatch nobody
-can see.
+There is also `:canonical-rfc7049`, the length-first key order — [clj-cbor][]'s,
+but calling it that understates its reach: [cbor2][] is the most widely deployed
+CBOR implementation there is and its canonical mode is this one, as is
+[ciborium][]'s. It is a separate profile rather than an option on `:canonical`,
+because a signer and a verifier who disagree about a sub-option that does not
+appear in the profile name produce a mismatch nobody can see.
+
+ciborium was listed here under the bytewise rule, and that was wrong. It was
+corrected in [COMPATIBILITY.md](doc/COMPATIBILITY.md#two-canonical-profiles)
+when `interop/rust/src/canonical.rs` compared ciborium's output against ours
+over 989 values, and the correction did not reach this page — so a reader who
+followed the README picked `:canonical` to match a ciborium peer and got a
+verification failure with nothing to point at. Two documents, one measurement,
+one of them updated.
 
 `:canonical` follows RFC 8949 §4.2 and the deterministic rules in
 [draft-ietf-cbor-serialization][cde]. It is deliberately **lossy** — a bignum
@@ -197,17 +267,42 @@ cannot both sign a document and preserve a host type the wire has no room for.
 ## Reading without decoding
 
 `boring.nav` walks encoded CBOR and builds only what you ask for — and because
-a cursor implements `ILookup`, `clojure.core/get-in` works on it directly:
+a cursor implements `ILookup`, `clojure.core/get-in` works on it directly for
+**map keys**:
 
 ```clojure
 (require '[boring.nav :as nav] '[boring.mmap :as mmap])
 
-(def c (nav/source bs {:stringref false}))
-(nav/value (get-in c ["customer-137" "name"]))   ; the other 199 are never built
+(def customers (into {} (for [i (range 200)]
+                          [(str "customer-" i) {"name" (str "name-" i)}])))
+
+;; :stringref false at WRITE time — see below; it is not optional
+(def bs (boring/encode customers {:stringref false}))
+
+(def c (nav/source bs))
+(nav/value (get-in c ["customer-137" "name"]))   ; => "name-137"
+                                                 ; the other 199 are never built
 
 (mmap/with-mmap [c "events.cbor"]                ; JDK 22+; the file need not fit in heap
   (nav/value (get-in c ["customer-137" "name"])))
 ```
+
+Two things that example is carrying, both of which used to be silent:
+
+**The write is where `:stringref false` belongs.** boring writes stringref by
+default, and a stringref is an index into a table built from every preceding
+string, so a cursor holding only an offset cannot resolve one — `nav/source`
+refuses such a document with `:boring/stringref-not-navigable`. Passing
+`{:stringref false}` to `nav/source` does not help: it forces that option
+anyway, in both directions, so the caller's value is ignored. This snippet used
+to pass it there, over bytes the README's own encode example had written *with*
+stringref, and so it threw the very error it looked like the fix for.
+
+**`get-in` descends maps, not arrays.** `Cursor`'s `valAt` handles map keys and
+realises tags; an array position falls through to the not-found value, so
+`(get-in c ["p" 1])` is `nil` where `(get-in (boring/decode bs) ["p" 1])` is
+`20`. No error — the arity does not have one to give. Use `nth` on the array
+cursor: `(nav/value (nth (get c "p") 1))`.
 
 Against decode-then-`get-in`: **21×** for one leaf, **~1400×** for `count`
 (O(1) — the element count is in the head), and **~290×** to locate a 1 MiB
@@ -258,7 +353,7 @@ round-tripped through it ([Migrate codec](doc/MIGRATE-CODEC.md) §6).
 
 What exists today: one shared `.cljc` conformance suite run on both platforms
 (`bin/ci` prints the counts; pinning them here only means they are wrong by the
-next commit), RFC 8949 Appendix A 82/82, the CBOR
+next commit), RFC 8949 Appendix A 81/81 and Appendix F.1 94/94, the CBOR
 working group's not-well-formed corpus 46/47, coverage measured against
 nippy's `stress-data`, a frozen [golden corpus](doc/COMPATIBILITY.md) asserted
 in both directions, mutation fuzzing gated in CI on both platforms, and
@@ -308,5 +403,6 @@ only, and are not distributed in boring's jar.
 [transit-format]: https://github.com/cognitect/transit-format
 [incognito]: https://github.com/replikativ/incognito
 [rfc8949]: https://www.rfc-editor.org/rfc/rfc8949
+[cbor-impls]: https://cbor.io/impls.html
 [rfc8746]: https://www.rfc-editor.org/rfc/rfc8746
 [cde]: https://datatracker.ietf.org/doc/draft-ietf-cbor-serialization/

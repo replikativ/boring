@@ -11,6 +11,7 @@
             [boring.conformance :as c]
             [boring.wg-bad :as wg]
             [boring.hostile :as hostile]
+            [boring.appendix-f :as appf]
             [boring.records :as records]))
 
 ;; ---------------------------------------------------------------- helpers
@@ -170,7 +171,7 @@
       (is (data/unknown-record? (:ok back))
           (str "unregistered record should decode to UnknownRecord, got "
                (pr-str (:ok back))))
-      (is (= "boring.conformance_test.ConfPoint" (data/record-type (:ok back))))
+      (is (= "boring.conformance-test/ConfPoint" (data/record-type (:ok back))))
       (is (= {:x 3 :y 4} (data/record-fields (:ok back)))))))
 
 (deftest unknown-record-behaves-like-the-record-it-stands-for
@@ -187,7 +188,7 @@
       (is (= 9 (:z (assoc ur :z 9))))
       (testing "with defrecord equality semantics, not map equality"
         (is (not= ur {:x 3 :y 4}))
-        (is (= ur (data/unknown-record "boring.conformance_test.ConfPoint"
+        (is (= ur (data/unknown-record "boring.conformance-test/ConfPoint"
                                        {:x 3 :y 4})))))))
 
 (deftest unknown-record-passthrough-is-byte-identical
@@ -201,9 +202,9 @@
   (testing "the JVM class name and the name ClojureScript derives must be the
             same string, or a record written on one platform is unreadable on
             the other even with a registration"
-    (is (= "boring.conformance_test.ConfPoint"
+    (is (= "boring.conformance-test/ConfPoint"
            (data/record-type-name (->ConfPoint 1 2))))
-    (is (= "boring.conformance_test.ConfEvent"
+    (is (= "boring.conformance-test/ConfEvent"
            (data/record-type-name (->ConfEvent 1 2 3))))))
 
 (deftest registered-records-round-trip-as-themselves
@@ -212,9 +213,9 @@
     ;; into any other test regardless of the order clojure.test picks — which
     ;; is exactly why the process-global default was removed.
     (let [reg (-> (boring/tag-registry)
-                  (boring/register-record "boring.conformance_test.ConfPoint"
+                  (boring/register-record "boring.conformance-test/ConfPoint"
                                           map->ConfPoint)
-                  (boring/register-record "boring.conformance_test.ConfEvent"
+                  (boring/register-record "boring.conformance-test/ConfEvent"
                                           map->ConfEvent))
           opts {:registry reg}
           p (->ConfPoint 3 4)
@@ -231,7 +232,7 @@
      (testing "the JVM-only reflective convenience agrees with the portable form"
        (let [reflective (boring/register-record-class (boring/tag-registry) ConfPoint)
              explicit (boring/register-record (boring/tag-registry)
-                                              "boring.conformance_test.ConfPoint"
+                                              "boring.conformance-test/ConfPoint"
                                               map->ConfPoint)
              p (->ConfPoint 7 8)]
          (doseq [reg [reflective explicit]]
@@ -650,10 +651,21 @@
                    (str "tag " tag " should decode to a real array"))
                (is (= expected (vec v)) (str "tag " tag))))))
 
-       (testing "a uint64 above Long/MAX_VALUE has no lossless long, so it is
-                 REFUSED rather than handed back as a negative number that
-                 silently is not the value"
-         (is (:err (try-decode "d84748ffffffffffffffff" {}))))
+       (testing "a uint64 above Long/MAX_VALUE has no lossless long, so the array
+                 widens to a vector of bignums rather than being REFUSED.
+
+                 It used to be refused, which rejected conforming RFC 8746 input
+                 over a host-type limit -- and did so DATA-DEPENDENTLY, so a
+                 producer's tag 67 worked until the day a value crossed 2^63.
+                 The common case still returns a primitive long[]; only an array
+                 that needs the width pays for boxing."
+         (is (= [18446744073709551615N]
+                (:ok (try-decode "d84748ffffffffffffffff" {})))
+             "2^64-1 survives")
+         ;; tag 67 is uint64 BIG-endian; tag 71 is the little-endian one.
+         (is (= [5 18446744073709551615N]
+                (:ok (try-decode "d843500000000000000005ffffffffffffffff" {})))
+             "mixed widths in one array"))
 
        (testing "a REGISTERED reader overrides the built-in mapping. The built-in
                  typed-array types are a DEFAULT, not a ceiling: a consumer with
@@ -768,11 +780,17 @@
            (is (contains? (try-decode "d81b826c636c6f6a7572652f6368617264f09f92a9" {}) :err)))
 
        ;; ClojureScript has no character type at all -- the reader turns `\a`
-       ;; into the one-character string -- so there is nothing to preserve on
-       ;; this side. What matters is that JVM-written data still DECODES here
-       ;; rather than surfacing as an UnknownRecord the caller must unwrap.
+       ;; into the one-character string -- so the character itself cannot
+       ;; survive here. What must survive is the FRAME: this used to decode to
+       ;; the bare string "a", which re-encodes as a plain text string, so a
+       ;; JVM peer on the far side received a String where it had sent a
+       ;; Character and the type was gone for good. The carrier keeps the
+       ;; payload reachable and the bytes intact -- see
+       ;; `tag27-markers-round-trip-to-identical-bytes`.
        :cljs
-       (is (= "a" (boring/decode (c/hex->bytes "d81b826c636c6f6a7572652f636861726161")))))))
+       (let [v (boring/decode (c/hex->bytes "d81b826c636c6f6a7572652f636861726161"))]
+         (is (= "clojure/char" (data/frame-name v)))
+         (is (= "a" (data/frame-payload v)))))))
 
 (deftest stringref-namespaces-are-scoped
   (testing "tag 256 opens a FRESH table and restores the enclosing one.
@@ -918,6 +936,235 @@
                        ["in a keyword"   (keyword "emoji💩")]
                        ["surrounded"     (str "a💩b")]]]
       (is (= v (boring/decode (boring/encode v))) label))))
+
+(deftest conforming-tag-content-the-specs-allow-and-boring-refused
+  (testing "RFC 8746 3.1.1 admits a plain CBOR array, a typed array or a tag-41
+            Homogeneous Array as a tag-40 payload, and bounds the dimension
+            count nowhere. Tag 258 is registered against \"array\", which 3.2.2
+            makes include the indefinite-length form. Tag 39's registered data
+            item is \"multiple\", not \"text string\". boring rejected all four,
+            which is rejecting conforming input -- identically on both
+            platforms, so nothing here is a differential."
+    ;; tag 40 [[2,3], [2,4,8,4,16,256]] -- RFC 8746 Figure 2, verbatim.
+    ;; A plain CBOR array payload nests into vectors on both platforms, so
+    ;; these compare directly with no array-equality helper.
+    (is (= [[2 4 8] [4 16 256]]
+           (:ok (try-decode "d82882820203860204080410190100" interop-opts)))
+        "Figure 2 of the defining RFC")
+    ;; tag 40 [[2,2,2], [1..8]]
+    (is (= [[[1 2] [3 4]] [[5 6] [7 8]]]
+           (:ok (try-decode "d8288283020202880102030405060708" interop-opts)))
+        "three dimensions")
+    ;; tag 258 around an indefinite-length array
+    (is (= #{1 2 3} (:ok (try-decode "d901029f010203ff" interop-opts)))
+        "a set over an indefinite-length array")
+    ;; tag 39 around an integer -- degrades, does not throw
+    (is (contains? (try-decode "d82701" interop-opts) :ok)
+        "an identifier tag over non-text content stays inert")
+    ;; tag 0 "2016-12-31T23:59:60Z" -- a real leap second, legal RFC 3339 5.6
+    (let [leap (try-decode "c074323031362d31322d33315432333a35393a36305a" interop-opts)]
+      (is (contains? leap :ok)
+          "a leap second is a legal timestamp, not a malformed document")
+      (is (= "2016-12-31T23:59:60Z" (:value (:ok leap)))
+          "and the STRING survives: Instant.parse collapses :60 to :59 and
+           new Date rejects it outright, so neither platform has a lossless
+           native value -- preserving the text is the only honest option"))))
+
+(deftest a-truncated-indefinite-string-is-reported-as-truncation
+  (testing "`5f 41 00` and `7f 61 00` are indefinite-length strings that run out
+            before their break code -- Appendix F.1 lists them under 'too little
+            data'. ClojureScript reported them as :boring/bad-indefinite-chunk
+            'contains a chunk of major 0', naming a chunk that does not exist:
+            `aget` past the end of a Uint8Array is `undefined`, and
+            `undefined >> 5` is 0 in JavaScript. Both platforms now agree, and
+            agree with the RFC's own classification."
+    (doseq [hex ["5f4100" "7f6100"]]
+      (let [r (try (do (boring/decode (c/hex->bytes hex)) nil)
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                     (:type (ex-data e))))]
+        (is (= :boring/truncated-input r) hex)))))
+
+(deftest tag-40-dimension-count-cannot-blow-the-host-stack
+  (testing "tag 40's dimensions are a FLAT array, so :max-depth never charged
+            for them -- while the decoded value nests once per dimension. A
+            structurally shallow 20 KB item declaring 20 000 dimensions of 1
+            therefore recursed 20 000 deep in the reconstructor: StackOverflowError
+            on the JVM, RangeError under Node, neither carrying ex-data, both
+            contradicting doc/SECURITY.md's typed-failure guarantee.
+
+            Rebuilt iteratively AND charged against :max-depth -- iteration alone
+            is not enough, because the result would still be 20 000 deep and
+            would overflow in the caller on `=` or `hash`."
+    ;; d8 28 82 99 4e 20 <20000 x 01> 81 07
+    (let [hex (str "d82882994e20" (apply str (repeat 20000 "01")) "8107")
+          r (try {:ok (boring/decode (c/hex->bytes hex))}
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                   (if (:type (ex-data e)) {:typed (:type (ex-data e))} {:untyped (str e)}))
+                 #?(:clj (catch Throwable e {:raw (.getSimpleName (class e))})))]
+      (is (= {:typed :boring/max-depth-exceeded} r)
+          (str "expected a typed depth error, got " (pr-str r)))))
+  (testing "and dimensionality the RFC allows still decodes"
+    (is (= [[[1 2] [3 4]] [[5 6] [7 8]]]
+           (:ok (try-decode "d8288283020202880102030405060708" interop-opts))))))
+
+(deftest max-items-is-enforced-on-both-platforms-and-per-item
+  (testing ":max-items is the only heap-amplification control doc/SECURITY.md
+            names, and ClojureScript did not implement it at all -- the option
+            was accepted and silently ignored, so a browser or Node reader had
+            no bound whatsoever. On the JVM the counter existed but carried
+            across top-level items, which made acceptance depend on the
+            streaming chunk size: the same five items decoded at `:chunk-size 2`
+            and failed at 65536. A limit whose meaning changes with an unrelated
+            buffering knob cannot be the right one.
+
+            The budget is now PER TOP-LEVEL ITEM on both platforms, which is
+            what the streaming API already promises: retained memory is bounded
+            by the largest single item, not by the file."
+    (let [o {:stringref false}]
+      (testing "one oversized item is refused"
+        (is (= :boring/max-items-exceeded
+               (try (do (boring/decode (c/hex->bytes "8a0102030405060708090a")
+                                       (assoc o :max-items 3)) nil)
+                    (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                      (:type (ex-data e)))))))
+      (testing "an item within budget decodes"
+        (is (= [1 2] (boring/decode (c/hex->bytes "820102") (assoc o :max-items 5)))))
+      (testing "and the budget does NOT accumulate across a sequence"
+        ;; five [1] items: each costs 2, so a budget of 3 admits every one
+        (is (= [[1] [1] [1] [1] [1]]
+               (vec (boring/decode-seq (c/hex->bytes "81018101810181018101")
+                                       (assoc o :max-items 3))))))
+      (testing "the option is validated rather than coerced"
+        (doseq [bad [-1 1.5 "x"]]
+          (is (= :boring/bad-option
+                 (try (do (boring/decode (c/hex->bytes "8101") (assoc o :max-items bad)) nil)
+                      (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                        (:type (ex-data e)))))
+              (str "max-items " (pr-str bad))))))))
+
+(deftest a-caller-supplied-tag-number-is-validated-on-both-platforms
+  (testing "ClojureScript's `head!` range-checked its BigInt branch but assumed
+            an unsigned integer in the Number branch, so a TaggedValue carrying
+            a bad tag reached the arithmetic unchecked. `tag 1.5` emitted `c1 00`
+            -- silently BECOMING tag 1 -- and `tag -1` emitted `ff 00`, the break
+            code followed by an item, which is not one well-formed CBOR value.
+            Neither threw. The JVM has rejected both since `writeTag` gained its
+            check; the platforms now agree."
+    (doseq [bad [-1 -40 1.5]]
+      (is (= :boring/bad-tag
+             (try (do (boring/encode (data/tagged-value bad 0) {:stringref false}) nil)
+                  (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                    (:type (ex-data e)))))
+          (str "tag " (pr-str bad) " must be refused, not emitted")))
+    ;; UNINTERPRETED tag numbers deliberately: a semantic tag validates its
+    ;; content on the way back (tag 0 wants an RFC 3339 string), which would be
+    ;; testing the tag handler rather than the number check.
+    (testing "and ordinary tags still round-trip, including large ones"
+      (doseq [good [60000 1000000 39650 4294967295]]
+        (let [v (data/tagged-value good "x")]
+          (is (= v (boring/decode (boring/encode v {:stringref false})
+                                  {:stringref false}))
+              (str "tag " good)))))))
+
+(deftest a-leap-second-is-validated-before-it-is-preserved
+  (testing "both readers identified a leap second by finding `:60` after the
+            second colon and returned the inert tag BEFORE the real date parser
+            ran. So `9999-99-99T99:99:60Z` was accepted and handed back intact.
+            Preserving a legal leap second does not make an impossible month,
+            day, hour or minute legal -- the non-leap part still has to be a
+            real timestamp."
+    ;; c0 74 "9999-99-99T99:99:60Z"
+    (is (= :boring/bad-tag-content
+           (try (do (boring/decode (c/hex->bytes "c074393939392d39392d39395439393a39393a36305a")) nil)
+                (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                  (:type (ex-data e)))))
+        "an impossible date is refused even wearing a leap second")
+    (testing "and a real one is still preserved, string intact"
+      ;; c0 74 "2016-12-31T23:59:60Z"
+      (let [v (boring/decode (c/hex->bytes "c074323031362d31322d33315432333a35393a36305a"))]
+        (is (= "2016-12-31T23:59:60Z" (:value v)))))))
+
+(deftest a-canonical-set-element-is-encoded-exactly-once
+  (testing "ClojureScript staged each element to sort it and then called
+            `write-value!` on the ORIGINAL element again, so a registered
+            handler ran twice per element. A handler that reads a clock, a
+            counter or anything else mutable could then emit bytes different
+            from the ones the sort used -- output that is neither canonical nor
+            sorted, from the profile whose entire promise is that equal values
+            give equal bytes. The JVM was fixed first; the canonical MAP path
+            has always copied its staged key bytes."
+    ;; `:encode-fallback` rather than a registered tag: it is consulted from the
+    ;; canonical scratch writer too (which inherits it), it is portable, and
+    ;; String is dispatched before the registry so a handler for it could never
+    ;; run anyway.
+    (let [calls (atom 0)
+          unencodable (fn [] #?(:clj (Object.) :cljs (js/Object.)))
+          opts {:profile :canonical
+                :encode-fallback (fn [_] (swap! calls inc) (str "v" @calls))}]
+      ;; built programmatically: the reader dedups literal set elements
+      (boring/encode (into #{} [(unencodable) (unencodable) (unencodable)]) opts)
+      (is (= 3 @calls)
+          (str "one fallback call per element, got " @calls
+               " -- twice per element means the sorted bytes and the emitted"
+               " bytes came from different invocations"))))
+  (testing "and the bytes are still sorted and decodable"
+    (let [opts {:profile :canonical}
+          bs (boring/encode #{"bb" "a" "ccc"} opts)]
+      (is (= #{"a" "bb" "ccc"} (boring/decode bs opts)))
+      (is (= (vec bs) (vec (boring/encode #{"ccc" "a" "bb"} opts)))
+          "iteration order must not change the bytes"))))
+
+(deftest a-sealed-sequence-decodes-to-the-same-items-on-both-platforms
+  (testing "JVM `write-seq!` appends a tag-27 `boring/index` frame by default,
+            and JVM `decode-seq` hides it. ClojureScript had no recognition of
+            it at all, so the library's OWN default output decoded to N+1 items
+            there and N on the JVM -- the same portable CBOR sequence, two
+            different logical results. Writing the index is JVM-only; reading
+            past it must not be.
+
+            The bytes below are a real sealed sequence of three `{1: n}` maps at
+            stride 1, produced by write-seq!."
+    (let [o {:stringref false}
+          ;; a1 0101 / a1 0102 / a1 0103, then the tag-27 frame
+          ;; produced by (write-seq! w [{1 1} {1 2} {1 3}] out {:index 1 :index-min 1})
+          bs (c/hex->bytes
+              (str "a10101a10102a10103d81b826c626f72696e672f696e6465788601"
+                   "d84e50ffffffff000000000300000006000000"
+                   "d84e5003000000010000000100000001000000"
+                   "844300030341014101410184f4f5f5f5480000000000000009"))]
+      (is (= [{1 1} {1 2} {1 3}] (vec (boring/decode-seq bs o)))
+          "three items, not four -- the frame is metadata")))
+  (testing "and an impostor sharing the name is NOT erased"
+    (let [o {:stringref false}
+          ;; a1 0101 then tag 27 ["boring/index", {"not" "an index"}]
+          bs (c/hex->bytes (str "a10101"
+                                "d81b826c626f72696e672f696e646578"
+                                "a1636e6f7468616e20696e646578"))]
+      (is (= 2 (count (vec (boring/decode-seq bs o))))
+          "a name collision must not delete a logical item"))))
+
+(deftest rfc-8949-appendix-f1-is-rejected-in-full
+  (testing "every byte sequence RFC 8949 Appendix F.1 names as not well-formed
+            must raise a typed error, on both platforms.
+
+            `boring.wg-bad` is the CBOR working group's corpus and is NOT a
+            superset of Appendix F.1 -- it was missing subkind 2 and subkind 5
+            entirely, 18 of 24 reserved additional-information bytes, 8 of 10
+            chunk cases, and every large-declared-length case. The subkind-2 gap
+            is precisely why boring decoded `f8 18` as simple(24) for as long as
+            it did. See boring.appendix-f for the full accounting."
+    (doseq [[label hex] appf/cases]
+      (let [r (try {:ok (boring/decode (c/hex->bytes hex))}
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                     (if (:type (ex-data e))
+                       {:typed (:type (ex-data e))}
+                       {:untyped (str e)}))
+                   #?(:clj (catch Throwable e
+                             {:raw (.getSimpleName (class e))})))]
+        (is (contains? r :typed)
+            (str label " (" hex ") -> "
+                 (pr-str (or (:raw r) (:untyped r)
+                             (str "decoded to " (pr-str (:ok r)))))))))))
 
 (deftest every-malformed-tag-fails-typed
   (testing "a well-formed CBOR item of the WRONG SHAPE inside a tag boring
@@ -1798,3 +2045,1149 @@
       (is (= (->RegPoint 7 8) (boring/decode bs {:registry with-one})))
       (is (not (instance? RegPoint (boring/decode bs {:registry empty-reg})))
           "the registry we started from is unchanged"))))
+
+;; ---------------------------------------------------------- platform parity
+;;
+;; Every case below was found by reading the JVM reader against the CLJS one and
+;; asking "which documents does exactly one of these accept?". A parser
+;; differential is a defect of the FORMAT, not of either implementation: the
+;; whole claim boring makes is that a document means one thing, and a reader
+;; that admits what the other refuses breaks that claim whichever value the two
+;; sides go on to produce.
+
+(defn- err-type
+  "The `:type` of the typed error `f` raises, or `[:ok value]` when it returns."
+  [f]
+  (try [:ok (f)]
+       (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+         (:type (ex-data e)))))
+
+(defn- dec-hex
+  ([hex] (dec-hex hex nil))
+  ([hex opts] (boring/decode (c/hex->bytes hex) opts)))
+
+(defn- hex-byte [n]
+  (let [h #?(:clj (Integer/toHexString n) :cljs (.toString n 16))]
+    (if (== 1 (count h)) (str "0" h) h)))
+
+(deftest byte-strings-are-compared-by-content-not-identity
+  (testing "two byte strings with the same bytes are ONE CBOR data item, so a
+            map holding both is invalid -- but a host byte array compares by
+            IDENTITY on both platforms, so this decoded to a two-entry map
+            carrying the very duplicate the check exists to reject"
+    ;; {h'01': 1, h'01': 2}
+    (is (= :boring/duplicate-map-key (err-type #(dec-hex "a2410101410102")))))
+
+  (testing "and above the array-map threshold, where the small-map scan that
+            catches host-equal keys does not run at all"
+    ;; nine pairs: seven integer keys, then h'01' twice
+    (let [hex (str "a9"
+                   (apply str (for [i (range 7)] (str "18" (hex-byte (+ 100 i)) "01")))
+                   "410101410102")]
+      (is (= :boring/duplicate-map-key (err-type #(dec-hex hex))))))
+
+  (testing "tag 258 the same way: two independently allocated but byte-equal
+            elements are one element, and the set silently kept both"
+    ;; 258([h'01', h'01'])
+    (is (= :boring/duplicate-set-element (err-type #(dec-hex "d901028241014101")))))
+
+  (testing "byte strings that genuinely differ are still two distinct keys"
+    (is (= 2 (count (dec-hex "a2410101410202"))))))
+
+(deftest lenient-utf8-is-lenient-on-both-platforms
+  (testing ":validate-utf8 false replaces the malformed byte rather than raising
+            -- ClojureScript still routed it through a fatal TextDecoder, so an
+            option whose entire purpose is to accept this input produced a raw,
+            untyped host error there and a replacement character on the JVM"
+    (is (= "�" (dec-hex "61ff" {:validate-utf8 false}))))
+  (testing "and the default still refuses it, with the typed error"
+    (is (= :boring/invalid-utf8 (err-type #(dec-hex "61ff"))))))
+
+(deftest rfc-9581-duration-rules-hold-on-both-platforms
+  ;; ClojureScript keeps tag 1002 an inert TaggedValue -- there is no
+  ;; java.time.Duration here -- but "we do not convert it" is not a licence to
+  ;; accept a shape the JVM rejects.
+  (testing "an unsigned key other than the base is CRITICAL (RFC 9581 3)"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d903eaa201050205")))))
+  (testing "at most one decimally scaled fraction key (RFC 9581 3.3)"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d903eaa3010528012b01")))))
+  (testing "a negative fraction is not a duration"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d903eaa201052820")))))
+  (testing "finer than a nanosecond is refused rather than silently truncated"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d903eaa201052b01")))))
+  (testing "keys 4 and 5 -- decimal-fraction and bigfloat bases -- are refused
+            by name rather than reported as a missing base value"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d903eaa104820001")))))
+  (testing "but every OTHER negative key is elective and ignored, which the RFC
+            requires: {1: 5, -1: 0} is timescale UTC, the default"
+    (is (not= :boring/bad-tag-content (err-type #(dec-hex "d903eaa201052000")))))
+  (testing "and an ordinary seconds+nanoseconds duration still decodes"
+    (is (not= :boring/bad-tag-content (err-type #(dec-hex "d903eaa201052801"))))))
+
+(deftest tag-27-markers-accept-the-same-shapes-on-both-platforms
+  ;; The JVM builds a boolean[]/String[]/Object[] and so rejects what cannot go
+  ;; in one. ClojureScript reached all of them through `(vec argument)`, which
+  ;; turns nil into [] and a string into a vector of characters.
+  (let [marker (fn [nm arg-hex]
+                 (str "d81b82" (hex-byte (+ 0x60 (count nm)))
+                      (apply str (map #(hex-byte #?(:clj (int %) :cljs (.charCodeAt % 0)))
+                                      nm))
+                      arg-hex))]
+    (testing "java/boolean-array holds booleans, not integers"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "java/boolean-array" "8101"))))))
+    (testing "java/object-array wraps an array, and null is not one"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "java/object-array" "f6"))))))
+    (testing "java/string-array holds strings"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "java/string-array" "8101"))))))
+    (testing "java/char-array wraps a text string"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "java/char-array" "01"))))))
+    (testing "clojure/ex-info data must be a map"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "clojure/ex-info" "8361610101"))))))
+    (testing "java/throwable names a class, as a string"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "java/throwable" "8301f6f6"))))))
+    (testing "incomparable sorted-set elements are a TYPED error, not whatever
+              the host's compare happens to throw"
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (marker "clojure/sorted-set" "82016161"))))))
+    (testing "a null payload is an EMPTY sorted set on both platforms -- the JVM
+              admits it, so this is parity and not an oversight"
+      (is (= #{} (dec-hex (marker "clojure/sorted-set" "f6")))))
+    (testing "and the valid shapes still decode -- to the host array on the JVM,
+              and on ClojureScript, which has no such array type, to the
+              frame-preserving carrier every unupgradable tag-27 frame gets.
+              `frame-payload` reads both, which is the point of it"
+      (let [payload (fn [x] (vec #?(:clj x :cljs (data/frame-payload x))))]
+        (is (= [true false] (payload (dec-hex (marker "java/boolean-array" "82f5f4")))))
+        (is (= ["a"] (payload (dec-hex (marker "java/string-array" "816161")))))))))
+
+(deftest duplicate-detection-does-not-depend-on-decoder-cache-state
+  (testing "whether a repeated key is caught must not depend on how many OTHER
+            identifiers were decoded between its two occurrences. ClojureScript
+            interns identifiers in a bounded cache that clears wholesale, so a
+            shortcut that trusted `identical?` for keywords decoded
+            {:a 1, :zzz <5000 keywords>, :a 2} to a THREE-entry array map
+            holding :a twice -- a corrupt map, not a missed error"
+    (let [filler (into {} (map (fn [i] [(keyword (str "k" i)) i])) (range 5000))
+          enc    #(boring/encode % {:stringref false})
+          parts  [(c/hex->bytes "a3")                       ; map, 3 pairs
+                  (enc :a) (enc 1)
+                  (enc :zzz) (enc filler)
+                  (enc :a) (enc 2)]
+          bs     #?(:clj (let [bos (java.io.ByteArrayOutputStream.)]
+                           (doseq [^bytes p parts] (.write bos p))
+                           (.toByteArray bos))
+                    :cljs (let [total (reduce + (map #(.-length %) parts))
+                                out (js/Uint8Array. total)]
+                            (loop [ps (seq parts) off 0]
+                              (if ps
+                                (do (.set out (first ps) off)
+                                    (recur (next ps) (+ off (.-length (first ps)))))
+                                out))))]
+      (is (= :boring/duplicate-map-key
+             (err-type #(boring/decode bs {:stringref false})))))))
+
+;; ------------------------------------------------- second semantic re-audit
+;;
+;; Ten findings from .internal/CBOR-SEMANTIC-MEMORY-REAUDIT-2.md, each pinned by
+;; the reproducer that found it.
+
+(defn- tag27-hex
+  "Hex for `27([nm, <arg>])`, with `arg-hex` already encoded."
+  [nm arg-hex]
+  (str "d81b82" (hex-byte (+ 0x60 (count nm)))
+       (apply str (map #(hex-byte #?(:clj (int %) :cljs (.charCodeAt % 0))) nm))
+       arg-hex))
+
+(defn- tag0-bytes
+  "`0(s)` as platform bytes, letting the encoder size the text header."
+  [s]
+  (c/hex->bytes (str "c0" (c/bytes->hex (boring/encode s {:stringref false})))))
+
+(deftest max-items-bounds-what-the-decoder-builds-not-only-what-it-reads
+  (testing "a tag-40 payload arrives as ONE byte string and is expanded into a
+            host object per element, none of which goes through `read` -- so the
+            item budget never saw it. A 500,018-byte document declaring
+            dimensions [500000 1 1] built 71 MB of nested vectors, a 149x
+            amplification, with {:max-items 100} set and honoured"
+    ;; tag 78 (sint32 little-endian) rather than tag 64: both platforms decode
+    ;; it to a typed array, so the test exercises the BUDGET rather than the
+    ;; documented gap in which typed-array tags each platform reads.
+    ;; 500000 bytes / 4 = 125000 elements, dims [125000 1 1].
+    (let [n 500000
+          head (c/hex->bytes (str "d82882" "831a0001e8480101" "d84e5a0007a120"))
+          doc  #?(:clj (let [bos (java.io.ByteArrayOutputStream.)]
+                         (.write bos ^bytes head)
+                         (dotimes [_ n] (.write bos 1))
+                         (.toByteArray bos))
+                  :cljs (let [out (js/Uint8Array. (+ (.-length head) n))]
+                          (.set out head 0)
+                          (.fill out 1 (.-length head))
+                          out))]
+      (is (= :boring/max-items-exceeded
+             (err-type #(boring/decode doc {:max-items 100}))))))
+
+  (testing "and a tag-40 that fits the budget still decodes"
+    (is (not= :boring/max-items-exceeded
+              (err-type #(dec-hex "d82882820202d8404401020304"))))))
+
+(deftest a-tag-number-is-validated-however-it-is-written
+  (testing "a negative BigInt tag emitted `ff` -- a bare BREAK code -- because
+            `check-tag!` delegated its range check to a function that narrows
+            BigInt to Number BEFORE checking. The library must not emit a
+            document it cannot itself parse"
+    (doseq [t [#?(:clj -1 :cljs (js/BigInt -1))
+               #?(:clj -100 :cljs (js/BigInt -100))]]
+      (is (= :boring/bad-tag
+             (err-type #(boring/encode (data/tagged-value t 0))))
+          (str "tag " t))))
+  (testing "a legal one still round-trips -- an UNINTERPRETED tag, so the
+            round trip is of the tag number and not of a date"
+    (let [v (data/tagged-value #?(:clj 999 :cljs (js/BigInt 999)) 0)]
+      (is (= 0 (:value (boring/decode (boring/encode v))))))))
+
+(deftest a-leap-second-does-not-excuse-an-impossible-timestamp
+  (testing "the repair used to validate a leap second replaced EVERY `:60`, so
+            an impossible minute or UTC offset was repaired on the way past and
+            the repair was what got validated"
+    (doseq [s ["2016-12-31T23:60:60Z"
+               "2016-12-31T23:59:60+00:60"
+               "2016-12-31T23:59:60-00:60"]]
+      (is (= :boring/bad-tag-content (err-type #(boring/decode (tag0-bytes s))))
+          s)))
+  (testing "while a real leap second is still preserved rather than refused"
+    (is (not= :boring/bad-tag-content
+              (err-type #(boring/decode (tag0-bytes "2016-12-31T23:59:60Z")))))))
+
+(deftest tag-27-collection-markers-require-an-array
+  (testing "`seqableContent` admitted anything Seqable, and `seq` of a map
+            yields MAP ENTRIES -- so a simple value and a map both became sets
+            of vectors nobody encoded"
+    (doseq [[nm arg] [["clojure/sorted-set" "f8ac"]
+                      ["clojure/sorted-set" "a10102"]
+                      ["clojure/queue" "a10102"]]]
+      (is (= :boring/bad-tag-content (err-type #(dec-hex (tag27-hex nm arg))))
+          (str nm " " arg))))
+  (testing "an array still works, and so do the two shapes both platforms admit"
+    (is (= #{1 2} (dec-hex (tag27-hex "clojure/sorted-set" "820201"))))
+    (is (= #{} (dec-hex (tag27-hex "clojure/sorted-set" "f6"))))
+    (is (= #{1 2} (dec-hex (tag27-hex "clojure/sorted-set" "d90102820201"))))))
+
+(deftest rfc-3339-grammar-is-the-same-grammar-on-both-platforms
+  (testing "RFC 3339 has no expanded-year production; `Instant.parse` accepts
+            java.time's own extension and ClojureScript's grammar refuses it"
+    (is (= :boring/bad-tag-content
+           (err-type #(boring/decode (tag0-bytes "+10000-01-01T00:00:00Z"))))))
+  (testing "a fraction longer than nanoseconds is refused rather than silently
+            truncated to milliseconds on one platform and rejected on the other"
+    (is (= :boring/bad-tag-content
+           (err-type #(boring/decode (tag0-bytes "2020-01-01T00:00:00.1234567890Z"))))))
+  (testing "ordinary instants are unaffected"
+    (is (not= :boring/bad-tag-content
+              (err-type #(boring/decode (tag0-bytes "2020-01-01T00:00:00Z")))))))
+
+(deftest tag-1-accepts-a-bignum-on-both-platforms
+  (testing "boring's own bignum handler produces the integer type each platform
+            uses for large integers, so `1(2(h'01'))` -- epoch second 1 -- must
+            not decode on one and be refused on the other"
+    (is (not= :boring/bad-tag-content (err-type #(dec-hex "c1c24101"))))))
+
+(deftest unimplemented-typed-array-tags-are-still-validated
+  (testing "ClojureScript decodes 5 of RFC 8746's 24 tags and the JVM 21 -- a
+            documented asymmetry. What was neither documented nor intended is
+            that the rest fell through to the unknown-tag path UNVALIDATED, so
+            a tag-64 wrapping a text string decoded on one platform and was
+            refused on the other"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d840646e6f7065"))))
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d8431881"))))
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d84343010203")))
+        "a payload that is not a whole number of elements"))
+  (testing "a well-formed one is accepted on both, whatever it decodes to"
+    (is (not= :boring/bad-tag-content (err-type #(dec-hex "d843480102030405060708"))))))
+
+;; -------------------------------------------------- third semantic re-audit
+
+(defn- tag32-hex [u]
+  (str "d820" (hex-byte (+ 0x60 (count u)))
+       (apply str (map #(hex-byte #?(:clj (int %) :cljs (.charCodeAt % 0))) u))))
+
+#?(:clj
+   (deftest max-items-bounds-typed-array-reconstruction-too
+     ;; JVM only, and that is the finding rather than a gap in the test: the
+     ;; amplification exists exactly where the host has no lossless primitive
+     ;; form and BOXES. ClojureScript preserves tag 67 as its bytes, so a
+     ;; million of them stay a million bytes there.
+     (testing "a typed array is 1.0x only while it STAYS a typed array. A
+               uint64 array whose values exceed 2^63 has no lossless long, so it
+               becomes one boxed object per element: 1 MB of `ff` under tag 67
+               retained 11 MB, 12.5x, with {:max-items 100} set and honoured.
+               The first fix charged tag-40 reconstruction and missed this one"
+       (let [bos (java.io.ByteArrayOutputStream.)]
+         (.write bos ^bytes (c/hex->bytes "d8475a000f4240"))
+         (dotimes [_ 1000000] (.write bos 0xff))
+         (is (= :boring/max-items-exceeded
+                (err-type #(boring/decode (.toByteArray bos) {:max-items 100}))))))
+
+     (testing "while the PRIMITIVE path is not charged, because it does not
+               amplify: the same million bytes of small values is one long[]"
+       (let [bos (java.io.ByteArrayOutputStream.)]
+         (.write bos ^bytes (c/hex->bytes "d8475a000f4240"))
+         (dotimes [_ 1000000] (.write bos 1))
+         (is (not= :boring/max-items-exceeded
+                   (err-type #(boring/decode (.toByteArray bos) {:max-items 100}))))))))
+
+(deftest rfc-3339-ranges-and-the-calendar-are-both-checked
+  (testing "an impossible day is not a date. `js/Date` ROLLS IT FORWARD rather
+            than refusing, so 2020-02-30 decoded to 2020-03-01 on ClojureScript
+            and re-encoded a different document than the one that arrived"
+    (doseq [s ["2020-02-30T00:00:00Z" "2019-02-29T00:00:00Z"]]
+      (is (= :boring/bad-tag-content (err-type #(boring/decode (tag0-bytes s)))) s)))
+  (testing "hour 24 is out of RFC 3339 5.6's range on both platforms, and both
+            used to roll it forward to the next day"
+    (is (= :boring/bad-tag-content
+           (err-type #(boring/decode (tag0-bytes "2020-01-01T24:00:00Z"))))))
+  (testing "and `time-secfrac` needs at least one digit"
+    (is (= :boring/bad-tag-content
+           (err-type #(boring/decode (tag0-bytes "2020-01-01T00:00:00.Z"))))))
+  (testing "real dates, leap days and leap seconds still decode"
+    (doseq [s ["2020-02-29T00:00:00Z" "2020-01-01T23:59:60Z" "2020-01-01T00:00:00.5Z"]]
+      (is (not= :boring/bad-tag-content
+                (err-type #(boring/decode (tag0-bytes s)))) s))))
+
+(deftest a-typed-array-payload-is-a-definite-length-byte-string
+  (testing "RFC 8746 2. ClojureScript routed the payload through the general
+            reader, which MERGES indefinite chunks, so a form the JVM refuses
+            decoded there"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d8435f44010203044405060708ff"))))
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d84e5f44010203044405060708ff")))))
+  (testing "the definite form is unaffected"
+    (is (not= :boring/bad-tag-content (err-type #(dec-hex "d843480102030405060708"))))))
+
+(deftest tag-32-content-is-checked-as-a-uri-not-only-as-a-scheme
+  (testing "checking the scheme alone left characters RFC 3986 has no
+            production for accepted on ClojureScript and rejected on the JVM"
+    (doseq [u ["a b" "a|b" "%zz"]]
+      (is (= :boring/bad-tag-content (err-type #(dec-hex (tag32-hex u)))) u)))
+  (testing "and both absolute and relative references still decode"
+    (doseq [u ["http://a.b" "/a/b" "ab"]]
+      (is (not= :boring/bad-tag-content (err-type #(dec-hex (tag32-hex u)))) u))))
+
+(deftest structural-tags-cannot-be-given-a-reader
+  (testing "stringref is resolved while the value is BUILT, not at tag
+            dispatch, so a reader registered for it applied to a bare 25(0) and
+            was silently ignored for the same reference inside a tag-39
+            identifier -- one registration meaning two things"
+    (doseq [t [25 256]]
+      (is (= :boring/bad-tag-number
+             (err-type #(boring/register-tag (boring/tag-registry) t nil nil identity)))
+          (str "tag " t))))
+  (testing "and a tag number that no document can carry is refused rather than
+            registered dead"
+    (doseq [t [-1 1.5]]
+      (is (= :boring/bad-tag-number
+             (err-type #(boring/register-tag (boring/tag-registry) t nil nil identity)))
+          (str "tag " t)))))
+
+;; ------------------------------------------------- fourth semantic re-audit
+
+(defn- tag1004-hex [d]
+  (str "d903ec" (hex-byte (+ 0x60 (count d)))
+       (apply str (map #(hex-byte #?(:clj (int %) :cljs (.charCodeAt % 0))) d))))
+
+(deftest an-impossible-day-is-refused-however-it-is-written
+  (testing "the calendar check ran below the leap-second return and only for a
+            trailing Z, so it caught one of the three ways an impossible day
+            arrives: with an offset it still decoded to the following day and
+            re-encoded a DIFFERENT document, and with :60 seconds it was
+            preserved without the day being looked at"
+    (doseq [s ["2020-02-30T00:00:00Z"
+               "2020-02-30T00:00:00+00:00"
+               "2020-02-30T23:59:60Z"
+               "2019-02-29T00:00:00Z"]]
+      (is (= :boring/bad-tag-content (err-type #(boring/decode (tag0-bytes s)))) s)))
+  (testing "and real dates -- including a leap day, a leap second, and a year
+            below 100, which Date.UTC would have mapped into the 1900s -- still
+            decode on both platforms"
+    (doseq [s ["2020-02-29T00:00:00Z" "2020-01-01T23:59:60Z"
+               "0050-01-01T00:00:00Z" "2020-01-01T00:00:00-00:00"]]
+      (is (not= :boring/bad-tag-content (err-type #(boring/decode (tag0-bytes s)))) s))))
+
+(deftest rfc-3339-offsets-agree-across-platforms
+  (testing "the shared grammar allowed offsets to +-23:59, which RFC 3339 does
+            permit and java.time.ZoneOffset does not hold -- so 125 documents
+            decoded on ClojureScript and were refused on the JVM. Both now stop
+            at the +-18:00 java.time can represent"
+    (is (= :boring/bad-tag-content
+           (err-type #(boring/decode (tag0-bytes "2020-01-01T00:00:00+23:00")))))
+    (is (not= :boring/bad-tag-content
+              (err-type #(boring/decode (tag0-bytes "2020-01-01T00:00:00+18:00")))))))
+
+(deftest tag-1004-uses-the-rfc-3339-grammar-not-the-host-parser
+  (testing "`LocalDate.parse` accepts java.time's expanded years, so
+            1004(\"+10000-01-01\") decoded on the JVM and was refused on
+            ClojureScript -- the same defect tag 0 had, in the tag beside it"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex (tag1004-hex "+10000-01-01")))))
+    (is (not= :boring/bad-tag-content (err-type #(dec-hex (tag1004-hex "2020-01-01")))))))
+
+#?(:clj
+   (deftest max-depth-is-validated-like-max-items
+     (testing ":max-depth went straight through `int`: 1.5 truncated to 1, -1
+               and 0 disabled the nesting bound outright, and a string escaped
+               untyped -- from the option parser for a documented safety control
+               whose sibling :max-items was already correct"
+       (doseq [v [-1 0 1.5 "x"]]
+         (is (= :boring/bad-option
+                (err-type #(boring/decode (c/hex->bytes "01") {:max-depth v})))
+             (pr-str v))))
+     (testing "and a legal one still applies"
+       (is (= :boring/max-depth-exceeded
+              (err-type #(boring/decode (c/hex->bytes "81818101") {:max-depth 2})))))))
+
+(deftest tag-32-accepts-what-the-other-platform-accepts
+  (testing "the character check added for the ASCII cases was RFC 3986 exactly,
+            which is ASCII-only -- but java.net.URI takes the IRI-ish superset
+            every JVM peer already writes, so a URI with a non-ASCII path became
+            a FALSE REJECTION on ClojureScript. A stricter grammar only one side
+            enforces is the same defect as a looser one"
+    (doseq [u ["http://a.b/café" "é" "http://a.b/中" "http://ok" "/rel"]]
+      (is (not= :boring/bad-tag-content (err-type #(dec-hex (tag32-hex u)))) u)))
+  (testing "while the characters RFC 3986 has no production for stay refused"
+    (doseq [u ["a b" "a|b" "%zz"]]
+      (is (= :boring/bad-tag-content (err-type #(dec-hex (tag32-hex u)))) u))))
+
+(deftest tag-1002-base-precision-and-bounds-match
+  (testing "a base finer than a nanosecond cannot round-trip a Duration, so the
+            JVM refuses it -- ClojureScript had no exactness rule at all"
+    (doseq [h ["d903eaa101fb3e01203af9ee7561" "d903eaa101fb3ddb7cdfd9d7bdbb"]]
+      (is (= :boring/bad-tag-content (err-type #(dec-hex h))) h)))
+  (testing "and the negative bound was `<` where the positive one was `>=`, so
+            -2^63 as a double was accepted here and refused there"
+    (is (= :boring/bad-tag-content (err-type #(dec-hex "d903eaa101fbc3e0000000000000")))))
+  (testing "bases a Duration does hold are unaffected"
+    (doseq [h ["d903eaa101fb3ff8000000000000" "d903eaa101fb3fb999999999999a" "d903eaa10105"]]
+      (is (not= :boring/bad-tag-content (err-type #(dec-hex h))) h))))
+
+(deftest a-decoded-value-can-always-be-re-encoded
+  (testing "ClojureScript built a 2-D typed tag-40 array with `make-array`,
+            which is a raw JS Array, and its own writer has no case for one --
+            so this document decoded to a value boring could not re-encode. The
+            rows are still zero-copy subarray views"
+    (let [v (dec-hex "d82882820202d84e5001020304050607080910111213141516")]
+      (is (not= :boring/unencodable-class (err-type #(boring/encode v)))))))
+
+#?(:clj
+   (deftest register-tag-rejects-an-out-of-range-tag-typed
+     (testing "`(long tag)` on a bignum past Long/MAX_VALUE raised a raw
+               IllegalArgumentException -- untyped, out of the registration API,
+               at exactly the boundary someone testing limits would reach for"
+       (is (= :boring/bad-tag-number
+              (err-type #(boring/register-tag (boring/tag-registry)
+                                              18446744073709551615N nil nil identity)))))
+     (testing "and Long/MAX_VALUE itself still registers"
+       (is (not= :boring/bad-tag-number
+                 (err-type #(boring/register-tag (boring/tag-registry)
+                                                 Long/MAX_VALUE nil nil identity)))))))
+
+#?(:clj
+   (deftest the-index-retry-applies-only-where-the-file-says-the-footer-is
+     (testing "the budget retry accepted anything frame-SHAPED at any offset, so
+               two concatenated sealed files ended at the FIRST file's footer:
+               352 records decoded as 200 under :max-depth 4, silently, with no
+               error. Gated on the trailing back-pointer now"
+       (let [mk (fn [n] (let [o (java.io.ByteArrayOutputStream.)]
+                          (boring/write-seq! (boring/writer 4096)
+                                             (vec (for [i (range n)] {:e i :v (str "v" i)})) o)
+                          (.toByteArray o)))
+             both (let [o (java.io.ByteArrayOutputStream.)]
+                    (.write o ^bytes (mk 200)) (.write o ^bytes (mk 150)) (.toByteArray o))]
+         (is (= 352 (count (boring/decode-seq both))))
+         (is (= 352 (count (boring/decode-seq both {:max-items 600}))))
+         (is (not= 200 (err-type #(count (boring/decode-seq both {:max-depth 4}))))
+             "a budget too small for the second footer must error, never truncate")))
+
+     (testing "and a single sealed file still reads back under budgets too small
+               for its own footer, which is what the retry exists for"
+       (let [o (java.io.ByteArrayOutputStream.)]
+         (boring/write-seq! (boring/writer 4096)
+                            (vec (for [i (range 200)] {:e i :v (str "v" i)})) o)
+         (let [bs (.toByteArray o)]
+           (is (= 200 (count (boring/decode-seq bs {:max-depth 3}))))
+           (is (= 200 (count (boring/decode-seq bs {:max-items 700})))))))
+
+     (testing "the retry must not lift :max-items for anything but the footer --
+               a 500 000-element tag-40 item under {:max-items 100} was re-read
+               with NO budget and allocated 473 MB before reporting the same
+               error it would otherwise have reported for free"
+       (let [bos (java.io.ByteArrayOutputStream.)]
+         (.write bos ^bytes (c/hex->bytes "d82882831a0007a1200101d84e5a0007a120"))
+         (dotimes [_ 500000] (.write bos 1))
+         (let [doc (.toByteArray bos)
+               tmx (java.lang.management.ManagementFactory/getThreadMXBean)
+               tid (.getId (Thread/currentThread))
+               before (.getThreadAllocatedBytes tmx tid)]
+           (err-type #(doall (boring/decode-seq doc {:max-items 100})))
+           (is (< (- (.getThreadAllocatedBytes tmx tid) before) 50000000)
+               "the budgeted decode must not allocate the whole reconstruction"))))))
+
+(deftest rfc-3339-offsets-stop-at-eighteen-hours-exactly
+  (testing "the narrowing landed on `1[0-8]:[0-5]\\d`, which admits +18:01 to
+            +18:59 -- 720 offsets java.time cannot hold, under a doc sentence
+            written in the same commit claiming the opposite"
+    (doseq [o ["+18:01" "+18:59" "-18:30" "+19:00"]]
+      (is (= :boring/bad-tag-content
+             (err-type #(boring/decode (tag0-bytes (str "2020-01-01T00:00:00" o))))) o)))
+  (testing "while the bound itself and everything below it stay legal"
+    (doseq [o ["+18:00" "-18:00" "+17:59" "Z"]]
+      (is (not= :boring/bad-tag-content
+                (err-type #(boring/decode (tag0-bytes (str "2020-01-01T00:00:00" o))))) o))))
+
+(defn- tag32-bytes
+  "`32(s)` as platform bytes, letting the encoder do the UTF-8."
+  [s]
+  (c/hex->bytes (str "d820" (c/bytes->hex (boring/encode s {:stringref false})))))
+
+(deftest tag-32-agrees-with-the-jvm-on-unicode
+  (testing "`java.net.URI` accepts non-ASCII but refuses Unicode whitespace and
+            controls. Allowing all of U+0080-U+FFFF to fix the ASCII cases
+            traded eleven agreements for eleven disagreements the other way"
+    (doseq [cp [0x00A0 0x2000 0x3000 0x0085 0x0001 0x007F]]
+      (is (= :boring/bad-tag-content
+             (err-type #(boring/decode (tag32-bytes (str "a" (char cp) "b")))))
+          (str "U+" cp))))
+  (testing "while ordinary non-ASCII stays legal on both"
+    (doseq [cp [0x00E9 0x4E2D 0xFEFF 0x200B]]
+      (is (not= :boring/bad-tag-content
+                (err-type #(boring/decode (tag32-bytes (str "a" (char cp) "b")))))
+          (str "U+" cp)))))
+
+#?(:clj
+   (deftest streaming-decode-reads-borings-own-default-output
+     (testing "`decode-seq` got the footer budget retry and the streaming arity
+               did not, so the path documented for dumps larger than the heap
+               still could not read back what `write-seq!` writes by default"
+       (let [o (java.io.ByteArrayOutputStream.)]
+         (boring/write-seq! (boring/writer 4096)
+                            (vec (for [i (range 500)]
+                                   {:e i :a :n/x :v (str "v" i) :t i :added true})) o)
+         (let [bs (.toByteArray o)]
+           (doseq [opts [{} {:max-depth 3} {:max-depth 4} {:max-items 700}
+                         {:max-items 1000} {:chunk-size 64}]]
+             (is (= 500 (count (boring/decode-seq-from
+                                (java.io.ByteArrayInputStream. bs) opts)))
+                 (pr-str opts))))))))
+
+#?(:clj
+   (deftest a-corrupt-back-pointer-does-not-throw-out-of-the-footer-probe
+     (testing "`footer-start` built the pointer with checked arithmetic, so any
+               file whose last eight bytes have the top bit set raised a raw
+               ArithmeticException from the function whose job is to decide
+               whether to trust those bytes"
+       (let [bs (byte-array (concat (seq (c/hex->bytes "01"))
+                                    [(unchecked-byte 0x48)]
+                                    (repeat 8 (unchecked-byte 0xff))))]
+         (is (not= :boring/bad-option (err-type #(doall (boring/decode-seq bs)))))))))
+
+(deftest option-typos-are-refused-not-silently-honoured
+  (testing ":float-policy was COMPARED, not validated -- the writer asked
+            `(= :preserve-width v)`, so a typo, a string or nil selected
+            :shortest and silently narrowed every Double to a Float. That is
+            precisely the corruption the option exists to prevent"
+    (doseq [v [:preserve-widht "preserve-width" nil 1]]
+      (is (= :boring/bad-option (err-type #(boring/encode 1.5 {:float-policy v})))
+          (pr-str v))))
+  (testing "and both legal values still work"
+    (doseq [v [:preserve-width :shortest]]
+      (is (not= :boring/bad-option (err-type #(boring/encode 1.5 {:float-policy v})))
+          (pr-str v))))
+  (testing ":encode-fallback took anything `ifn?`, so `:placehodler` was invoked
+            as a keyword lookup and silently replaced unencodable values with
+            nil, while a vector threw untyped"
+    (doseq [v [:placehodler [1 2] {} #{1}]]
+      (is (= :boring/bad-option
+             (err-type #(boring/encode #?(:clj (Object.) :cljs (js/WeakMap.))
+                                       {:encode-fallback v})))
+          (pr-str v)))))
+
+#?(:clj
+   (deftest shapes-never-changes-the-value
+     (testing "the shaped-array encoding carries keys and values and nothing
+               else, so a map that is MORE than its entries cannot go in one.
+               Records were excluded; sorted maps and maps with metadata were
+               not, and came back as plain maps with the extra silently gone.
+               `=` returns true for both, which is why round-trip tests missed it"
+       (let [sorted [(sorted-map "0" 1) (sorted-map "0" 2)]
+             metad  [(with-meta {:a 1} {:m 1}) (with-meta {:a 2} {:m 2})]]
+         (is (every? sorted? (boring/decode (boring/encode sorted {:shapes true}))))
+         (is (= [{:m 1} {:m 2}] (mapv meta (boring/decode (boring/encode metad {:shapes true})))))))
+
+     (testing "`containsKey` on a sorted map runs its comparator against a key
+               from a different map, which threw a raw ClassCastException out of
+               encode"
+       (is (not= :boring/bad-option
+                 (err-type #(boring/encode [{false nil} (sorted-map "0" nil)]
+                                           {:shapes true})))))
+
+     (testing "and plain maps are still shaped, which is what the option is for"
+       (let [v (vec (repeat 20 {:a 1 :b 2 :c 3}))]
+         (is (< (alength (boring/encode v {:shapes true}))
+                (alength (boring/encode v {:shapes false}))))))))
+
+(deftest max-depth-is-bounded-on-both-platforms
+  (testing "ClojureScript set maxDepth unchecked, so a non-numeric value made
+            every `(> depth maxDepth)` compare against NaN -- ALWAYS false in
+            JavaScript -- and removed the nesting bound entirely. The same
+            option raised :boring/bad-option on the JVM, and doc/SECURITY.md
+            names a browser as an attacker source and this as one of its three
+            bounds"
+    (doseq [v [:kw [1] "x" -1 0 1.5 nil]]
+      (is (= :boring/bad-option
+             (err-type #(boring/decode (c/hex->bytes "01") {:max-depth v})))
+          (pr-str v))))
+  (testing "a document deeper than the default is still refused, and raising
+            the limit within what the stack survives still accepts it"
+    (let [deep (c/hex->bytes (str (apply str (repeat 1500 "81")) "00"))]
+      (is (= :boring/max-depth-exceeded (err-type #(boring/decode deep))))
+      (is (not= :boring/max-depth-exceeded
+                (err-type #(boring/decode deep {:max-depth 2000}))))))
+  (testing "and a limit the host stack cannot honour is refused as an option
+            rather than accepted and then raising a raw StackOverflowError,
+            which doc/SECURITY.md promises cannot escape"
+    (is (= :boring/bad-option
+           (err-type #(boring/decode (c/hex->bytes "01") {:max-depth 100000}))))))
+
+#?(:clj
+   (deftest build-index-validates-its-stride-like-everything-else
+     (testing "`build-index` read `:index` its own way, so all four defects
+               `index-opt` closed were live in the API's flagship indexed entry
+               point: 1.5 became stride 1, -1 became 16, a string was a raw
+               ClassCastException, and 0 -- the documented off switch --
+               silently produced a LARGER file than omitting the option"
+       (doseq [v [1.5 -1 "x" 0]]
+         (is (= :boring/bad-option
+                (err-type #(boring/encode-indexed (vec (range 40)) {:index v})))
+             (pr-str v))))
+     (testing "and a legal stride still seals"
+       (is (not= :boring/bad-option
+                 (err-type #(boring/encode-indexed (vec (range 40)) {:index 16})))))))
+
+(defn- count-bytes [bs]
+  #?(:clj (alength ^bytes bs) :cljs (.-length bs)))
+
+(deftest encode-indexed-works-on-both-platforms
+  (testing "ClojureScript can index an already-encoded blob. konserve is
+            portable and wants indexed access into stored blobs from either
+            side, so this could not stay JVM-only. It walks bytes rather than
+            hooking the writer, which is why it ports at all -- the streaming
+            capture path (`write-seq! {:index N}`) is a different and larger
+            thing that is still JVM-only"
+    (let [v (vec (for [i (range 40)] {:e i :a :n/x :v (str "value-" i)}))
+          plain (boring/encode v {:stringref false})
+          idx (boring/encode-indexed v {:index 4 :index-min 4})]
+      (testing "the result is still a CBOR sequence whose first item is the value"
+        (is (= v (first (boring/decode-seq idx)))))
+      (testing "and the frame is metadata, not an item"
+        (is (= 1 (count (boring/decode-seq idx)))))
+      (testing "the index costs something but not much"
+        (is (> (count-bytes idx) (count-bytes plain)))
+        (is (< (count-bytes idx) (* 1.1 (count-bytes plain)))))
+      (testing "nothing worth indexing means no frame, so the result still decodes"
+        (is (= [1 2] (first (boring/decode-seq
+                             (boring/encode-indexed [1 2] {:index-min 16}))))))))
+
+  (testing "the stride is validated here too -- `build-index` read `:index` its
+            own way on both platforms and let a fractional, negative or
+            non-numeric stride through"
+    (doseq [bad [1.5 -1 "x" 0]]
+      (is (= :boring/bad-option
+             (err-type #(boring/encode-indexed (vec (range 40)) {:index bad})))
+          (pr-str bad)))))
+
+(deftest indexed-bytes-are-identical-on-both-platforms
+  (testing "The `sorted` flag in the index frame is COMPUTED, not assumed.
+            ClojureScript emitted `false` for every container while the JVM
+            emitted the real flag, so the two platforms wrote different bytes
+            for the same value -- silently, because nav treats `false` as
+            'scan instead of binary-search' and still returns right answers.
+            konserve is portable and content-addressed: two platforms must not
+            disagree about the bytes.
+
+            These two cases differ in ONE byte -- f5 vs f4, the flag itself --
+            which is what makes them a discriminator rather than a smoke test.
+            Without the fix the ascending case fails on ClojureScript and
+            passes on the JVM."
+    (let [opts {:index 1 :index-min 3 :shapes false :stringref false}
+          asc  (array-map "a" 1 "b" 2 "c" 3)
+          desc (array-map "c" 1 "b" 2 "a" 3)]
+      (is (= (str "81a3616101616202616303d81b826c626f72696e672f696e646578"
+                  "8601d84e4401000000d84e4403000000814301030381f5"
+                  "48000000000000000b")
+             (c/bytes->hex (boring/encode-indexed [asc] opts)))
+          "ascending keys -> sorted true (f5)")
+      (is (= (str "81a3616301616202616103d81b826c626f72696e672f696e646578"
+                  "8601d84e4401000000d84e4403000000814301030381f4"
+                  "48000000000000000b")
+             (c/bytes->hex (boring/encode-indexed [desc] opts)))
+          "descending keys -> sorted false (f4)")
+      (testing "the flag is what separates them: same keys, same values, same
+                length, and the frame differs"
+        (let [a (c/bytes->hex (boring/encode-indexed [asc] opts))
+              d (c/bytes->hex (boring/encode-indexed [desc] opts))]
+          (is (= (count a) (count d)))
+          (is (not= a d)))))))
+
+(deftest a-sealed-file-reads-at-a-depth-budget-that-fits-its-data
+  (testing "The trailing index frame is boring's OWN metadata, and its fixed
+            nesting must not be charged to the caller's `:max-depth`. It was, on
+            ClojureScript: a valid 500-item file written by `write-seq!` on the
+            JVM -- which the JVM reads back at `{:max-depth 3}` -- raised
+            `:boring/max-depth-exceeded` in the browser at both 3 and 4. Write
+            on the server, fail on the client, on this library's own default
+            output. The JVM located the frame by its bytes and never decoded
+            it; ClojureScript decoded it and judged afterwards."
+    (let [v (vec (for [i (range 40)] {:e i :a "x" :v (str "v" i)}))
+          idx (boring/encode-indexed v {:index 4 :index-min 4})]
+      (testing "the control: this data really does fit in three levels, so a
+                failure below is the FRAME's nesting and not the data's.
+                `:stringref false` because `encode-indexed` forces it -- with
+                stringref on, the wrapping tag is a fourth level and the
+                comparison would be against a different document"
+        (is (= v (boring/decode (boring/encode v {:stringref false}) {:max-depth 3}))))
+      (testing "so every reader gets it back at that budget"
+        (is (= [v] (vec (boring/decode-seq idx {:max-depth 3}))))
+        (is (= [v] (vec (boring/decode-seq-from
+                         #?(:clj (java.io.ByteArrayInputStream. idx)
+                            :cljs (let [done (volatile! false)]
+                                    (fn [] (when-not @done (vreset! done true) idx))))
+                         {:max-depth 3})))))
+      (testing "and the frame is still not an item"
+        (is (= 1 (count (boring/decode-seq idx {:max-depth 3}))))))))
+
+(deftest the-skip-walk-terminates-on-hostile-bytes
+  (testing "`skip-from` walks heads without building values, which is what
+            makes indexing and frame recognition cheap -- and it must refuse
+            what the decoder refuses. The ClojureScript twin validated nothing:
+            `aget` past a Uint8Array yields `undefined`, which is never the
+            0xff break byte, so a truncated indefinite container spun forever.
+            Twenty-seven bytes -- a real index-frame prefix followed by an
+            unclosed `9f` -- HUNG `decode-seq` in the browser where the JVM
+            answered `:boring/truncated-input`. A hang is worse than a wrong
+            answer: nothing above it can recover, and this runs on bytes
+            somebody else wrote.
+
+            A declared count is now checked against the bytes that remain, so
+            the walk is linear in the input rather than in what the input
+            claims -- `9b ffffffffffffffff` owed 2^64 items and simply did not
+            finish."
+    (doseq [[label hex] [["frame prefix, unclosed indefinite array"
+                          "d81b826c626f72696e672f696e646578869f480000000000000000"]
+                         ["array of 3 with 1 element"        "8301"]
+                         ["map of 2 with 1 pair"             "a20101"]
+                         ["array declaring 2^64 elements"    "9bffffffffffffffff"]
+                         ["byte string declaring 2^64 bytes" "5bffffffffffffffff"]
+                         ["bare indefinite array head"       "9f"]
+                         ["indefinite map, no break"         "bf01"]]]
+      (testing label
+        (is (contains? #{:boring/truncated-input :boring/bad-count}
+                       (err-type #(count (boring/decode-seq (c/hex->bytes hex)))))
+            "decode-seq refuses it, typed")
+        (is (contains? #{:boring/truncated-input :boring/bad-count}
+                       (err-type #(boring/build-index (c/hex->bytes hex)
+                                                      {:index 1 :index-min 1})))
+            "and so does the walk that never decodes")))
+    (testing "the control: well-formed input of the SAME shapes still walks, so
+              the assertions above are about the damage and not about the
+              shapes being rejected wholesale"
+      (doseq [hex ["83010203" "a201020304"]]
+        (is (= 1 (count (boring/decode-seq (c/hex->bytes hex)))) hex)
+        (is (some? (boring/build-index (c/hex->bytes hex) {:index 1 :index-min 1})) hex)))))
+
+(deftest a-declared-count-cannot-size-an-array-before-it-is-checked
+  (testing "`build-index` sizes an anchor array from a count it reads off the
+            wire. Six bytes -- `ba 7fffffff 01`, a map declaring 2^31-1 pairs --
+            therefore asked for a long[] of that many entries and gave
+            `OutOfMemoryError` out of a public entry point documented for
+            \"a file somebody else wrote\". `Reader.checkCount` has always
+            guarded the decoder against exactly this; the index walk sizes an
+            array from a wire count too and never got the same guard."
+    (doseq [[label hex] [["map declaring 2^31-1 pairs"    "ba7fffffff01"]
+                         ["array declaring 2^31-1 items"  "9a7fffffff01"]
+                         ["map declaring 2^64-1 pairs"    "bbffffffffffffffff01"]]]
+      (testing label
+        (is (contains? #{:boring/bad-count :boring/truncated-input}
+                       (err-type #(boring/build-index (c/hex->bytes hex)
+                                                      {:index 1 :index-min 1}))))))
+    (testing "the control: a container whose count IS backed by bytes still
+              indexes, so the guard rejects the lie and not the shape"
+      (doseq [hex ["83010203" "a201020304"]]
+        (is (some? (boring/build-index (c/hex->bytes hex) {:index 1 :index-min 1}))
+            hex)))))
+
+(deftest a-nil-input-is-a-typed-error-on-every-read-path
+  (testing "doc/SECURITY.md's third guarantee says nothing escapes as a raw
+            NullPointerException, so a caller's `catch ExceptionInfo` is
+            sufficient. `(Reader. nil)` is exactly that, and four of the five
+            read paths raised it -- `nav/source` was the only one that honoured
+            the guarantee. A nil is a caller mistake rather than bad data, but
+            the guarantee does not distinguish and neither should the caller."
+    (doseq [[label f] [["decode"      #(boring/decode nil)]
+                       ["decode-seq"  #(doall (boring/decode-seq nil))]
+                       ["build-index" #(boring/build-index nil)]]]
+      (is (= :boring/bad-argument (err-type f)) label))
+    (testing "the control: the same entry points still read real bytes"
+      (let [bs (boring/encode {:a 1})]
+        (is (= {:a 1} (boring/decode bs)))
+        (is (= [{:a 1}] (vec (boring/decode-seq bs))))))))
+
+(deftest an-ordinary-keyword-is-not-a-sentinel
+  (testing "`decode-seq` compared each decoded item against `::index-frame` --
+            a leftover sentinel from a refactor, and dead code, since nothing
+            produces it any more. Keywords are INTERNED, so a user's
+            `:boring.core/index-frame` is that exact object: a sequence
+            containing it silently truncated there. `[1 :boring.core/index-frame
+            3]` came back `[1]`. Two items lost, no error, on a namespaced
+            keyword anybody could write.
+
+            The lesson is about sentinels rather than this keyword: a sentinel
+            drawn from the same value space as the data cannot be distinguished
+            from the data."
+    (let [o {:stringref false}
+          seq-of (fn [xs] (let [w (boring/writer 4096 o)
+                                out #?(:clj (java.io.ByteArrayOutputStream.) :cljs nil)]
+                            #?(:clj (do (doseq [x xs] (boring/write-to! w x out))
+                                        (vec (boring/decode-seq (.toByteArray out) o)))
+                               :cljs (let [acc (atom [])]
+                                       (boring/write-seq! w xs #(swap! acc conj %) o)
+                                       (vec (boring/decode-seq
+                                             (let [n (reduce + (map #(.-length %) @acc))
+                                                   b (js/Uint8Array. n)]
+                                               (reduce (fn [off c] (.set b c off)
+                                                         (+ off (.-length c))) 0 @acc)
+                                               b)
+                                             o))))))]
+      (doseq [k [:boring.core/index-frame :boring/index :boring.core/whatever]]
+        (is (= [1 k 3] (seq-of [1 k 3])) (str "a sequence holding " k))))))
+
+(deftest a-sequence-is-navigable-on-both-platforms
+  (testing "`nav` refuses a document that opens a stringref namespace -- a
+            cursor holding only an offset cannot resolve one. The JVM's
+            `write-seq!` indexes by default and therefore forces stringref off;
+            the ClojureScript arity cannot index, so it had no such trigger and
+            its default output carried `d9 0100` per item. The same portable
+            call produced a navigable file on one platform and not the other,
+            while the ClojureScript docstring promised `boring.nav` could read
+            it. Forced off there too now."
+    (let [w (boring/writer 4096)
+          acc (atom [])
+          sink (fn [c] (swap! acc conj c))
+          n #?(:clj (let [out (java.io.ByteArrayOutputStream.)]
+                      (boring/write-seq! w [{:a 1 :b "x"} {:a 2 :b "x"}] out)
+                      (reset! acc [(.toByteArray out)])
+                      (alength ^bytes (first @acc)))
+               :cljs (boring/write-seq! w [{:a 1 :b "x"} {:a 2 :b "x"}] sink))]
+      (is (pos? n))
+      (testing "no item opens a stringref namespace (d9 0100)"
+        (doseq [chunk @acc]
+          (let [b0 #?(:clj (bit-and (aget ^bytes chunk 0) 0xff) :cljs (aget chunk 0))]
+            (is (not= 0xd9 b0)
+                "a sequence meant to be navigable must not open a stringref namespace")))))))
+
+(deftest every-registration-path-writes-the-same-wire-name
+  (testing "A record's wire name is decided in several places -- the writer's
+            fallback, `record-type-name`, `boring.records/wire-name`, and
+            `register-record-class`'s default. They must all say the same
+            thing, and one of them did not: `register-record-class` defaulted
+            to the raw class name, so a type registered through it went out as
+            `my_ns.My-Rec` while `encode` of the SAME TYPE wrote
+            `my-ns/My-Rec`. Two names for one type inside one version, which is
+            worse than either name being wrong.
+
+            An audit of the consuming projects found this, and also found that
+            NOTHING here asserted a wire-name string at all -- `register-records`,
+            `record-type-name`, `auto-registry` and `registry-for` had zero test
+            references between them. That gap is why a format change could reach
+            three consumers before anything noticed."
+    (let [p (->ConfPoint 1 2)
+          expected (data/record-type-name p)]
+      (testing "the shape itself: namespace as written, slash, name as written"
+        (is (re-matches #"[^/]+/[A-Za-z][A-Za-z0-9]*" expected)
+            (str "unexpected wire-name shape: " expected))
+        (is (not (re-find #"_" expected))
+            "the namespace must not be munged"))
+      (testing "and the bytes carry exactly that name"
+        (let [hex (c/bytes->hex (boring/encode p {:stringref false}))]
+          (is (re-find (re-pattern (c/bytes->hex (boring/encode expected {:stringref false}))) hex)
+              "the encoded record must contain the encoded wire name")))
+      #?(:clj
+         (testing "every registration path agrees with it"
+           (let [via-class (boring/register-record-class (boring/tag-registry) (class p))
+                 back (boring/decode (boring/encode p) {:registry via-class})]
+             (is (= p back)
+                 "register-record-class must register the name encode writes")))))))
+
+(deftest a-bignum-and-an-equal-integer-are-one-key
+  (testing "`{1: true, 2(h'01'): false}` decoded as a TWO-entry map in a browser
+            and raised `:boring/duplicate-map-key` on the server -- a parser
+            differential in the direction COMPATIBILITY.md does not consider, a
+            document a browser accepts and the JVM refuses. Both platforms
+            decode `c2 41 01` to a bignum; the JVM's `(= 1 1N)` is true and
+            ClojureScript's `(= 1 (js/BigInt 1))` is false, so it was the
+            duplicate check's equality that differed, not the decoded values.
+
+            A CHOICE, unlike `1` versus `1.0`, which JavaScript genuinely
+            cannot tell apart. boring's own canonical rule reduces a bignum
+            that fits to a basic integer, so treating them as one key is what
+            the rest of the codec already believes."
+    (is (= :boring/duplicate-map-key
+           (err-type #(boring/decode (c/hex->bytes "a201f5c24101f4")))))
+    (testing "the control: a bignum that is NOT equal to the integer key stays
+              a second key, so the check has not become a blanket refusal"
+      (is (= 2 (count (boring/decode
+                       (c/hex->bytes "a2c249010000000000000000f501f4"))))))
+    (testing "and two plainly different integer keys are untouched"
+      (is (= 2 (count (boring/decode (c/hex->bytes "a201f502f4"))))))))
+
+;; --------------------------------------------------- reserved tag-27 markers
+
+(def ^:private marker-frames
+  "Every reserved tag-27 frame the JVM writer emits, produced by encoding a
+  real value of the type each marker names. Hand-written hex would not prove
+  the same thing: the point is that these are the bytes a JVM peer actually
+  sends."
+  [["clojure/char"       "d81b826c636c6f6a7572652f636861726161"]
+   ["java/period"        "d81b826b6a6176612f706572696f6463503144"]
+   ["java/period YMD"    "d81b826b6a6176612f706572696f6467503159314d3144"]
+   ["java/char-array"    "d81b826f6a6176612f636861722d6172726179626162"]
+   ["java/boolean-array" "d81b82726a6176612f626f6f6c65616e2d617272617982f5f4"]
+   ["java/string-array"  "d81b82716a6176612f737472696e672d61727261798261616162"]
+   ["java/object-array"  "d81b82716a6176612f6f626a6563742d61727261798201f5"]
+   ["clojure/queue"      "d81b826d636c6f6a7572652f717565756583010203"]
+   ["clojure/sorted-map" "d81b8272636c6f6a7572652f736f727465642d6d6170a2016161026162"]
+   ["clojure/sorted-set" "d81b8272636c6f6a7572652f736f727465642d736574820102"]
+   ["clojure/ex-info"    "d81b826f636c6f6a7572652f65782d696e666f83616da1d827623a6101f6"]])
+
+(deftest tag27-markers-round-trip-to-identical-bytes
+  (testing "a marker naming a type ClojureScript does not have used to decode
+            to the bare payload, so re-encoding emitted a plain string or array
+            and the tag-27 frame was GONE. Seven of these eleven lost their
+            frame that way -- a JVM peer received a String where it had sent a
+            java.time.Period, permanently, and a relay downgraded every such
+            value it passed through. That is the failure COMPATIBILITY.md
+            refuses for URI, against the promise that `a round trip through
+            ClojureScript never corrupts a document`.
+
+            Runs on both platforms and asserts the SAME bytes on each, so it
+            fails on ClojureScript alone if the two ever drift apart again."
+    (doseq [[label hex] marker-frames]
+      (is (= hex (c/bytes->hex (boring/encode (boring/decode (c/hex->bytes hex))
+                                              {:stringref false})))
+          (str label " must re-encode to the frame it decoded from"))))
+  (testing "and under the option sets that could reshape a payload -- :shapes
+            is the one to fear, since the array-payload markers now hand back a
+            vector and a homogeneous vector is what the shaped-array writer
+            looks for"
+    (doseq [[label hex] marker-frames
+            opts [{:stringref false :shapes true}
+                  {:profile :canonical}
+                  {:profile :archival}
+                  {:profile :interop}]]
+      (is (= hex (c/bytes->hex (boring/encode (boring/decode (c/hex->bytes hex))
+                                              opts)))
+          (str label " must survive " (pr-str opts)))))
+  (testing "the send direction: BOTH writers encode a TaggedLiteral to its
+            frame, so the same source line produces the JVM's bytes on either
+            platform. This is what lets a browser originate a value whose type
+            only the JVM has -- the receive half above is what was missing."
+    (is (= "d81b826c636c6f6a7572652f636861726161"
+           (c/bytes->hex (boring/encode (tagged-literal 'clojure/char "a")
+                                        {:stringref false}))))
+    (is (= "d81b826f6a6176612f636861722d6172726179626162"
+           (c/bytes->hex (boring/encode (tagged-literal 'java/char-array "ab")
+                                        {:stringref false}))))))
+
+(deftest on-unknown-record-policies
+  ;; 27(["my-ns/Rec", {"x": 1}]) and 27(["my-ns/Pos", [1, 2]]) -- the two
+  ;; payload shapes, since the fallback branches on shape.
+  (let [mapped "d81b82696d792d6e732f526563a1d827623a7801"
+        posed  "d81b82696d792d6e732f506f73820102"]
+    (testing "the default is unchanged: lossless passthrough, which is the
+              whole reason the carrier exists -- a relay must be able to carry
+              a type it has no constructor for"
+      (is (data/unknown-record? (boring/decode (c/hex->bytes mapped))))
+      (is (= "my-ns/Rec" (data/frame-name (boring/decode (c/hex->bytes mapped)))))
+      (is (= [1 2] (data/frame-payload (boring/decode (c/hex->bytes posed)))))
+      (is (= "my-ns/Rec" (data/frame-name
+                          (boring/decode (c/hex->bytes mapped)
+                                         {:on-unknown-record :fallback})))))
+
+    (testing ":error is the opt-out. Passthrough HIDES a registry that can
+              never match: when a record's wire name became `namespace/Name`, a
+              registration still keyed on the munged class name stopped
+              matching and the records came back as UnknownRecord with no
+              error at all"
+      (is (= :boring/unregistered-record
+             (err-type #(boring/decode (c/hex->bytes mapped)
+                                       {:on-unknown-record :error}))))
+      (is (= :boring/unregistered-record
+             (err-type #(boring/decode (c/hex->bytes posed)
+                                       {:on-unknown-record :error})))))
+
+    (testing "a function receives [name payload] and its return value is used,
+              which is how a caller warns without boring owning a logger"
+      (is (= [:saw "my-ns/Rec" {:x 1}]
+             (boring/decode (c/hex->bytes mapped)
+                            {:on-unknown-record (fn [nm p] [:saw nm p])})))
+      (testing "and `data/frame-for` gives back the default, so a
+                warn-then-continue handler does not reimplement the rule"
+        (is (= "my-ns/Rec"
+               (data/frame-name
+                (boring/decode (c/hex->bytes mapped)
+                               {:on-unknown-record
+                                (fn [nm p] (data/frame-for nm p))}))))))
+
+    (testing "RESERVED MARKERS ARE NOT UNKNOWN RECORDS. Their names are known
+              even where the type behind one is not, so `clojure/char` must not
+              trip a policy about unregistered names -- on ClojureScript it
+              reaches the very same fallback helper, which is exactly how it
+              would have"
+      (let [ch "d81b826c636c6f6a7572652f636861726161"]
+        (is (= ch (c/bytes->hex
+                   (boring/encode (boring/decode (c/hex->bytes ch)
+                                                 {:on-unknown-record :error})
+                                  {:stringref false}))))))
+
+    (testing "and neither is a name the registry resolves"
+      (let [reg (boring/register-record (boring/tag-registry) "my-ns/Rec"
+                                        (fn [m] [:built m]))]
+        (is (= [:built {:x 1}]
+               (boring/decode (c/hex->bytes mapped)
+                              {:registry reg :on-unknown-record :error})))))
+
+    (testing "a value that is neither keyword nor callable is refused, rather
+              than silently meaning one of them"
+      (is (= :boring/bad-option
+             (err-type #(boring/decode (c/hex->bytes mapped)
+                                       {:on-unknown-record 5})))))))
+
+(deftest unknown-record-keeps-its-type-through-map-operations
+  (testing "the middle-peer property doc/EXTENDING.md argues for: a peer with
+            no constructor for a type can still enrich or prune the value and
+            the far end gets its record back. Every row here is a table in that
+            document, so the document cannot rot away from the code."
+    (let [u (data/unknown-record "my-ns/Rec" {:a 1 :b 2})
+          kept (fn [label v]
+                 (is (data/unknown-record? v) (str label " must stay a record"))
+                 (is (= "my-ns/Rec" (data/frame-name v))
+                     (str label " must keep the wire type"))
+                 (is (clojure.string/starts-with?
+                      (c/bytes->hex (boring/encode v {:stringref false})) "d81b")
+                     (str label " must re-encode as a tag-27 frame")))]
+      (kept "assoc"      (assoc u :c 3))
+      (kept "assoc-in"   (assoc-in u [:a] 9))
+      (kept "update"     (update u :a inc))
+      (kept "update-in"  (update-in u [:a] inc))
+      (kept "dissoc"     (dissoc u :a))
+      (kept "dissoc all" (dissoc u :a :b))
+      (kept "conj"       (conj u [:c 3]))
+      (kept "merge onto" (merge u {:c 3}))
+      (kept "into"       (into u {:c 3}))
+      (kept "empty"      (empty u))
+      (kept "with-meta"  (with-meta u {:m 1})))
+
+    (testing "and the operations that build a FRESH map cannot keep it -- which
+              is Clojure's boundary, not boring's: a real defrecord loses its
+              type at exactly these three too"
+      (let [u (data/unknown-record "my-ns/Rec" {:a 1 :b 2})]
+        (doseq [[label v] [["select-keys"    (select-keys u [:a])]
+                           ["into {}"        (into {} u)]
+                           ["merge into map" (merge {:c 3} u)]]]
+          (is (not (data/unknown-record? v))
+              (str label " is documented as losing the type")))))
+
+    (testing "equality follows defrecord: same wire type AND same fields"
+      (is (= (data/unknown-record "my-ns/Rec" {:a 1})
+             (data/unknown-record "my-ns/Rec" {:a 1})))
+      (is (not= (data/unknown-record "my-ns/Rec" {:a 1})
+                (data/unknown-record "other/Rec" {:a 1}))
+          "same fields, different wire type -- not the same value")
+      (is (not= (data/unknown-record "my-ns/Rec" {:a 1}) {:a 1})
+          "not equal to a bare map with those fields. NOTE the reverse
+           direction is asymmetric on ClojureScript and is deliberately not
+           asserted here -- see boring.data and doc/EXTENDING.md"))))
+
+(def ^:private period-verdicts
+  "Pinned accept/reject for `java/period`, and byte stability for every accept.
+
+  `java.time.Period.parse` takes far more than `Period.toString()` emits --
+  lower case, a leading sign, per-component signs, weeks, leading zeros -- but
+  a `Period` holds years, months and days and NO spelling, so the rest cannot
+  be stored faithfully. Tracking the parser by hand went wrong in BOTH
+  directions: `p1d` was accepted on the JVM and refused on ClojureScript, and
+  `P2147483648D` was accepted on ClojureScript and refused on the JVM -- a
+  browser admitting a document its server rejects.
+
+  Both platforms now accept exactly the canonical form. The JVM decides it
+  definitionally (parse, then require the result to print back to the input);
+  ClojureScript spells the same rule as a regex. This table is what holds the
+  two level, so it must run on both."
+  [["P1D"          true]
+   ["P0D"          true]
+   ["P1M"          true]
+   ["P1Y"          true]
+   ["P-1D"         true]
+   ["P1Y1M1D"      true]
+   ["P-1Y-2M-3D"   true]
+   ["P999999999D"  true]
+   ;; accepted by java.time, not canonical: the spelling cannot be stored
+   ["p1d"          false]    ; case
+   ["P1W"          false]    ; weeks fold to days -- re-emits P7D
+   ["P1Y1W1D"      false]    ; re-emits P1Y8D
+   ["-P1D"         false]    ; leading sign -- re-emits P-1D
+   ["+P1D"         false]
+   ["P00001D"      false]    ; leading zeros
+   ["P1Y0M"        false]    ; zero component omitted on output
+   ["P0Y0M0D"      false]    ; re-emits P0D
+   ["P2147483648D" false]    ; does not fit an int
+   ;; not a period at all
+   ["P"            false]
+   ["PT1H"         false]
+   ["P1WT0S"       false]
+   ["PP1D"         false]
+   ["P1.5D"        false]
+   ["P1DX"         false]
+   ["P1D "         false]
+   [" P1D"         false]])
+
+(defn- period-frame-hex
+  "27([\"java/period\", s]) as hex. Built by hand because the writer would
+  normalise a non-canonical spelling away before it reached the wire. ASCII
+  only, so one character is one byte."
+  [s]
+  (str "d81b826b6a6176612f706572696f64"
+       (c/bytes->hex #?(:clj (byte-array [(unchecked-byte (+ 0x60 (count s)))])
+                        :cljs (js/Uint8Array. #js [(+ 0x60 (count s))])))
+       (apply str (map (fn [i]
+                         (let [c #?(:clj (int (.charAt ^String s i))
+                                    :cljs (.charCodeAt s i))]
+                           (c/bytes->hex
+                            #?(:clj (byte-array [(unchecked-byte c)])
+                               :cljs (js/Uint8Array. #js [c])))))
+                       (range (count s))))))
+
+(deftest period-domains-agree
+  (doseq [[s accept?] period-verdicts]
+    (let [hex (period-frame-hex s)
+          r   (try {:ok (boring/decode (c/hex->bytes hex))}
+                   (catch #?(:clj Throwable :cljs :default) e
+                     {:err (or (:type (ex-data e)) :unknown)}))]
+      (if accept?
+        (do (is (contains? r :ok) (str s " must be accepted"))
+            (when (contains? r :ok)
+              (is (= hex (c/bytes->hex (boring/encode (:ok r) {:stringref false})))
+                  (str s " must re-encode to the bytes it came from"))))
+        (is (= :boring/bad-tag-content (:err r))
+            (str s " must be refused as :boring/bad-tag-content"))))))

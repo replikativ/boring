@@ -133,14 +133,25 @@
                  ;; Called with a value that has no encoding; its result is
                  ;; written instead. nil (default) throws as before.
                  ^:mutable encodeFallback
-                 ^:mutable inFallback])
+                 ^:mutable inFallback
+                 ;; Depth already consumed by a PARENT writer, for a canonical
+                 ;; scratch. Separate from `depth` because `reset!` runs before
+                 ;; every staged key and zeroes `depth`: copying the parent's
+                 ;; depth into the scratch therefore did nothing at all, and a
+                 ;; map key got a fresh budget -- so nesting through key
+                 ;; positions could repeatedly renew a cap set as a SECURITY
+                 ;; bound. The JVM carries the same field for the same reason.
+                 ^:mutable depthOffset
+                 ;; Pre-resolved core options for reusable writers. Kept opaque
+                 ;; here to avoid coupling the byte emitter back to core.
+                 ^:mutable opts])
 
 (defn writer
   ([] (writer 256))
   ([size]
    (let [b (js/Uint8Array. (max 64 size))]
      (Writer. b (js/DataView. (.-buffer b)) 0 (js/Map.) 0 true true false false false nil
-              (js/Map.) true false 0 1024 false nil false))))
+              (js/Map.) true false 0 1024 false nil false 0 nil))))
 
 (defn reset! [^Writer w]
   (set! (.-pos w) 0)
@@ -154,6 +165,8 @@
   ;; worse than an untyped one, because it looks recoverable. The JVM reset
   ;; already cleared its counter.
   (set! (.-depth w) 0)
+  ;; `depthOffset` deliberately survives: it records what a PARENT already
+  ;; spent, and a scratch writer is reset once per staged key.
   (set! (.-metaWrapped w) false)
   w)
 
@@ -421,6 +434,40 @@
             (.set (.-srKeys w) s (.-srNext w))
             (set! (.-srNext w) (inc (.-srNext w)))))))))
 
+(defn- check-tag!
+  "A caller-supplied tag number, validated before it reaches `head!`.
+
+  `head!`'s BigInt branch range-checks, but its Number branch assumed an
+  unsigned integer and did arithmetic on whatever arrived. So `tag 1.5` emitted
+  `c1 00` -- silently becoming tag 1 -- and `tag -1` emitted `ff 00`, the BREAK
+  code followed by an item, which is not one well-formed CBOR value at all. No
+  exception either way: just output no reader can parse, or the wrong tag. The
+  JVM has rejected both since `writeTag` gained its check; this is the port.
+
+  THE BIGINT BRANCH IS CHECKED HERE, not delegated. `head!` range-checks its
+  BigInt argument, but it narrows every BigInt at or below
+  `Number.MAX_SAFE_INTEGER` to a Number FIRST -- and a negative BigInt is below
+  that bound, so it landed back on the unchecked Number path this function was
+  written to replace. `(tagged-value (js/BigInt -1) 0)` emitted `d90100 ff 00`:
+  a stringref namespace, then a bare BREAK code, which boring's own decoder
+  then rejects as `:boring/unexpected-break`. `(js/BigInt -100)` silently
+  became tag 28. Delegating a range check to a function that changes the type
+  before performing it is not a range check."
+  [t]
+  (cond
+    (= "bigint" (goog/typeOf t))
+    (if (or (< t (js/BigInt 0)) (> t (js/BigInt "18446744073709551615")))
+      (throw (ex-info (str "boring: tag must be an unsigned 64-bit integer, got " t)
+                      {:type :boring/bad-tag :tag (str t)}))
+      t)
+    (not (number? t))
+    (throw (ex-info (str "boring: tag must be an integer, got " (pr-str t))
+                    {:type :boring/bad-tag :tag t}))
+    (or (not (js/Number.isInteger t)) (neg? t) (> t js/Number.MAX_SAFE_INTEGER))
+    (throw (ex-info (str "boring: tag must be an unsigned integer, got " t)
+                    {:type :boring/bad-tag :tag t}))
+    :else t))
+
 (defn write-stringref-namespace! [^Writer w] (head! w TAG TAG-SR-NS))
 
 (defn- write-ident! [^Writer w s]
@@ -474,7 +521,15 @@
     (set! (.-inclMetadata scratch) (.-inclMetadata w))
     (set! (.-permitReservedSimpleValues scratch) (.-permitReservedSimpleValues w))
     (set! (.-maxDepth scratch) (.-maxDepth w))
-    (set! (.-depth scratch) (.-depth w))
+    ;; ACCUMULATED, and into `depthOffset` rather than `depth`: `reset!` runs
+    ;; before every staged key and zeroes `depth`, so assigning it there was a
+    ;; no-op and the budget renewed itself at each hop through key position.
+    (set! (.-depthOffset scratch) (+ (.-depth w) (.-depthOffset w)))
+    ;; The fallback AND its re-entry guard. Copying the callback alone lets a
+    ;; fallback whose result still contains the unsupported value recurse
+    ;; through a fresh scratch forever.
+    (set! (.-encodeFallback scratch) (.-encodeFallback w))
+    (set! (.-inFallback scratch) (.-inFallback w))
     scratch))
 
 (defn- write-set-canonical!
@@ -505,7 +560,16 @@
                         {:type :boring/canonical-duplicate}))))
     (head! w TAG TAG-SET)
     (head! w ARRAY (count s))
-    (doseq [[_ v] sorted] (write-value! w v))))
+    ;; THE STAGED BYTES, not a second encoding. This called `write-value!` on
+    ;; the original element again, so a registered handler ran TWICE per element
+    ;; -- and a handler that reads a clock, a counter or anything else mutable
+    ;; could emit bytes different from the ones the sort used, making the
+    ;; "canonical" output neither canonical nor sorted. The JVM was fixed first;
+    ;; the canonical MAP path a few lines below has always done it this way.
+    (doseq [[eb _] sorted]
+      (ensure! w (.-length eb))
+      (.set (.-buf w) eb (.-pos w))
+      (set! (.-pos w) (+ (.-pos w) (.-length eb))))))
 
 (defn- write-map-entries! [^Writer w m]
   (if-not (.-canonical w)
@@ -520,12 +584,44 @@
                              [(to-bytes scratch) v])))
           cmp (if (.-legacyCanonicalOrder w) compare-bytes-length-first compare-bytes)
           sorted (sort-by first cmp entries)]
+      ;; Two DISTINCT host keys can encode identically under canonical
+      ;; reduction -- `1` and `(js/BigInt 1)` are both the single byte `01` --
+      ;; and a map with two identical CBOR keys is output this library's OWN
+      ;; reader rejects as :boring/duplicate-map-key. Canonical SETS have always
+      ;; checked this; maps did not, on either platform. The JVM was fixed
+      ;; first; a successful encode must never produce bytes the paired decoder
+      ;; refuses.
+      (doseq [[[a _] [b _]] (partition 2 1 sorted)]
+        (when (zero? (compare-bytes a b))
+          (throw (ex-info "boring: two map keys encode identically under :canonical"
+                          {:type :boring/canonical-duplicate}))))
       (head! w MAP (count m))
       (doseq [[kb v] sorted]
         (ensure! w (.-length kb))
         (.set (.-buf w) kb (.-pos w))
         (set! (.-pos w) (+ (.-pos w) (.-length kb)))
         (write-value! w v)))))
+
+(defn- plain-map?
+  "Whether `m` may be flattened into a shaped array.
+
+  MIRRORS `Writer.plainMap`, whose comment is the rule: \"an optimisation that
+  silently changes the value is not one.\" That JVM guard excludes records,
+  sorted maps and metadata-carrying maps; this side checked `record?` alone,
+  which is the same rule written twice with one copy weaker.
+
+  Three things were destroyed on this platform and not the JVM: a sorted map
+  came back unsorted, metadata was dropped while `:incl-metadata?` was still
+  true, and an `UnknownRecord` -- which is `map?` and NOT `record?` here -- was
+  shaped, breaking the documented guarantee that it re-encodes to identical
+  bytes. All three are silent: the bytes are valid CBOR and the loss shows up
+  as a changed value much later."
+  [m]
+  (and (map? m)
+       (not (record? m))
+       (not (data/unknown-record? m))
+       (not (sorted? m))
+       (nil? (meta m))))
 
 (def ^:private sentinel (js-obj))
 
@@ -537,14 +633,14 @@
   (let [rows (count v)]
     (when (>= rows 2)
       (let [m0 (nth v 0)]
-        (when (and (map? m0) (not (record? m0)) (pos? (count m0)))
+        (when (and (plain-map? m0) (pos? (count m0)))
           (let [ks (vec (keys m0))
                 n (count ks)]
             (loop [i 1]
               (cond
                 (= i rows) ks
                 :else (let [m (nth v i)]
-                        (if (and (map? m) (not (record? m)) (== n (count m))
+                        (if (and (plain-map? m) (== n (count m))
                                  ;; get-with-sentinel: one lookup, where
                                  ;; contains? does a lookup and a test
                                  (loop [j 0]
@@ -582,12 +678,14 @@
 (declare write-value!*)
 
 (defn- enter! [^Writer w]
-  (set! (.-depth w) (inc (.-depth w)))
-  (when (> (.-depth w) (.-maxDepth w))
+  ;; Checked BEFORE incrementing, and against the parent's spend as well as our
+  ;; own -- see `depthOffset`.
+  (when (> (+ (inc (.-depth w)) (.-depthOffset w)) (.-maxDepth w))
     (throw (ex-info (str "boring: value nested deeper than maxDepth ("
                          (.-maxDepth w) ")")
                     {:type :boring/max-depth-exceeded
-                     :max-depth (.-maxDepth w)}))))
+                     :max-depth (.-maxDepth w)})))
+  (set! (.-depth w) (inc (.-depth w))))
 
 (defn- exit! [^Writer w] (set! (.-depth w) (dec (.-depth w))))
 
@@ -648,16 +746,29 @@
     ;;
     ;; Registration is an instruction, not a suggestion: a handler exists
     ;; precisely to override what boring would do on its own.
-    (get-in (.-registry w) [:writers (type x)])
+    (and (some? (.-registry w))
+         (get-in (.-registry w) [:writers (type x)]))
     (let [h (get-in (.-registry w) [:writers (type x)])]
-      (head! w TAG (:tag h))
+      (head! w TAG (check-tag! (:tag h)))
       (write-value! w ((:fn h) x)))
 
     (instance? js/Date x)
-    (do (head! w TAG TAG-DATETIME)
-        ;; toISOString always prints milliseconds; ISO_INSTANT on the JVM omits
-        ;; them when zero. Normalise so both platforms emit the same bytes.
-        (write-string! w (.replace (.toISOString x) ".000Z" "Z")))
+    ;; toISOString always prints milliseconds; ISO_INSTANT on the JVM omits
+    ;; them when zero. Normalise so both platforms emit the same bytes.
+    (let [s (.replace (.toISOString x) ".000Z" "Z")]
+      ;; RFC 3339's date-fullyear is 4DIGIT. JS renders anything outside
+      ;; 0000-9999 in the expanded form (`+275760-09-13T00:00:00Z`), which no
+      ;; conforming parser accepts -- and boring read it back happily, so the
+      ;; round-trip tests saw nothing. The sign prefix is the marker; the
+      ;; 4-digit form never carries one. Matches Writer.rfc3339 on the JVM.
+      (when (or (= "+" (.charAt s 0)) (= "-" (.charAt s 0)))
+        (throw (ex-info
+                (str "boring: " s " has a year outside 0000-9999, which RFC 3339 cannot "
+                     "express, so there is no valid tag 0 text for it; encode the epoch "
+                     "value yourself if you need this range")
+                {:type :boring/unrepresentable-date :value s :tag 0})))
+      (head! w TAG TAG-DATETIME)
+      (write-string! w s))
 
     ;; Before uuid?: a RegExp is not a uuid, but keeping the registered-tag
     ;; branches together makes the ordering constraint visible.
@@ -710,16 +821,20 @@
         (throw (ex-info (str "boring: simple value must be 0-255, got " (pr-str n))
                         {:type :boring/bad-simple-value :value n}))
         (< n 24) (u8! w (bit-or SIMPLE n))
+        ;; The escape hatch produces bytes boring itself rejects -- RFC 8949 3.3
+        ;; makes `f8 00`..`f8 1f` not well-formed, so the reader now refuses
+        ;; them. See the longer note in Writer.java for why it is kept.
         (and (< n 32) (not (.-permitReservedSimpleValues w)))
         (throw (ex-info
                 (str "boring: RFC 8949 3.3 forbids encoding simple value " n
-                     "; set :permit-reserved-simple-values to emit it anyway"
-                     " for byte-identical passthrough")
+                     ", and makes such sequences not well-formed, so boring will"
+                     " not read the result back; set :permit-reserved-simple-values"
+                     " to emit it anyway")
                 {:type :boring/reserved-simple-value :value n}))
         :else (do (u8! w (bit-or SIMPLE 24)) (u8! w n))))
 
     (data/tagged-value? x)
-    (do (head! w TAG (:tag x)) (write-value! w (:value x)))
+    (do (head! w TAG (check-tag! (:tag x))) (write-value! w (:value x)))
 
     ;; The payload is USUALLY a field map, but the reader accepts any tag-27
     ;; constructor argument, so a positional type (datahike's Datom carries a
