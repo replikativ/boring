@@ -83,9 +83,46 @@ to identical bytes:
       (boring/register-record "my.ns/Point" map->Point)))
 ```
 
-The wire name is `boring.data/record-type-name` of an instance: on the JVM the
-class name, and ClojureScript munges its own name to match. So **one
-registration serves data written on either platform**.
+The wire name is `boring.data/record-type-name` of an instance: `namespace/Name`
+**as written**, on both platforms, with nothing munged. So **one registration
+serves data written on either platform**.
+
+That sentence used to say the JVM wrote the class name and ClojureScript munged
+its own name to match. It no longer does, and the difference is not cosmetic:
+Clojure's `namespace-munge` turns `-` into `_` when it builds a record's class
+name, so the JVM had *lost* the namespace as written and boring made the
+browser discard information it still had in order to agree. The JVM now inverts
+that munge by looking the namespace up rather than guessing.
+
+### Prefer a registration that derives the name
+
+A hand-written name string is the one part of this that can silently stop
+matching, because a registry that never matches looks exactly like data with no
+constructor: the record simply arrives as an `UnknownRecord`, with no error.
+That is not hypothetical — it is precisely how the change above went unnoticed
+in boring's own nippy suite, which registered `taoensso.nippy.StressRecord`
+while the wire had moved to `taoensso.nippy/StressRecord`.
+
+Both drift-proof forms derive the name from the type itself, so a change to the
+naming rule cannot leave them behind:
+
+```clojure
+(records/auto-registry "my.app")            ; both platforms, compile time
+(boring/register-record-class reg Point)    ; JVM, reflective
+```
+
+Use these where you can. When you must write the name by hand — `.cljc` code
+registering a ClojureScript record, most often — `{:on-unknown-record :error}`
+turns the silence into a typed failure:
+
+```clojure
+(boring/decode bs {:registry reg :on-unknown-record :error})
+;; => :boring/unregistered-record, rather than an UnknownRecord you did not expect
+```
+
+That is worth doing in tests even if production keeps the default, since the
+default exists to let a value pass through a peer that has no constructor for
+it — see [Records you cannot construct](#records-you-cannot-construct-and-why-that-is-the-point).
 
 A handful of tag-27 names are reserved by boring for types CBOR cannot
 otherwise distinguish — `clojure/sorted-map`, `clojure/sorted-set`,
@@ -134,6 +171,127 @@ Thread the return value. On the JVM an earlier design mutated in place, which
 meant registration code that ignored the return value worked there and silently
 did nothing on ClojureScript — it compiled either way. Both sides are values
 now, so that trap is gone.
+
+## Records you cannot construct, and why that is the point
+
+The default for an unregistered record — an `UnknownRecord` rather than an
+error — is the design decision this section exists to argue for, because it is
+what lets record types survive a network of peers that do not all share a
+classpath.
+
+**The problem it solves.** In a peer-to-peer or store-and-forward Clojure
+system, a value is written by one process, relayed or cached by several that
+have never heard of its types, and read by another that has them. The usual
+outcome is that the type is lost at the first hop: a serializer that flattens
+records to maps destroys the name immediately, and one that *errors* on an
+unknown type makes the middle peers refuse to handle the data at all. Either
+way the far end cannot get the record back, and the middle is forced to know
+about types that are none of its business.
+
+boring's answer is that the type name travels **in the data**, as CBOR tag 27,
+and a peer that cannot construct the type still holds the name and the fields:
+
+```
+    peer A                    peer B                     peer C
+ has my.app/Point          no classpath entry        has my.app/Point
+       │                          │                          │
+   #my.app/Point{:x 1}   ──►  UnknownRecord      ──►    #my.app/Point{:x 1}
+                              "my.app/Point"
+                              {:x 1}
+                                   │
+                            stores it, indexes it,
+                            re-encodes it — byte-identical
+```
+
+Peer B needs no registration, no schema and no code generation. It can store
+the value, put it in a queue, content-address it, hand it back later — and what
+comes out is the same bytes that went in, so C reconstructs the record C's
+classpath knows about. The middle peer participates without being coupled.
+
+This is what [incognito][] exists to provide for fressian. boring does not need
+a companion library for it because the name is in the format.
+
+**And it stays a map the whole time.** An `UnknownRecord` is not an opaque box
+you have to unwrap: it implements the map interfaces, so peer B's ordinary
+Clojure code works on it.
+
+```clojure
+(def u (boring/decode bs))          ; no registry
+(:x u)                              ; => 1
+(get u :x)                          ; => 1
+(keys u)                            ; => (:x :y)
+(count u)                           ; => 2
+(map? u)                            ; => true
+(data/frame-name u)                 ; => "my.app/Point"
+```
+
+### Does manipulating it keep the type?
+
+Yes, for everything that builds *from* the record. Measured, identical on both
+platforms:
+
+| operation | result | re-encodes as |
+|---|---|---|
+| `assoc`, `assoc-in`, `update`, `update-in` | `UnknownRecord` | its tag-27 frame |
+| `dissoc`, `dissoc` of every key | `UnknownRecord` | its tag-27 frame |
+| `conj`, `merge` *onto* it, `into` it | `UnknownRecord` | its tag-27 frame |
+| `empty`, `with-meta` | `UnknownRecord` | its tag-27 frame |
+| `select-keys`, `into {}`, `merge` *into a map* | **plain map** | a plain map — type gone |
+
+So a middle peer can enrich or prune a record it has never seen and the far end
+still gets a record.
+
+The bottom row is not a boring limitation — it is Clojure's, and **a real
+`defrecord` behaves the same way**. `select-keys`, `into {}` and
+`(merge {} r)` all build a fresh map and cannot preserve any type. Measured
+side by side, `UnknownRecord` matches `defrecord` at every one of those points
+and is *more* forgiving at two:
+
+| operation | `defrecord` | `UnknownRecord` |
+|---|---|---|
+| `dissoc` of a basis field | degrades to a plain map | keeps the type |
+| `empty` | **throws** `UnsupportedOperationException` | empty record of the same type |
+
+The rule to carry: **if the operation would keep a `defrecord` a record, it
+keeps an `UnknownRecord` an `UnknownRecord`.** Code written against real
+records behaves the same when the record turns out to be unregistered, which is
+what makes the middle-peer story work without special cases.
+
+### Equality is the one place to be careful
+
+`UnknownRecord` follows `defrecord` equality: equal to another of the **same
+wire type with the same fields**, and *not* equal to a bare map with those
+fields. Two frames with different type names and identical fields are not
+equal.
+
+Comparing one against a plain map is **asymmetric on ClojureScript** and does
+not agree across platforms. Measured, the same expression on both:
+
+```clojure
+[(= u {:a 1}) (= {:a 1} u) (contains? #{{:a 1}} u) (contains? #{u} {:a 1})]
+;; JVM   [false false false false]
+;; CLJS  [false true  false true ]
+```
+
+ClojureScript's `equiv-map` excludes only *real* records, and `UnknownRecord`
+satisfies `IMap`, so the map's own `-equiv` accepts it while the record's does
+not. `hash` disagrees in both directions on both platforms, so set membership
+follows whichever side you put it on. **Do not rely on `=` between an
+`UnknownRecord` and a plain map in portable code** — compare `frame-name` and
+`frame-payload`, or register the type.
+
+### When you would rather it failed
+
+The passthrough is a default, not a policy. A peer that *should* have every
+type on its classpath can say so:
+
+```clojure
+(boring/decode bs {:registry reg :on-unknown-record :error})
+```
+
+See [`:on-unknown-record`](#prefer-a-registration-that-derives-the-name) above;
+it also takes a function, which is how you warn without boring choosing a
+logging library for you.
 
 ## Reconstructing records without registering them
 

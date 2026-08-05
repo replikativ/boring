@@ -3073,6 +3073,52 @@
              (err-type #(boring/decode (c/hex->bytes mapped)
                                        {:on-unknown-record 5})))))))
 
+(deftest unknown-record-keeps-its-type-through-map-operations
+  (testing "the middle-peer property doc/EXTENDING.md argues for: a peer with
+            no constructor for a type can still enrich or prune the value and
+            the far end gets its record back. Every row here is a table in that
+            document, so the document cannot rot away from the code."
+    (let [u (data/unknown-record "my-ns/Rec" {:a 1 :b 2})
+          kept (fn [label v]
+                 (is (data/unknown-record? v) (str label " must stay a record"))
+                 (is (= "my-ns/Rec" (data/frame-name v))
+                     (str label " must keep the wire type"))
+                 (is (clojure.string/starts-with?
+                      (c/bytes->hex (boring/encode v {:stringref false})) "d81b")
+                     (str label " must re-encode as a tag-27 frame")))]
+      (kept "assoc"      (assoc u :c 3))
+      (kept "assoc-in"   (assoc-in u [:a] 9))
+      (kept "update"     (update u :a inc))
+      (kept "update-in"  (update-in u [:a] inc))
+      (kept "dissoc"     (dissoc u :a))
+      (kept "dissoc all" (dissoc u :a :b))
+      (kept "conj"       (conj u [:c 3]))
+      (kept "merge onto" (merge u {:c 3}))
+      (kept "into"       (into u {:c 3}))
+      (kept "empty"      (empty u))
+      (kept "with-meta"  (with-meta u {:m 1})))
+
+    (testing "and the operations that build a FRESH map cannot keep it -- which
+              is Clojure's boundary, not boring's: a real defrecord loses its
+              type at exactly these three too"
+      (let [u (data/unknown-record "my-ns/Rec" {:a 1 :b 2})]
+        (doseq [[label v] [["select-keys"    (select-keys u [:a])]
+                           ["into {}"        (into {} u)]
+                           ["merge into map" (merge {:c 3} u)]]]
+          (is (not (data/unknown-record? v))
+              (str label " is documented as losing the type")))))
+
+    (testing "equality follows defrecord: same wire type AND same fields"
+      (is (= (data/unknown-record "my-ns/Rec" {:a 1})
+             (data/unknown-record "my-ns/Rec" {:a 1})))
+      (is (not= (data/unknown-record "my-ns/Rec" {:a 1})
+                (data/unknown-record "other/Rec" {:a 1}))
+          "same fields, different wire type -- not the same value")
+      (is (not= (data/unknown-record "my-ns/Rec" {:a 1}) {:a 1})
+          "not equal to a bare map with those fields. NOTE the reverse
+           direction is asymmetric on ClojureScript and is deliberately not
+           asserted here -- see boring.data and doc/EXTENDING.md"))))
+
 (def ^:private period-verdicts
   "Pinned accept/reject for `java/period`, and byte stability for every accept.
 
