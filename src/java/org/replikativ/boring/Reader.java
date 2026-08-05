@@ -2730,6 +2730,22 @@ public final class Reader {
                 // losslessly is honest; truncating it is not.
                 Object sec = m.get(1L);
                 Object nano = null;
+                // PRESENCE IS A FLAG OF ITS OWN, not `nano != null`. A CBOR
+                // null decodes to Clojure nil, so a scaled-fraction key with a
+                // NULL value left `nano` null and the whole key silently
+                // degraded to "no fraction present":
+                //
+                //   d903ea a2 01 05 28 f6            {1: 5, -9: null}  -> PT5S
+                //   d903ea a3 01 05 28 f6 22 01      {1: 5, -9: null, -3: 1}
+                //                                                      -> PT5.001S
+                //
+                // The second one is worse than a bad value: RFC 9581 3.3 says
+                // "MUST NOT contain more than one of these keys", and the check
+                // below never fired because the first key had not registered.
+                // ClojureScript refused both. Now so does this: a present key
+                // with a non-integer value reaches "fraction must be an
+                // integer" instead of being dropped.
+                boolean fracSeen = false;
                 int fracScale = 0;                  // 3, 6, 9, 12, 15 or 18
                 for (Object k : m.keySet()) {
                     // A TEXT KEY IS ELECTIVE and skipped -- see the negative-key
@@ -2761,10 +2777,11 @@ public final class Reader {
                         || kk == -12 || kk == -15 || kk == -18) {
                         // RFC 9581 3.3: "Each extended time data item MUST NOT
                         // contain more than one of these keys."
-                        if (nano != null)
+                        if (fracSeen)
                             throw Err.of("bad-tag-content",
                                 "boring: tag 1002 has more than one decimally scaled"
                                 + " fraction key", "tag", 1002L);
+                        fracSeen = true;
                         fracScale = (int) -kk;
                         nano = m.get(k);
                     }
@@ -2815,7 +2832,7 @@ public final class Reader {
                             + " does not fit a java.time.Duration", "tag", 1002L);
                     sec = Long.valueOf(bi.longValueExact());
                 }
-                if (nano == null) {
+                if (!fracSeen) {
                     if (!fracBase)
                         return java.time.Duration.ofSeconds(((Number) sec).longValue());
                     // A fractional base with no scaled fraction: exact, or refused.

@@ -225,7 +225,19 @@ public final class TagRegistry {
         String n = recordNames.get(cls);
         if (n != null) return n;
         String c = trueNames.get(cls);
-        if (c == null) { c = unmungedName(cls); trueNames.put(cls, c); }
+        if (c != null) return c;
+        c = unmungedName(cls);
+        // ONLY A RESOLVED NAME IS CACHED. The lookup inverts the namespace
+        // munge by scanning loaded namespaces, so its answer depends on what
+        // was loaded when it first ran -- and caching the FALLBACK made that
+        // permanent: the same record encoded as `wn-ns.core/R` in one JVM and
+        // `wn_ns.core/R` in another, and reloading the namespace did not fix
+        // it. Wire bytes must not depend on class-load order.
+        //
+        // A fallback is a "not resolved yet" rather than an answer, so it is
+        // recomputed until the namespace is there. Once resolved the name
+        // cannot change, so caching from then on is sound.
+        if (c.indexOf('_') < 0) trueNames.put(cls, c);
         return c;
     }
 
