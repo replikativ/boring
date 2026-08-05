@@ -204,11 +204,57 @@ these names deliberately works.
 | `clojure/queue` | an array | returns a vector |
 | `clojure/with-meta` | `[meta, value]` | metadata is dropped |
 | `clojure/char` | a 1-character string | returns a `String`, and `(= \a "a")` is FALSE |
-| `java/period` | an ISO-8601 string | throws |
+| `java/period` | a canonical ISO-8601 period | throws |
 
 They are **frozen** and pinned in the golden corpus. Renaming one is a silent
 break rather than a loud one: an unrecognised name decodes to an ordinary
 `UnknownRecord` value, so nothing raises.
+
+#### What a marker decodes to on ClojureScript
+
+Seven of these name a type ClojureScript does not have. They decode there to
+the same carrier any unregistered tag-27 frame decodes to — a `TaggedLiteral`,
+read with `boring.data/frame-name` and `frame-payload` — which **re-encodes to
+the identical frame**:
+
+| marker | JVM | ClojureScript |
+|---|---|---|
+| `clojure/sorted-map`, `sorted-set`, `queue`, `with-meta`, `ex-info` | native | native |
+| `java/throwable` | `ExceptionInfo` | `ExceptionInfo` (both re-emit as `clojure/ex-info`) |
+| `clojure/char` | `Character` | `#clojure/char "a"` |
+| `java/period` | `java.time.Period` | `#java/period "P1D"` |
+| `java/char-array` | `char[]` | `#java/char-array "ab"` |
+| `java/boolean-array`, `string-array`, `object-array` | arrays | `#java/boolean-array [true false]` |
+
+This is the same rule as URI below, for the same reason. These used to decode
+to the bare payload — `"P1D"` rather than a carrier — which reads as more
+convenient and is not: re-encoding a bare string emits a plain text string, so
+the frame was gone and a JVM peer on the far side received a `String` where it
+had sent a `Period`. A ClojureScript relay downgraded every such value it
+passed through, permanently.
+
+**Both platforms can originate every marker**, which is what makes this
+symmetric rather than merely lossless. Both writers encode a `TaggedLiteral` to
+its frame, so
+
+```clojure
+(boring/encode (tagged-literal 'clojure/char "a"))
+```
+
+produces identical bytes on either platform, and a JVM peer decodes it to `\a`.
+A browser can send a `char[]` or a `Period` it has no type for.
+
+**`java/period` accepts only the canonical form** — exactly what
+`Period.toString()` emits. `java.time.Period.parse` accepts much more (lower
+case, a leading sign, per-component signs, weeks, leading zeros), but a
+`Period` holds years, months and days and no spelling, so the rest cannot be
+stored faithfully: `P1W` re-encodes as `P7D`, `+P1D` as `P1D`, `P1Y0M` as
+`P1Y`. Accepting only what can be stored is what makes the two platforms agree
+on legality *and* keeps every accepted document byte-stable, which matters
+because boring keys content by bytes (see `boring.hasch`). Nothing legitimate
+is refused — boring's writer emits `Period.toString()`, and `java/period` is
+boring's own reserved name. Same trade as refusing RFC 3339 offsets past
+±18:00.
 
 The registry is consulted BEFORE these names, so a caller who wants one of them
 for their own type can take it.

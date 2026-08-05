@@ -49,6 +49,33 @@ here.
 
 ### Changed
 
+- **BREAKING, ClojureScript: a reserved tag-27 marker naming a type
+  ClojureScript does not have now decodes to a frame-preserving carrier**
+  instead of to its bare payload. `27(["java/period", "P1D"])` was `"P1D"` and
+  is now `#java/period "P1D"`, read with `boring.data/frame-payload`; the same
+  applies to `clojure/char`, `java/char-array`, `java/boolean-array`,
+  `java/string-array` and `java/object-array`. The bare payload was not
+  round-trip safe — re-encoding it emitted a plain text string or array, the
+  tag-27 frame was gone, and a JVM peer received a `String` where it had sent a
+  `java.time.Period`. All eleven markers now re-encode to the bytes they
+  decoded from, on both platforms and under every profile. The four whose type
+  ClojureScript has (`sorted-map`, `sorted-set`, `queue`, `ex-info`) are
+  unchanged.
+
+  Both platforms can also now *originate* every marker, since both writers
+  encode a `TaggedLiteral` to its frame:
+  `(boring/encode (tagged-literal 'clojure/char "a"))` gives identical bytes on
+  either platform and decodes to `\a` on the JVM.
+
+- **BREAKING: `java/period` accepts only the canonical ISO-8601 form** — what
+  `java.time.Period.toString()` emits. `Period.parse` accepts lower case, a
+  leading sign, per-component signs, weeks and leading zeros, but a `Period`
+  stores years, months and days and no spelling, so those cannot be stored
+  faithfully: `27(["java/period", "P1W"])` used to decode and re-encode as
+  `P7D`. Two parser differentials closed with it, one in each direction: `p1d`
+  was accepted on the JVM and refused on ClojureScript, and `P2147483648D` was
+  accepted on ClojureScript and refused on the JVM.
+
 - **BREAKING, wire format: a record's type name is now `namespace/Name` as
   WRITTEN**, where it was the munged JVM class name (`my_ns.MyRecord`). A
   record written by 0.1.10 or earlier decodes as an `UnknownRecord` under this
