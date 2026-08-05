@@ -91,6 +91,20 @@ here.
   The mechanism already worked — `asSlice` plus `segment-source` — but only by
   reaching past `boring.mmap` into both. This is the way to ask for it.
 
+- **`decode`, `reader` and `decode-with` accept a `ByteSource`**, not only a
+  `byte[]`. The Java `Reader` has taken one since `boring.nav` needed it, but
+  the Clojure API did not — so a caller holding off-heap bytes had to copy into
+  a `byte[]` to decode them at all. Navigation could read a source and a
+  whole-value decode could not, which is backwards: a store's normal case is
+  wanting the whole value.
+
+      (boring/decode (mmap/segment-source seg))        ; no byte[] materialised
+      (boring/decode-with reader seg-source)           ; one Reader, a segment per value
+
+  Nothing is gated on JDK 22 by this. `ByteSource` is deliberately a JDK-9
+  interface naming no FFM type; only a caller who CONSTRUCTS a segment-backed
+  source needs the newer JDK.
+
 ### Changed
 
 - **BREAKING, ClojureScript: a reserved tag-27 marker naming a type
