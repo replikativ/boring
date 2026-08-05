@@ -524,7 +524,14 @@
   Not part of the supported API."
   ^Reader [^Reader r opts]
   (set! (.-tolerateUnknownTags r) (boolean (get opts :tolerate-unknown-tags true)))
-  (set! (.-instantAsDate r) (not= :instant (get opts :instant-type :date)))
+  (let [it (get opts :instant-type :date)]
+    ;; A FUNCTION is legal on both platforms -- see `Reader.instantFn`. This
+    ;; honoured only the two keywords, so a portable caller passing a
+    ;; constructor got their type on ClojureScript and a `Date` here.
+    ;; NOT bare `ifn?`: a keyword satisfies it, so `:date` and `:instant`
+    ;; were invoked as constructors and every instant decoded to nil.
+    (set! (.-instantFn r) (when-not (#{:date :instant} it) it))
+    (set! (.-instantAsDate r) (not= :instant it)))
   (set! (.-fullDateAsSqlDate r) (= :sql-date (get opts :date-type :local-date)))
   (set! (.-maxDepth r) (int (get opts :max-depth 1024)))
   ;; 0 = unlimited, which is the default. See Reader.maxItems for why the budget

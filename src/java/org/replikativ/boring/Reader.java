@@ -95,6 +95,21 @@ public final class Reader {
      *  and Instant (ns) are a JVM distinction the wire cannot carry. */
     public boolean instantAsDate = true;
 
+    /**
+     * A caller-supplied constructor for tag 0 and tag 1, or null.
+     *
+     * `:instant-type` accepts a FUNCTION on both platforms -- ClojureScript
+     * has one time type, so a caller wanting `cljc.java-time` or `tick` values
+     * supplies the constructor rather than boring depending on js-joda. The
+     * option spec allowed it on the JVM too and only ClojureScript honoured
+     * it, so a portable `.cljc` caller passing one options map got their type
+     * in a browser and a `java.util.Date` on the server: the silent
+     * cross-platform divergence the option was changed to remove.
+     *
+     * Takes epoch milliseconds, matching the ClojureScript side.
+     */
+    public clojure.lang.IFn instantFn;
+
     public TagRegistry registry = TagRegistry.EMPTY;
 
     /**
@@ -2378,6 +2393,7 @@ public final class Reader {
                         "tag", 0L, "value", v);
                 }
                 try {
+                    if (instantFn != null) return instantFn.invoke(t.toEpochMilli());
                     return instantAsDate ? java.util.Date.from(t) : t;
                 } catch (java.time.DateTimeException | ArithmeticException | IllegalArgumentException e) {
                     throw Err.of("bad-tag-content",
@@ -2411,6 +2427,7 @@ public final class Reader {
                         "boring: tag 1 epoch out of range: " + v, "tag", 1L, "value", v);
                 }
                 try {
+                    if (instantFn != null) return instantFn.invoke(t.toEpochMilli());
                     return instantAsDate ? java.util.Date.from(t) : t;
                 } catch (java.time.DateTimeException | ArithmeticException | IllegalArgumentException e) {
                     throw Err.of("bad-tag-content",

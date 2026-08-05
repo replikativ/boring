@@ -307,6 +307,16 @@
                         _ (need! r (- (inc q) (.-pos r)))
                         mj (major-at r q)
                         info (info-at r q)]
+                    ;; INDEFINITE IS ONLY LEGAL FOR MAJORS 2-5. Treating
+                    ;; info-31 as indefinite for every major made `1f` and `3f`
+                    ;; -- an integer head with a reserved info -- come out
+                    ;; `:boring/truncated-input` here and `:boring/reserved-info`
+                    ;; on the JVM. Both refuse, so nothing is accepted that
+                    ;; should not be; the types simply disagreed about why.
+                    (when (and (== info 31) (or (< mj 2) (> mj 5)))
+                      (err :boring/reserved-info
+                           (str "boring: reserved additional-info 31 for major type " mj)
+                           {:major mj}))
                     (if (== info 31)
                       ;; Indefinite: consume until the break, which owes one more
                       ;; item each time round rather than a known count.

@@ -441,6 +441,29 @@
           "boring.nav: a cursor is a read-only view over bytes; assoc is not supported"
           {:offset off}))
 
+  ;; `Associative` EXTENDS `IPersistentCollection`, so declaring it obliges
+  ;; `equiv`, `cons` and `empty` as well as the `count` and `seq` below. Only
+  ;; those two were implemented, so `(= cursor x)` threw
+  ;; `java.lang.AbstractMethodError` on UNDAMAGED data -- and an `Error`, so a
+  ;; caller's `catch Exception` does not see it. Third instance of that family
+  ;; in this file: `count` threw the same way before `Counted` was added, and
+  ;; `reduce` before `IReduce`. Declaring an interface is a promise about every
+  ;; method on it, including the ones inherited.
+  (equiv [this o]
+    ;; IDENTITY, not the value. A cursor is a view over bytes and realising one
+    ;; to answer `=` would do arbitrary decode work behind an operation that
+    ;; reads as free -- the same argument that keeps `Cursor` out of `IDeref`.
+    ;; Compare `(nav/value c)` when you mean the value.
+    (identical? this o))
+  (cons [_ _]
+    (fail :boring/read-only
+          "boring.nav: a cursor is a read-only view over bytes; conj is not supported"
+          {}))
+  (empty [_]
+    (fail :boring/read-only
+          "boring.nav: a cursor is a read-only view over bytes; empty is not supported"
+          {}))
+
   clojure.lang.ILookup
   (valAt [this k] (.valAt this k nil))
   (valAt [_ k nf]

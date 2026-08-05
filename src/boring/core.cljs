@@ -735,7 +735,15 @@
   predictable bytes, which is how the frame is found without parsing backwards."
   [index data-len opts]
   (let [{:keys [containers counts slots sorted]} index
-        stride (get opts :index default-index-stride)
+        ;; THE INDEX'S OWN STRIDE, not this call's options. `build-index`
+        ;; returns the stride it laid the anchors at; reading it from `opts`
+        ;; here meant the documented public pair silently sealed a frame
+        ;; claiming one stride over slots laid at another whenever the two
+        ;; calls were given different options -- 8 of 9 combinations. `nav`
+        ;; then jumps by the claimed stride and the index is dead: 39 skips
+        ;; where 3 would do, with no error. The JVM has always taken it from
+        ;; the index map."
+        stride (or (:stride index) (get opts :index default-index-stride))
         packed (vec (map-indexed (fn [i s] (delta-slot s (max 0 (nth containers i))))
                                  slots))]
     ;; TYPED ARRAYS, not plain vectors. `boring.nav/read-index*` requires
