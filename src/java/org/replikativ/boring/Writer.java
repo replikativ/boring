@@ -370,10 +370,29 @@ public final class Writer {
     /** Added to every recorded offset, so `write-seq!` gets file offsets. */
     private long idxBase = 0;
 
-    private long[] idxOffs = new long[32];
-    private int[] idxCnts = new int[32];
-    private boolean[] idxSrt = new boolean[32];
-    private long[][] idxSlots = new long[32][];
+    // NULL UNTIL AN INDEX IS ACTUALLY BUILT. These were field initialisers,
+    // so every Writer paid for them -- including the ones `encode` builds,
+    // which can never index: `encode` emits one CBOR item and refuses to
+    // append a frame, by design.
+    //
+    // Measured against the merge base on one machine, back to back: a Writer
+    // cost 9 408 bytes where it had cost 512, and `(writer 256)` went from
+    // 0.060 to 1.437 us -- 24x. That is the whole of a 3.9-5.2x regression on
+    // small-payload encode, and it is invisible on large ones because a fixed
+    // ~1.4 us disappears into an 83 us datom encode. `encode` is the primary
+    // API and the one every small message goes through.
+    //
+    // Lazily allocated at the two points that grow them, `reserveNode` and
+    // `idxItem`, both of which already run only while indexing.
+    private long[] idxOffs;
+    private int[] idxCnts;
+    private boolean[] idxSrt;
+    private long[][] idxSlots;
+
+    private static final long[] NO_LONGS = new long[0];
+    private static final int[] NO_INTS = new int[0];
+    private static final boolean[] NO_BOOLS = new boolean[0];
+    private static final Object[] NO_OBJS = new Object[0];
     private int idxN = 0;
 
     /**
@@ -417,7 +436,9 @@ public final class Writer {
     // in this picture and is not thread-safe anyway, so there is nothing for a
     // barrier to protect.
 
-    private long[] idxSeq = new long[1024];
+    /** Null until the first anchored item -- see the node arrays above. 8 KB
+     *  on every Writer was the largest single piece of that regression. */
+    private long[] idxSeq;
     private int idxSeqN = 0;
     private long idxItems = 0;
     private int idxItemCountdown = 1;
@@ -429,7 +450,9 @@ public final class Writer {
     public void idxItem(long off) {
         if (idxStride <= 0) return;
         if (--idxItemCountdown == 0) {
-            if (idxSeqN == idxSeq.length) idxSeq = java.util.Arrays.copyOf(idxSeq, idxSeqN * 2);
+            if (idxSeq == null) idxSeq = new long[1024];
+            else if (idxSeqN == idxSeq.length)
+                idxSeq = java.util.Arrays.copyOf(idxSeq, idxSeqN * 2);
             idxSeq[idxSeqN++] = checkedOffset(off);   // already file-relative
             idxItemCountdown = idxStride;
         }
@@ -457,7 +480,9 @@ public final class Writer {
     public long idxItemTotal() { return idxItems; }
 
     /** Offsets of every `stride`th top-level item. */
-    public long[] idxItemOffsets() { return java.util.Arrays.copyOf(idxSeq, idxSeqN); }
+    public long[] idxItemOffsets() {
+        return idxSeq == null ? NO_LONGS : java.util.Arrays.copyOf(idxSeq, idxSeqN);
+    }
 
     public void idxReset() {
         // Null the slot references, do not merely forget the count. Each slot
@@ -465,17 +490,29 @@ public final class Writer {
         // indexed container for the life of the writer -- and a writer is meant
         // to be long-lived and reused. Same reasoning, and the same fix, as the
         // stringref key table below.
-        if (idxN > 0) java.util.Arrays.fill(idxSlots, 0, idxN, null);
+        if (idxSlots != null && idxN > 0)
+            java.util.Arrays.fill(idxSlots, 0, idxN, null);
         idxN = 0;
         idxSeqN = 0;
         idxItems = 0;
         idxItemCountdown = 1;
     }
     public int idxCount() { return idxN; }
-    public long[] idxContainers() { return java.util.Arrays.copyOf(idxOffs, idxN); }
-    public int[] idxCounts()     { return java.util.Arrays.copyOf(idxCnts, idxN); }
-    public Object[] idxSlots()   { return java.util.Arrays.copyOf(idxSlots, idxN); }
-    public boolean[] idxSorted() { return java.util.Arrays.copyOf(idxSrt, idxN); }
+    // Null-safe because the backing arrays are lazy now: a writer that never
+    // indexed has none, and `idxN` is 0, so an empty result is the right
+    // answer rather than an NPE.
+    public long[] idxContainers() {
+        return idxOffs == null ? NO_LONGS : java.util.Arrays.copyOf(idxOffs, idxN);
+    }
+    public int[] idxCounts() {
+        return idxCnts == null ? NO_INTS : java.util.Arrays.copyOf(idxCnts, idxN);
+    }
+    public Object[] idxSlots() {
+        return idxSlots == null ? NO_OBJS : java.util.Arrays.copyOf(idxSlots, idxN);
+    }
+    public boolean[] idxSorted() {
+        return idxSrt == null ? NO_BOOLS : java.util.Arrays.copyOf(idxSrt, idxN);
+    }
 
     /** Anchors an indexed container of `n` entries needs at the current stride. */
     private int anchorCount(int n) {
@@ -506,7 +543,12 @@ public final class Writer {
      * siblings ascend. So the array comes out sorted with no sort.
      */
     private int reserveNode() {
-        if (idxN == idxOffs.length) {
+        if (idxOffs == null) {
+            idxOffs = new long[32];
+            idxCnts = new int[32];
+            idxSrt = new boolean[32];
+            idxSlots = new long[32][];
+        } else if (idxN == idxOffs.length) {
             int m = idxN * 2;
             idxOffs = java.util.Arrays.copyOf(idxOffs, m);
             idxCnts = java.util.Arrays.copyOf(idxCnts, m);
@@ -725,13 +767,17 @@ public final class Writer {
         if (freed > 0) { buf = new byte[initialSize]; pos = 0; }
         if (srKeys.length > 16) initSymtab(16);
         idxReset();
-        if (idxOffs.length > 32) {
-            idxOffs = new long[32];
-            idxCnts = new int[32];
-            idxSrt = new boolean[32];
-            idxSlots = new long[32][];
+        // RELEASED, not reallocated to the default size. `trim()` exists to
+        // give memory back, and the arrays are lazy now, so dropping them
+        // returns more than shrinking them and costs nothing until the next
+        // index is built. A writer that never indexes keeps holding nothing.
+        if (idxOffs != null && idxOffs.length > 32) {
+            idxOffs = null;
+            idxCnts = null;
+            idxSrt = null;
+            idxSlots = null;
         }
-        if (idxSeq.length > 1024) idxSeq = new long[1024];
+        if (idxSeq != null && idxSeq.length > 1024) idxSeq = null;
         return Math.max(0, freed);
     }
 
