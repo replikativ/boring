@@ -1050,6 +1050,29 @@
   [^Reader r p stride min-entries base ^java.util.ArrayList acc]
   (index-walk* r p stride min-entries base acc 0))
 
+(defn- frame-payload-array?
+  "Is the container at `p` the 2-element `[name, args]` array of a TAG-27 FRAME?
+
+  If it is, it gets no index node. `boring.nav` never descends a tag
+  structurally, so a node for this array can never be used -- and the writer's
+  index capture does not emit one, so emitting it here made the byte walk and
+  the writer disagree about the same value: 306 bytes against 295 for a
+  40-entry `sorted-map` at `:index-min 2`, containers `[2 22]` against `[22]`.
+  The contents are still descended into and still get their nodes; it is only
+  the wrapper that is dropped.
+
+  `q0` is where the tag chain started and `p` where it ended, so the whole
+  check costs nothing for an untagged container -- which is nearly all of them,
+  and why the chain is re-walked here rather than threaded out of the loop that
+  collapsed it. It needs `:index-min` <= 2 to be reachable at all; the default
+  of 16 is why this was never seen."
+  [^Reader r q0 p mj n]
+  (and (= mj 4) (= 2 (long n)) (not= (long p) (long q0))
+       (= 27 (long (loop [q (long q0) t -1]
+                     (if (= 6 (.majorAt r q))
+                       (recur (long (.headEndAt r q)) (long (.headArgAt r q)))
+                       t))))))
+
 (defn- index-walk*
   [^Reader r p stride min-entries base ^java.util.ArrayList acc depth]
   ;; CONTAINER nesting is bounded too, not only the tag chain. `build-index` is
@@ -1090,6 +1113,7 @@
         ;;
         ;; Collapsing the chain is equivalent to recursing through it: a tag's
         ;; extent IS its payload's extent, so the payload's end is the value's.
+        q0 (long p)
         p (long (loop [q p]
                   (if (= 6 (.majorAt r q)) (recur (long (.headEndAt r q))) q)))
         mj (.majorAt r p)]
@@ -1129,7 +1153,8 @@
                                            (if map? " pairs" " elements")
                                            " but only " avail " bytes remain")
                                       {:type :boring/bad-count :count n :offset p}))))
-                keep? (>= n min-entries)
+                keep? (and (>= n min-entries)
+                           (not (frame-payload-array? r q0 p mj n)))
                 m (if keep?
                       ;; An empty container needs no anchors. The `(max n 1)`
                       ;; this replaces yielded ONE for n=0, and the loop never

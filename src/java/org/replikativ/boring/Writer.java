@@ -2026,26 +2026,34 @@ public final class Writer {
         // hazard produced an unreadable document instead of an error. Only
         // reachable from a map that considers such keys distinct (an
         // IdentityHashMap, a custom comparator), which is why it survived.
-        for (int j = 1; j < n; j++)
-            if (compareBytes(encodedKeys[order[j - 1]], encodedKeys[order[j]]) == 0)
+        //
+        // The same sweep answers `sorted` below, which is why it is one loop
+        // and not two.
+        //
+        // `sorted` is the claim "these keys are in BYTEWISE ascending order",
+        // because bytewise is what `Reader.compareItemsAt` -- the comparator the
+        // navigator's binary search actually uses -- compares. Under
+        // `legacyCanonicalOrder` (:profile :canonical-rfc7049) the sort above
+        // ran LENGTH FIRST, which is a different order, so the sort's comparator
+        // is not the answer and this loop is. Reading it off the emitted key
+        // bytes is what `build-index`'s byte walk has always done; taking
+        // `!legacyCanonicalOrder` instead made the two builders disagree about
+        // the same file, which `the-two-index-builders-agree` asserts they
+        // cannot. The conservative answer is SAFE -- it only ever gives up a
+        // binary search -- but it was given up for every `:canonical-rfc7049`
+        // file, including the many whose keys are bytewise ascending anyway.
+        boolean sorted = true;
+        for (int j = 1; j < n; j++) {
+            int c = compareBytes(encodedKeys[order[j - 1]], encodedKeys[order[j]]);
+            if (c == 0)
                 throw Err.of("canonical-duplicate",
                     "boring: two map keys encode identically under :canonical ("
                     + keys[order[j - 1]] + " and " + keys[order[j]] + ")");
+            if (c > 0) sorted = false;
+        }
 
         long start = absOffset();
         head(MAP, n);
-        // Sorted by construction -- but only under the RFC 8949 comparator.
-        //
-        // `legacyCanonicalOrder` (:profile :canonical-rfc7049) sorts LENGTH
-        // FIRST, while every reader here compares plain bytewise, so under that
-        // profile this method's output is NOT in the order a binary search
-        // assumes. Claiming otherwise silently lost keys: measured 11 of 20 on
-        // a map mixing short text keys with large integer keys, where the two
-        // orderings genuinely diverge.
-        //
-        // No comparisons on either branch: the sort just ran, so its comparator
-        // is the whole answer.
-        boolean sorted = !legacyCanonicalOrder;
         long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
         int a = 0, countdown = 1;

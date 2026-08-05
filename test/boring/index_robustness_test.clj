@@ -1377,6 +1377,84 @@
           (is (= (nav/value (nav/source c o)) (nav/value (nav/source (boring/encode v o) o)))
               (str label ": and both must read back as the plain encoding")))))))
 
+(deftest the-two-index-builders-agree-across-profiles-strides-and-frames
+  (testing "`the-two-index-builders-agree` above asserts byte identity of the
+            whole sealed file -- but over ONE profile, ONE `:index-min`, and
+            four values none of which is tag-27 wrapped. Both of the places the
+            two builders actually disagreed were outside that box, so the test
+            could not fail for either of them.
+
+            Widened here rather than in place, so the original stays the
+            regression it was written to be. The two disagreements:
+
+            THE `sorted` FLAG UNDER `:profile :canonical-rfc7049`. That profile
+            sorts keys LENGTH FIRST, so `Writer` took `!legacyCanonicalOrder`
+            and claimed nothing, while the byte walk compared the emitted key
+            bytes and reported the truth. Same bytes, same offsets, different
+            flag -- and the conservative side gives up the binary search for
+            every `:canonical-rfc7049` file written through `write-seq!`.
+
+            AND A TAG-27 FRAME'S OWN `[name, args]` ARRAY. For a `sorted-map`
+            or `sorted-set` the byte walk emitted a node for the wrapper as
+            well as for the collection inside it: containers `[2 22]` against
+            `[22]`, 306 bytes against 295. It needs `:index-min` <= 2 to
+            appear, which is why the default of 16 hid it.
+
+            Compared as bytes AND as the decoded node structure, because two
+            files can differ in a flag the byte comparison would catch but the
+            message would not name."
+    (let [capture (fn [v opts] (let [w (boring/writer 65536 opts)
+                                     out (ByteArrayOutputStream.)]
+                                 (boring/write-indexed! w v out opts)
+                                 (.toByteArray out)))
+          walk (fn [v opts] (boring/encode-indexed v opts))
+          payload (fn [^bytes bs]
+                    (let [p (long (#'boring.frame/footer-start bs))]
+                      (boring.data/frame-payload (.readFrom (Reader. bs) p))))
+          shape (fn [^bytes bs]
+                  (let [p (payload bs)]
+                    {:stride (nth p 0)
+                     :containers (vec (nth p 1))
+                     :counts (vec (nth p 2))
+                     :sorted (vec (nth p 4))}))]
+      (doseq [[label v]
+              [["vec of maps"  (vec (for [i (range 30)] {"a" i "b" (str i)}))]
+               ["nested"       {"L1" (into {} (for [i (range 20)]
+                                                [(format "m%02d" i)
+                                                 {"L3" (vec (range 20))}]))}]
+               ;; Keys where LENGTH-FIRST and BYTEWISE genuinely diverge: a
+               ;; short text key sorts after a large integer key one way and
+               ;; before it the other. Equal-length keys cannot show it.
+               ["mixed widths" (into {} (concat (for [i (range 20)]
+                                                  [(str "k" i) i])
+                                                (for [i (range 20)]
+                                                  [(+ 100000000 i) i])))]
+               ;; Tag-27 wrapped, which is what F10b needed.
+               ["sorted map"   (into (sorted-map)
+                                     (for [i (range 40)] [(format "k%02d" i) i]))]
+               ["sorted set"   (into (sorted-set) (range 40))]
+               ["record"       (->Widget (vec (range 30)) (into {} (for [i (range 30)]
+                                                                     [(str i) i])))]]
+              profile [:canonical :canonical-rfc7049 :clojure :archival :interop]
+              stride [1 4 16]
+              min-entries [2 4]]
+        (let [o (cond-> {:profile profile :index stride :index-min min-entries}
+                  (not (#{:canonical :canonical-rfc7049 :archival} profile))
+                  (assoc :stringref false))
+              tag (str label " | " profile " | stride " stride
+                       " | :index-min " min-entries)
+              c (capture v o)
+              w (walk v o)]
+          (is (= (shape c) (shape w))
+              (str tag ": the two builders must derive the same nodes"))
+          (is (= (seq c) (seq w))
+              (str tag ": and therefore the same file, byte for byte"))
+          ;; Both must still READ as the plain value, so a builder cannot be
+          ;; made to agree by making both of them wrong.
+          (is (= (nav/value (nav/source c o))
+                 (nav/value (nav/source (boring/encode v o) o)))
+              (str tag ": and the file must read back as the plain encoding")))))))
+
 (deftest indexed-and-unindexed-agree-across-shapes
   (testing "the correctness spine: for every container shape, stride and
             profile, the indexed answer must equal the unindexed one for EVERY

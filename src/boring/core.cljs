@@ -624,6 +624,21 @@
           (aset d i delta)
           (recur (inc i) v (min mn delta) (max mx delta)))))))
 
+(defn- frame-payload-array?
+  "Is the container at `p` the 2-element `[name, args]` array of a TAG-27 FRAME?
+
+  If it is, it gets no index node. Mirrors the JVM `frame-payload-array?`,
+  which carries the measurement: `boring.nav` never descends a tag
+  structurally, so this node can never be used, and the writer's index capture
+  does not emit one. `q0` is where the tag chain started and `p` where it
+  ended, so an untagged container pays nothing for the check."
+  [r q0 p mj n]
+  (and (== mj 4) (== 2 n) (not= p q0)
+       (== 27 (loop [q q0 t -1]
+                (if (== 6 (rd/major-at r q))
+                  (recur (rd/head-end-at r q) (rd/head-arg-at r q))
+                  t)))))
+
 (defn- index-walk*
   "Walk the value at `p`, returning where it ends, accumulating nodes into `acc`.
 
@@ -641,7 +656,8 @@
                          INDEX-WALK-MAX-DEPTH "). This document can be decoded "
                          "but not indexed.")
                     {:type :boring/max-depth-exceeded :max-depth INDEX-WALK-MAX-DEPTH})))
-  (let [p (loop [q p] (if (== 6 (rd/major-at r q)) (recur (rd/head-end-at r q)) q))
+  (let [q0 p
+        p (loop [q p] (if (== 6 (rd/major-at r q)) (recur (rd/head-end-at r q)) q))
         mj (rd/major-at r p)]
     (if-not (or (== mj 4) (== mj 5))
       (rd/skip-from r p)
@@ -649,7 +665,8 @@
             map? (== mj 5)]
         (if (neg? n)
           (rd/skip-from r p)                    ; indefinite: not indexable
-          (let [keep? (>= n min-entries)
+          (let [keep? (and (>= n min-entries)
+                           (not (frame-payload-array? r q0 p mj n)))
                 m (if keep?
                     (cond (<= n 0) 0
                           (== stride 1) n
