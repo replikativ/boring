@@ -282,12 +282,54 @@ a cursor implements `ILookup`, `clojure.core/get-in` works on it directly for
 (def c (nav/source bs))
 (nav/value (get-in c ["customer-137" "name"]))   ; => "name-137"
                                                  ; the other 199 are never built
-
-(mmap/with-mmap [c "events.cbor"]                ; JDK 22+; the file need not fit in heap
-  (nav/value (get-in c ["customer-137" "name"])))
 ```
 
-Two things that example is carrying, both of which used to be silent:
+That walks the container to find the key. **An offset index turns the walk into
+a jump** — opt-in, and a pure optimisation: the answers are identical, and a
+missing, truncated or stale index falls back to scanning.
+
+```clojure
+;; ONE large value you will navigate into. `encode-indexed` seals an index
+;; onto it and implies :stringref false, so you no longer pass it yourself.
+(def ibs (boring/encode-indexed customers))
+
+(boring/decode ibs)                              ; => the map, unchanged
+(nav/value (get-in (nav/source ibs) ["customer-137" "name"]))   ; => "name-137"
+```
+
+The result is a two-item CBOR sequence — the value, then the index — so
+`decode` still returns the value and any CBOR reader in any language consumes
+both. Here it cost **1.37%** on the wire.
+
+For a log, `write-seq!` indexes by default and `nav/items` uses it:
+
+```clojure
+(def events (vec (for [i (range 200000)] {:id i :s (str "event-" i)})))
+
+(with-open [o (java.io.FileOutputStream. "events.cbor")]
+  (boring/write-seq! (boring/writer 65536) events o))
+
+(def items (nav/items (java.nio.file.Files/readAllBytes
+                       (.toPath (java.io.File. "events.cbor")))))
+(nav/value (nth items 199999))                   ; O(1) to the nearest anchor,
+                                                 ; then at most stride-1 skips
+
+;; the same file, mapped — `mmap-items`, because a log is a SEQUENCE.
+;; `mmap-source` is the single-value shape and hands back a cursor at the root.
+(let [[items arena] (mmap/mmap-items "events.cbor")]   ; JDK 22+; need not fit in heap
+  (with-open [a arena]
+    (nav/value (nth items 199999))))
+```
+
+Measured on 200 000 `{:id n :s "event-n"}` items with the code above: reaching
+the **last** item takes 7.8 µs indexed against 4.34 ms scanning — 557× — for
+**0.44%** more file. Build `items` once and reuse it; constructing it reads the
+index frame, so folding that into every lookup measures setup rather than the
+jump.
+
+Two things the **first** example is carrying, both of which used to be silent —
+and neither applies to the indexed forms above, which set `:stringref false`
+themselves:
 
 **The write is where `:stringref false` belongs.** boring writes stringref by
 default, and a stringref is an index into a table built from every preceding
