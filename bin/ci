@@ -263,6 +263,24 @@ stage_fuzz_cljs () {
       -co '{:language-in :ecmascript-next}' -O advanced -t node \
       -o target/cljs-fuzz.js -c cljsbench.fuzz
   run fuzz-cljs node target/cljs-fuzz.js 50000
+
+  # `skip-from` must land exactly where `read!` lands. A skip one byte off
+  # yields an offset into the middle of an item, which reads back as a
+  # plausible WRONG VALUE rather than an error -- and the index this branch
+  # adds is built entirely out of these offsets, so it is the property the
+  # whole feature rests on.
+  #
+  # It lives here rather than in stage_cljs because it is randomised (20 000
+  # generated values per run), and it needed no CircleCI change: the `fuzz`
+  # job already invokes `bin/ci fuzz-cljs`.
+  #
+  # It existed in bench/ for this entire branch and NOTHING RAN IT -- not a
+  # stage, not a compile target, not required by the runner.
+  rm -f target/cljs-skipprop.js
+  run skipprop-compile clojure -M:cljs-deps -m cljs.main \
+      -co '{:language-in :ecmascript-next}' -O advanced -t node \
+      -o target/cljs-skipprop.js -c cljsbench.skipprop
+  run skipprop node target/cljs-skipprop.js
 }
 
 ensure_classes

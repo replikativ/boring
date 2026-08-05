@@ -183,6 +183,26 @@ jobs:
           command: bin/ci fuzz-cljs
       - store-logs
 
+  # The gate that proves the index tests DEPEND on the index: it damages the
+  # index in known ways and requires the suite to go red for each. Without it,
+  # a test that passes whether or not the index is used still passes, and the
+  # whole feature could be dead code behind a green suite.
+  #
+  # Its own job because it runs the index suite four times over, which is
+  # minutes -- which is also why `bin/ci` deliberately leaves it out of `all`,
+  # with a comment saying it "belongs in CI proper rather than in a local
+  # bin/ci run". It was never added here, so it belonged nowhere and had never
+  # run: not locally, not in CI.
+  mutants:
+    executor: clj-node
+    steps:
+      - checkout
+      - restore-deps
+      - run:
+          name: Index mutation gate
+          command: bin/ci mutants
+      - store-logs
+
 workflows:
   build-and-test:
     jobs:
@@ -204,6 +224,7 @@ workflows:
       - cljs
       - interop
       - fuzz
+      - mutants
       - tools/format:
           context: docker-deploy
           requires:
