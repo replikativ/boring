@@ -292,3 +292,50 @@
               (is (= {:id 4999} (nav/value (nth it 4999))))
               (is (= {:id 0} (nav/value (nth it 0))))))
           (finally (.delete f)))))))
+
+(deftest decoding-a-whole-value-from-a-bytesource
+  (when ffm?
+    (testing "the Java Reader has taken a ByteSource since boring.nav needed
+              one, but the Clojure API was byte[]-only -- so a caller holding
+              off-heap bytes had to COPY into a byte[] to decode them at all.
+              Navigation could read a source and a whole-value decode could
+              not, which is backwards: a store's normal case is wanting the
+              whole value, not part of it.
+
+              The motivating caller is konserve-lmdb, which hands out a
+              MemorySegment over LMDB's own mapping per read."
+      (let [v {:meta {:k "x"}
+               :value (vec (for [i (range 256)] [i :a (str "p" i) true]))}
+            ^bytes bs (boring/encode v {:stringref false})]
+        (with-open [arena (java.lang.foreign.Arena/ofShared)]
+          (let [seg (.allocate arena (long (alength bs)))
+                _   (java.lang.foreign.MemorySegment/copy
+                     bs 0 seg java.lang.foreign.ValueLayout/JAVA_BYTE 0 (alength bs))
+                src ((requiring-resolve 'boring.mmap/segment-source) seg)]
+            (testing "decode takes a ByteSource and agrees with the byte[] path"
+              (is (= v (boring/decode src)))
+              (is (= v (boring/decode bs))))
+            (testing "and so does a reused Reader, which is the shape a store
+                      wants: one Reader, a fresh segment per value"
+              (let [r (boring/reader bs)]
+                (is (= v (boring/decode-with r src)))
+                (is (= v (boring/decode-with r src {})))
+                (testing "the byte[] arm still works on the same reader"
+                  (is (= v (boring/decode-with r bs))))))
+            (testing "a Reader can be built from a source directly"
+              (is (= v (boring/decode-with (boring/reader src) src))))))))))
+
+(deftest a-bad-decode-input-is-typed
+  (testing "nil and a wrong type are `:boring/bad-argument`, not a raw NPE or
+            ClassCastException -- doc/SECURITY.md's third guarantee says no raw
+            host exception escapes a read path, and widening these to accept
+            two input kinds is exactly where a stray cast would appear"
+    (doseq [[label f] [["decode nil" #(boring/decode nil)]
+                       ["decode number" #(boring/decode 42)]
+                       ["reader nil" #(boring/reader nil)]
+                       ["reader number" #(boring/reader 42)]
+                       ["decode-with nil" #(boring/decode-with (boring/reader (boring/encode 1)) nil)]
+                       ["decode-with number" #(boring/decode-with (boring/reader (boring/encode 1)) 42)]]]
+      (is (= :boring/bad-argument
+             (:type (ex-data (try (f) (catch Exception e e)))))
+          label))))

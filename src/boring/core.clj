@@ -40,9 +40,13 @@
             [boring.options :as opt]
             [clojure.string :as str])
   (:import (java.nio ByteBuffer)
-           (org.replikativ.boring Reader TagRegistry Writer)))
+           (org.replikativ.boring ByteSource Reader TagRegistry Writer)))
 
 (set! *warn-on-reflection* true)
+
+;; `reader` and `decode` both build a Reader from a byte[] or a ByteSource, and
+;; the shared constructor lives further down next to the other input guards.
+(declare bytes! reader-of reset-reader!)
 
 ;; The Java hot path recognises boring.data's types without importing them (which
 ;; would make the Java uncompilable without the Clojure sources on the path
@@ -118,8 +122,9 @@
   a registry, a depth cap or a date type without reaching into the Java fields.
   An API that is documented as the fast path has to accept the same
   configuration as the slow one."
-  (^Reader [^bytes bs] (Reader. bs))
-  (^Reader [^bytes bs opts] (configure-reader! (Reader. bs) (opt/check-opts opts))))
+  (^Reader [src] (reader-of src "reader"))
+  (^Reader [src opts] (configure-reader! (reader-of src "reader")
+                                         (opt/check-opts opts))))
 
 (def unencodable
   "The default `:encode-fallback` placeholder: a tag-27 frame naming the type
@@ -517,6 +522,44 @@
                     {:type :boring/bad-argument :entry entry})))
   bs)
 
+(defn- reset-reader!
+  "Rebind `r` to `src`, a `byte[]` or a `ByteSource`.
+
+  The ByteSource arm is what makes a reusable Reader usable off-heap: LMDB
+  hands out a fresh MemorySegment per read over its own mapping, so the
+  efficient shape is one Reader rebound per value rather than one Reader per
+  value. `Reader.reset` has had both overloads all along."
+  [^Reader r src entry]
+  (cond
+    (nil? src) (bytes! src entry)
+    (bytes? src) (.reset r ^bytes src)
+    (instance? ByteSource src) (.reset r ^ByteSource src)
+    :else (throw (ex-info (str "boring: " entry " needs a byte array or a "
+                               "ByteSource, got " (pr-str (type src)))
+                          {:type :boring/bad-argument :entry entry}))))
+
+(defn- reader-of
+  "A `Reader` over `src`, which is a `byte[]` or a `ByteSource`.
+
+  The Java Reader has taken a ByteSource since `boring.nav` needed one, but
+  the Clojure API here did not, so a caller holding off-heap bytes -- an
+  mmap'ed file, or the MemorySegment LMDB hands out over its own mapping --
+  had to copy into a `byte[]` first to decode them at all. Navigation could
+  read a source and a whole-value decode could not, which is backwards: a
+  store's normal case is wanting the whole value.
+
+  Nothing is gated on JDK 22 by this. `ByteSource` is deliberately a JDK-9
+  interface that names no FFM type -- see its javadoc -- so only the caller
+  who CONSTRUCTS a segment-backed source needs the newer JDK."
+  ^Reader [src entry]
+  (cond
+    (nil? src) (bytes! src entry)                   ; one typed nil error
+    (bytes? src) (Reader. ^bytes src)
+    (instance? ByteSource src) (Reader. ^ByteSource src)
+    :else (throw (ex-info (str "boring: " entry " needs a byte array or a "
+                               "ByteSource, got " (pr-str (type src)))
+                          {:type :boring/bad-argument :entry entry}))))
+
 (defn ^:no-doc configure-reader!
   "Apply decode options to a Reader. Public only so `boring.nav` can apply the
   SAME options its docstrings promise -- it realises values through this reader,
@@ -586,9 +629,9 @@
   opposite case — a registration that can never match is otherwise SILENT, and
   a record simply arrives as an `UnknownRecord`. Reserved marker names
   (`clojure/char`, `java/period`, …) are known names and never reach this."
-  ([^bytes bs] (decode bs nil))
-  ([^bytes bs opts]
-   (with-decode-errors (.read (configure-reader! (Reader. (bytes! bs "decode"))
+  ([src] (decode src nil))
+  ([src opts]
+   (with-decode-errors (.read (configure-reader! (reader-of src "decode")
                                                  (opt/check-opts opts))))))
 
 (defn decode-with
@@ -598,9 +641,9 @@
   reader keeps whatever it was last configured with, which is what makes the
   two-arity form fast and also what makes it a state-leak hazard across
   tenants -- pass opts unless the reader is yours alone."
-  ([^Reader r ^bytes bs] (.reset r (bytes! bs "decode-with")) (with-decode-errors (.read r)))
-  ([^Reader r ^bytes bs opts]
-   (.reset r bs)
+  ([^Reader r src] (reset-reader! r src "decode-with") (with-decode-errors (.read r)))
+  ([^Reader r src opts]
+   (reset-reader! r src "decode-with")
    (configure-reader! r (opt/check-opts opts))
    (with-decode-errors (.read r))))
 
