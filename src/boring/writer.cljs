@@ -602,6 +602,27 @@
         (set! (.-pos w) (+ (.-pos w) (.-length kb)))
         (write-value! w v)))))
 
+(defn- plain-map?
+  "Whether `m` may be flattened into a shaped array.
+
+  MIRRORS `Writer.plainMap`, whose comment is the rule: \"an optimisation that
+  silently changes the value is not one.\" That JVM guard excludes records,
+  sorted maps and metadata-carrying maps; this side checked `record?` alone,
+  which is the same rule written twice with one copy weaker.
+
+  Three things were destroyed on this platform and not the JVM: a sorted map
+  came back unsorted, metadata was dropped while `:incl-metadata?` was still
+  true, and an `UnknownRecord` -- which is `map?` and NOT `record?` here -- was
+  shaped, breaking the documented guarantee that it re-encodes to identical
+  bytes. All three are silent: the bytes are valid CBOR and the loss shows up
+  as a changed value much later."
+  [m]
+  (and (map? m)
+       (not (record? m))
+       (not (data/unknown-record? m))
+       (not (sorted? m))
+       (nil? (meta m))))
+
 (def ^:private sentinel (js-obj))
 
 (defn- homogeneous-shape
@@ -612,14 +633,14 @@
   (let [rows (count v)]
     (when (>= rows 2)
       (let [m0 (nth v 0)]
-        (when (and (map? m0) (not (record? m0)) (pos? (count m0)))
+        (when (and (plain-map? m0) (pos? (count m0)))
           (let [ks (vec (keys m0))
                 n (count ks)]
             (loop [i 1]
               (cond
                 (= i rows) ks
                 :else (let [m (nth v i)]
-                        (if (and (map? m) (not (record? m)) (== n (count m))
+                        (if (and (plain-map? m) (== n (count m))
                                  ;; get-with-sentinel: one lookup, where
                                  ;; contains? does a lookup and a test
                                  (loop [j 0]
