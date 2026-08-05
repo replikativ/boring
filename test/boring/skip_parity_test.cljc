@@ -13,7 +13,8 @@
   Nothing here is derived from either implementation's source: the inputs are
   hand-written CBOR that is malformed in one specific way each, and the
   expected verdict is what RFC 8949 says of it."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [boring.conformance :refer [hex->bytes]]
             [boring.core :as b]
             #?(:cljs [boring.reader :as rd]))
@@ -213,3 +214,107 @@
       (is (= :ok (verdict #(b/encode-indexed specimen {:index 4 :index-min 4
                                                        :stringref false}))))
       (is (= :ok (verdict #(b/encode-indexed specimen {:index 4 :index-min 4})))))))
+
+;; ## Tag readers that implemented the same tag differently
+;;
+;; Each of these is one rule with two implementations. The expected value is
+;; the JVM's in every case EXCEPT tag 1002 and tag 39649, where the JVM was the
+;; wrong side and moved; both are called out below.
+
+(defn- decode-type [bs] (verdict #(b/decode bs)))
+
+(deftest tag-readers-accept-and-refuse-the-same-documents
+  (doseq [[hex expected what]
+          [;; The JVM range-checks a decimal-fraction exponent against the
+           ;; 32-bit scale a BigDecimal can carry; ClojureScript did not, and
+           ;; produced a Decimal no JVM peer can construct.
+           ["c4821a8000000001" :boring/bad-tag-content
+            "tag 4 with exponent 2^31"]
+           ["c48221 1896"      :ok
+            "tag 4 with an ordinary exponent still decodes"]
+
+           ;; THE JVM MOVED HERE. It used the fraction VALUE as its
+           ;; "fraction seen" flag, so a CBOR null degraded the key to absent.
+           ["d903eaa2010528f6" :boring/bad-tag-content
+            "tag 1002 with a null scaled fraction"]
+           ;; And with the key not registered, RFC 9581 3.3's "at most one
+           ;; scaled fraction" could never fire.
+           ["d903eaa3010528f6 2201" :boring/bad-tag-content
+            "tag 1002 with a null fraction AND a real one"]
+           ["d903eaa2010528 1a3b9ac9ff" :ok
+            "tag 1002 with one real scaled fraction still decodes"]
+           ["d903eaa10105" :ok
+            "tag 1002 with no fraction at all still decodes"]
+
+           ;; THE JVM MOVED HERE TOO. Shape-key distinctness fell out of
+           ;; building each row, so zero rows checked nothing.
+           ["d99ae182820101 80" :boring/bad-tag-content
+            "a shaped array with duplicate keys and ZERO rows"]
+           ["d99ae18282010181820102" :boring/bad-tag-content
+            "a shaped array with duplicate keys and one row"]
+           ["d99ae182820102 81820304" :ok
+            "a shaped array with distinct keys still decodes"]
+
+           ;; `java.net.URI` requires a non-empty scheme-specific part; the
+           ;; ClojureScript grammar approximation did not.
+           ["d82062613a" :boring/bad-tag-content
+            "tag 32 \"a:\" -- a scheme with an EMPTY scheme-specific part"]
+           ["d820647572 6e3a" :boring/bad-tag-content
+            "tag 32 \"urn:\" -- the same, with a longer scheme"]
+           ["d8206461 3a2366" :boring/bad-tag-content
+            "tag 32 \"a:#f\" -- the part ends at the fragment, not the string"]
+           ["d820 64613a3f71" :ok
+            "tag 32 \"a:?q\" -- a query IS a scheme-specific part"]
+           ["d82063613a62" :ok
+            "tag 32 \"a:b\" still decodes"]]]
+    (testing what
+      (is (= expected (decode-type (hex->bytes (str/replace hex " " ""))))
+          (str hex " -- " what)))))
+
+(deftest a-shaped-arrays-keys-must-be-distinct-whatever-the-map-options-say
+  (testing "`:check-duplicate-keys` is an option about MAP CONTENT. Repeated
+            SHAPE keys make the shape itself meaningless -- the row values have
+            nowhere distinct to land -- so no decode option may turn that check
+            off. The JVM gated it and ClojureScript did not, and with the option
+            off the same bytes were `[{1 2}]` there and refused here."
+    (let [bs (hex->bytes "d99ae18282010181820102")]
+      (is (= :boring/bad-tag-content
+             (verdict #(b/decode bs {:check-duplicate-keys false}))))
+      (is (= :boring/bad-tag-content
+             (verdict #(b/decode bs {:check-duplicate-keys true})))))))
+
+;; ## Round trips
+;;
+;; A verdict can agree while the VALUE does not, so these compare the bytes a
+;; decode/re-encode produces. That is the property that matters for a document
+;; passing through one platform on its way to the other.
+
+(defn- to-hex [bs]
+  (let [n #?(:clj (alength ^bytes bs) :cljs (.-length bs))]
+    (apply str (for [i (range n)]
+                 (let [b (bit-and (aget bs i) 0xFF)]
+                   (str (when (< b 16) "0")
+                        #?(:clj (Integer/toString b 16) :cljs (.toString b 16))))))))
+
+(deftest tag-30-round-trips-to-the-same-bytes-on-both-platforms
+  (testing "The JVM reads tag 30 through `clojure.lang.Numbers.divide`, which
+            reduces to lowest terms, puts the sign on the numerator, and yields
+            an INTEGER when the denominator reduces to 1. ClojureScript kept
+            whatever was on the wire, so `30([4,2])` re-encoded as itself
+            instead of as an integer, and `30([1,-2])` and `30([-1,2])` stayed
+            two different values.
+
+            Compared as bytes rather than as values, because the two platforms
+            genuinely have different types here -- `clojure.lang.Ratio` against
+            `boring.data/Rational` -- and the bytes are what crosses."
+    (doseq [[hex expected what]
+            [["d81e820402" "c24102"     "30([4,2]) reduces to the integer 2"]
+             ["d81e820201" "c24102"     "30([2,1]) is already an integer"]
+             ["d81e820121" "d81e822002" "30([1,-2]) puts the sign on top"]
+             ["d81e822002" "d81e822002" "30([-1,2]) is already normal"]
+             ["d81e82021864" "d81e82011832" "30([2,100]) reduces to 1/50"]
+             ["d81e820103" "d81e820103" "30([1,3]) is already lowest terms"]]]
+      (testing what
+        (is (= expected
+               (to-hex (b/encode (b/decode (hex->bytes hex)) {:stringref false})))
+            (str hex " -- " what))))))

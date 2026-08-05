@@ -1732,6 +1732,32 @@ public final class Reader {
         }
     }
 
+    /**
+     * The keys of a tag-39649 shape, which must be distinct.
+     *
+     * Same two-tier strategy as `checkDistinct` -- a pairwise scan while `n` is
+     * small, a hashed pass past that, so the work is never attacker-controlled
+     * O(n^2) -- but stride 1 over a key-only array, and a `bad-tag-content`
+     * error carrying the tag, which is what ClojureScript raises for the same
+     * document.
+     */
+    private static void checkShapeKeys(Object[] keys, int n) {
+        if (n <= DUP_SCAN_MAX) {
+            for (int i = 1; i < n; i++)
+                for (int j = 0; j < i; j++)
+                    if (KeyProbe.eq(keys[i], keys[j])) throw duplicateShapeKey(keys[i]);
+            return;
+        }
+        java.util.HashSet<KeyProbe> seen = new java.util.HashSet<>(Math.max(4, n * 2));
+        for (int i = 0; i < n; i++)
+            if (!seen.add(new KeyProbe(keys[i]))) throw duplicateShapeKey(keys[i]);
+    }
+
+    private static RuntimeException duplicateShapeKey(Object k) {
+        return Err.of("bad-tag-content",
+            "boring: shaped array has a duplicate key: " + k, "tag", 39649L, "key", k);
+    }
+
     private static boolean anyArrayKey(Object[] kvs, int n) {
         for (int i = 0; i < n; i++) {
             Object k = kvs[i * 2];
@@ -2463,6 +2489,23 @@ public final class Reader {
                         "boring: shaped array needs at least one key", "tag", 39649L);
                 Object[] keys = new Object[n];
                 for (int i = 0; i < n; i++) keys[i] = read();
+                // THE SHAPE'S KEYS ARE CHECKED ONCE, HERE, AND UNCONDITIONALLY.
+                //
+                // Distinctness used to fall out of building each row's map, so
+                // it inherited two properties that do not belong to it. With
+                // ZERO ROWS nothing was built and nothing was checked --
+                // `d99ae1 82 82 0101 80` decoded to `[]` here and
+                // `:boring/bad-tag-content` on ClojureScript. And it was gated
+                // on `:check-duplicate-keys`, which is an option about MAP
+                // CONTENT: with it off, `39649([[1,1],[[1,2]]])` decoded to
+                // `[{1 2}]` here and was refused there.
+                //
+                // Repeated keys make the shape itself meaningless -- the row
+                // values have nowhere distinct to land -- so it is a property
+                // of the tag content, not of the maps that come out of it, and
+                // no decode option should be able to turn it off. That is what
+                // ClojureScript has always done.
+                checkShapeKeys(keys, n);
 
                 int rh = u8();
                 if ((rh >>> 5) != 4)

@@ -985,6 +985,55 @@
   (or (= "bigint" (goog/typeOf x))
       (and (number? x) (js/Number.isInteger x))))
 
+(def ^:private BIG-ZERO (js/BigInt 0))
+(def ^:private BIG-ONE (js/BigInt 1))
+
+(defn- ->big [x] (if (= "bigint" (goog/typeOf x)) x (js/BigInt x)))
+
+(defn- narrow-big
+  "A BigInt back to an ordinary number when it fits, which is the convention
+  every other path in this reader uses -- and which the writer depends on,
+  since a `js/BigInt` goes out as a bignum (tag 2/3) even when it is small."
+  [b]
+  (if (and (<= (js/BigInt (- js/Number.MAX_SAFE_INTEGER)) b)
+           (<= b (js/BigInt js/Number.MAX_SAFE_INTEGER)))
+    (js/Number b)
+    b))
+
+(defn- normalized-rational
+  "Tag 30's `[numerator denominator]` reduced to lowest terms, sign on the
+  numerator, and an INTEGER when the denominator reduces to 1.
+
+  The JVM reads tag 30 through `clojure.lang.Numbers.divide`, which does all
+  three, so `30([4,2])` is `2N` there and re-encodes as `02`. Here it was a
+  `Rational{4,2}` that re-encoded as `d81e820402` -- so a document written by
+  anyone else did not survive a decode/encode round trip on this platform, and
+  `30([1,-2])` and `30([-1,2])` were two different values instead of one.
+
+  BigInt throughout: the numerator and denominator may be bignums, and mixing
+  BigInt with Number in JS is a TypeError rather than a coercion.
+
+  THE INTEGER CASE STAYS A BigInt, deliberately, where the ratio's two halves
+  are narrowed. That is not tidiness, it is byte parity: `Numbers.divide`
+  yields a `clojure.lang.BigInt`, which the JVM writer emits as a bignum, so
+  `30([4,2])` re-encodes as `c24102` there -- while a Ratio's numerator and
+  denominator go out as plain integers, `30([1,-2])` as `d81e822002`. Narrowing
+  both would have made the integer case `02` here and `c24102` there, trading
+  one round-trip divergence for another."
+  [n d]
+  (let [bn (->big n)
+        bd (->big d)
+        neg? (< bd BIG-ZERO)
+        bn (if neg? (- BIG-ZERO bn) bn)
+        bd (if neg? (- BIG-ZERO bd) bd)
+        g (loop [a (if (< bn BIG-ZERO) (- BIG-ZERO bn) bn) b bd]
+            (if (<= b BIG-ZERO) a (recur b (js-mod a b))))
+        bn (/ bn g)
+        bd (/ bd g)]
+    (if (<= bd BIG-ONE)
+      bn
+      (data/rational (narrow-big bn) (narrow-big bd)))))
+
 (def ^:private DURATION-SCALES #{-3 -6 -9 -12 -15 -18})
 
 (def ^:private MIN-I64 (js/BigInt "-9223372036854775808"))
@@ -1517,6 +1566,16 @@
           (when-not (and (cbor-integer? e) (cbor-integer? m))
             (err :boring/bad-tag-content
                  "boring: tag 4 exponent and mantissa must be integers" {:tag 4}))
+          ;; THE EXPONENT IS RANGE-CHECKED, as it is on the JVM, where a
+          ;; BigDecimal's scale is a 32-bit int and `Reader` refuses anything
+          ;; wider. `c4 82 1a80000000 01` -- exponent 2^31 -- decoded here to a
+          ;; Decimal no JVM peer can construct, so a document written in a
+          ;; browser had no reading on the server. The mantissa is deliberately
+          ;; NOT bounded: a bignum mantissa is exactly what tag 4 is for.
+          (let [en (js/Number e)]
+            (when (or (> en 2147483647) (< en -2147483648))
+              (err :boring/bad-tag-content
+                   (str "boring: tag 4 exponent out of range: " e) {:tag 4})))
           (data/decimal e m)))
 
     30 (let [l (read! r)]                           ; rational
@@ -1527,9 +1586,12 @@
            (when-not (and (cbor-integer? n) (cbor-integer? d))
              (err :boring/bad-tag-content
                   "boring: tag 30 numerator and denominator must be integers" {:tag 30}))
-           (when (zero? d)
-             (err :boring/bad-tag-content "boring: tag 30 denominator is zero" {:tag 30}))
-           (data/rational n d)))
+           ;; Compared as a BigInt rather than with `zero?`, because `d` may be
+           ;; one and cljs equality does not reach a BigInt primitive.
+           (let [bd (->big d)]
+             (when-not (or (< bd BIG-ZERO) (> bd BIG-ZERO))
+               (err :boring/bad-tag-content "boring: tag 30 denominator is zero" {:tag 30})))
+           (normalized-rational n d)))
 
       ;; RFC 8746 typed arrays, little-endian. JS has native counterparts, so
       ;; these map directly rather than through a stand-in.
@@ -1616,11 +1678,26 @@
                 {:tag 32 :value v}))
          (let [i (.search v #"[/?#]")
                colon (.indexOf v ":")]
-           (when (and (not= -1 colon) (or (= -1 i) (< colon i))
-                      (not (re-matches #"[A-Za-z][A-Za-z0-9+.\-]*" (subs v 0 colon))))
-             (err :boring/bad-tag-content
-                  (str "boring: tag 32 content is not a valid URI: " v)
-                  {:tag 32 :value v})))
+           (when (and (not= -1 colon) (or (= -1 i) (< colon i)))
+             (when-not (re-matches #"[A-Za-z][A-Za-z0-9+.\-]*" (subs v 0 colon))
+               (err :boring/bad-tag-content
+                    (str "boring: tag 32 content is not a valid URI: " v)
+                    {:tag 32 :value v}))
+             ;; A SCHEME MUST BE FOLLOWED BY A NON-EMPTY SCHEME-SPECIFIC PART.
+             ;; RFC 3986's own grammar allows `path-empty`, so `"a:"` parses --
+             ;; but `java.net.URI` refuses it ("Expected scheme-specific part at
+             ;; index 2"), and matching the other platform is what this check is
+             ;; for. It was the last hole left in the approximation.
+             ;;
+             ;; The part ends at a `#`, not at the end of the string: the JVM
+             ;; accepts `"a:?q"` and refuses `"a:#f"` and `"urn:"`. Measured
+             ;; across sixteen forms rather than derived from the class's
+             ;; javadoc.
+             (when (== (inc colon) (let [h (.indexOf v "#" (inc colon))]
+                                     (if (== -1 h) (count v) h)))
+               (err :boring/bad-tag-content
+                    (str "boring: tag 32 content is not a valid URI: " v)
+                    {:tag 32 :value v}))))
          (data/tagged-value 32 v))
 
     1002 (let [v (read! r)]

@@ -284,7 +284,16 @@ Residuals, all of them platform limits rather than decisions:
   reads, and only the 5 ClojureScript reads. The same asymmetry as the row
   below, reached through a different tag.
 
-A regex is symmetric — both platforms have the type, so tag 35 has no caveat.
+A regex is symmetric in its TYPE — both platforms have one — but not in its
+LANGUAGE, and the sentence here used to claim otherwise. Tag 35 carries a
+pattern *source*, and `java.util.regex.Pattern` and `js/RegExp` do not accept
+the same sources. Measured: `35("(?i)abc")` compiles on the JVM and is
+`:boring/bad-tag-content` on ClojureScript, because JavaScript has no inline
+flag syntax. The same applies to possessive quantifiers, atomic groups,
+`\p{...}` outside the `u` flag, and `\A`/`\z`. Nothing in boring can close
+this — translating one regex dialect into another is not a codec's job — so a
+pattern that must cross platforms should be written in the intersection, and a
+reader that may receive foreign patterns should expect a typed refusal.
 
 URI is not: ClojureScript has no URI type, so tag 32 stays a `TaggedValue`
 there. That is deliberate. Decoding it to a plain string looks lossless — a URI
