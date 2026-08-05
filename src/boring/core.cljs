@@ -772,28 +772,32 @@
   reference resolves against a table built from every preceding string, so an
   offset alone cannot be decoded inside a stringref namespace.
 
-  UNCONDITIONALLY here, which is NOT what the JVM does and is the one place
-  this function's bytes differ from its twin's. The JVM forces it only when the
-  caller has not said otherwise -- `(if (contains? opts :stringref) opts ...)`
-  -- and its docstring offers the trade explicitly: \"pass `:stringref true`
-  and it is honoured, you simply get an index nothing can use\". There is no
-  such escape here. Measured on `(vec (repeat 20 \"aaaaaaaaaa\"))`, the same
-  `.cljc` call on the two platforms:
+  An EXPLICIT `:stringref true` is therefore REFUSED with
+  `:boring/incompatible-options`, exactly as the JVM's `encode-indexed`,
+  `write-seq!` and `write-indexed!` all refuse it. It used to be overwritten
+  with `false` and encoded anyway, so `seq_index_test.clj`'s
+  `stringref-and-an-index-are-refused-by-every-writer` -- whose docstring ends
+  \"Three functions, one rule, and one of them did not follow it\" -- was
+  counting three writers where there are four. Measured on
+  `(vec (repeat 20 \"aaaaaaaaaa\"))` with `{:index 4 :index-min 4
+  :stringref true}`: `:boring/incompatible-options` on the JVM, 268 silently
+  un-stringref'd bytes here.
 
-      (encode-indexed v)                  268 bytes both platforms
-      (encode-indexed v {:stringref true})  JVM 122 bytes, opening d9 0100
-                                           CLJS 268 bytes, no namespace
-
-  So a document built this way is portable only while nobody passes
-  `:stringref true`. Losing the option is the safer of the two answers -- what
-  it buys on the JVM is an index `boring.nav` then refuses -- but it is a
-  divergence, not a match.
+  OPTIONS ARE VALIDATED BEFORE `:stringref` IS OVERWRITTEN, which is the other
+  half of the same defect: forcing the key first meant a garbage VALUE for it
+  was thrown away unread, so `{:stringref \"yes\"}` was `:boring/bad-option` on
+  the JVM and `:ok` here -- the single disagreement in a 174-cell option matrix.
 
   Returns the plain encoding when nothing clears `:index-min`, which is what the
   JVM does and why the result is always decodable either way."
   ([v] (encode-indexed v nil))
   ([v opts]
-   (let [o (assoc (or opts {}) :stringref false)
+   (when (true? (:stringref opts))
+     (throw (ex-info (str "boring: :stringref true cannot be combined with an index -- "
+                          "boring.nav cannot resolve string references from an offset, "
+                          "so the index would be unusable. Drop one of the two.")
+                     {:type :boring/incompatible-options :stringref true})))
+   (let [o (assoc (or (opt/check-opts opts) {}) :stringref false)
          body (encode v o)
          idx (build-index body o)]
      (if-not idx

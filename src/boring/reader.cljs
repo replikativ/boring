@@ -258,8 +258,24 @@
 ;; as a plausible wrong value rather than an error. The property test that
 ;; guards them compares `skip-from` against where `read!` actually stops.
 
-(defn major-at [^Reader r p] (bit-shift-right (aget (.-buf r) p) 5))
-(defn- info-at [^Reader r p] (bit-and (aget (.-buf r) p) 0x1F))
+(defn- b-at
+  "Unsigned byte at an absolute offset, BOUNDS-CHECKED.
+
+  Mirrors `Reader.b(long)`, whose comment records the same defect on the JVM:
+  the positional accessors had no limit check, so a damaged document gave
+  `decode` a typed error and the navigator an untyped one. Here it was worse
+  than untyped -- `aget` past the end of a Uint8Array yields `undefined`, and
+  `(bit-shift-right undefined 5)` is `0`, so offset 99 of a two-byte buffer read
+  back as an unsigned-integer head of length 0 rather than raising at all."
+  [^Reader r p]
+  (when (or (neg? p) (>= p (.-length (.-buf r))))
+    (err :boring/truncated-input
+         (str "boring: read past the end of the input at offset " p
+              " (size " (.-length (.-buf r)) ")")))
+  (aget (.-buf r) p))
+
+(defn major-at [^Reader r p] (bit-shift-right (b-at r p) 5))
+(defn- info-at [^Reader r p] (bit-and (b-at r p) 0x1F))
 
 (defn head-arg-at
   "The head's argument at `p` -- element count, pair count, or byte length.
@@ -281,77 +297,160 @@
     (when (and (>= info 24) (< info 28)) (arg! r info))
     (let [v (.-pos r)] (set! (.-pos r) save) v)))
 
+(defn- skip-limit
+  "The bound on skip NESTING -- a STACK bound, deliberately not `maxDepth`.
+
+  Mirrors `Reader.skipLimit()` exactly, including the floor: skip cannot
+  reproduce `read`'s depth accounting (a tag reader that consumes its payload's
+  containers inline charges nothing for them), so it is deliberately LAXER than
+  read -- never below 1024, above that whatever the caller allowed read.
+  Making skip STRICTER than read is the failure that matters, because
+  navigation would then refuse a document that decodes."
+  [^Reader r] (max (.-maxDepth r) 1024))
+
+(defn- skip-indefinite-chunks!
+  "Definite-length chunks of `mj` up to the break, all skipped.
+
+  Mirrors `Reader.skipIndefiniteChunks`. The major check is the point: without
+  it `5f 20 ff` (an indefinite BYTE string holding a negative integer) and
+  `7f 41 61 ff` (an indefinite TEXT string holding a byte string) were skipped
+  clean here and refused with `:boring/bad-indefinite-chunk` on the JVM -- so
+  `build-index` in a browser indexed documents neither platform can decode.
+  A chunk head of info 31 falls through to `arg!`, which refuses 28-31, so a
+  nested indefinite chunk is `:boring/reserved-info` on both sides."
+  [^Reader r mj]
+  (loop []
+    (let [h (b-at r (.-pos r))]
+      (set! (.-pos r) (inc (.-pos r)))
+      (when (not== h 0xff)
+        (when (not== mj (bit-shift-right h 5))
+          (err :boring/bad-indefinite-chunk
+               (str "boring: indefinite-length item contains a chunk of major "
+                    (bit-shift-right h 5))
+               {:major (bit-shift-right h 5)}))
+        (let [n (check-count r (arg! r (bit-and h 0x1F)) 1)]
+          (set! (.-pos r) (+ (.-pos r) n)))
+        (recur)))))
+
 (defn skip-from
   "Where the item at `p` ENDS, without building its value.
 
   Decoding and discarding would be simpler and is what a first attempt should
   reach for -- but it allocates the whole structure to learn one integer, which
-  is the cost `build-index` exists to avoid. This walks heads only."
+  is the cost `build-index` exists to avoid. This walks heads only.
+
+  IT MUST ACCEPT EXACTLY WHAT `Reader.skipStructural` ACCEPTS. It is the inner
+  loop of `build-index` and of frame recognition, and an index built here is
+  read by `boring.nav` on the JVM -- so anything this accepts and the JVM
+  refuses is a file one platform will index and the other cannot open.
+
+  EXPLICITLY ITERATIVE, with `stack` standing in for the JVM's recursion. Two
+  separate reasons, both of which cost something before they were understood:
+  a tag chain (`c0 c0 c0 ... 00`, legal CBOR) recursed once per tag, and 20 000
+  open `9f` recursed once per container for an UNTYPED `RangeError` with empty
+  ex-data -- a promise doc/SECURITY.md makes and this broke on the one platform
+  browsers run. Depth is now a NUMBER that is checked, not a stack that runs out.
+
+  One frame per open container, innermost last:
+
+    n >= 0  a definite container still owing `n` items (a map owes 2 per pair)
+    -1      an indefinite array: a break may close it here
+    -2      an indefinite map at a KEY boundary: a break may close it here
+    -3      an indefinite map owing a VALUE: a break here is not a close
+
+  The bottom frame is the single item the caller asked about, so container
+  nesting is `(dec (.-length stack))`. `-3` is what makes `bf 01 ff` -- an
+  indefinite map that breaks between a key and its value -- come out
+  `:boring/unexpected-break` here as it does on the JVM, instead of `:ok`."
   [^Reader r p]
-  (let [save (.-pos r)]
+  (let [save (.-pos r)
+        limit (skip-limit r)
+        stack #js [1]
+        push! (fn [v]
+                (.push stack v)
+                (when (> (dec (.-length stack)) limit)
+                  (err :boring/max-depth-exceeded
+                       (str "boring: nesting deeper than the skip bound (" limit ")")
+                       {:max-depth limit})))]
     (set! (.-pos r) p)
-    (let [end (loop [n 1]                      ; items still owed
-                (if (zero? n)
-                  (.-pos r)
-                  (let [q (.-pos r)
-                        ;; EVERY head is bounds-checked before it is read.
-                        ;; Without this, `aget` past the end of a Uint8Array
-                        ;; yields `undefined` -- which is never the 0xff break
-                        ;; byte and never equal to anything -- so the break
-                        ;; scan below ran forever. Twenty-seven bytes, a real
-                        ;; frame prefix followed by an unclosed `9f`, HUNG
-                        ;; `decode-seq` on this platform where the JVM answered
-                        ;; `:boring/truncated-input`. A hang is worse than a
-                        ;; wrong answer: nothing above it can recover, and this
-                        ;; runs on bytes somebody else wrote.
-                        _ (need! r (- (inc q) (.-pos r)))
-                        mj (major-at r q)
-                        info (info-at r q)]
-                    ;; INDEFINITE IS ONLY LEGAL FOR MAJORS 2-5. Treating
-                    ;; info-31 as indefinite for every major made `1f` and `3f`
-                    ;; -- an integer head with a reserved info -- come out
-                    ;; `:boring/truncated-input` here and `:boring/reserved-info`
-                    ;; on the JVM. Both refuse, so nothing is accepted that
-                    ;; should not be; the types simply disagreed about why.
-                    (when (and (== info 31) (or (< mj 2) (> mj 5)))
-                      (err :boring/reserved-info
-                           (str "boring: reserved additional-info 31 for major type " mj)
-                           {:major mj}))
-                    (if (== info 31)
-                      ;; Indefinite: consume until the break, which owes one more
-                      ;; item each time round rather than a known count.
-                      (do (set! (.-pos r) (inc q))
-                          (recur (+ (dec n) (loop [k 0]
-                                              (need! r 1)
-                                              (if (== 0xff (aget (.-buf r) (.-pos r)))
-                                                (do (set! (.-pos r) (inc (.-pos r))) k)
-                                                (do (set! (.-pos r) (skip-from r (.-pos r)))
-                                                    (recur k)))))))
-                      (let [he (head-end-at r q)
-                            a (head-arg-at r q)]
-                        (set! (.-pos r) he)
-                        ;; DECLARED COUNTS ARE VALIDATED AGAINST THE BYTES THAT
-                        ;; REMAIN, as `Reader.skipStructural` has always done
-                        ;; with `checkCount`. Unchecked, `9b ffffffffffffffff`
-                        ;; owed 2^64 items and the loop below simply did not
-                        ;; finish; and a declared byte-string length past the
-                        ;; end walked `pos` outside the buffer, after which
-                        ;; every read was `undefined`. It also made this
-                        ;; platform BUILD AN INDEX over truncated input -- `8301`
-                        ;; and `a20101` -- that the JVM refuses.
-                        ;;
-                        ;; Bounding the count also bounds the total work: `n`
-                        ;; can never exceed the bytes left, so the walk is
-                        ;; linear in the input rather than in what the input
-                        ;; claims.
-                        (case mj
-                          (2 3) (let [len (check-count r a 1)]
-                                  (set! (.-pos r) (+ he len))
-                                  (recur (dec n)))
-                          4 (recur (+ (dec n) (check-count r a 1)))
-                          5 (recur (+ (dec n) (* 2 (check-count r a 2))))
-                          6 (recur n)            ; a tag owes its payload
-                          (recur (dec n))))))))]
+    (while (pos? (.-length stack))
+      (let [d (dec (.-length stack))
+            top (aget stack d)]
+        (cond
+          ;; A definite container that owes nothing is closed.
+          (zero? top) (.pop stack)
+
+          ;; An indefinite container at a boundary where a break is legal.
+          (and (or (== top -1) (== top -2)) (== 0xff (b-at r (.-pos r))))
+          (do (set! (.-pos r) (inc (.-pos r))) (.pop stack))
+
+          :else
+          (let [q (.-pos r)
+                h (b-at r q)
+                mj (bit-shift-right h 5)
+                info (bit-and h 0x1F)]
+            (set! (.-pos r) (inc q))
+            ;; Settle the parent BEFORE dispatching -- except for a tag, which
+            ;; owes its payload and is settled by whatever the payload turns
+            ;; out to be.
+            (when (not== mj 6)
+              (aset stack d (cond (== top -1) -1        ; indefinite array
+                                  (== top -2) -3        ; key read, value owed
+                                  (== top -3) -2        ; pair complete
+                                  :else (dec top))))
+            (case mj
+              ;; DECLARED COUNTS ARE VALIDATED AGAINST THE BYTES THAT REMAIN,
+              ;; as `Reader.skipStructural` has always done with `checkCount`.
+              ;; Unchecked, `9b ffffffffffffffff` owed 2^64 items and this loop
+              ;; simply did not finish; and a declared byte-string length past
+              ;; the end walked `pos` outside the buffer. Bounding the count
+              ;; also bounds the total work: the outstanding item count can
+              ;; never exceed the bytes left, so the walk is linear in the
+              ;; input rather than in what the input claims.
+              (0 1) (arg! r info)                ; info 28-31 -> :reserved-info
+              (2 3) (if (== info 31)
+                      (skip-indefinite-chunks! r mj)
+                      (let [n (check-count r (arg! r info) 1)]
+                        (set! (.-pos r) (+ (.-pos r) n))))
+              ;; An EMPTY DEFINITE ARRAY costs no nesting and an empty definite
+              ;; map costs one, because that is what `Reader.skipStructural`
+              ;; does -- case 4 returns before `enterSkip()` when n is 0, case 5
+              ;; does not. Mirrored rather than tidied: the two walkers agreeing
+              ;; is worth more here than either one being tidy, and the
+              ;; difference is only observable at the bound itself.
+              4 (if (== info 31)
+                  (push! -1)
+                  (let [n (check-count r (arg! r info) 1)]
+                    (when-not (zero? n) (push! n))))
+              5 (if (== info 31)
+                  (push! -2)
+                  (push! (* 2 (check-count r (arg! r info) 2))))
+              ;; A TAG CHAIN IS CONSUMED INLINE AND BOUNDED BY ITS LENGTH, as
+              ;; the JVM does. Charging each tag to the nesting budget instead
+              ;; was tried there and was wrong: several tag readers parse their
+              ;; payload's head without entering, so a mirrored skip refused
+              ;; `#{}` at a depth decode accepted.
+              6 (do (arg! r info)
+                    (loop [chain 1]
+                      (let [h2 (b-at r (.-pos r))]
+                        (when (== 6 (bit-shift-right h2 5))
+                          (when (> (inc chain) limit)
+                            (err :boring/max-depth-exceeded
+                                 (str "boring: tag chain longer than the skip bound ("
+                                      limit ")")
+                                 {:max-depth limit}))
+                          (set! (.-pos r) (inc (.-pos r)))
+                          (arg! r (bit-and h2 0x1F))
+                          (recur (inc chain))))))
+              ;; Major 7. A break that reaches here is one no indefinite
+              ;; container is waiting for -- `83 ff 01 ff 02 03`, a break inside
+              ;; a DEFINITE array, which this platform used to skip clean and
+              ;; hand to `build-index`.
+              (if (== info 31)
+                (err :boring/unexpected-break
+                     "boring: break code outside an indefinite-length item")
+                (arg! r info)))))))
+    (let [end (.-pos r)]
       (set! (.-pos r) save)
       end)))
 
@@ -660,7 +759,18 @@
     v))
 
 (defn- read-map! [^Reader r n]
-  (if (zero? n) {} (read-map-n! r n)))
+  ;; AN EMPTY MAP COSTS A LEVEL OF `:max-depth`, because it does on the JVM --
+  ;; `Reader.read` case 5 has no `n == 0` short-circuit and calls `enter()`
+  ;; around an empty loop, where case 4 returns the shared empty vector first.
+  ;; Skipping `enter!` here made `[{}]` decode at `:max-depth 1` in a browser
+  ;; and raise `:boring/max-depth-exceeded` on the JVM for the same bytes, so a
+  ;; pipeline that writes in the browser and reads on the server rejected its
+  ;; own valid documents at exactly the setting doc/SECURITY.md tells an
+  ;; operator to tighten. `skip-from` mirrors the same asymmetry.
+  ;;
+  ;; The shared `{}` singleton stays: it is the memory-amplification guard, and
+  ;; it is independent of the depth charge.
+  (if (zero? n) (do (enter! r) (exit! r) {}) (read-map-n! r n)))
 
 ;; Separate function for the same inlining reason as read-array-small!.
 (defn- read-map-small! [^Reader r n]
