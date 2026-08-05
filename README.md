@@ -127,9 +127,11 @@ is the winner. Regenerate with `clojure -M:bench -m published`.
 | str-maps-200 | encode | **23.17** | 25.48 | 23.31 | 36.50 |
 | str-maps-200 | decode | 22.63 | **13.77** | 23.20 | 38.86 |
 
-Against nippy that is a win on all twelve cells. Against [hako][] — an
-experimental codec built for speed, and the fastest thing in this table — it is
-mixed.
+Against nippy that is a win on **every encode cell**, plus the two large map
+payloads on decode — `datom-maps-200` by 2.5×, `str-maps-200` by 1.6×. The four
+small decode cells trade places with nippy run to run; treat them as equal.
+Against [hako][] — an experimental codec built for speed, and the fastest thing
+in this table — it is mixed.
 
 **Read that table with its tier in mind.** It calls a fresh codec per message,
 which is matched across all four libraries but is *not* how hako is meant to be
@@ -155,9 +157,9 @@ nippy's filter, nippy's timing loop), round-trip µs and bytes:
 | `pr-str` + `read-string` | 5 369 | 15 880 |
 | nippy/lzma2 | 9 079 | 3 888 |
 
-Raw, boring is 1.6× nippy/fast. Compressed — which is what a storage layer
-actually writes — boring+zstd matches nippy's default round-trip time at
-**1.7× smaller**. Only nippy/lzma2 goes smaller, at 8× the time.
+Raw, boring is about 1.5× nippy/fast. Compressed — which is what a storage
+layer actually writes — boring+zstd is **1.7× smaller** at within 10% of
+nippy's default round-trip time. Only nippy/lzma2 goes smaller, at 8× the time.
 
 **Where it loses.** hako is faster on deeply nested maps (and 1.4× smaller
 there), 2.4× faster decoding a plain vector of integers, and marginally ahead

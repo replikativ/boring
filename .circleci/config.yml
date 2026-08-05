@@ -114,8 +114,15 @@ jobs:
           command: |
             sudo apt-get update -qq
             sudo apt-get install -y -qq python3-pip
-            pip3 install --user --break-system-packages cbor2 \
-              || pip3 install --user cbor2
+            # FLOORED at 5.5, where cbor2 renamed its pure-Python modules to
+            # _decoder/_encoder/_types. Unpinned, this image resolved something
+            # older and `interop-canonical` died with `cannot import name
+            # _decoder`, while a 5.8.0 workstation was green.
+            # test_canonical_bytes.py accepts both layouts now; the floor is
+            # here so the C-extension/pure-Python PAIR this gate compares is a
+            # known one rather than whatever the image happens to resolve.
+            pip3 install --user --break-system-packages 'cbor2>=5.5,<6' \
+              || pip3 install --user 'cbor2>=5.5,<6'
             if ! command -v cargo >/dev/null 2>&1; then
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
                 | sh -s -- -y --profile minimal --default-toolchain stable

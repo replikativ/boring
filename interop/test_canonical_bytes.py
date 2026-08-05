@@ -50,10 +50,21 @@ import cbor2
 # be given values decoded by their OWN decoder: the C extension's CBORTag and
 # FrozenDict are different classes from `cbor2._types`', and the pure encoder
 # refuses to serialise the C ones.
-from cbor2 import _decoder as py_decoder  # noqa: E402
-from cbor2 import _encoder as py_encoder  # noqa: E402
-from cbor2._types import CBORTag as PyCBORTag  # noqa: E402
-from cbor2._types import FrozenDict as PyFrozenDict  # noqa: E402
+# cbor2 5.5 renamed the pure-Python modules with a leading underscore. Both
+# layouts are accepted because the two are the same code under two names, and
+# pinning the developer's machine is not something this file can do -- CI runs
+# whatever `pip3 install cbor2` yields on its image, which is how this broke:
+# green on a 5.8.0 workstation, ImportError on CI's older build.
+try:                                                   # cbor2 >= 5.5
+    from cbor2 import _decoder as py_decoder  # noqa: E402
+    from cbor2 import _encoder as py_encoder  # noqa: E402
+    from cbor2._types import CBORTag as PyCBORTag  # noqa: E402
+    from cbor2._types import FrozenDict as PyFrozenDict  # noqa: E402
+except ImportError:                                    # cbor2 < 5.5
+    from cbor2 import decoder as py_decoder  # noqa: E402
+    from cbor2 import encoder as py_encoder  # noqa: E402
+    from cbor2.types import CBORTag as PyCBORTag  # noqa: E402
+    from cbor2.types import FrozenDict as PyFrozenDict  # noqa: E402
 
 C_EXT = getattr(cbor2.dumps, "__module__", "") == "_cbor2"
 

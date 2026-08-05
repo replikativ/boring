@@ -82,8 +82,17 @@ Wire size, bytes:
 | long-vec-1k | 2 726 | 2 726 | 2 740 | 2 874 |
 | str-maps-200 | 7 550 | **4 570** | 9 741 | 11 465 |
 
-boring beats nippy on all twelve timing cells, and on size for the two payloads
-where the shape machinery applies. Against hako — an experimental codec built
+boring beats nippy on **all six encode cells** and on size for the two payloads
+where the shape machinery applies. On decode it wins the two large map payloads
+decisively — `datom-maps-200` by 2.5× and `str-maps-200` by 1.6× — and trades
+the other four with nippy inside the noise: nippy takes `small-map` and
+`long-vec-1k` decode in the table above, and a re-measurement on the same
+machine had it take `mixed` and `nested-map-50` decode as well.
+
+This paragraph said "all twelve timing cells" for a while, which the table
+directly above it has never supported — `small-map` decode reads 0.31 against
+nippy's 0.29, and `long-vec-1k` decode 11.05 against 10.23. A claim that its
+own evidence refutes is worse than no claim. Against hako — an experimental codec built
 for speed — it wins the small-payload encodes, ties `datom-maps-200`, wins
 `str-maps-200` decode by 1.7× at **2.1× smaller on the wire**, and loses the
 nested-map and integer-vector rows (see below).
@@ -155,13 +164,17 @@ nippy reports, plus boring and the compressed tiers:
 | `pr-str` + `read-string` | 2 220 | 3 149 | 5 369 | 15 880 |
 | nippy/lzma2 | 6 336 | 2 743 | 9 079 | 3 888 |
 
-Raw against raw, boring is 1.6× nippy/fast and 4.8× fressian on round-trip.
+Raw against raw, boring is about 1.5× nippy/fast and over 4× fressian on
+round-trip. Two measurements on the same machine put those at 1.57×/4.81× and
+1.50×/4.16×; fressian is the one that moves, so the weaker bound is the one
+quoted.
 
 The size column needs the compressed rows to be read fairly: `nippy/freeze`
 compresses above a size threshold, so its 8 518 is a codec *plus* a compressor
 against boring's raw 15 326. Put both behind a compressor and **boring+zstd
-lands at 4 900 bytes in the same 1 102 µs nippy takes for 8 518** — 1.7×
-smaller at equal time. nippy/lzma2 is smaller still at 3 888, for 8× the
+lands at 4 900 bytes against nippy's 8 518, in about the same round-trip
+time** — 1.7× smaller, within 10% on time (measured 1 102 µs against 1 102,
+and 1 186 against 1 099). nippy/lzma2 is smaller still at 3 888, for 8× the
 round-trip. fressian+zstd is 6% smaller than boring+zstd and 2.8× slower.
 
 ## Reading: `byte[]`, FFM, and navigation
