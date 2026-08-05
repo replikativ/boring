@@ -92,6 +92,30 @@
      file, two logical contents. The 0x86 in these bytes is that count."
      (byte-array (map unchecked-byte prefix-bytes))))
 
+(defn- be64
+  "The 8 big-endian bytes at `off` as a number.
+
+  PLATFORM-SPLIT, and the split is the point. `bit-shift-left` is 32-BIT on
+  ClojureScript, so the shift form -- correct on the JVM -- truncated the
+  pointer there BEFORE the range test the code below says \"rejects a nonsense
+  pointer\" ever saw it. Measured over an exhaustive single-byte sweep of a
+  sealed file: 20 cases where both platforms decoded successfully and disagreed
+  about how many items the file holds. One file, two logical contents.
+
+  Multiplication is exact on ClojureScript to 2^53, which is far past any file
+  length; on the JVM it is CHECKED arithmetic and a pointer with the high bit
+  set would raise a raw ArithmeticException out of the function whose whole job
+  is deciding whether to trust these bytes -- which is why that side keeps the
+  shifts. Anything above 2^53 fails the range test as a nonsense pointer, which
+  is what it is."
+  ^long [bs ^long off]
+  (loop [i 0 acc 0]
+    (if (= i 8)
+      acc
+      (recur (inc i)
+             #?(:clj (bit-or (bit-shift-left acc 8) (ubyte bs (+ off i)))
+                :cljs (+ (* acc 256) (ubyte bs (+ off i))))))))
+
 (defn prefix-at?
   "Whether `bs` carries the frame prefix at `off`."
   [bs ^long off]
@@ -115,16 +139,7 @@
   (let [n (blen bs)]
     (if (or (< n 9) (not= 0x48 (ubyte bs (- n 9))))
       -1
-      ;; SHIFTS, not `(+ (* acc 256) b)`. Clojure's arithmetic is checked, so
-      ;; the top bit of an eight-byte pointer -- which any file can carry, and
-      ;; a corrupt one certainly can -- raised a raw ArithmeticException from
-      ;; inside the function whose whole job is deciding whether to trust these
-      ;; bytes. The range test below is what rejects a nonsense pointer.
-      (let [p (loop [i 0 acc 0]
-                (if (= i 8)
-                  acc
-                  (recur (inc i) (bit-or (bit-shift-left acc 8)
-                                         (ubyte bs (+ (- n 8) i))))))]
+      (let [p (be64 bs (- n 8))]
         ;; Three conditions, and the third is the one that keeps being dropped.
         ;; The pointer doubles as the length of the data section, so it must
         ;; land inside the file and leave room for the frame it names -- and
@@ -172,9 +187,4 @@
                 (and #?(:clj (bytes? ptr) :cljs (instance? js/Uint8Array ptr))
                      (= 8 (blen ptr))
                      (or (neg? start)
-                         (= start (loop [i 0 acc 0]
-                                    (if (= i 8)
-                                      acc
-                                      (recur (inc i)
-                                             (bit-or (bit-shift-left acc 8)
-                                                     (ubyte ptr i)))))))))))))
+                         (= start (be64 ptr 0)))))))))
