@@ -82,6 +82,40 @@
                                                  [StandardOpenOption/READ]))]
       (.map ch FileChannel$MapMode/READ_ONLY 0 (.size ch) arena))))
 
+(defn- sub-segment
+  "`seg`, narrowed to `:offset`/`:length` if either is given.
+
+  WHY THIS EXISTS. A CBOR document is not always the whole file. konserve
+  writes a blob as a 20-byte header, then metadata, then the value -- so the
+  value a caller wants to navigate begins partway in, and mapping from zero
+  addresses the header as though it were CBOR.
+
+  `MemorySegment.asSlice` is the whole mechanism and it already worked; what
+  was missing was a way to ASK for it without reaching past this namespace
+  into `asSlice` and `segment-source` by hand. `:length` defaults to the rest
+  of the segment, which is the common case -- a trailing value.
+
+  Bounds are checked here rather than left to `asSlice`, whose
+  IndexOutOfBoundsException says nothing about why a caller's offset was
+  wrong."
+  ^MemorySegment [^MemorySegment seg {:keys [offset length]}]
+  (if (and (nil? offset) (nil? length))
+    seg
+    (let [total (.byteSize seg)
+          off   (long (or offset 0))
+          len   (long (or length (- total off)))]
+      (when (or (neg? off) (> off total))
+        (throw (ex-info (str "boring.mmap: :offset " off " is outside the file, "
+                             "which is " total " bytes")
+                        {:type :boring/bad-argument :offset off :size total})))
+      (when (or (neg? len) (> (+ off len) total))
+        (throw (ex-info (str "boring.mmap: :offset " off " plus :length " len
+                             " runs past the end of the file, which is " total
+                             " bytes")
+                        {:type :boring/bad-argument
+                         :offset off :length len :size total})))
+      (.asSlice seg off len))))
+
 (defn mmap-source
   "Map `file` and return `[cursor arena]` -- a `boring.nav` cursor at the root,
   and the arena that owns the mapping.
@@ -92,7 +126,15 @@
 
   The file must have been written with `{:stringref false}` -- see
   `boring.nav`, which refuses a stringref document rather than resolving
-  references wrongly."
+  references wrongly.
+
+  `:offset` and `:length` narrow the mapping to PART of the file, for a
+  document that is not the whole of it. konserve stores a blob as a 20-byte
+  header, then metadata, then the value, so navigating the value means
+
+      (mmap-source path {:offset (+ 20 meta-size)})
+
+  `:length` defaults to the rest of the file."
   ([file] (mmap-source file nil))
   ([file opts]
    ;; The arena is CLOSED if anything after it throws. It owns the mapping, and
@@ -102,7 +144,7 @@
    ;; mapping with no handle left to close it.
    (let [arena (Arena/ofShared)]
      (try
-       (let [seg (mmap-segment file arena)]
+       (let [seg (sub-segment (mmap-segment file arena) opts)]
          [(nav/source (segment-source seg) opts) arena])
        (catch Throwable t
          (.close ^java.lang.AutoCloseable arena)
@@ -130,7 +172,7 @@
    ;; mapping with no handle left to close it.
    (let [arena (Arena/ofShared)]
      (try
-       (let [seg (mmap-segment file arena)]
+       (let [seg (sub-segment (mmap-segment file arena) opts)]
          [(nav/items (segment-source seg) opts) arena])
        (catch Throwable t
          (.close ^java.lang.AutoCloseable arena)

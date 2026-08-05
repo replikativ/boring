@@ -76,6 +76,21 @@ here.
   that only wants to warn can return the default instead of reimplementing it,
   which is how the two would drift apart.
 
+- **`boring.mmap/mmap-source` and `mmap-items` take `:offset` and `:length`**,
+  narrowing the mapping to part of a file. A CBOR document is not always the
+  whole file: konserve stores a blob as a 20-byte header, then metadata, then
+  the value, so the value begins partway in and mapping from zero addresses
+  the header as though it were CBOR.
+
+      (mmap/mmap-source path {:offset (+ 20 meta-size)})
+
+  `:length` defaults to the rest of the file. An offset or length past the end
+  is a typed `:boring/bad-argument` naming the file size, rather than an
+  `IndexOutOfBoundsException` from `MemorySegment.asSlice`.
+
+  The mechanism already worked — `asSlice` plus `segment-source` — but only by
+  reaching past `boring.mmap` into both. This is the way to ask for it.
+
 ### Changed
 
 - **BREAKING, ClojureScript: a reserved tag-27 marker naming a type
