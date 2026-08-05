@@ -2918,3 +2918,25 @@
                  back (boring/decode (boring/encode p) {:registry via-class})]
              (is (= p back)
                  "register-record-class must register the name encode writes")))))))
+
+(deftest a-bignum-and-an-equal-integer-are-one-key
+  (testing "`{1: true, 2(h'01'): false}` decoded as a TWO-entry map in a browser
+            and raised `:boring/duplicate-map-key` on the server -- a parser
+            differential in the direction COMPATIBILITY.md does not consider, a
+            document a browser accepts and the JVM refuses. Both platforms
+            decode `c2 41 01` to a bignum; the JVM's `(= 1 1N)` is true and
+            ClojureScript's `(= 1 (js/BigInt 1))` is false, so it was the
+            duplicate check's equality that differed, not the decoded values.
+
+            A CHOICE, unlike `1` versus `1.0`, which JavaScript genuinely
+            cannot tell apart. boring's own canonical rule reduces a bignum
+            that fits to a basic integer, so treating them as one key is what
+            the rest of the codec already believes."
+    (is (= :boring/duplicate-map-key
+           (err-type #(boring/decode (c/hex->bytes "a201f5c24101f4")))))
+    (testing "the control: a bignum that is NOT equal to the integer key stays
+              a second key, so the check has not become a blanket refusal"
+      (is (= 2 (count (boring/decode
+                       (c/hex->bytes "a2c249010000000000000000f501f4"))))))
+    (testing "and two plainly different integer keys are untouched"
+      (is (= 2 (count (boring/decode (c/hex->bytes "a201f502f4"))))))))

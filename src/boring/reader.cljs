@@ -648,6 +648,25 @@
   [a b]
   (or (identical? a b)
       (= a b)
+      ;; A BIGNUM AND A NUMBER THAT AGREE ARE ONE KEY, as they are on the JVM
+      ;; where `(= 1 1N)` is true. Here `(= 1 (js/BigInt 1))` is false, so
+      ;; `{1: true, 2(h'01'): false}` decoded as a TWO-entry map in a browser
+      ;; and raised `:boring/duplicate-map-key` on the server -- a parser
+      ;; differential in the direction `doc/COMPATIBILITY.md` does not consider,
+      ;; a document a browser accepts and the JVM refuses.
+      ;;
+      ;; This one is a CHOICE, unlike `1` versus `1.0` and `0` versus `-0.0`:
+      ;; those two JavaScript genuinely cannot tell apart, so calling them
+      ;; duplicates is forced. Both platforms decode `c2 41 01` to a bignum, and
+      ;; boring's own canonical rule reduces a bignum that fits to a basic
+      ;; integer -- so treating them as one key is what the rest of the codec
+      ;; already believes.
+      (let [ba (= "bigint" (goog/typeOf a))
+            bb (= "bigint" (goog/typeOf b))]
+        (and (or ba bb)
+             (or (not ba) (not (js/isNaN (js/Number a))))
+             (or (not bb) (not (js/isNaN (js/Number b))))
+             (== (js/Number a) (js/Number b))))
       (and (array-key? a) (array-key? b)
            (= (array-content-key a) (array-content-key b)))))
 
