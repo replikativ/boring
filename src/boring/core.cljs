@@ -155,6 +155,7 @@
 
 (defn- configure-reader! [^rd/Reader r opts]
   (set! (.-tolerateUnknownTags r) (boolean (get opts :tolerate-unknown-tags true)))
+  (set! (.-onUnknownRecord r) (get opts :on-unknown-record :fallback))
   ;; `:instant-type` is a FUNCTION here, not the JVM's `:date`/`:instant`
   ;; keyword. JavaScript has one time type, so the keyword choice has no
   ;; counterpart -- but a caller using a cross-platform time library
@@ -213,6 +214,18 @@
   `:tolerate-unknown-tags` (default true) makes an unregistered tag surface as
   a `boring.data/TaggedValue`; false makes it an error, which is the
   closed-reader behaviour datahike's dump requirements ask for.
+
+  `:on-unknown-record` is the same choice for a tag-27 NAME no registry
+  resolves — `:fallback` (default) for the `UnknownRecord`/`TaggedLiteral`
+  carrier, `:error` for `:boring/unregistered-record`, or `(fn [name payload])`
+  whose return value is used. `boring.data/frame-for` is the default rule, so a
+  handler that only wants to warn can return it rather than reimplement it.
+
+  Reserved marker names (`clojure/char`, `java/period`, …) never reach this.
+  They are KNOWN names, and on this platform they reach the same fallback
+  helper as an unregistered name because the TYPE behind them is missing here —
+  which is precisely how they would have tripped a policy that is not about
+  them.
 
   Options are validated by the SHARED `boring.options` spec, so a typo is
   refused here exactly as it is on the JVM. `:auto-construct-records?` is the

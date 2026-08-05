@@ -47,6 +47,35 @@ here.
   cbor2 and Rust ciborium over 989 values, byte for byte.
 - [doc/STORAGE.md](doc/STORAGE.md).
 
+- **`:on-unknown-record`**, a decode option for what a tag-27 name no registry
+  resolves should become: `:fallback` (the default, unchanged — the
+  `UnknownRecord`/`TaggedLiteral` carrier), `:error` for
+  `:boring/unregistered-record`, or `(fn [name payload])` whose return value is
+  used.
+
+  The default is lossless passthrough, which is why the carrier exists: a relay
+  must be able to carry a type it has no constructor for. `:error` is for the
+  opposite need, because that passthrough makes a registry that can *never*
+  match completely silent — a record simply arrives as an `UnknownRecord`, with
+  no error and no warning. That is not hypothetical: it is how the record wire
+  name change below went unnoticed in boring's own nippy suite.
+
+  There is deliberately no `:warn`. boring would have to own an output channel
+  (`*err*` versus `js/console.warn`) and the dedupe state to keep a 200 000-item
+  log from flooding, and neither is testable without capturing output. The
+  function form is that capability without boring choosing a logger for anyone:
+
+      (boring/decode bs {:on-unknown-record
+                         (fn [nm payload]
+                           (log/warn "unregistered record" nm)
+                           (boring.data/frame-for nm payload))})
+
+- **`boring.data/frame-for`**, the rule both readers use to pick a carrier for
+  an unresolvable tag-27 frame — `UnknownRecord` for a map payload, a
+  `TaggedLiteral` for anything else. Public so an `:on-unknown-record` handler
+  that only wants to warn can return the default instead of reimplementing it,
+  which is how the two would drift apart.
+
 ### Changed
 
 - **BREAKING, ClojureScript: a reserved tag-27 marker naming a type

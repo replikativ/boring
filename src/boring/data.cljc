@@ -324,6 +324,24 @@
     :else (throw (ex-info "boring: not a tag-27 frame"
                           {:type :boring/not-a-frame :value x}))))
 
+(defn frame-for
+  "The value an unregistered tag-27 frame decodes to: `name` and `payload` in
+  whichever carrier the payload's SHAPE calls for.
+
+  Public because `:on-unknown-record` hands you the two pieces and uses what
+  you return, so a handler that only wants to warn needs the default rule to
+  return -- and reimplementing it is how the two would drift. Both readers
+  apply exactly this.
+
+  The choice is by payload shape and never by a claim about the sender: tag 27
+  carries no record/non-record bit and could not, since its content is
+  `[type-name, *constructor-args]`."
+  [name payload]
+  (if (map? payload)
+    (unknown-record name payload)
+    #?(:clj (clojure.lang.TaggedLiteral/create (symbol name) payload)
+       :cljs (tagged-literal (symbol name) payload))))
+
 (defn frame-payload
   "The payload of an unregistered tag-27 frame: a field map for an
   `UnknownRecord`, whatever was written for a `TaggedLiteral`."

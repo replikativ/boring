@@ -524,6 +524,10 @@
   Not part of the supported API."
   ^Reader [^Reader r opts]
   (set! (.-tolerateUnknownTags r) (boolean (get opts :tolerate-unknown-tags true)))
+  ;; Passed through as-is: `:fallback`, `:error`, or a function of
+  ;; [name payload]. The Reader distinguishes them, and deliberately does NOT
+  ;; use `ifn?` to do it -- see `Reader.onUnknownRecord`.
+  (set! (.-onUnknownRecord r) (get opts :on-unknown-record :fallback))
   (let [it (get opts :instant-type :date)]
     ;; A FUNCTION is legal on both platforms -- see `Reader.instantFn`. This
     ;; honoured only the two keywords, so a portable caller passing a
@@ -560,7 +564,28 @@
 
   `:tolerate-unknown-tags` (default true) makes an unregistered tag surface as
   a `boring.data/TaggedValue`; false makes it an error, which is the closed-reader
-  behaviour datahike's dump requirements ask for."
+  behaviour datahike's dump requirements ask for.
+
+  `:on-unknown-record` is the same choice for a tag-27 NAME no registry
+  resolves — `:fallback` (default) for the `UnknownRecord`/`TaggedLiteral`
+  carrier, `:error` for `:boring/unregistered-record`, or `(fn [name payload])`
+  whose return value is used:
+
+      ;; records or nothing
+      (boring/decode bs {:registry reg :on-unknown-record :error})
+
+      ;; warn and carry on -- `frame-for` is the default rule, so a handler
+      ;; that only wants to log does not reimplement it
+      (boring/decode bs {:on-unknown-record
+                         (fn [nm payload]
+                           (log/warn \"unregistered record\" nm)
+                           (boring.data/frame-for nm payload))})
+
+  The default is lossless passthrough, which is why the carrier exists: a relay
+  must be able to carry a type it has no constructor for. `:error` is for the
+  opposite case — a registration that can never match is otherwise SILENT, and
+  a record simply arrives as an `UnknownRecord`. Reserved marker names
+  (`clojure/char`, `java/period`, …) are known names and never reach this."
   ([^bytes bs] (decode bs nil))
   ([^bytes bs opts]
    (with-decode-errors (.read (configure-reader! (Reader. (bytes! bs "decode"))

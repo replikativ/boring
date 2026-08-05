@@ -147,7 +147,18 @@
    ["profile unknown"        {:profile :nope}           #{:decode :encode}]
    ["float-policy unknown"   {:float-policy :nope}      #{:encode}]
    ["encode-fallback bad"    {:encode-fallback :nope}   #{:encode}]
-   ["registry number"        {:registry 5}              #{:decode :encode}]])
+   ["registry number"        {:registry 5}              #{:decode :encode}]
+   ;; `:on-unknown-record` takes two keywords or a function, and the keywords
+   ;; must be checked BEFORE callability rather than after: a Clojure keyword
+   ;; is `ifn?`, so a reader that tested callability first would invoke
+   ;; `:fallback` as a function of [name payload]. The valid rows are here so
+   ;; that a side which forgot to accept the option at all fails on them, and
+   ;; the invalid ones so that neither side quietly widens to "anything goes".
+   ["on-unknown-record fallback" {:on-unknown-record :fallback} #{:decode}]
+   ["on-unknown-record error"    {:on-unknown-record :error}    #{:decode}]
+   ["on-unknown-record fn"       {:on-unknown-record (fn [_ p] p)} #{:decode}]
+   ["on-unknown-record unknown"  {:on-unknown-record :nope}     #{:decode}]
+   ["on-unknown-record number"   {:on-unknown-record 5}         #{:decode}]])
 
 (defn run
   "The whole matrix as `{[side label entry] verdict}`."

@@ -25,6 +25,13 @@
    [:decode "max-items legal"]       :ok
    [:decode "chunk-size legal"]      :ok
    [:decode "profile interop"]       :ok
+   ;; All three legal forms must be ACCEPTED by every decode entry point. The
+   ;; `:fallback` row is not redundant with `default`: a reader that tested
+   ;; callability before the keywords would accept it here and then invoke it,
+   ;; and only these rows plus `on-unknown-record-policies` distinguish those.
+   [:decode "on-unknown-record fallback"] :ok
+   [:decode "on-unknown-record error"]    :ok
+   [:decode "on-unknown-record fn"]       :ok
    [:decode "max-depth nil"]         :boring/bad-option
    [:decode "max-depth string"]      :boring/bad-option
    [:decode "max-depth fractional"]  :boring/bad-option
@@ -37,6 +44,8 @@
    [:decode "chunk-size string"]     :boring/bad-option
    [:decode "chunk-size zero"]       :boring/bad-option
    [:decode "chunk-size negative"]   :boring/bad-option
+   [:decode "on-unknown-record unknown"] :boring/bad-option
+   [:decode "on-unknown-record number"]  :boring/bad-option
    [:decode "profile unknown"]       :boring/unknown-profile
    [:decode "registry number"]       :boring/bad-option
 

@@ -87,6 +87,30 @@ public final class Reader {
      *  REQUIREMENTS.md §7 wants strict-by-default; set false for that. */
     public boolean tolerateUnknownTags = true;
 
+    /**
+     * `:on-unknown-record` — what to do with a tag-27 name nothing recognises:
+     * the keyword {@code :fallback} (the default), the keyword {@code :error},
+     * or an {@code IFn} of [name payload] whose return value is used.
+     *
+     * <p>Held as Object and dispatched on identity against the two keywords,
+     * NOT by an {@code instanceof IFn} test — a Clojure keyword implements
+     * IFn, so a keyword-first design that tested callability would invoke
+     * {@code :fallback} as a function. That confusion already shipped once on
+     * this branch: {@code :date} and {@code :instant} were invoked as instant
+     * constructors and every instant decoded to null, silently, because
+     * invoking a keyword is legal.
+     *
+     * <p>Only consulted for a name nothing recognises. boring's own reserved
+     * markers ({@code clojure/char}, {@code java/period}, …) are KNOWN names
+     * and never reach it, even on a platform lacking the type behind one.
+     */
+    static final clojure.lang.Keyword KW_FALLBACK =
+        clojure.lang.Keyword.intern("fallback");
+    static final clojure.lang.Keyword KW_ERROR =
+        clojure.lang.Keyword.intern("error");
+
+    public Object onUnknownRecord = KW_FALLBACK;
+
     /** Which JVM type tag 1004 produces. LocalDate is the modern type and the
      *  default; java.sql.Date exists for code still on the JDBC type. */
     public boolean fullDateAsSqlDate = false;
@@ -290,6 +314,13 @@ public final class Reader {
         static final clojure.lang.IFn MAKE_TAGGED;
         static final Object UNDEFINED;
         static final clojure.lang.IFn MAKE_UNKNOWN_RECORD;
+        /**
+         * The shape rule for an unresolvable tag-27 frame, shared with
+         * ClojureScript and public so an `:on-unknown-record` handler that
+         * only wants to warn can return the default rather than reimplement
+         * it — which is how the two would drift apart.
+         */
+        static final clojure.lang.IFn FRAME_FOR;
 
         static {
             try {
@@ -299,6 +330,7 @@ public final class Reader {
                 MAKE_TAGGED = clojure.lang.RT.var("boring.data", "tagged-value");
                 UNDEFINED = clojure.lang.RT.var("boring.data", "undefined").deref();
                 MAKE_UNKNOWN_RECORD = clojure.lang.RT.var("boring.data", "unknown-record");
+                FRAME_FOR = clojure.lang.RT.var("boring.data", "frame-for");
             } catch (Exception e) {
                 throw new ExceptionInInitializerError(e);
             }
@@ -2772,15 +2804,23 @@ public final class Reader {
                 // Anything else becomes a clojure.lang.TaggedLiteral, which
                 // offers :tag and :form and never promises map-ness, so the
                 // same operations fail as ordinary "not a map" errors.
-                if (argument instanceof java.util.Map) {
-                    if (autoConstructRecords) {
-                        Object built = tryConstructRecord(name, argument);
-                        if (built != null) return built;
-                    }
-                    return Data.MAKE_UNKNOWN_RECORD.invoke(name, argument);
+                if (argument instanceof java.util.Map && autoConstructRecords) {
+                    Object built = tryConstructRecord(name, argument);
+                    if (built != null) return built;
                 }
-                return clojure.lang.TaggedLiteral.create(
-                    clojure.lang.Symbol.intern(name), argument);
+                // `:on-unknown-record`, and this is the ONLY place it applies:
+                // every earlier return above resolved the name, through the
+                // registry or a reserved marker. Auto-construction is tried
+                // first, so a policy of :error fires only when nothing at all
+                // could build the type.
+                if (onUnknownRecord == KW_ERROR)
+                    throw Err.of("unregistered-record",
+                        "boring: no record constructor registered for \"" + name
+                        + "\" and :on-unknown-record is :error",
+                        "tag", 27L);
+                if (onUnknownRecord != KW_FALLBACK && onUnknownRecord != null)
+                    return ((clojure.lang.IFn) onUnknownRecord).invoke(name, argument);
+                return Data.FRAME_FOR.invoke(name, argument);
             }
             case 1002: {                                     // duration, RFC 9581 4
                 Object v = read();

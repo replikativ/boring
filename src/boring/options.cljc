@@ -263,6 +263,27 @@
                     :want ":local-date or :sql-date"}
    :encode-fallback {:pred #(or (nil? %) (= :placeholder %) (callable? %))
                      :want "nil, :placeholder, or a function"}
+   ;; What an unregistered tag-27 name decodes to.
+   ;;
+   ;;   :fallback  UnknownRecord / TaggedLiteral (the default -- lossless
+   ;;              passthrough, which is why the carrier exists)
+   ;;   :error     :boring/unregistered-record
+   ;;   a function of [name payload], whose return value is used
+   ;;
+   ;; `:error` exists because passthrough HIDES a registry that can never
+   ;; match. When a record's wire name became `namespace/Name`, a registration
+   ;; still keyed on the munged class name stopped matching and the records
+   ;; came back as UnknownRecord with no error -- caught here only by a suite
+   ;; that asserted equality with the input.
+   ;;
+   ;; No `:warn`: boring would have to own an output channel (`*err*` versus
+   ;; `js/console.warn`) and the dedupe state to keep a 200 000-item log from
+   ;; flooding, and neither is testable without capturing output. The function
+   ;; form is that capability without boring choosing a logger for anyone --
+   ;; `boring.data/frame-for` is public so a handler can warn and then return
+   ;; the default.
+   :on-unknown-record {:pred #(or (#{:fallback :error} %) (callable? %))
+                       :want ":fallback, :error, or a function of [name payload]"}
    ;; How much of a sealed index to believe, for `boring.nav`.
    ;;
    ;;   :trusted  use it (the default, and today's behaviour)

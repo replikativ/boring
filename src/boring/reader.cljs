@@ -73,12 +73,18 @@
                  ;; Node. 0 means unlimited, which is the default.
                  ^:mutable maxItems
                  ^:mutable items
+                 ;; `:fallback` (the default), `:error`, or a function of
+                 ;; [name payload]. Only ever consulted for a name NOTHING
+                 ;; recognises -- not for boring's own reserved markers, whose
+                 ;; names are known even where the type is not.
+                 ^:mutable onUnknownRecord
                  ^:mutable registry])
 
 (defn reader
   [^js/Uint8Array bs]
   (Reader. bs (js/DataView. (.-buffer bs) (.-byteOffset bs) (.-byteLength bs))
-           0 #js [] #js [] false (js/Map.) 0 1024 true nil true true 0 0 nil))
+           0 #js [] #js [] false (js/Map.) 0 1024 true nil true true 0 0
+           :fallback nil))
 
 (defn reset! [^Reader r ^js/Uint8Array bs]
   (set! (.-buf r) bs)
@@ -940,11 +946,50 @@
   they already were and could not demonstrate: both writers encode a
   `TaggedLiteral` to its frame, so `(encode (tagged-literal 'clojure/char
   \"a\"))` produces the same bytes here as the JVM writes for a real `\\a`, and
-  a JVM peer decodes it to `\\a`. Only the receive half was missing."
+  a JVM peer decodes it to `\\a`. Only the receive half was missing.
+
+  NOT the place `:on-unknown-record` hooks. These names ARE known -- they are
+  boring's own reserved markers -- and only the type behind them is missing on
+  this platform, so a caller who asked to be told about unregistered records
+  must not hear about `clojure/char`. That policy applies at the default
+  branch, which is the one reached by a name nothing recognises."
   [nm argument]
-  (if (map? argument)
-    (data/unknown-record nm argument)
-    (tagged-literal (symbol nm) argument)))
+  (data/frame-for nm argument))
+
+(defn- unknown-record!
+  "`frame-fallback` under the `:on-unknown-record` policy.
+
+  Reached only for a tag-27 name nothing recognises. The default is
+  `:fallback`, which is lossless passthrough and the whole reason
+  `UnknownRecord` exists -- a relay must be able to carry a type it has no
+  constructor for.
+
+  `:error` exists because that passthrough hides a registration that can never
+  match. When a record's wire name became `namespace/Name`, a registry still
+  keyed on the old munged class name simply stopped matching, and the records
+  came back as `UnknownRecord` with no error and no warning -- boring's own
+  nippy suite is where that was eventually caught, by asserting equality with
+  the input. A consumer who wants records or nothing can now say so."
+  [^Reader r nm argument]
+  (let [policy (.-onUnknownRecord r)]
+    (cond
+      (= :error policy)
+      (err :boring/unregistered-record
+           (str "boring: no record constructor registered for " (pr-str nm)
+                " and :on-unknown-record is :error")
+           {:tag 27 :record-name nm})
+
+      ;; THE KEYWORDS FIRST, and not by falling through to an `ifn?` test: a
+      ;; keyword IS `ifn?`, so `:fallback` would be INVOKED as a function
+      ;; here. That exact confusion already shipped once on this branch --
+      ;; `:date` and `:instant` were called as instant constructors and
+      ;; returned nil -- and it is silent, because invoking a keyword is
+      ;; legal.
+      (= :fallback policy) (data/frame-for nm argument)
+
+      (some? policy) (policy nm argument)
+
+      :else (data/frame-for nm argument))))
 
 (defn- sorted-content
   "`(into coll xs)` with incomparable members reported as a typed error.
@@ -2035,7 +2080,9 @@
                                  "period: " (pr-str argument))
                             {:tag 27})))
                    (frame-fallback nm argument))
-               (frame-fallback nm argument)))))
+               ;; The one place `:on-unknown-record` applies: a name nothing
+               ;; recognises -- not the registry, not a reserved marker.
+               (unknown-record! r nm argument)))))
     ;; The registry was consulted above, before the built-ins.
     (if (.-tolerateUnknownTags r)
       (data/tagged-value tag (read! r))

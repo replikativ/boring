@@ -3009,6 +3009,70 @@
            (c/bytes->hex (boring/encode (tagged-literal 'java/char-array "ab")
                                         {:stringref false}))))))
 
+(deftest on-unknown-record-policies
+  ;; 27(["my-ns/Rec", {"x": 1}]) and 27(["my-ns/Pos", [1, 2]]) -- the two
+  ;; payload shapes, since the fallback branches on shape.
+  (let [mapped "d81b82696d792d6e732f526563a1d827623a7801"
+        posed  "d81b82696d792d6e732f506f73820102"]
+    (testing "the default is unchanged: lossless passthrough, which is the
+              whole reason the carrier exists -- a relay must be able to carry
+              a type it has no constructor for"
+      (is (data/unknown-record? (boring/decode (c/hex->bytes mapped))))
+      (is (= "my-ns/Rec" (data/frame-name (boring/decode (c/hex->bytes mapped)))))
+      (is (= [1 2] (data/frame-payload (boring/decode (c/hex->bytes posed)))))
+      (is (= "my-ns/Rec" (data/frame-name
+                          (boring/decode (c/hex->bytes mapped)
+                                         {:on-unknown-record :fallback})))))
+
+    (testing ":error is the opt-out. Passthrough HIDES a registry that can
+              never match: when a record's wire name became `namespace/Name`, a
+              registration still keyed on the munged class name stopped
+              matching and the records came back as UnknownRecord with no
+              error at all"
+      (is (= :boring/unregistered-record
+             (err-type #(boring/decode (c/hex->bytes mapped)
+                                       {:on-unknown-record :error}))))
+      (is (= :boring/unregistered-record
+             (err-type #(boring/decode (c/hex->bytes posed)
+                                       {:on-unknown-record :error})))))
+
+    (testing "a function receives [name payload] and its return value is used,
+              which is how a caller warns without boring owning a logger"
+      (is (= [:saw "my-ns/Rec" {:x 1}]
+             (boring/decode (c/hex->bytes mapped)
+                            {:on-unknown-record (fn [nm p] [:saw nm p])})))
+      (testing "and `data/frame-for` gives back the default, so a
+                warn-then-continue handler does not reimplement the rule"
+        (is (= "my-ns/Rec"
+               (data/frame-name
+                (boring/decode (c/hex->bytes mapped)
+                               {:on-unknown-record
+                                (fn [nm p] (data/frame-for nm p))}))))))
+
+    (testing "RESERVED MARKERS ARE NOT UNKNOWN RECORDS. Their names are known
+              even where the type behind one is not, so `clojure/char` must not
+              trip a policy about unregistered names -- on ClojureScript it
+              reaches the very same fallback helper, which is exactly how it
+              would have"
+      (let [ch "d81b826c636c6f6a7572652f636861726161"]
+        (is (= ch (c/bytes->hex
+                   (boring/encode (boring/decode (c/hex->bytes ch)
+                                                 {:on-unknown-record :error})
+                                  {:stringref false}))))))
+
+    (testing "and neither is a name the registry resolves"
+      (let [reg (boring/register-record (boring/tag-registry) "my-ns/Rec"
+                                        (fn [m] [:built m]))]
+        (is (= [:built {:x 1}]
+               (boring/decode (c/hex->bytes mapped)
+                              {:registry reg :on-unknown-record :error})))))
+
+    (testing "a value that is neither keyword nor callable is refused, rather
+              than silently meaning one of them"
+      (is (= :boring/bad-option
+             (err-type #(boring/decode (c/hex->bytes mapped)
+                                       {:on-unknown-record 5})))))))
+
 (def ^:private period-verdicts
   "Pinned accept/reject for `java/period`, and byte stability for every accept.
 

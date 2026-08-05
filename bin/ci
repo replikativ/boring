@@ -153,6 +153,15 @@ stage_hasch () {
 }
 
 stage_cljs () {
+  # DELETED FIRST. `run` records a failure and carries on, so a failed compile
+  # left the PREVIOUS run's target/cljs-test.js in place and `cljs-tests`
+  # happily ran it -- reporting ok, with the old test count, against code that
+  # does not compile. Observed: a broken docstring in reader.cljs failed
+  # cljs-compile while cljs-tests passed 178 tests from a stale build.
+  #
+  # Removing the artifact rather than gating on the compile's exit status,
+  # because it also catches a compile that "succeeds" and writes nothing.
+  rm -f target/cljs-test.js
   run cljs-compile clojure -M:cljs-deps -m cljs.main \
       -co '{:language-in :ecmascript-next}' -O advanced -t node \
       -o target/cljs-test.js -c cljsbench.runner
@@ -246,6 +255,10 @@ stage_fuzz () {
 }
 
 stage_fuzz_cljs () {
+  # Same stale-artifact hole as stage_cljs, and it fired in the same run:
+  # fuzz-cljs-compile FAILED and fuzz-cljs reported ok, fuzzing the previous
+  # build.
+  rm -f target/cljs-fuzz.js
   run fuzz-cljs-compile clojure -M:cljs-deps -m cljs.main \
       -co '{:language-in :ecmascript-next}' -O advanced -t node \
       -o target/cljs-fuzz.js -c cljsbench.fuzz
