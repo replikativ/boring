@@ -92,7 +92,8 @@
   The practical consequence: a diff in this file after running the generator
   proves nothing on its own. Run the two checkers. They are what decides
   whether the committed copy is stale."
-  (:require [boring.core :as boring])
+  (:require [boring.core :as boring]
+            [clojure.string :as str])
   (:import (java.util Arrays)))
 
 ;; Both canonical profiles, for every case. `:canonical-rfc7049` is what the
@@ -316,9 +317,20 @@
    ["order-prefix-texts"     {"a" 1 "aa" 2 "aaa" 3 "" 4}]
    ["order-prefix-bytes"     {(byte-array 0) 1 (bs 1 0) 2 (bs 2 0) 3 (bs 1 1) 4}]
    ["order-bytes-vs-text"    {(byte-array (map unchecked-byte [0x61])) 1 "a" 2}]
-   ["order-mixed-majors"     {0 "int" "s" "text" (bs 1 0x61) "bytes"
-                              [] "array" {} "map" true "bool" nil "null"
-                              1.5 "float" 1000 "wide-int"}]
+   ;; `array-map`, NOT a map literal, and the reason is this fixture's
+   ;; reproducibility rather than anything about the case. Nine entries is one
+   ;; past the array-map threshold, so a literal becomes a PersistentHashMap --
+   ;; and one key here is a byte array, which hashes by IDENTITY. Its slot
+   ;; therefore moved on every JVM run, the `value` field carries boring's
+   ;; iteration-order `:interop` encoding, and the committed fixture came out
+   ;; different every time `bin/ci` regenerated it. Not an encoder fault: the
+   ;; map's own order varied and boring wrote it faithfully. The canonical
+   ;; expectations in this row sort their keys, so the property under test is
+   ;; unaffected by the input order and this changes nothing about what is
+   ;; checked.
+   ["order-mixed-majors"     (array-map 0 "int" "s" "text" (bs 1 0x61) "bytes"
+                                        [] "array" {} "map" true "bool" nil "null"
+                                        1.5 "float" 1000 "wide-int")]
    ["order-nfc-vs-nfd"       {"é" 1 "é" 2}]
    ["order-nested-maps"      {"outer" {1000 "x" "a" "y"}
                               [1000 "z"] {24 "q" (byte-array 0) "r"}}]
@@ -332,6 +344,11 @@
    ;; and this corpus's Rust checker all apply the map-key rule to elements,
    ;; which is a convention, not a standard. Stated so it is not mistaken for
    ;; conformance.
+   ;; A byte string inside a set, which the generated sets can no longer carry
+   ;; -- see `gen-cases`. ONE element on purpose: a byte array hashes by
+   ;; identity, so any set holding one alongside others iterates differently
+   ;; on every JVM run, and a singleton has no order to vary.
+   ["order-set-singleton-bytes" #{(bs 1 0x61)}]
    ["order-set-mixed"        #{1000 "a" 24 [] nil true}]
    ["order-set-ints"         #{0 23 24 255 256 -1 -24 -25}]])
 
@@ -419,26 +436,52 @@
   (let [rnd (java.util.Random. 20260803)
         pick (fn [^java.util.List coll] (nth coll (.nextInt rnd (count coll))))
         keys-n (fn [k] (map #(nth key-pool %)
-                            (take k (distinct (repeatedly #(.nextInt rnd (count key-pool)))))))]
+                            (take k (distinct (repeatedly #(.nextInt rnd (count key-pool)))))))
+        ;; INSERTION ORDER, not hash order. `zipmap` builds a
+        ;; PersistentHashMap, and `key-pool` holds five byte arrays, which hash
+        ;; by IDENTITY -- so a generated map holding one landed its entries in
+        ;; a different order on every JVM run. `array-map` keeps the order it
+        ;; is given at any size (only `assoc` promotes past 8), and boring
+        ;; writes a map in iteration order, so this is what makes the emitted
+        ;; bytes reproducible. It does not change WHAT is tested: the canonical
+        ;; expectations sort their keys, which is the property under test.
+        omap (fn [ks] (apply array-map
+                             (interleave ks (repeatedly (count ks)
+                                                        #(pick value-pool)))))]
     (for [i (range n)
           :let [kind (mod i 4)]]
       (case kind
         ;; small maps: the size where a single mis-ordered pair is obvious
         0 [(str "gen-map-" i)
-           (zipmap (keys-n (+ 2 (.nextInt rnd 6))) (repeatedly #(pick value-pool)))]
+           (omap (keys-n (+ 2 (.nextInt rnd 6))))]
         ;; wide maps: crosses the 23/24 map-header boundary, and gives the
         ;; comparator enough keys that a non-total order shows up as an
         ;; unstable sort rather than a lucky pass
         1 [(str "gen-map-wide-" i)
-           (zipmap (keys-n (+ 10 (.nextInt rnd 25))) (repeatedly #(pick value-pool)))]
-        ;; sets: same comparator, applied to elements
+           (omap (keys-n (+ 10 (.nextInt rnd 25))))]
+        ;; sets: same comparator, applied to elements.
+        ;;
+        ;; BYTE ARRAYS DROPPED, and unlike the maps above this one costs
+        ;; coverage. A set has no insertion-ordered counterpart to switch to,
+        ;; and a PersistentHashSet holding even ONE identity-hashed member
+        ;; iterates differently on every run -- the member's slot moves, which
+        ;; moves everything after it. So a byte string cannot appear in a
+        ;; generated set and have this fixture stay reproducible. The shape is
+        ;; kept by `order-set-singleton-bytes` above, where one element means
+        ;; there is no order to vary; the ORDERING property these rows exist
+        ;; for is exercised by every other member type.
+        ;;
+        ;; Filtered after sampling rather than by narrowing the pool, so the
+        ;; RNG draw sequence is untouched and the other 375 generated cases
+        ;; are the same values they were.
         2 [(str "gen-set-" i)
-           (set (keys-n (+ 2 (.nextInt rnd 12))))]
+           (set (remove bytes? (keys-n (+ 2 (.nextInt rnd 12)))))]
         ;; nesting: ordering has to hold at every level, not just the top
         3 [(str "gen-nested-" i)
-           (let [inner (fn [] (zipmap (keys-n (+ 1 (.nextInt rnd 4)))
-                                      (repeatedly (fn [] (pick value-pool)))))]
-             (zipmap (keys-n (+ 2 (.nextInt rnd 4))) (repeatedly inner)))]))))
+           (let [inner (fn [] (omap (keys-n (+ 1 (.nextInt rnd 4)))))
+                 ks    (keys-n (+ 2 (.nextInt rnd 4)))]
+             (apply array-map
+                    (interleave ks (repeatedly (count ks) inner))))]))))
 
 (def cases
   (concat scalars integers float-cases strings unicode containers ordering tags
@@ -497,7 +540,52 @@
     [label (boring/encode ["rep" kind n unit] transport)
      ["rep-enc" head unit-enc n] (byte-array 0) ["rep"]]))
 
+(defn- unstable-order
+  "Every place in `v` whose ITERATION order depends on an identity hash, as a
+  seq of reasons. Empty means this value encodes to the same bytes on every
+  JVM run.
+
+  Why this is asserted rather than trusted: a byte array hashes by identity, so
+  a hash-ordered collection holding one puts its entries in a different order
+  per run, and boring writes a collection in iteration order. The committed
+  fixture then changed on every regeneration -- which it did, silently, until
+  `bin/ci` started comparing it.
+
+  Repeated runs are NOT evidence here. HotSpot's identity hash is a per-run
+  PRNG that yields the same sequence for the same allocation order, so a
+  broken generator can produce identical bytes several times and then diverge
+  when anything perturbs allocation. Three consecutive runs agreed while this
+  was still broken. The structural check is the one that holds."
+  [v]
+  (cond
+    (map? v)
+    (concat (when (and (some bytes? (keys v))
+                       (not (instance? clojure.lang.PersistentArrayMap v)))
+              [(str "hash-map with a byte-array key, " (count v) " entries")])
+            (mapcat unstable-order (keys v))
+            (mapcat unstable-order (vals v)))
+
+    ;; A set has no insertion-ordered counterpart, so ANY identity-hashed
+    ;; member makes it unstable -- it moves, and everything after it moves.
+    ;; A singleton is exempt: there is no order to vary.
+    (set? v)
+    (concat (when (and (< 1 (count v)) (some bytes? v))
+              [(str "set with a byte-array member, " (count v) " elements")])
+            (mapcat unstable-order v))
+
+    (sequential? v) (mapcat unstable-order v)
+    :else nil))
+
 (defn -main [& _]
+  ;; Before anything is written: the corpus must be reproducible.
+  (let [bad (for [[label v] cases
+                  reason (unstable-order v)]
+              (str "  " label ": " reason))]
+    (when (seq bad)
+      (throw (ex-info (str "boring: this corpus does not encode reproducibly, so"
+                           " the committed fixture would change on every run:\n"
+                           (str/join "\n" bad))
+                      {:cases (count bad)}))))
   (let [rows (into (mapv row cases) (mapv rep-row rep-cases))
         labels (mapv first rows)]
     (when-not (= (count labels) (count (set labels)))

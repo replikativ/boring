@@ -186,6 +186,22 @@ stage_interop () {
     # this project keeps having to ask: can this test fail?
     run interop-fixture clojure -Sdeps '{:paths ["src" "interop" "target/classes"]}' \
         -M -m gen-canonical-fixture
+    # The regenerated fixture must MATCH the committed one. Two different
+    # failures hide in the gap, and both were live:
+    #
+    #   - the generator is not reproducible. It was not: `order-mixed-majors`
+    #     was a 9-entry map literal -- one past the array-map threshold, so a
+    #     PersistentHashMap -- with a byte-array key, which hashes by IDENTITY.
+    #     Its slot moved every JVM run, so the fixture came out different every
+    #     time and every `bin/ci` run silently dirtied the tree.
+    #   - the committed fixture is STALE against the current encoder, which the
+    #     header of gen_canonical_fixture.clj says must never happen and which
+    #     nothing checked.
+    #
+    # Neither shows up in the checkers below, because they read the file that
+    # was just written. Without this the requirement was documentation.
+    run interop-fixture-committed \
+        git diff --exit-code -- interop/canonical_fixture.cbor
     run interop-canonical python3 interop/test_canonical_bytes.py
   else
     echo "\u2500\u2500\u25b6 interop-python"
