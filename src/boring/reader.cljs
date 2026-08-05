@@ -914,6 +914,38 @@
          {:tag 27}))
   argument)
 
+(defn- frame-fallback
+  "What a tag-27 frame this platform cannot upgrade decodes to.
+
+  ONE rule, used by the unregistered-name default AND by every reserved marker
+  naming a JVM type ClojureScript does not have. The distinction is the payload
+  shape, never the name: a map payload gets the map-presenting `UnknownRecord`,
+  anything else a `TaggedLiteral`, which offers `:tag` and `:form` and promises
+  no map-ness. `boring.data/frame-name` and `frame-payload` read either.
+
+  THE MARKERS USED TO RETURN THE BARE PAYLOAD instead, on the reasoning that a
+  browser is better served by `\"P1D\"` than by a wrapper it has to unpack. The
+  cost was silent: re-encoding a bare string emits a plain text string, so the
+  tag-27 frame was gone and a JVM peer on the far side received a `String`
+  where it had sent a `java.time.Period`. Measured over the frames the JVM
+  writer actually emits, seven of them lost their frame on a ClojureScript
+  round trip -- `clojure/char`, `java/period`, `java/char-array`,
+  `java/boolean-array`, `java/string-array`, `java/object-array` -- while the
+  four whose type ClojureScript HAS were byte-identical. That is the exact
+  failure doc/COMPATIBILITY.md refuses for URI, and it broke the promise
+  stated two paragraphs above it: \"a round trip through ClojureScript never
+  corrupts a document; it just hands back less than the JVM would.\"
+
+  This also makes the two platforms symmetric in what they can SEND, which
+  they already were and could not demonstrate: both writers encode a
+  `TaggedLiteral` to its frame, so `(encode (tagged-literal 'clojure/char
+  \"a\"))` produces the same bytes here as the JVM writes for a real `\\a`, and
+  a JVM peer decodes it to `\\a`. Only the receive half was missing."
+  [nm argument]
+  (if (map? argument)
+    (data/unknown-record nm argument)
+    (tagged-literal (symbol nm) argument)))
+
 (defn- sorted-content
   "`(into coll xs)` with incomparable members reported as a typed error.
 
@@ -1879,25 +1911,28 @@
                "clojure/queue"      (into cljs.core/PersistentQueue.EMPTY
                                           (seq-content argument "clojure/queue"))
                ;; ClojureScript has no character type -- `\a` READS as the
-               ;; one-character string -- and no java.time. The marker is
-               ;; therefore write-side-only on this platform: JVM data still
-               ;; decodes, to the closest thing that exists here, rather than
-               ;; surfacing as an UnknownRecord the caller has to unwrap.
+               ;; one-character string -- and no java.time, so these markers
+               ;; name a type this platform cannot build. They are VALIDATED
+               ;; here exactly as on the JVM and then handed back through
+               ;; `frame-fallback`, which preserves the frame; see its
+               ;; docstring for what returning the bare payload cost.
                ;;
-               ;; Validated to the same standard as the JVM even so. A reader
-               ;; that accepts what the other platform rejects is a parser
+               ;; Validation is the half that must not move. A reader that
+               ;; accepts what the other platform rejects is a parser
                ;; differential, and it does not stop being one because the
-               ;; value it produces here is simpler.
+               ;; value it produces here is a carrier rather than the type.
                "clojure/char"
                (do (when-not (and (string? argument) (== 1 (count argument)))
                      (err :boring/bad-tag-content
                           "boring: clojure/char must wrap exactly one character"
                           {:tag 27}))
-                   argument)
+                   (frame-fallback nm argument))
                ;; ClojureScript has no typed arrays for these and no Throwable
-               ;; hierarchy, so they decode to the closest thing that exists:
-               ;; a vector, a string, or an ex-info. JVM data still DECODES
-               ;; rather than surfacing as an UnknownRecord to unwrap.
+               ;; hierarchy. The arrays go through `frame-fallback` for the
+               ;; reason above; the two exception markers do NOT, because
+               ;; ClojureScript has `ex-info` and the JVM re-emits a decoded
+               ;; `java/throwable` as `clojure/ex-info` too -- that pair is
+               ;; already symmetric.
                ;; ELEMENT DOMAINS TOO, not merely the container shape. The JVM
                ;; builds a `boolean[]`/`String[]`, so it rejects an element that
                ;; is not one; `(vec argument)` accepted anything, and
@@ -1912,20 +1947,21 @@
                      (err :boring/bad-tag-content
                           "boring: java/boolean-array element is not a boolean"
                           {:tag 27})))
-                 l)
+                 (frame-fallback nm l))
                "java/char-array"
                (do (when-not (string? argument)
                      (err :boring/bad-tag-content
                           "boring: java/char-array must wrap a text string" {:tag 27}))
-                   argument)
+                   (frame-fallback nm argument))
                "java/string-array"
                (let [l (list-marker-content argument "java/string-array")]
                  (doseq [x l]
                    (when-not (or (nil? x) (string? x))
                      (err :boring/bad-tag-content
                           "boring: java/string-array element is not a string" {:tag 27})))
-                 l)
-               "java/object-array" (list-marker-content argument "java/object-array")
+                 (frame-fallback nm l))
+               "java/object-array"
+               (frame-fallback nm (list-marker-content argument "java/object-array"))
                "clojure/ex-info"
                (do (when-not (and (vector? argument) (== 3 (count argument)))
                      (err :boring/bad-tag-content
@@ -1959,22 +1995,47 @@
                             {:boring/throwable-class (nth argument 0)}
                             (when (instance? js/Error (nth argument 2))
                               (nth argument 2))))
+               ;; CANONICAL FORM ONLY -- exactly what `Period.toString()`
+               ;; emits, which is the only thing boring's own writer produces.
+               ;; The JVM enforces this definitionally (parse, then require the
+               ;; result to print back to the input); this regex is the same
+               ;; rule spelled out, and `period-domains-agree` in the
+               ;; conformance suite holds the two to the same verdict.
+               ;;
+               ;; The old regex tracked `java.time.Period.parse`, which is far
+               ;; looser -- lower case, a leading sign, per-component signs,
+               ;; weeks, leading zeros -- and tracking it by hand went wrong in
+               ;; BOTH directions: `p1d` was accepted on the JVM and refused
+               ;; here, and `P2147483648D` was accepted HERE and refused there,
+               ;; a browser admitting a document its server rejects. It could
+               ;; not be fixed by widening, either: `Period` stores years,
+               ;; months and days and no spelling, so the JVM cannot round-trip
+               ;; `P1W` (it re-emits `P7D`), `+P1D`, `P00001D` or `P1Y0M`.
+               ;; Accepting only what we can faithfully store is what makes the
+               ;; two platforms agree AND every accepted document byte-stable.
                "java/period"
-               (do (when-not (and (string? argument)
-                                  (re-matches #"[+-]?P(?!$)([+-]?\d+Y)?([+-]?\d+M)?([+-]?\d+W)?([+-]?\d+D)?"
-                                              argument))
+               (do (when-not (string? argument)
                      (err :boring/bad-tag-content
-                          (str "boring: java/period is not an ISO-8601 period: "
+                          (str "boring: java/period must wrap a text string, got "
                                (pr-str argument))
                           {:tag 27}))
-                   argument)
-               ;; Chosen by PAYLOAD SHAPE, not by any claim about the sender --
-               ;; see the JVM Reader. A map gets the map-presenting wrapper; a
-               ;; positional payload gets a TaggedLiteral, which offers :tag
-               ;; and :form and never promises map-ness.
-               (if (map? argument)
-                 (data/unknown-record nm argument)
-                 (tagged-literal (symbol nm) argument))))))
+                   (let [m (re-matches
+                            #"P(?:0D|(?=[-\d])(?:(-?[1-9]\d*)Y)?(?:(-?[1-9]\d*)M)?(?:(-?[1-9]\d*)D)?)"
+                            argument)]
+                     ;; Each component is an `int` on the JVM, so one that does
+                     ;; not fit is refused rather than silently widened.
+                     (when-not (and m (every? (fn [g]
+                                                (or (nil? g)
+                                                    (let [n (js/parseInt g 10)]
+                                                      (and (>= n -2147483648)
+                                                           (<= n 2147483647)))))
+                                              (rest m)))
+                       (err :boring/bad-tag-content
+                            (str "boring: java/period is not a canonical ISO-8601 "
+                                 "period: " (pr-str argument))
+                            {:tag 27})))
+                   (frame-fallback nm argument))
+               (frame-fallback nm argument)))))
     ;; The registry was consulted above, before the built-ins.
     (if (.-tolerateUnknownTags r)
       (data/tagged-value tag (read! r))

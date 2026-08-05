@@ -780,11 +780,17 @@
            (is (contains? (try-decode "d81b826c636c6f6a7572652f6368617264f09f92a9" {}) :err)))
 
        ;; ClojureScript has no character type at all -- the reader turns `\a`
-       ;; into the one-character string -- so there is nothing to preserve on
-       ;; this side. What matters is that JVM-written data still DECODES here
-       ;; rather than surfacing as an UnknownRecord the caller must unwrap.
+       ;; into the one-character string -- so the character itself cannot
+       ;; survive here. What must survive is the FRAME: this used to decode to
+       ;; the bare string "a", which re-encodes as a plain text string, so a
+       ;; JVM peer on the far side received a String where it had sent a
+       ;; Character and the type was gone for good. The carrier keeps the
+       ;; payload reachable and the bytes intact -- see
+       ;; `tag27-markers-round-trip-to-identical-bytes`.
        :cljs
-       (is (= "a" (boring/decode (c/hex->bytes "d81b826c636c6f6a7572652f636861726161")))))))
+       (let [v (boring/decode (c/hex->bytes "d81b826c636c6f6a7572652f636861726161"))]
+         (is (= "clojure/char" (data/frame-name v)))
+         (is (= "a" (data/frame-payload v)))))))
 
 (deftest stringref-namespaces-are-scoped
   (testing "tag 256 opens a FRESH table and restores the enclosing one.
@@ -2152,9 +2158,13 @@
     (testing "a null payload is an EMPTY sorted set on both platforms -- the JVM
               admits it, so this is parity and not an oversight"
       (is (= #{} (dec-hex (marker "clojure/sorted-set" "f6")))))
-    (testing "and the valid shapes still decode"
-      (is (= [true false] (vec (dec-hex (marker "java/boolean-array" "82f5f4")))))
-      (is (= ["a"] (vec (dec-hex (marker "java/string-array" "816161"))))))))
+    (testing "and the valid shapes still decode -- to the host array on the JVM,
+              and on ClojureScript, which has no such array type, to the
+              frame-preserving carrier every unupgradable tag-27 frame gets.
+              `frame-payload` reads both, which is the point of it"
+      (let [payload (fn [x] (vec #?(:clj x :cljs (data/frame-payload x))))]
+        (is (= [true false] (payload (dec-hex (marker "java/boolean-array" "82f5f4")))))
+        (is (= ["a"] (payload (dec-hex (marker "java/string-array" "816161")))))))))
 
 (deftest duplicate-detection-does-not-depend-on-decoder-cache-state
   (testing "whether a repeated key is caught must not depend on how many OTHER
@@ -2940,3 +2950,134 @@
                        (c/hex->bytes "a2c249010000000000000000f501f4"))))))
     (testing "and two plainly different integer keys are untouched"
       (is (= 2 (count (boring/decode (c/hex->bytes "a201f502f4"))))))))
+
+;; --------------------------------------------------- reserved tag-27 markers
+
+(def ^:private marker-frames
+  "Every reserved tag-27 frame the JVM writer emits, produced by encoding a
+  real value of the type each marker names. Hand-written hex would not prove
+  the same thing: the point is that these are the bytes a JVM peer actually
+  sends."
+  [["clojure/char"       "d81b826c636c6f6a7572652f636861726161"]
+   ["java/period"        "d81b826b6a6176612f706572696f6463503144"]
+   ["java/period YMD"    "d81b826b6a6176612f706572696f6467503159314d3144"]
+   ["java/char-array"    "d81b826f6a6176612f636861722d6172726179626162"]
+   ["java/boolean-array" "d81b82726a6176612f626f6f6c65616e2d617272617982f5f4"]
+   ["java/string-array"  "d81b82716a6176612f737472696e672d61727261798261616162"]
+   ["java/object-array"  "d81b82716a6176612f6f626a6563742d61727261798201f5"]
+   ["clojure/queue"      "d81b826d636c6f6a7572652f717565756583010203"]
+   ["clojure/sorted-map" "d81b8272636c6f6a7572652f736f727465642d6d6170a2016161026162"]
+   ["clojure/sorted-set" "d81b8272636c6f6a7572652f736f727465642d736574820102"]
+   ["clojure/ex-info"    "d81b826f636c6f6a7572652f65782d696e666f83616da1d827623a6101f6"]])
+
+(deftest tag27-markers-round-trip-to-identical-bytes
+  (testing "a marker naming a type ClojureScript does not have used to decode
+            to the bare payload, so re-encoding emitted a plain string or array
+            and the tag-27 frame was GONE. Seven of these eleven lost their
+            frame that way -- a JVM peer received a String where it had sent a
+            java.time.Period, permanently, and a relay downgraded every such
+            value it passed through. That is the failure COMPATIBILITY.md
+            refuses for URI, against the promise that `a round trip through
+            ClojureScript never corrupts a document`.
+
+            Runs on both platforms and asserts the SAME bytes on each, so it
+            fails on ClojureScript alone if the two ever drift apart again."
+    (doseq [[label hex] marker-frames]
+      (is (= hex (c/bytes->hex (boring/encode (boring/decode (c/hex->bytes hex))
+                                              {:stringref false})))
+          (str label " must re-encode to the frame it decoded from"))))
+  (testing "and under the option sets that could reshape a payload -- :shapes
+            is the one to fear, since the array-payload markers now hand back a
+            vector and a homogeneous vector is what the shaped-array writer
+            looks for"
+    (doseq [[label hex] marker-frames
+            opts [{:stringref false :shapes true}
+                  {:profile :canonical}
+                  {:profile :archival}
+                  {:profile :interop}]]
+      (is (= hex (c/bytes->hex (boring/encode (boring/decode (c/hex->bytes hex))
+                                              opts)))
+          (str label " must survive " (pr-str opts)))))
+  (testing "the send direction: BOTH writers encode a TaggedLiteral to its
+            frame, so the same source line produces the JVM's bytes on either
+            platform. This is what lets a browser originate a value whose type
+            only the JVM has -- the receive half above is what was missing."
+    (is (= "d81b826c636c6f6a7572652f636861726161"
+           (c/bytes->hex (boring/encode (tagged-literal 'clojure/char "a")
+                                        {:stringref false}))))
+    (is (= "d81b826f6a6176612f636861722d6172726179626162"
+           (c/bytes->hex (boring/encode (tagged-literal 'java/char-array "ab")
+                                        {:stringref false}))))))
+
+(def ^:private period-verdicts
+  "Pinned accept/reject for `java/period`, and byte stability for every accept.
+
+  `java.time.Period.parse` takes far more than `Period.toString()` emits --
+  lower case, a leading sign, per-component signs, weeks, leading zeros -- but
+  a `Period` holds years, months and days and NO spelling, so the rest cannot
+  be stored faithfully. Tracking the parser by hand went wrong in BOTH
+  directions: `p1d` was accepted on the JVM and refused on ClojureScript, and
+  `P2147483648D` was accepted on ClojureScript and refused on the JVM -- a
+  browser admitting a document its server rejects.
+
+  Both platforms now accept exactly the canonical form. The JVM decides it
+  definitionally (parse, then require the result to print back to the input);
+  ClojureScript spells the same rule as a regex. This table is what holds the
+  two level, so it must run on both."
+  [["P1D"          true]
+   ["P0D"          true]
+   ["P1M"          true]
+   ["P1Y"          true]
+   ["P-1D"         true]
+   ["P1Y1M1D"      true]
+   ["P-1Y-2M-3D"   true]
+   ["P999999999D"  true]
+   ;; accepted by java.time, not canonical: the spelling cannot be stored
+   ["p1d"          false]    ; case
+   ["P1W"          false]    ; weeks fold to days -- re-emits P7D
+   ["P1Y1W1D"      false]    ; re-emits P1Y8D
+   ["-P1D"         false]    ; leading sign -- re-emits P-1D
+   ["+P1D"         false]
+   ["P00001D"      false]    ; leading zeros
+   ["P1Y0M"        false]    ; zero component omitted on output
+   ["P0Y0M0D"      false]    ; re-emits P0D
+   ["P2147483648D" false]    ; does not fit an int
+   ;; not a period at all
+   ["P"            false]
+   ["PT1H"         false]
+   ["P1WT0S"       false]
+   ["PP1D"         false]
+   ["P1.5D"        false]
+   ["P1DX"         false]
+   ["P1D "         false]
+   [" P1D"         false]])
+
+(defn- period-frame-hex
+  "27([\"java/period\", s]) as hex. Built by hand because the writer would
+  normalise a non-canonical spelling away before it reached the wire. ASCII
+  only, so one character is one byte."
+  [s]
+  (str "d81b826b6a6176612f706572696f64"
+       (c/bytes->hex #?(:clj (byte-array [(unchecked-byte (+ 0x60 (count s)))])
+                        :cljs (js/Uint8Array. #js [(+ 0x60 (count s))])))
+       (apply str (map (fn [i]
+                         (let [c #?(:clj (int (.charAt ^String s i))
+                                    :cljs (.charCodeAt s i))]
+                           (c/bytes->hex
+                            #?(:clj (byte-array [(unchecked-byte c)])
+                               :cljs (js/Uint8Array. #js [c])))))
+                       (range (count s))))))
+
+(deftest period-domains-agree
+  (doseq [[s accept?] period-verdicts]
+    (let [hex (period-frame-hex s)
+          r   (try {:ok (boring/decode (c/hex->bytes hex))}
+                   (catch #?(:clj Throwable :cljs :default) e
+                     {:err (or (:type (ex-data e)) :unknown)}))]
+      (if accept?
+        (do (is (contains? r :ok) (str s " must be accepted"))
+            (when (contains? r :ok)
+              (is (= hex (c/bytes->hex (boring/encode (:ok r) {:stringref false})))
+                  (str s " must re-encode to the bytes it came from"))))
+        (is (= :boring/bad-tag-content (:err r))
+            (str s " must be refused as :boring/bad-tag-content"))))))

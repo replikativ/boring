@@ -2695,8 +2695,9 @@ public final class Reader {
                         }
                         case "java/period": {
                             String ps = stringContent(argument, 27);
+                            java.time.Period p;
                             try {
-                                return java.time.Period.parse(ps);
+                                p = java.time.Period.parse(ps);
                             } catch (java.time.format.DateTimeParseException e) {
                                 // Wrapped: java.time's own exception is not an
                                 // ex-info, so a caller catching ExceptionInfo
@@ -2706,6 +2707,37 @@ public final class Reader {
                                     "boring: java/period is not an ISO-8601 period: " + ps,
                                     "tag", 27L);
                             }
+                            // CANONICAL FORM ONLY, and this is the definition
+                            // of it rather than a restatement: accept exactly
+                            // the spellings we would emit.
+                            //
+                            // `Period.parse` is much looser than `toString` --
+                            // it takes lower case, a leading sign, per-part
+                            // signs, weeks and leading zeros -- but a `Period`
+                            // holds years, months and days and NO spelling, so
+                            // everything else is unstorable. Measured over 25
+                            // legal inputs, 8 came back as different bytes than
+                            // they went in: P1W -> P7D, -P1D -> P-1D, +P1D ->
+                            // P1D, P1Y0M -> P1Y, P00001D -> P1D, P1Y1W1D ->
+                            // P1Y8D, P0Y0M0D -> P0D, p1d -> P1D. boring keys
+                            // content by bytes (see boring.hasch), so a decode
+                            // that silently respells is a changed address for
+                            // an unchanged value.
+                            //
+                            // Nothing legitimate is lost: boring's own writer
+                            // emits `Period.toString()`, and `java/period` is
+                            // boring's reserved name, so no other producer
+                            // writes it. Same trade as refusing RFC 3339
+                            // offsets past +/-18:00 -- conforming input
+                            // refused, deliberately, so the two platforms
+                            // agree. ClojureScript spells the same rule as a
+                            // regex; `period-domains-agree` holds them level.
+                            if (!p.toString().equals(ps))
+                                throw Err.of("bad-tag-content",
+                                    "boring: java/period is not a canonical ISO-8601"
+                                    + " period: " + ps + " (canonically " + p + ")",
+                                    "tag", 27L);
+                            return p;
                         }
                         case "clojure/queue": {
                             Object q = clojure.lang.PersistentQueue.EMPTY;
