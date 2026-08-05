@@ -229,7 +229,7 @@
 
 (deftest mapping-part-of-a-file
   (when ffm?
-  (testing "a CBOR document is not always the whole file. konserve writes a
+    (testing "a CBOR document is not always the whole file. konserve writes a
             blob as a 20-byte header, then metadata, then the value -- so the
             value begins partway in, and mapping from zero addresses the header
             as though it were CBOR. `:offset`/`:length` narrow the mapping.
@@ -237,55 +237,58 @@
             The mechanism (MemorySegment.asSlice) already worked; what was
             missing was a way to ask for it without reaching past this
             namespace into asSlice and segment-source by hand."
-    (let [value   (into {} (for [i (range 200)]
-                             [(str "customer-" i) {"name" (str "name-" i)}]))
-          meta-bs (boring/encode {:key "k"} {:stringref false})
-          val-bs  (boring/encode-indexed value)
-          off     (+ 20 (alength ^bytes meta-bs))
-          f       (java.io.File/createTempFile "boring-slice" ".bin")]
-      (try
-        (with-open [o (java.io.FileOutputStream. f)]
-          (.write o (byte-array (repeat 20 (byte 0))))
-          (.write o ^bytes meta-bs)
-          (.write o ^bytes val-bs))
-        (testing ":offset alone runs to the end of the file"
-          (let [[c a] ((requiring-resolve 'boring.mmap/mmap-source) (.getPath f) {:offset off})]
-            (with-open [_ a]
-              (is (= "name-137" (nav/value (get-in c ["customer-137" "name"])))))))
-        (testing ":offset with an explicit :length"
-          (let [[c a] ((requiring-resolve 'boring.mmap/mmap-source) (.getPath f)
-                 {:offset off :length (alength ^bytes val-bs)})]
-            (with-open [_ a]
-              (is (= "name-137" (nav/value (get-in c ["customer-137" "name"])))))))
-        (testing "no offset still maps the whole file, so nothing changed for
+      (let [value   (into {} (for [i (range 200)]
+                               [(str "customer-" i) {"name" (str "name-" i)}]))
+            meta-bs (boring/encode {:key "k"} {:stringref false})
+            val-bs  (boring/encode-indexed value)
+            off     (+ 20 (alength ^bytes meta-bs))
+            f       (java.io.File/createTempFile "boring-slice" ".bin")]
+        (try
+          (with-open [o (java.io.FileOutputStream. f)]
+            (.write o (byte-array (repeat 20 (byte 0))))
+            (.write o ^bytes meta-bs)
+            (.write o ^bytes val-bs))
+          (testing ":offset alone runs to the end of the file"
+            (let [[c a] ((requiring-resolve 'boring.mmap/mmap-source) (.getPath f) {:offset off})]
+              (with-open [_ a]
+                (is (= "name-137" (nav/value (get-in c ["customer-137" "name"])))))))
+          (testing ":offset with an explicit :length"
+            (let [open! (requiring-resolve 'boring.mmap/mmap-source)
+                  [c a] (open! (.getPath f)
+                               {:offset off :length (alength ^bytes val-bs)})]
+              (with-open [_ a]
+                (is (= "name-137" (nav/value (get-in c ["customer-137" "name"])))))))
+          (testing "no offset still maps the whole file, so nothing changed for
                   callers that do not ask"
-          (let [[_ a] ((requiring-resolve 'boring.mmap/mmap-source) (.getPath f))]
-            (.close ^java.lang.AutoCloseable a)
-            (is true "constructing over the header must not throw here")))
-        (testing "an offset past the end is a TYPED error naming the size,
+            (let [[_ a] ((requiring-resolve 'boring.mmap/mmap-source) (.getPath f))]
+              (.close ^java.lang.AutoCloseable a)
+              (is true "constructing over the header must not throw here")))
+          (testing "an offset past the end is a TYPED error naming the size,
                   not an IndexOutOfBoundsException from asSlice"
-          (is (= :boring/bad-argument
-                 (:type (ex-data (try ((requiring-resolve 'boring.mmap/mmap-source) (.getPath f) {:offset 99999999})
-                                      (catch Exception e e)))))))
-        (testing "and so is a length that runs past the end"
-          (is (= :boring/bad-argument
-                 (:type (ex-data (try ((requiring-resolve 'boring.mmap/mmap-source) (.getPath f)
-                        {:offset off :length 99999999})
-                                      (catch Exception e e)))))))
-        (finally (.delete f)))))))
+            (is (= :boring/bad-argument
+                   (:type (ex-data (try ((requiring-resolve 'boring.mmap/mmap-source) (.getPath f) {:offset 99999999})
+                                        (catch Exception e e)))))))
+          (testing "and so is a length that runs past the end"
+            (is (= :boring/bad-argument
+                   (:type (ex-data (try (let [open! (requiring-resolve
+                                                     'boring.mmap/mmap-source)]
+                                          (open! (.getPath f)
+                                                 {:offset off :length 99999999}))
+                                        (catch Exception e e)))))))
+          (finally (.delete f)))))))
 
 (deftest mapping-part-of-a-sequence-file
   (when ffm?
-  (testing "the same for `mmap-items`, which is the log shape -- and the index
+    (testing "the same for `mmap-items`, which is the log shape -- and the index
             still drives `nth` through the slice"
-    (let [w  (boring/writer 8192)
-          f  (java.io.File/createTempFile "boring-slice-seq" ".bin")]
-      (try
-        (with-open [o (java.io.FileOutputStream. f)]
-          (.write o (byte-array (repeat 20 (byte 0))))
-          (boring/write-seq! w (vec (for [i (range 5000)] {:id i})) o))
-        (let [[it a] ((requiring-resolve 'boring.mmap/mmap-items) (.getPath f) {:offset 20})]
-          (with-open [_ a]
-            (is (= {:id 4999} (nav/value (nth it 4999))))
-            (is (= {:id 0} (nav/value (nth it 0))))))
-        (finally (.delete f)))))))
+      (let [w  (boring/writer 8192)
+            f  (java.io.File/createTempFile "boring-slice-seq" ".bin")]
+        (try
+          (with-open [o (java.io.FileOutputStream. f)]
+            (.write o (byte-array (repeat 20 (byte 0))))
+            (boring/write-seq! w (vec (for [i (range 5000)] {:id i})) o))
+          (let [[it a] ((requiring-resolve 'boring.mmap/mmap-items) (.getPath f) {:offset 20})]
+            (with-open [_ a]
+              (is (= {:id 4999} (nav/value (nth it 4999))))
+              (is (= {:id 0} (nav/value (nth it 0))))))
+          (finally (.delete f)))))))
