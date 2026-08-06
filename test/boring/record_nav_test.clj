@@ -1,28 +1,22 @@
 (ns boring.record-nav-test
-  "Navigating a tag-27 record without realising it.
+  "Navigating a tag-27 record without realising it -- and, mostly, REFUSING to.
 
    A record writes `27([name, {fields}])`, so the field map begins past the tag
-   and the name -- 22 bytes for `clojure/sorted-map`. The cursor stands on the
-   TAG, `node-slot` is asked about the tag's offset, and no index node matches,
-   so every lookup realised the whole record. 577 us on a 2000-key sorted-map
-   against 7.91 us navigated, with the navigated cost flat in size.
+   and the name. Descending means answering from that map instead of building
+   what the reader would build, and that is only sound when the two are the same
+   thing.
 
-   The cursor STAYS on the tag; only the container operations redirect to the
-   field map. That is what keeps `value` realising the record rather than the
-   bare map, and `value-type` answering `:tag`.
+   WHO DECIDES. Not this namespace. `Reader.recordDescendable` does, beside the
+   tag-27 dispatch it has to agree with, reading the same fields that dispatch
+   reads. The previous gate was `recordCtor == nil`, mirrored here in Clojure
+   with a docstring claiming the two could not drift because both read the same
+   registry -- true of the registry, false of the DECISION, which also depends on
+   the reserved-name table and on two options. It was wrong about all three the
+   day it was written; `:on-unknown-record` had been added the day before.
 
-   TWO REFUSALS, both about answering differently from the reader:
-
-   - A REGISTERED name does not descend. `TagRegistry.recordCtor` is an
-     arbitrary `IFn` and may rename or drop fields. Unregistered names decode to
-     `UnknownRecord`, whose `valAt`/`count`/`seq` delegate straight to the field
-     map, so descent is exactly equivalent there.
-
-   - A SORTED-MAP descends only for keyword, symbol and string keys. It looks up
-     by `compare`, not `=`, and the two disagree across numeric types:
-     `(get (sorted-map 1 :a) 1.0)` is `:a` because `(compare 1 1.0)` is 0, while
-     a byte probe for 1.0 matches nothing. A custom comparator cannot reach here
-     at all -- the writer refuses to encode one."
+   So the tests below are mostly about refusal, and about refusal being
+   INDISTINGUISHABLE FROM THE OUTSIDE: whatever the gate decides, the answers
+   must match `decode`, or nav must decline rather than answer."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
@@ -30,165 +24,170 @@
             [boring.core :as boring]
             [boring.data]
             [boring.nav :as nav]
-            [boring.nav-conformance :as nc]))
+            [boring.nav-conformance :as nc])
+  (:import (org.replikativ.boring Reader)))
 
 (def ^:private opts {:stringref false})
-(def ^:private trusted (assoc opts :trust-index :trusted))
-
-(defn- enc ^bytes [v] (boring/encode-indexed v (assoc opts :index 16 :index-min 8)))
-
-(defn- realised-get
-  "`get` on the realised value, with the sorted-map comparator's raw
-   ClassCastException folded to not-found -- which is `nav/get`'s contract and
-   was so before this descent existed."
-  [m k nf]
-  (try (get m k nf) (catch ClassCastException _ nf)))
-
-(deftest navigating-a-record-agrees-with-realising-it
-  (doseq [[label m]
-          [["sorted-map keywords" (into (sorted-map) (for [j (range 60)] [(keyword (str "f" j)) j]))]
-           ["sorted-map strings"  (into (sorted-map) (for [j (range 60)] [(str "f" j) j]))]
-           ["sorted-map longs"    (into (sorted-map) (for [j (range 60)] [j (str "v" j)]))]
-           ["sorted-map doubles"  (into (sorted-map) (for [j (range 20)] [(double j) j]))]
-           ["two entries"         (sorted-map 1 :a 2 :b)]
-           ["empty"               (sorted-map)]]]
-    (testing label
-      (let [bs (enc m)
-            c (nav/source bs trusted)
-            realised (boring/decode bs opts)]
-        (is (= m realised) "the fixture must round-trip at all")
-        (is (= m (nav/value c)) "value realises the RECORD, not the field map")
-        (is (= :tag (nav/value-type c)) "and value-type still says tag")
-        (is (= (count realised) (count c)))
-        (testing "every key, and keys of every other type"
-          (doseq [k (concat (keys m) [:absent "absent" 'absent 0 1.0 nil [1] [1.0]])]
-            (is (= (realised-get realised k ::nf)
-                   (nav/value (get c k ::nf)))
-                (str "key " (pr-str k)))))
-        (is (= realised (into {} (map (fn [[k v]] [k (nav/value v)])) (seq c))) "seq")
-        (is (= realised (into {} (map (fn [[k v]] [k (nav/value v)])) c)) "reduce")
-        (is (nil? (nth c 0 nil)) "nth on a map is not-found")))))
-
-(deftest the-numeric-key-divergence-is-not-papered-over
-  (testing "this is the case `record-key-ok?` exists for. `compare` says 1 and
-            1.0 are the same key and `=` says they are not, so descending on a
-            numeric key would answer differently from the reader. It must
-            realise instead, and agree."
-    (let [m (sorted-map 1 :a 2 :b)
-          c (nav/source (enc m) trusted)]
-      (is (= :a (get m 1.0)) "the premise: a sorted-map matches across types")
-      (is (= :a (nav/value (get c 1.0)))
-          "so navigation must give :a too, by realising rather than probing")
-      (is (= :a (nav/value (get c 1)))))))
 
 (defrecord Pt [x y])
-
-(deftest a-registered-name-does-not-descend
-  (testing "the ctor is an arbitrary IFn, so answering from the field map could
-            answer from bytes the reader would never have produced. It must keep
-            realising -- and keep giving the same answers."
-    (let [reg (-> (boring/tag-registry)
-                  (boring/register-record
-                   (boring.data/record-type-name (->Pt 1 2)) map->Pt))
-          o (assoc opts :registry reg)
-          bs (boring/encode (->Pt 1 2) o)
-          c (nav/source bs o)]
-      (is (= (->Pt 1 2) (nav/value c)))
-      (is (= 1 (nav/value (get c :x))))
-      (is (= 2 (nav/value (get c :y))))
-      (is (= ::nf (nav/value (get c :nope ::nf)))))))
-
-(deftest an-unregistered-record-descends-and-agrees
-  (testing "no registration means UnknownRecord, whose lookup IS the field map"
-    (let [reg (-> (boring/tag-registry)
-                  (boring/register-record
-                   (boring.data/record-type-name (->Pt 1 2)) map->Pt))
-          bs (boring/encode (->Pt 7 8) (assoc opts :registry reg))
-          ;; read back WITHOUT the registration
-          c (nav/source bs opts)
-          realised (boring/decode bs opts)]
-      (is (= 7 (get realised :x)) "UnknownRecord looks up its fields")
-      (is (= 7 (nav/value (get c :x))))
-      (is (= 2 (count c)))
-      (is (= {:x 7 :y 8} (into {} (map (fn [[k v]] [k (nav/value v)])) (seq c)))))))
-
 (def ^:private pt-name (boring.data/record-type-name (->Pt 1 2)))
 
+(defn- outcome [f]
+  (try [:ok (f)]
+       (catch clojure.lang.ExceptionInfo e [(or (:type (ex-data e)) :untyped)])
+       (catch Throwable e [:untyped (class e)])))
+
+(defn- descends?
+  "Whether nav actually descended, observed from the outside: a descended record
+   is Counted, an opaque tag is not."
+  [bs o]
+  (= :ok (first (outcome #(count (nav/source bs o))))))
+
+;; ------------------------------------------------- what the gate must decide
+
+(def ^:private gate-cases
+  "[label opts descend?]. `decode` is the oracle for the ANSWERS; this column is
+   only about whether the fast path is taken."
+  [["unregistered, :fallback" {} true]
+   ["unregistered, :on-unknown-record :error" {:on-unknown-record :error} false]
+   ["unregistered, :on-unknown-record fn"
+    {:on-unknown-record (fn [_nm m] {:renamed (get m :x)})} false]
+   ["auto-construct, type exists" {:auto-construct-records? true} false]
+   ["registered, undeclared"
+    {:registry (-> (boring/tag-registry) (boring/register-record pt-name map->Pt))} false]
+   ["registered AND declared"
+    {:registry (-> (boring/tag-registry)
+                   (boring/register-record pt-name map->Pt)
+                   (boring/declare-navigable-record pt-name))} true]])
+
+(deftest the-gate-descends-exactly-where-it-should
+  (doseq [[label o descend?] gate-cases]
+    (testing label
+      (let [oo (merge opts o)
+            bs (boring/encode (->Pt 1 2) oo)]
+        (is (= descend? (descends? bs oo))
+            (str label ": expected descend? " descend?))))))
+
+(deftest answers-agree-with-decode-however-the-gate-decides
+  (testing "the point of the gate. Refusing is fine; answering differently is
+            not. Where `decode` succeeds, nav must match it; where `decode`
+            raises, nav must raise the same type rather than answer."
+    (doseq [[label o _] gate-cases]
+      (testing label
+        (let [oo (merge opts o)
+              bs (boring/encode (->Pt 1 2) oo)
+              [dk dv] (outcome #(boring/decode bs oo))]
+          (doseq [k [:x :y :nope]]
+            (let [want (if (= :ok dk) [:ok (get dv k ::nf)] [dk])
+                  got (outcome #(nav/value (get (nav/source bs oo) k ::nf)))]
+              (is (= want got) (str label " get " k)))))))))
+
+;; ------------------------------------------------------------ reserved names
+
+(def ^:private reserved-names
+  "Every name the reader resolves ITSELF, before the registry matters. Each
+   builds something the field map is not, so none may be descended into.
+
+   Listed here as well as in `Reader.isReservedRecordName` on purpose: this is
+   the check that the Java list has not fallen behind the switch beside it."
+  ["clojure/sorted-map" "clojure/sorted-set" "clojure/with-meta" "clojure/char"
+   "clojure/ex-info" "clojure/queue" "java/throwable" "java/boolean-array"
+   "java/char-array" "java/string-array" "java/object-array" "java/period"])
+
+(deftest no-reserved-name-is-descendable
+  (testing "S7. All twelve descended and answered before, while `decode` raised
+            `:boring/bad-tag-content` for most of them. `clojure/sorted-set` was
+            the sharpest case: `get` on a set is MEMBERSHIP, which the tag
+            taxonomy comment already named as the kind that must stay opaque."
+    (let [^Reader r (Reader. (byte-array 1))]
+      (doseq [nm reserved-names]
+        (is (not (.recordDescendable r nm)) (str nm " must not be descendable"))))))
+
+(deftest sorted-map-no-longer-descends-and-still-answers
+  (testing "the trade, recorded. `clojure/sorted-map` was descendable and worth a
+            measured 73x, and is now refused with the rest. Sound only for
+            sorted-maps BORING wrote -- a hand-crafted document can claim the
+            name over keys that are not mutually comparable, and then `decode`
+            raises while `count` and `seq` answer. Establishing comparability
+            costs realising every key at view-build, which is O(K) on the
+            operation the descent made O(log K).
+
+            What must NOT change is the answers."
+    (let [m (into (sorted-map) {:x 1 :y 2})
+          bs (boring/encode m opts)]
+      (is (not (descends? bs opts)) "refused")
+      (is (= m (nav/value (nav/source bs opts))) "value still realises correctly")
+      (is (= 1 (nav/value (get (nav/source bs opts) :x))) "and lookups still answer")
+      (is (= ::nf (nav/value (get (nav/source bs opts) :nope ::nf)))))))
+
+;; ------------------------------------------------------------- descent works
+
+(deftest an-unregistered-record-descends-and-agrees
+  (testing "the case that survives: no constructor means UnknownRecord, whose
+            valAt, count and seq delegate straight to the field map"
+    (let [bs (boring/encode (->Pt 7 8) opts)
+          c (nav/source bs opts)
+          realised (boring/decode bs opts)]
+      (is (descends? bs opts))
+      (is (= :tag (nav/value-type c)) "value-type still reports the tag")
+      (is (= realised (nav/value c)) "value realises the record, not the field map")
+      (is (= 2 (count c)))
+      (is (= 7 (nav/value (get c :x))))
+      (is (= (into {} realised)
+             (into {} (map (fn [[k v]] [k (nav/value v)])) (seq c)))))))
+
 (deftest a-declared-name-descends
-  (testing "`declare-navigable-record` is how a handler's author says the
-            constructor preserves structure. `map->Pt` does, so descent must
-            engage AND agree -- value still realises the RECORD."
-    (let [reg (-> (boring/tag-registry)
-                  (boring/register-record pt-name map->Pt)
-                  (boring/declare-navigable-record pt-name))
-          o (assoc opts :registry reg)
-          c (nav/source (boring/encode (->Pt 1 2) o) o)]
-      (is (= (->Pt 1 2) (nav/value c)) "value realises the record, not the map")
-      (is (= :tag (nav/value-type c)))
-      (is (= 2 (count c)) "count descends -- it refused every tag before")
-      (is (= 1 (nav/value (get c :x))))
-      (is (= ::nf (nav/value (get c :nope ::nf))))
-      (is (= {:x 1 :y 2} (into {} (map (fn [[k v]] [k (nav/value v)])) (seq c)))))))
+  (let [reg (-> (boring/tag-registry)
+                (boring/register-record pt-name map->Pt)
+                (boring/declare-navigable-record pt-name))
+        o (assoc opts :registry reg)
+        bs (boring/encode (->Pt 1 2) o)
+        c (nav/source bs o)]
+    (is (descends? bs o))
+    (is (= (->Pt 1 2) (nav/value c)) "value realises the RECORD")
+    (is (= 1 (nav/value (get c :x))))
+    (is (= ::nf (nav/value (get c :nope ::nf))))))
+
+;; ------------------------------------------------------------- conformance
 
 (deftest conformance-catches-a-declaration-that-is-not-true
-  (testing "the declaration is a CLAIM, and a wrong one returns wrong values
-            silently -- no exception, no slow path. This is the check that
-            makes it testable rather than assertable."
-    (let [;; a constructor that invents a field: structure NOT preserved
-          liar (fn [m] (assoc m :extra 99))
+  (testing "a wrong declaration returns wrong values silently -- no exception,
+            no slow path. This is what makes it checkable rather than asserted."
+    (let [liar (fn [m] (assoc m :extra 99))
           reg (-> (boring/tag-registry)
                   (boring/register-record pt-name liar)
                   (boring/declare-navigable-record pt-name))
           r (nc/check-record reg pt-name [(->Pt 1 2)])]
       (is (some? r) "a lying declaration must not pass")
-      (is (= :count (:check r)))
-      (is (= 3 (:expected r)) "the realised value has the invented field")
-      (is (= 2 (:actual r)) "the wire has only what was written")))
+      (is (= :count (:check r)))))
 
-  (testing "an honest declaration passes"
+  (testing "an honest one passes"
     (let [reg (-> (boring/tag-registry)
                   (boring/register-record pt-name map->Pt)
                   (boring/declare-navigable-record pt-name))]
       (is (nil? (nc/check-record reg pt-name [(->Pt 1 2) (->Pt 0 0)])))))
 
-  (testing "and a check that would be VACUOUS says so rather than passing --
-            an undeclared name never descends, so agreeing proves nothing"
-    (let [reg (-> (boring/tag-registry) (boring/register-record pt-name map->Pt))
-          r (nc/check-record reg pt-name [(->Pt 1 2)])]
-      (is (= :declared (:check r))))))
+  (testing "and a VACUOUS check says so rather than passing"
+    (let [reg (-> (boring/tag-registry) (boring/register-record pt-name map->Pt))]
+      (is (= :declared (:check (nc/check-record reg pt-name [(->Pt 1 2)])))))))
 
 (deftest conformance-checks-the-built-in-descents
-  (testing "check-value is the same property the shaped, typed and record tests
-            assert by hand, exposed for handler authors to run on their own data"
-    (is (nil? (nc/check-value (into (sorted-map) {:a 1 :b 2}) opts)))
-    (is (nil? (nc/check-value (vec (for [i (range 40)] {:id i :n (str i)}))
-                              (assoc opts :shapes true))))
-    (is (nil? (nc/check-value (long-array (range 50)) opts)))
-    (is (nil? (nc/check-value {:a 1 :b [1 2 3]} opts)))
-    (is (nil? (nc/check-value #{1 2 3} opts)) "an opaque tag must pass too")))
+  (is (nil? (nc/check-value (into (sorted-map) {:a 1 :b 2}) opts)))
+  (is (nil? (nc/check-value (vec (for [i (range 40)] {:id i :n (str i)}))
+                            (assoc opts :shapes true))))
+  (is (nil? (nc/check-value (long-array (range 50)) opts)))
+  (is (nil? (nc/check-value (long-array [-3 -2 -1 0]) opts)) "negatives too")
+  (is (nil? (nc/check-value {:a 1 :b [1 2 3]} opts)))
+  (is (nil? (nc/check-value #{1 2 3} opts)) "an opaque tag must pass too"))
 
 (defspec record-descent-agrees-with-realising 150
   (prop/for-all
-   ;; ONE key type per map. A sorted-map of mixed keywords and strings is not
-   ;; mutually comparable, so `(into (sorted-map) ...)` throws while BUILDING
-   ;; the fixture -- a broken generator, not a finding.
-   [pairs (gen/let [kind (gen/elements [:kw :str :num])
-                    n (gen/choose 0 7)
-                    vs (gen/vector gen/small-integer n)]
-            (map-indexed
-             (fn [i v]
-               [(case kind
-                  :kw (keyword (str "k" i))
-                  :str (str "k" i)
-                  :num (long i))
-                v])
-             vs))]
-   (let [m (into (sorted-map) pairs)
-         bs (enc m)
-         c (nav/source bs trusted)
+   [xs (gen/vector gen/small-integer 0 6)]
+   (let [v (->Pt (vec xs) (count xs))
+         bs (boring/encode v opts)
+         c (nav/source bs opts)
          realised (boring/decode bs opts)]
-     (and (= m realised)
-          (= (count m) (count c))
-          (every? #(= (realised-get realised % ::nf)
-                      (nav/value (get c % ::nf)))
-                  (concat (keys m) [:absent "absent" 0 1.0]))))))
+     (and (= realised (nav/value c))
+          (= 2 (count c))
+          (= (vec xs) (nav/value (get c :x)))
+          (= ::nf (nav/value (get c :nope ::nf)))))))

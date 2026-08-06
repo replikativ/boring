@@ -1043,36 +1043,48 @@
               ;; is not a map and gets no descent here
               (when (= MAJOR-MAP (.majorAt r payload))
                 (let [nm (realize nav name-off)]
+                  ;; THE READER DECIDES. This used to be `recordCtor == nil` here
+                  ;; in Clojure, with a docstring claiming the two could not
+                  ;; drift because both read the same registry. True of the
+                  ;; registry, false of the DECISION: it also depends on the
+                  ;; reserved-name table and on `:on-unknown-record` and
+                  ;; `:auto-construct-records?`, and the mirror was wrong about
+                  ;; all three the day it was written -- `:on-unknown-record` had
+                  ;; been added the day before. Three documented configurations
+                  ;; produced silently wrong values, and a fourth let nav answer
+                  ;; where the reader raises, bypassing a policy gate.
+                  ;;
+                  ;; `Reader.recordDescendable` sits beside the dispatch it has
+                  ;; to agree with and reads the same fields. Nothing here
+                  ;; mirrors anything.
                   (when (and (string? nm)
-                             (or (nil? (.recordCtor (.registry r) ^String nm))
-                                 ;; ...or its author declared it
-                                 ;; structure-preserving. See
-                                 ;; `boring/declare-navigable-record`, and
-                                 ;; `boring.nav-conformance/check-record` for
-                                 ;; testing the claim rather than trusting it.
-                                 (.isNavigableRecord (.registry r) ^String nm)))
-                    (let [sorted? (= nm "clojure/sorted-map")]
+                             (.recordDescendable r ^String nm))
+                    ;; NO SORTED-MAP SPECIAL CASE ANY MORE. `clojure/sorted-map`
+                    ;; is a reserved name and `recordDescendable` refuses it, so
+                    ;; the compare-versus-equals dance that used to live here is
+                    ;; gone with it.
+                    ;;
+                    ;; That gives up a measured 73x on sorted-map lookups, which
+                    ;; is a real loss and worth stating plainly. The reason is
+                    ;; that descent was only sound for sorted-maps BORING WROTE.
+                    ;; Clojure cannot build a sorted-map whose keys are not
+                    ;; mutually comparable, and the writer refuses a custom
+                    ;; comparator -- but a hand-crafted document can claim the
+                    ;; name over any keys at all, and then `decode` raises while
+                    ;; `count` and `seq` answer. Establishing comparability means
+                    ;; realising every key when the view is built, which is O(K)
+                    ;; on the operation the descent exists to make O(log K).
+                    ;;
+                    ;; Revisitable: the shaped-row watermark shows how to verify
+                    ;; incrementally instead. Not worth it until someone stores
+                    ;; sorted-maps hot.
+                    (do
                       {:kind :map
                        :n (head-count nav payload)
                        :lookup
                        (fn [k]
-                         ;; A sorted-map looks up by `compare`, not `=`, and the
-                         ;; two disagree across numeric types:
-                         ;; `(get (sorted-map 1 :a) 1.0)` is `:a` because
-                         ;; `(compare 1 1.0)` is 0, while a byte probe for 1.0
-                         ;; matches nothing -- and the same trap is reachable
-                         ;; inside a vector key, since `(compare [1] [1.0])` is
-                         ;; 0 too. So sorted lookups descend only where the two
-                         ;; agree, and everything else realises.
-                         ;;
-                         ;; A custom comparator cannot arrive here at all:
-                         ;; `Writer.requireDefaultComparator` refuses to encode
-                         ;; one.
-                         (if (and sorted?
-                                  (not (or (keyword? k) (symbol? k) (string? k))))
-                           ::realise
-                           (let [p (lookup-map nav payload k)]
-                             (if (neg? p) ::miss (cursor-at nav p)))))
+                         (let [p (lookup-map nav payload k)]
+                           (if (neg? p) ::miss (cursor-at nav p))))
                        :entries
                        (fn []
                          (map (fn [[kp vp]]

@@ -35,6 +35,26 @@
   [m k nf]
   (try (get m k nf) (catch ClassCastException _ nf)))
 
+(defn- declined?
+  "Whether `x` is nav DECLINING rather than answering -- a typed `:boring/...`
+   error out of an operation the realised value can answer.
+
+   Declining is sound and is not a divergence. `count` on a tag with no descent
+   raises `:boring/not-a-container`, which is the contract for an opaque tag and
+   was the behaviour for EVERY tag before descents existed. What the invariant
+   forbids is answering DIFFERENTLY, not answering less.
+
+   An UNTYPED throwable is never declining -- it is the failure this namespace
+   exists to catch -- so it is deliberately not folded in here.
+
+   DECLINING TAKES TWO FORMS, which is easy to miss: `count` on an opaque tag
+   THROWS `:boring/not-a-container`, while `seq` on one simply returns NIL. Only
+   folding the throw in left the nil comparing as an empty collection against a
+   populated one."
+  [x]
+  (and (instance? clojure.lang.ExceptionInfo x)
+       (some? (:type (ex-data x)))))
+
 (defn- same?
   "Value equality, INCLUDING Java arrays.
 
@@ -80,19 +100,28 @@
          (let [want (count (if (and (some? realised) (.isArray (class realised)))
                             (seq realised) realised))
                got (try (count c) (catch Exception e e))]
-           (when-not (same? want got) (fail :count want got)))
-         (let [want (if (map? realised) (into {} realised) (vec (seq realised)))
-               got (try (if (map? realised)
-                          (into {} (map (fn [[k x]] [k (nav/value x)])) (seq c))
-                          (mapv nav/value (seq c)))
-                        (catch Exception e e))]
-           (when-not (same? want got) (fail :seq want got)))
-         (let [want (if (map? realised) (into {} realised) (vec (seq realised)))
-               got (try (if (map? realised)
-                          (into {} (map (fn [[k x]] [k (nav/value x)])) c)
-                          (into [] (map nav/value) c))
-                        (catch Exception e e))]
-           (when-not (same? want got) (fail :reduce want got)))))
+           (when-not (or (declined? got) (same? want got))
+             (fail :count want got)))
+         ;; the RAW seq first: nil is nav declining to enumerate, not an empty
+         ;; collection, and the two are indistinguishable once poured into a map
+         (let [raw (try (seq c) (catch Exception e e))]
+           (when-not (or (nil? raw) (declined? raw))
+             (let [want (if (map? realised) (into {} realised) (vec (seq realised)))
+                   got (try (if (map? realised)
+                              (into {} (map (fn [[k x]] [k (nav/value x)])) raw)
+                              (mapv nav/value raw))
+                            (catch Exception e e))]
+               (when-not (or (declined? got) (same? want got))
+                 (fail :seq want got)))))
+         (let [raw (try (seq c) (catch Exception e e))]
+           (when-not (or (nil? raw) (declined? raw))
+             (let [want (if (map? realised) (into {} realised) (vec (seq realised)))
+                   got (try (if (map? realised)
+                              (into {} (map (fn [[k x]] [k (nav/value x)])) c)
+                              (into [] (map nav/value) c))
+                            (catch Exception e e))]
+               (when-not (or (declined? got) (same? want got))
+                 (fail :reduce want got)))))))
       (first
        (keep (fn [k]
                (let [want (realised-get realised k ::absent)

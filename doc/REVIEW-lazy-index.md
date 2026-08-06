@@ -120,7 +120,7 @@ The contract is that only `ex-info` with a `:boring/...` type escapes.
 
 ## 2. Silently wrong values on undamaged data
 
-- [ ] **S6** `record-view`'s gate (`nav.clj:1000`) is `recordCtor == nil`, but
+- [x] **S6** `record-view`'s gate (`nav.clj:1000`) is `recordCtor == nil`, but
       that has **four** outcomes in the Reader (`Reader.java:2598-2823`), driven
       by options the gate never consults:
       - `:on-unknown-record <fn>` -> nav `get`/`count`/`seq` all wrong
@@ -131,13 +131,29 @@ The contract is that only `ex-info` with a `:boring/...` type escapes.
       - same, wire key order != basis order -> `seq` order differs
       The docstring's "the two cannot drift" is true of the registry and false of
       the decision.
-- [ ] **S7** **Eight** reserved tag-27 names with a map payload descend and
+      FIXED via option D: `Reader.recordDescendable` sits beside the tag-27
+      dispatch and reads the same fields. Nav mirrors nothing. Verified across
+      all six configurations: descent happens only for unregistered+`:fallback`
+      and registered+declared, and the ANSWERS agree with `decode` in every case
+      — nav either matches or declines.
+- [x] **S7** **Eight** reserved tag-27 names with a map payload descend and
       answer, while `decode` raises `:boring/bad-tag-content` for all of them:
       `clojure/sorted-set`, `clojure/queue`, `clojure/with-meta`, `clojure/char`,
       `clojure/ex-info`, `java/throwable`, `java/*-array`, `java/period`. The
       `sorted?` special case covers only `clojure/sorted-map`. `sorted-set` is
       precisely the "OPERATION-CHANGING, `get` on a set is MEMBERSHIP, stays
       opaque" case the dispatch comment claims is excluded.
+      FIXED: all twelve are refused by `Reader.isReservedRecordName`, listed once
+      beside the switch it mirrors and pinned by a test that names all twelve.
+
+      COST, recorded honestly: `clojure/sorted-map` goes with them, giving up a
+      measured 73x. Descent there was sound only for sorted-maps BORING wrote —
+      Clojure cannot build one with mutually incomparable keys and the writer
+      refuses a custom comparator, but a hand-crafted document can claim the name
+      over any keys, and then `decode` raises while `count` and `seq` answer.
+      Proving comparability means realising every key at view-build: O(K) on the
+      operation the descent made O(log K). Revisitable via the shaped-row
+      watermark pattern if anyone stores sorted-maps hot.
 - [ ] **S8** `typed-view` (`nav.clj:928`) never bounds the payload against the
       source. Tag 79 declaring 1 MiB with 8 bytes present: `count` -> 131072,
       `nth 0` fabricates an element; `decode` -> `:boring/bad-count`.
