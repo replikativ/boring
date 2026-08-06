@@ -75,13 +75,13 @@
 
 ;; -------------------------------------------------------- known divergences
 ;;
-;; Each entry is a finding from doc/REVIEW-lazy-index.md that is not fixed yet.
+;; Each entry is a finding from the branch review that is not fixed yet.
 ;; It is asserted to STILL diverge: removing the fix without removing the entry
 ;; keeps the suite green, but FIXING it turns this red, which is the prompt to
 ;; delete the row. Every entry must name its finding id.
 
 (def ^:private known-divergent
-  "#{[axis-label-or-:any document-label property]} -- see doc/REVIEW-lazy-index.md.
+  "#{[axis-label-or-:any document-label property]}.
 
    Both entries below are option-INDEPENDENT, hence `:any`: they are arithmetic
    defects that no reader option reaches. Discovering that is itself worth
@@ -109,8 +109,8 @@
 ;; would forbid a shallow lookup on a document with one deep malformed element,
 ;; which is exactly what lazy navigation is for. So this is a per-descent
 ;; obligation -- a descent must not enter a tag the reader would refuse -- and it
-;; belongs in the tests for each descent, not here. See PR 3 in
-;; doc/REVIEW-lazy-index.md.
+;; belongs in the tests for each descent, not here. See `boring.record-nav-test`,
+;; which pins it per descent.
 
 ;; ------------------------------------------------------------------ helpers
 
