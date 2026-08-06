@@ -23,6 +23,14 @@
     IReduceInit  `reduce` over children with no intermediate seq
     zipper       via `zipper`, read-only: make-node throws
 
+    source       open a document; takes options or a `context`
+    context      resolved options plus an encoded-key cache, for a SCAN that
+                 opens one source per document -- 2.4x on 4000 blobs
+    value        realise what a cursor points at
+    container?   whether a cursor can be descended into
+    items        top-level items of an RFC 8742 sequence
+    fork         a cursor usable from another thread
+
   NOT IDeref. `@cursor` would read as a cheap field access while doing
   arbitrary decode work, and IDeref means a reference type with changing
   identity or a caching pending computation -- a cursor is neither. `value` is
@@ -50,30 +58,101 @@
      so this can only arrive from a foreign streaming encoder. Decode such a
      document with `boring/decode`, which handles them fine.
 
-  TAGS ARE OPAQUE. `get` on a tagged value realises it through the normal
-  reader and continues with clojure.core/get on the result. A tag's reader is
-  an arbitrary function, so there is no general relationship between the wire
-  shape and the logical shape of what it returns -- descending structurally
-  could disagree with decoding, silently. The slow path IS the reference
-  implementation, which is what makes the fast path safe to trust."
+  TAGS ARE OPAQUE BY DEFAULT, WITH THREE EXCEPTIONS. `get` on a tagged value
+  realises it through the normal reader and continues with clojure.core/get on
+  the result. A tag's reader is an arbitrary function, so there is no general
+  relationship between the wire shape and the logical shape of what it returns
+  -- descending structurally could disagree with decoding, silently.
+
+  Three forms are descended into anyway, because boring WROTE them and knows
+  what they mean: shaped arrays (tag 39649), RFC 8746 typed arrays, and tag-27
+  records. Each is worth 36-73x on the shape it covers, and each refuses
+  wherever equivalence is not provable -- see the taxonomy above
+  `tag-view-builders`. A record's gate is `Reader.recordDescendable`, which
+  lives beside the dispatch it must agree with rather than mirroring it here.
+
+  Everything else still realises, and realising is still the reference
+  implementation.
+
+  A HANDLER CAN OPT IN. `boring/declare-navigable-record` says a registered
+  constructor preserves structure; `boring.nav-conformance` checks that claim
+  against your own data, because a wrong one returns wrong values silently.
+
+  THE INVARIANT, stated carefully, because the obvious version is false:
+
+    For a document the configured reader would decode successfully, every nav
+    answer equals the realised answer. Where the reader would raise on the
+    SUBTREE a nav operation actually touches, nav raises the same typed error.
+    Nav may also DECLINE -- `count` on an opaque tag refuses -- which is sound;
+    what it may never do is answer differently.
+
+  Nav does NOT charge document-wide resource budgets for a partial read.
+  `:max-items` and `:max-depth` bound a whole decode; a lookup that reads three
+  items is not charged for the other ten thousand, so `(get c :a)` can succeed
+  where `decode` raises `:boring/max-items-exceeded`. That is deliberate, it
+  predates every descent, and charging them would defeat this namespace.
+  `boring.nav-divergence-test` asserts the rest."
   (:require [boring.core :as boring]
             [boring.data]
             [boring.errors :as err]
             [boring.frame :as frame]
             [boring.options :as opt]
             [clojure.zip :as zip])
-  (:import (org.replikativ.boring Reader ByteSource)))
+  (:import (org.replikativ.boring Reader ByteSource)
+           (java.util.concurrent.atomic AtomicReferenceArray)))
 
 (set! *warn-on-reflection* true)
 
-(declare ->Cursor cursor-at read-index read-index*)
+(declare ->Cursor cursor-at read-index read-index* tag-view
+         nth-item realize lookup-map head-count child-offsets)
+
+;; A shaped array is `39649([keys, [row, row, ...]])`, where each row is an
+;; ARRAY of values positionally matching `keys`. It REALISES to a vector of
+;; maps, so a cursor on one has to present that shape without building it --
+;; see `shaped-view`.
+(def ^:private ^:const TAG-SHAPED-ARRAY 39649)
 
 (defn- fail [type msg data]
   (throw (ex-info msg (assoc data :type type))))
 
 ;; ---------------------------------------------------------------- the source
 
-(deftype Nav [^Reader rdr opts probes idx src])
+(declare slot-at node-sound?)
+
+;; `views` is a ONE-SLOT cache of the last tag view built, as `[offset view]`.
+;;
+;; It was an unbounded `atom {}` keyed by offset, and it grew one entry per tag
+;; offset TOUCHED -- `::none` for non-navigable ones included. A `reduce` over
+;; `nav/items` of 2000 records retained 2000 entries; 2000 sets retained 2000
+;; useless ones. That contradicts `items`' own promise that nothing before the
+;; cursor you are holding stays live, on exactly the workload the descents were
+;; built for.
+;;
+;; One slot is enough for what the cache is FOR. Every row of one shaped array
+;; shares a single tag offset, so a caller walking rows hits the slot every
+;; time; a caller walking many different tags gains nothing from memoising each
+;; one, and a miss is `majorAt` + `headArgAt` + a map lookup.
+;;
+;; Separate from `probes` rather than sharing it: `probes` is keyed by USER key
+;; values, so a caller whose key happened to equal a cache key would get a view
+;; where encoded bytes were expected.
+(deftype Nav [^Reader rdr opts probes idx src views])
+
+(defn- nav-idx
+  "The decoded index, parsed on first use.
+
+  `idx` holds a DELAY, not the index. Parsing the frame is the expensive part
+  -- measured 8.5 us of the 11.0 us a per-call indexed lookup took, against
+  2.5 us once the source is reused -- and a caller that only touches a
+  top-level key never needs it. A store hands out a fresh blob per read and so
+  constructs a source per read, which made an index cost more than it saved:
+  an indexed binary search ran 11.0 us per call against 2.5 us reused, and a
+  shallow `:meta` lookup went from 0.95 us unindexed to 7.5 us indexed.
+
+  Deferring it makes an index free for the lookups that do not consult it, and
+  unchanged for the ones that do."
+  [^Nav n]
+  (when-let [d (.idx n)] @d))
 
 (defn- node-slot
   "Position of the index node covering the container at `off`, or -1.
@@ -91,27 +170,96 @@
   ;; unusable now yields `{:data-end ptr}` alone -- the two questions are
   ;; answered separately, see `read-index*` -- so an index can be present and
   ;; carry no nodes at all.
-  (if-let [^longs cs (some-> ^Nav nav .idx :containers)]
-    (loop [lo 0 hi (dec (alength cs))]
-      (if (> lo hi)
-        -1
-        (let [mid (quot (+ lo hi) 2)
-              c (aget cs mid)]
-          (cond (= c off) mid
-                (< c off) (recur (inc mid) hi)
-                :else (recur lo (dec mid))))))
-    -1))
+  (let [ix (nav-idx nav)]
+    (if-let [^longs cs (:containers ix)]
+      (loop [lo 0 hi (dec (alength cs))]
+        (if (> lo hi)
+          -1
+          (let [mid (quot (+ lo hi) 2)
+                c (aget cs mid)]
+            (cond
+              ;; VALIDATED HERE, not at load. The node is checked against the
+              ;; data the first time a lookup lands on it, and an unsound one
+              ;; reports -1 -- which every caller already treats as "no index,
+              ;; walk it". So the fallback path is the one that always existed
+              ;; and the failure mode is unchanged; only the moment of
+              ;; discovery moved. See `index-payload`.
+              (= c off) (if (node-sound? nav ix mid) mid -1)
+              (< c off) (recur (inc mid) hi)
+              :else (recur lo (dec mid))))))
+      -1)))
+
+(def ^:private ^:const max-cached-probes
+  "How many encoded keys one context remembers. Generous for the intended use --
+  a path is a handful of keys -- and a bound rather than a target."
+  1024)
 
 (defn- probe-for
   "The encoded bytes of `k`, cached. Key matching compares bytes rather than
   decoding keys, which is sound because encoding is deterministic for a given
   profile -- so byte equality is value equality."
   ^bytes [^Nav nav k]
-  (let [p (.probes nav)]
-    (or (get @p k)
+  (let [p (.probes nav)
+        m @p]
+    (or (get m k)
         (let [bs (boring/encode k (.opts nav))]
-          (swap! p assoc k bs)
+          ;; BOUNDED. A context is documented as reusable for as long as its
+          ;; options hold, and its cache is shared by every source opened
+          ;; through it -- so with computed keys (`(str "id-" i)`) this grew for
+          ;; the life of the scan: 5000 entries after 5000 distinct keys. Past
+          ;; the bound the encoding still happens, it is simply not remembered,
+          ;; which costs a re-encode and never an answer.
+          ;;
+          ;; The cache exists for a PATH's keys, which is a handful repeated per
+          ;; document. A working set that large is not a path, it is a leak.
+          (when (< (count m) max-cached-probes)
+            (swap! p assoc k bs))
           bs))))
+
+;; A reusable navigation context: resolved options plus the PROBE CACHE, shared
+;; across every source opened through it.
+;;
+;; The probe cache holds `key value -> encoded bytes`, which is a fact about the
+;; key and the profile and NOT about any document, so sharing it is sound. It is
+;; also where the time goes when a caller opens one source per document and
+;; makes a handful of lookups: encoding the four keywords of
+;; `[:value :profile :address :city]` costs 0.711 us against 0.169 us for the
+;; navigation itself, so a scan over 4000 blobs paid for those four keys 4000
+;; times. Reusing one source instead measured 8.9x faster end to end.
+;;
+;; THE SHAPE CACHE IS DELIBERATELY NOT SHARED. It is keyed by OFFSET, which
+;; means something only within one document -- offset 22 is a different
+;; container in the next blob -- so a shared one would hand a cursor another
+;; document's shape and return wrong values. Each source gets its own.
+;; `cfg` is the reader configuration resolved ONCE. `configure-reader!` reads
+;; eleven options from a Clojure map, and a scan that opens a source per document
+;; repeated that per document -- 44 000 map lookups over 4000 blobs, each one a
+;; linear scan of a PersistentArrayMap, for an answer fixed before the scan
+;; began. Same shape as the encoded-key cache this type already carries.
+(deftype NavContext [opts probes ^objects cfg])
+
+(defn context
+  "A reusable navigation context for `opts`, to be passed to `source` in place
+  of the options map when opening MANY sources with the same options.
+
+  Sources opened through one context share the encoded-key cache, so a path's
+  keys are encoded once for the whole scan rather than once per document. That
+  is worth having: on 229-byte blobs, encoding the keys of a four-step path cost
+  0.711 us per document against 0.169 us for the navigation it enabled.
+
+    (let [ctx (nav/context {:stringref false})]
+      (doseq [blob blobs]
+        (nav/value (get-in (nav/source blob ctx) path))))
+
+  A context holds no document state and is safe to reuse for as long as the
+  options hold. It is NOT a cache of documents: per-document state, including
+  the index and the shape cache, still belongs to each source.
+
+  Thread-safe: the cache is an atom, and the worst a race can do is encode the
+  same key twice."
+  [opts]
+  (let [o (assoc (opt/check-opts opts) :stringref false)]
+    (NavContext. o (atom {}) (boring/reader-config o))))
 
 (defn- nav-of ^Nav [src opts]
   ;; VALIDATED like every other decode entry point. This was the one that was
@@ -125,7 +273,19 @@
   ;; resolution is deliberately not idempotent, because a resolved map has
   ;; `:canonical` in it and re-resolving reads that as the caller trying to
   ;; override what the profile locks.
-  (let [opts (assoc (opt/check-opts opts) :stringref false)
+  (let [_ (when-not (or (map? opts) (nil? opts) (instance? NavContext opts))
+            (fail :boring/bad-options
+                  (str "boring.nav: expected an options map or a `nav/context`, got "
+                       (some-> opts class .getName))
+                  {:got (class opts)}))
+        ctx? (instance? NavContext opts)
+        ;; A context has already been checked and had `:stringref false`
+        ;; applied; re-doing it per source would put the per-document cost back.
+        probes (if ctx? (.probes ^NavContext opts) (atom {}))
+        ^objects cfg (when ctx? (.cfg ^NavContext opts))
+        opts (if ctx?
+               (.opts ^NavContext opts)
+               (assoc (opt/check-opts opts) :stringref false))
         ^Reader r (cond
                     (bytes? src) (Reader. ^bytes src)
                     (instance? ByteSource src) (Reader. ^ByteSource src)
@@ -140,7 +300,9 @@
         ;; ordinary reader, same registry, same records" and `source`'s that
         ;; `opts` "are the decode options realisation will use". A caller's
         ;; `:max-depth`, which is a security bound, was not enforced here at all.
-        _ (boring/configure-reader! r opts)]
+        ;; A context applies its pre-resolved config; everything else resolves
+        ;; the map here, exactly as before.
+        _ (if cfg (boring/apply-reader-config! r cfg) (boring/configure-reader! r opts))]
     (when (.hasStringrefRoot r)
       (fail :boring/stringref-not-navigable
             (str "boring.nav: this document opens a stringref namespace, and a "
@@ -148,25 +310,53 @@
                  "with {:stringref false} to navigate it, or decode it whole "
                  "with boring/decode.")
             {}))
-    (let [nav (Nav. r opts (atom {}) nil src)]
-      ;; `:trust-index :ignore` skips the index entirely and scans. The scan is
-      ;; the reference implementation the indexed paths are checked against, so
-      ;; this is the one setting whose correctness needs no separate argument.
-      (Nav. r opts (atom {})
-            (when-not (= :ignore (:trust-index opts)) (read-index nav))
-            src))))
+    ;; ONE Nav, not two. The delay has to close over the Nav it will read from,
+    ;; and the Nav has to hold the delay, so this used to build a throwaway Nav
+    ;; purely to be captured -- two Navs and two shape atoms per source, on a
+    ;; path a document store walks once per blob. A volatile breaks the cycle
+    ;; without changing what anything sees: the delay cannot run before the
+    ;; vreset!, because only the returned Nav is reachable.
+    ;;
+    ;; `:trust-index :ignore` skips the index entirely and scans. The scan is
+    ;; the reference implementation the indexed paths are checked against, so
+    ;; this is the one setting whose correctness needs no separate argument.
+    (let [holder (volatile! nil)
+          ;; A DELAY. Detection is deferred with the parse: a document with no
+          ;; frame costs nothing to find that out, and one with a frame pays
+          ;; only if something consults it.
+          idx (when-not (= :ignore (:trust-index opts))
+                (delay (read-index @holder)))
+          nav (Nav. r opts probes idx src (volatile! nil))]
+      (vreset! holder nav)
+      nav)))
 
 (defn- fork-nav ^Nav [^Nav n]
   (let [src (.src n)
         ^Reader r (cond (bytes? src) (Reader. ^bytes src)
                         :else (Reader. ^ByteSource src))]
-    (boring/configure-reader! r (.opts n))
+    ;; Resolved once here rather than reading the options map, for the same
+    ;; reason `context` does it: `configure-reader!` is eleven `get`s on a
+    ;; PersistentArrayMap, whose `get` is a linear scan. Once per fork, so the
+    ;; saving is nil -- but a path that forgot is how the option surface drifts,
+    ;; and this file has found that shape three times already.
+    (boring/apply-reader-config! r (boring/reader-config (.opts n)))
+    ;; A FRESH VIEW SLOT, and that is load-bearing rather than tidy: a cached
+    ;; view holds closures over the parent's `nav`, hence over the parent's
+    ;; Reader. Sharing the slot across a fork would share the Reader, which is
+    ;; the one thing `fork` exists to prevent.
+    ;;
     ;; The decoded INDEX is shared -- it is immutable once built and it is the
     ;; expensive part: 145 us for a 20 000-item index against 175 ns for a
     ;; Reader. A fresh probe cache rather than a shared one, because it is the
     ;; only other mutable field and contending an atom to save a key encode is
     ;; the wrong trade.
-    (Nav. r (.opts n) (atom {}) (.idx n) src)))
+    ;; FORCED HERE, then shared as a realised value. Sharing the delay itself
+    ;; would let the forked thread parse the frame through the PARENT's
+    ;; Reader, which is the one thing `fork` exists to avoid. Forcing on the
+    ;; forking thread keeps the sharing -- 145 us for a 20 000-item index --
+    ;; without the aliasing.
+    (let [ix (nav-idx n)]
+      (Nav. r (.opts n) (atom {}) (when ix (delay ix)) src (volatile! nil)))))
 
 (defn source
   "A navigable view over `src` -- a byte[], or a ByteSource such as
@@ -187,6 +377,7 @@
 
 ;; ------------------------------------------------------------- wire queries
 
+(def ^:private ^:const MAJOR-TEXT 3)
 (def ^:private ^:const MAJOR-ARRAY 4)
 (def ^:private ^:const MAJOR-MAP 5)
 (def ^:private ^:const MAJOR-TAG 6)
@@ -306,7 +497,7 @@
   (let [^Reader r (.rdr nav)
         n (head-count nav off)
         ^bytes probe (probe-for nav k)
-        idx (.idx nav)
+        idx (nav-idx nav)
         ns (node-slot nav off)]
     ;; A node with NO anchors means nothing to jump to -- walk instead. Empty
     ;; containers legitimately produce one (`:index-min 0` will index a `{}`),
@@ -314,9 +505,9 @@
     ;; `(max 0 (min (dec m) hi))` still yields 0 and `aget` threw straight at
     ;; the caller of `get`. Cheaper to notice here than to special-case both
     ;; branches, and it also covers any future node that turns out empty.
-    (if (or (neg? ns) (zero? (alength ^longs (nth (:slots idx) ns))))
+    (if (or (neg? ns) (zero? (alength ^longs (slot-at idx ns))))
       (scan-map r (.headEndAt r off) n probe)
-      (let [^longs slot (nth (:slots idx) ns)
+      (let [^longs slot (slot-at idx ns)
             stride (long (:stride idx))
             m (alength slot)]
         ;; Entries after anchor a, which is NOT always `stride`: the last
@@ -344,6 +535,15 @@
                 ;; only on genuine misses, where an honest answer requires the
                 ;; walk anyway: trusting an index for a NEGATIVE is exactly
                 ;; what damage makes unsound.
+                ;; WHY `confirm` IS NOT REDUNDANT, beyond the damaged-anchor
+                ;; case argued above. A `:sorted` node over a map the WRITER
+                ;; ordered by something other than canonical CBOR bytes -- a
+                ;; `clojure/sorted-map` payload is ordered by Clojure `compare`
+                ;; -- leaves this binary-searching an array that is not sorted
+                ;; by the function the search compares with. It stays correct
+                ;; only because a negative is re-derived by an honest scan and a
+                ;; positive requires an exact byte match. Deleting `confirm` as
+                ;; a redundant optimisation would break those lookups silently.
                 (confirm [^long hit]
                   (if (neg? hit) (scan-map r (.headEndAt r off) n probe) hit))]
           (if (nth (:sorted idx) ns)
@@ -390,17 +590,22 @@
         n (head-count nav off)]
     (if (or (neg? idx) (>= idx n))
       -1
-      (let [ix (.idx nav)
+      (let [ix (nav-idx nav)
             ns (node-slot nav off)]
         (if (neg? ns)
           (loop [i 0 p (.headEndAt r off)]
             (if (= i idx) p (recur (inc i) (skip r p))))
-          (let [^longs slot (nth (:slots ix) ns)
+          (let [^longs slot (slot-at ix ns)
                 stride (long (:stride ix))
                 anchor (quot idx stride)]
             (loop [i (* anchor stride) p (long (aget slot anchor))]
               (if (= i idx) p (recur (inc i) (skip r p))))))))))
 
+;; NOTE: this compares the declared count against `room` BEFORE doubling for a
+;; map, while `Cursor.count` compares `2n`. Both are typed refusals, so the
+;; difference is which one fires -- a map declaring exactly `room` pairs passes
+;; here and fails in `skip`. Cosmetic, but the two guards should say the same
+;; thing if either is ever touched.
 (defn- child-offsets
   "Offsets of the children of the container at `off`, in wire order. For a map
   these alternate key, value."
@@ -425,7 +630,14 @@
         (persistent! acc)
         (recur (inc i) (skip r p) (conj! acc p))))))
 
-(deftype Cursor [^Nav nav ^long off]
+;; `shape` is nil for every ordinary cursor. It is non-nil only on a cursor
+;; standing on a ROW of a shaped array, where the bytes are an array of values
+;; but the logical value is a MAP -- the keys live once in the shape header.
+;;
+;; Carried on the cursor rather than looked up from the row's offset because a
+;; row does not know it is a row: nothing in its own bytes distinguishes it
+;; from any other array. The parent hands it down.
+(deftype Cursor [^Nav nav ^long off shape]
   ;; Associative, not merely ILookup: `contains?` and `find` are what a caller
   ;; reaches for after `get`, and both threw "not supported on type" -- an
   ;; untyped IllegalArgumentException on undamaged data. `assoc` is refused,
@@ -467,18 +679,114 @@
   clojure.lang.ILookup
   (valAt [this k] (.valAt this k nil))
   (valAt [_ k nf]
-    (let [mj (major nav off)]
-      (cond
-        (= mj MAJOR-MAP) (let [p (lookup-map nav off k)]
-                           (if (neg? p) nf (cursor-at nav p)))
+    (if shape
+      ;; A ROW of a shaped array. Its bytes are an array, but it IS a map, so
+      ;; the key is resolved through the shape to a position and the row is
+      ;; then indexed like any other array. A key the shape does not carry is
+      ;; absent -- `writeShapedArray` only emits rows whose key sets match.
+      (if-some [i (get (:pos shape) k)]
+        (let [p (nth-item nav off (long i))]
+          (if (neg? p) nf (cursor-at nav p)))
+        nf)
+      (let [mj (major nav off)]
+        (cond
+          (= mj MAJOR-MAP) (let [p (lookup-map nav off k)]
+                             (if (neg? p) nf (cursor-at nav p)))
+        ;; AN INTEGER KEY ON AN ARRAY IS AN INDEX, as it is for a Clojure
+        ;; vector. This fell through to not-found, so `get` reported a PRESENT
+        ;; element absent and `contains?` -- which is defined in terms of
+        ;; `valAt` two forms up -- reported false for a valid index, while
+        ;; `nth` returned the element. Undamaged data, no error.
+        ;;
+        ;; It survived because it depends on the ENCODING rather than the data:
+        ;; under `:shapes` an array is a tag cursor, so the MAJOR-TAG branch
+        ;; below realised it and clojure.core answered correctly. A consumer
+        ;; writing `get-in` over a path with an index therefore worked or
+        ;; silently returned nil according to how the document happened to be
+        ;; written.
+        ;; `(long k)`, NOT `(int k)`. The checked int cast threw
+        ;; ArithmeticException -- untyped, out of `get` -- for any index past
+        ;; 2^31, where `clojure.core/get` on the realised vector is total and
+        ;; simply answers not-found. `nth-item` already range-checks against the
+        ;; container's own count, so the long reaches it and comes back -1.
+          (and (= mj MAJOR-ARRAY) (integer? k))
+          (let [p (nth-item nav off (long k))]
+            (if (neg? p) nf (cursor-at nav p)))
         ;; A tag's reader is arbitrary, so structure does not imply semantics.
         ;; Realise and let clojure.core decide -- correct for every registry.
         ;; `clojure.core/get` is total EXCEPT on a sorted collection, where an
         ;; incomparable key throws a raw ClassCastException; a lookup that was
         ;; handed a not-found value must not throw.
-        (= mj MAJOR-TAG) (try (get (realize nav off) k nf)
-                              (catch ClassCastException _ nf))
-        :else nf)))
+        ;;
+        ;; THIS IS O(CONTAINER), AND IT IS THE ONE PLACE NAVIGATION IS NOT.
+        ;; Realising defeats the index completely -- not because the index is
+        ;; missing but because the cursor never reaches the container it
+        ;; describes. A tag-27 record puts its payload 22 bytes in, so the root
+        ;; cursor is the TAG, `node-slot` is asked about the tag's offset, and
+        ;; no node matches it.
+        ;;
+        ;; Measured on 2000 keys, reaching the last one: a bare map is 0.26 us
+        ;; against 13.47 us walking (52x, and FLAT in size), while the same
+        ;; pairs as a `sorted-map` -- which round-trips as a tag-27 record --
+        ;; cost 550 us with the index and 541 us without it. Position does not
+        ;; matter either: the FIRST key costs the same as the last, which is the
+        ;; signature of realisation rather than a scan that short-circuits.
+        ;;
+        ;; DESCENTS NOW EXIST FOR THREE OF THESE, each measured reaching the
+        ;; last element and each FLAT in size where realising grew:
+        ;;
+        ;;   shaped arrays   5.60 us against 206.83   (5000 rows)   36.9x
+        ;;   typed arrays    1.77 us against  70.90   (100k longs)    40x
+        ;;   records         7.91 us against 577.18   (2000 keys)     73x
+        ;;
+        ;; `:shapes` used to cost projection roughly 4x for its ~2x size win,
+        ;; so the fork users had to choose between -- small or navigable -- is
+        ;; gone for that shape.
+        ;;
+        ;; SETS ARE NOT AMONG THEM, and a registered tag-27 name is not either:
+        ;; `get` on a set means MEMBERSHIP, which no structural descent
+        ;; reproduces, and a registered ctor is an arbitrary `IFn`. Both still
+        ;; realise, which is what already worked.
+        ;;
+        ;; Descending into a tag in general means knowing its reader preserves
+        ;; structure, which is a registry question rather than a format one, and
+        ;; guessing wrong returns a wrong value rather than a slow one. A shaped
+        ;; array is the case where boring knows, because boring wrote it.
+          (= mj MAJOR-TAG)
+          (let [v (tag-view nav off)
+                ;; `clojure.core/get` is total EXCEPT on a sorted collection,
+                ;; where an incomparable key throws; a lookup handed a
+                ;; not-found value must not throw.
+                fallback #(try (get (realize nav off) k nf)
+                               (catch ClassCastException _ nf))]
+            (case (:kind v)
+              ;; WHICH KEYS A VECTOR-KINDED TAG ANSWERS IS THE VIEW'S BUSINESS,
+              ;; because the two of them realise to different host types and
+              ;; `clojure.core/get` treats those differently. A shaped array
+              ;; realises to a Clojure vector, which uses `Util.isInteger` and
+              ;; answers not-found for 0.0; a typed array realises to a JAVA
+              ;; ARRAY, and `RT.getFrom` tests `instanceof Number` there, so
+              ;; `(get (long-array [10]) 0.0)` is 10. Hard-coding `integer?`
+              ;; here was stricter than the thing it mirrors.
+              :vector (if ((:key-pred v) k)
+                        (let [r ((:nth v) (long k))]
+                          (cond (identical? ::miss r) nf
+                                ;; `::realise` is part of the view contract for
+                                ;; BOTH kinds, and only `:map` honoured it -- so
+                                ;; a vector-kinded builder returning it would
+                                ;; have handed the caller the keyword
+                                ;; `:boring.nav/realise`. No builder does today;
+                                ;; the next one would have found out the hard
+                                ;; way.
+                                (identical? ::realise r) (fallback)
+                                :else r))
+                        nf)
+              :map (let [r ((:lookup v) k)]
+                     (cond (identical? ::miss r) nf
+                           (identical? ::realise r) (fallback)
+                           :else r))
+              (fallback)))
+          :else nf))))
 
   clojure.lang.Indexed
   ;; THROWS out of range, as `Indexed.nth(int)` is specified to and as every
@@ -491,28 +799,78 @@
         (throw (IndexOutOfBoundsException. (str "boring.nav: index " i " out of bounds")))
         v)))
   (nth [_ i nf]
-    (let [mj (major nav off)]
-      (cond
-        (= mj MAJOR-ARRAY) (let [p (nth-item nav off i)]
-                             (if (neg? p) nf (cursor-at nav p)))
+    (if shape
+      ;; A row realises to a MAP, and `clojure.core/nth` on a map answers with
+      ;; the not-found value rather than an element. Matching that is what keeps
+      ;; `(nth (get c 0) 0 x)` the same before and after this descent existed.
+      nf
+      (let [mj (major nav off)]
+        (cond
+          (= mj MAJOR-ARRAY) (let [p (nth-item nav off i)]
+                               (if (neg? p) nf (cursor-at nav p)))
         ;; A tag's reader is arbitrary, so the realised value decides -- but
         ;; `clojure.core/nth` throws "nth not supported on this type" for a
         ;; realised keyword or set EVEN with a not-found argument, which leaked
         ;; an untyped error out of the arity whose whole point is not to throw.
-        (= mj MAJOR-TAG) (let [v (realize nav off)]
-                           (if (or (nil? v) (instance? clojure.lang.Indexed v)
-                                   (instance? java.util.List v) (string? v)
-                                   (and (some? v) (.isArray (class v))))
-                             (nth v i nf)
-                             nf))
-        :else nf)))
+          (= mj MAJOR-TAG)
+          (let [v (tag-view nav off)]
+            (case (:kind v)
+              :vector (let [r ((:nth v) i)]
+                        (cond (identical? ::miss r) nf
+                              (identical? ::realise r)
+                              (let [rv (realize nav off)]
+                                (if (or (nil? rv) (instance? clojure.lang.Indexed rv)
+                                        (instance? java.util.List rv) (string? rv)
+                                        (and (some? rv) (.isArray (class rv))))
+                                  (nth rv i nf)
+                                  nf))
+                              :else r))
+              ;; A map-kinded tag realises to a map or an UnknownRecord,
+              ;; neither of which is Indexed, so this was already not-found --
+              ;; but it realised the whole value to discover that.
+              :map nf
+              (let [rv (realize nav off)]
+                (if (or (nil? rv) (instance? clojure.lang.Indexed rv)
+                        (instance? java.util.List rv) (string? rv)
+                        (and (some? rv) (.isArray (class rv))))
+                  (nth rv i nf)
+                  nf))))
+          :else nf))))
 
   ;; Honest O(1): the count is in the head, and head-count refuses the
   ;; indefinite-length case where it would not be.
   clojure.lang.Counted
   (count [_]
-    (let [mj (major nav off)]
-      (if (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP))
+    (if shape
+      ;; A row counts its KEYS. The bytes say the same number -- one value per
+      ;; key -- but going through the shape says why.
+      (count (:ks shape))
+      ;; A navigable tag counts what the value it realises to counts: rows for
+      ;; a shaped array, elements for a typed one, fields for a record.
+      ;; `count` used to refuse every tag while `nth` on a typed array worked
+      ;; through the realising path -- countable by nobody, indexable by anyone.
+      ;; `major` read ONCE. It was called here and again in the `let` below.
+      (if-let [v (and (= MAJOR-TAG (major nav off)) (tag-view nav off))]
+        ;; CHECKED, exactly as the array and map branch below is. This branch
+        ;; did not check, which reproduced verbatim the defect that comment
+        ;; describes -- "an IMPOSSIBLE number, 1048576 entries from a five-byte
+        ;; document" -- simply by wrapping the same map in a tag-27 frame. And
+        ;; above 2^31 the `(int ...)` threw ArithmeticException, untyped, where
+        ;; `decode` reports :boring/bad-count.
+        ;;
+        ;; `(quot room 2)` rather than `(* 2 n)`: the multiplication is what
+        ;; overflows on the counts worth rejecting.
+        (let [n (long (:n v))
+              room (- (.size ^Reader (.rdr nav)) off)
+              too-many? (if (= :map (:kind v)) (> n (quot room 2)) (> n room))]
+          (when (or (neg? n) too-many?)
+            (fail :boring/bad-count
+                  (str "boring.nav: a tagged container declaring " n
+                       " entries cannot fit in the " room " bytes that follow")
+                  {:offset off :declared n}))
+          (int n))
+        (let [mj (major nav off)]
+          (if (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP))
         ;; CHECKED against the data, which this was the one entry point not to
         ;; do. `(int n)` on a head declaring 2^31 entries threw an untyped
         ;; ArithmeticException, and below that it returned an IMPOSSIBLE number
@@ -533,29 +891,51 @@
         ;;
         ;; One entry is at least one byte, so a count larger than the bytes
         ;; that follow cannot be honest.
-        (let [n (head-count nav off)
-              room (- (.size ^Reader (.rdr nav)) (.headEndAt ^Reader (.rdr nav) off))
-              need (if (= mj MAJOR-MAP) (* 2 n) n)]
-          (when (or (neg? n) (> need room))
-            (fail :boring/bad-count
-                  (str "boring.nav: a container declaring " n
-                       " entries cannot fit in the " room " bytes that follow")
-                  {:offset off :declared n}))
-          (int n))
-        (fail :boring/not-a-container
-              "boring.nav: count is only defined for arrays and maps"
-              {:offset off :major mj}))))
+            (let [n (head-count nav off)
+                  room (- (.size ^Reader (.rdr nav)) (.headEndAt ^Reader (.rdr nav) off))
+                  need (if (= mj MAJOR-MAP) (* 2 n) n)]
+              (when (or (neg? n) (> need room))
+                (fail :boring/bad-count
+                      (str "boring.nav: a container declaring " n
+                           " entries cannot fit in the " room " bytes that follow")
+                      {:offset off :declared n}))
+              (int n))
+            (fail :boring/not-a-container
+                  "boring.nav: count is only defined for arrays and maps"
+                  {:offset off :major mj}))))))
 
   clojure.lang.Seqable
   (seq [_]
-    (let [mj (major nav off)]
-      (cond
-        (= mj MAJOR-ARRAY) (seq (mapv #(cursor-at nav %) (child-offsets nav off)))
-        (= mj MAJOR-MAP)
-        (seq (mapv (fn [[kp vp]]
-                     (clojure.lang.MapEntry. (realize nav kp) (cursor-at nav vp)))
-                   (partition 2 (child-offsets nav off))))
-        :else nil)))
+    (if shape
+      ;; Entries, because a row IS a map: key from the shape, value from the
+      ;; matching position. `child-offsets` gives the row's values in order,
+      ;; which is exactly shape order.
+      (seq (mapv (fn [k p] (clojure.lang.MapEntry. k (cursor-at nav p)))
+                 (:ks shape)
+                 (child-offsets nav off)))
+      (let [mj (major nav off)]
+        (cond
+          (= mj MAJOR-ARRAY) (seq (mapv #(cursor-at nav %) (child-offsets nav off)))
+          (= mj MAJOR-MAP)
+          (seq (mapv (fn [[kp vp]]
+                       (clojure.lang.MapEntry. (realize nav kp) (cursor-at nav vp)))
+                     (partition 2 (child-offsets nav off))))
+          ;; A navigable tag seqs as the collection it realises to: rows for a
+          ;; shaped array, elements for a typed one, entries for a record. Wire
+          ;; order is already the realised order -- a sorted-map is written in
+          ;; its own iteration order, which is sorted.
+          (= mj MAJOR-TAG)
+          (let [v (tag-view nav off)]
+            (case (:kind v)
+              ;; NOT `(seq (vec ...))`. The `:items`/`:entries` closures already
+              ;; return lazy seqs, and pouring them through a vector first
+              ;; boxed every element of a 100k typed array before `reduce` saw
+              ;; one -- against this namespace's own promise to reduce over
+              ;; children with no intermediate seq.
+              :vector (seq ((:items v)))
+              :map (seq ((:entries v)))
+              nil))
+          :else nil))))
 
   ;; IReduce as well as IReduceInit: `(reduce f coll)` -- the arity everyone
   ;; actually writes -- threw a raw ClassCastException ("cannot be cast to
@@ -570,34 +950,378 @@
   ;; The reducers path: no intermediate seq, no child cursors retained beyond
   ;; the step that uses them.
   clojure.lang.IReduceInit
-  (reduce [_ f init]
-    (let [^Reader r (.rdr nav)
-          mj (major nav off)
-          n (head-count nav off)]
-      (cond
-        (= mj MAJOR-ARRAY)
-        (loop [i 0 p (.headEndAt r off) acc init]
-          (if (or (= i n) (reduced? acc))
-            (unreduced acc)
-            (recur (inc i) (skip r p) (f acc (cursor-at nav p)))))
-        (= mj MAJOR-MAP)
-        (loop [i 0 p (.headEndAt r off) acc init]
-          (if (or (= i n) (reduced? acc))
-            (unreduced acc)
-            (let [vp (skip r p)]
-              (recur (inc i) (skip r vp)
-                     (f acc (clojure.lang.MapEntry. (realize nav p)
-                                                    (cursor-at nav vp)))))))
-        :else (fail :boring/not-a-container
-                    "boring.nav: reduce is only defined for arrays and maps"
-                    {:offset off :major mj}))))
+  (reduce [this f init]
+    ;; A non-shaped tag must still fall through to the `:else` below, which
+    ;; refuses. Testing MAJOR-TAG alone would have turned that typed refusal
+    ;; into a silent `init`.
+    (if (or shape (and (= MAJOR-TAG (major nav off)) (tag-view nav off)))
+      ;; Both shaped forms go through `seq`, which already knows how to present
+      ;; them. Duplicating the walk here would be a second place for the
+      ;; key-to-position mapping to drift from the first.
+      (let [s (seq this)]
+        (if s (clojure.core/reduce f init s) init))
+      (let [^Reader r (.rdr nav)
+            mj (major nav off)
+            n (head-count nav off)]
+        (cond
+          (= mj MAJOR-ARRAY)
+          (loop [i 0 p (.headEndAt r off) acc init]
+            (if (or (= i n) (reduced? acc))
+              (unreduced acc)
+              (recur (inc i) (skip r p) (f acc (cursor-at nav p)))))
+          (= mj MAJOR-MAP)
+          (loop [i 0 p (.headEndAt r off) acc init]
+            (if (or (= i n) (reduced? acc))
+              (unreduced acc)
+              (let [vp (skip r p)]
+                (recur (inc i) (skip r vp)
+                       (f acc (clojure.lang.MapEntry. (realize nav p)
+                                                      (cursor-at nav vp)))))))
+          :else (fail :boring/not-a-container
+                      "boring.nav: reduce is only defined for arrays and maps"
+                      {:offset off :major mj})))))
 
   Object
-  (toString [_] (str "#boring.nav/cursor[" off "]")))
+  (toString [_] (str "#boring.nav/cursor[" off (when shape " shaped") "]")))
 
-(defn- cursor-at [^Nav nav ^long off] (->Cursor nav off))
+(defn- cursor-at [^Nav nav ^long off] (->Cursor nav off nil))
+
+;; ------------------------------------------------------- navigating a tag
+;;
+;; A CBOR tag is structurally uniform -- one tag number wrapping one data item
+;; -- and semantically anything at all, because the reader maps (tag, payload)
+;; to a host value through an arbitrary function. Descending is sound only when
+;; that function COMMUTES with the operation:
+;;
+;;     get(R(payload), k) == R_child(get_payload(payload, translate(k)))
+;;
+;; for the reader `R`. Which is why there is no single rule, and why the tags
+;; below fall into distinct kinds:
+;;
+;;   WRAPPER            R preserves structure. Navigate the payload; `value`
+;;                      still realises at the TAG, so nothing is reconstructed.
+;;                      Records are this.
+;;   RESTRUCTURING      R rearranges. Needs a key-to-position translation AND
+;;                      explicit reconstruction, because realising at the tag
+;;                      no longer describes a child. Shaped rows are this, and
+;;                      it is why they carry state on the cursor.
+;;   SCALAR-DECODING    Elements are packed rather than written as items, so
+;;                      access is arithmetic and yields VALUES, never cursors.
+;;                      Typed arrays are this.
+;;   OPERATION-CHANGING The operation means something else -- `get` on a set is
+;;                      MEMBERSHIP. No generic form; these stay opaque.
+;;   EXTERNALLY-RESOLVED The value is not a function of the bytes at all, as
+;;                      with a reader that resolves storage roots. Never
+;;                      navigable, and the reason "tag plus value" is not
+;;                      enough on its own.
+;;
+;; A VIEW is what a navigable tag produces: built once per (nav, offset),
+;; cached, and holding closures that have already captured both. Everything
+;; unknown yields nil and realises, so this is a pure optimisation with no
+;; correctness cliff -- a tag boring has never heard of behaves exactly as it
+;; did before any of this existed.
+;;
+;;   {:kind :map    :n <count> :lookup (fn [k]) :entries (fn [])}
+;;   {:kind :vector :n <count> :nth (fn [i])    :items   (fn [])}
+;;
+;; `:lookup` and `:nth` return a child cursor, a realised value, `::miss` for
+;; absent, or `::realise` to fall back for this key alone.
+
+(def ^:private ^:const TAG-RECORD 27)
+
+;; RFC 8746 typed arrays boring WRITES: signed little-endian integers plus f32
+;; and f64 LE. `Reader.readTypedArray` can read all 21 with a lossless JVM
+;; representation, but descent is implemented only for these five.
+;;
+;; NOT for lack of ambition. Each of the other tags has its own widening rule --
+;; uint8 becomes short[], not byte[], so that 200 does not read back as -56 --
+;; and mirroring a rule wrongly here returns a WRONG NUMBER rather than a slow
+;; one. The five below are the ones boring's own data uses and the ones whose
+;; boxing is pinned by test against `realize`; everything else falls back to
+;; realising, which is what already worked.
+(defn- le-long ^long [^bytes b ^long n]
+  (loop [i 0 acc 0] (if (= i n) acc
+                        (recur (inc i)
+                               (bit-or acc (bit-shift-left
+                                            (bit-and (long (aget b i)) 0xFF)
+                                            (* 8 i)))))))
+
+;; UNCHECKED casts, and that is the whole point. `le-long` accumulates bytes as
+;; UNSIGNED, so a two-byte element holding -1 arrives as 65535 and a four-byte
+;; one as 4294967295. Clojure's `short` and `int` are CHECKED: they threw
+;; `IllegalArgumentException` and `ArithmeticException` respectively, untyped,
+;; straight out of `get`/`nth`/`seq`/`reduce` -- on undamaged data that `decode`
+;; round-trips perfectly. Every negative element of a short[] or int[], and
+;; EVERY negative float, since tag 85 goes through the same int.
+;;
+;; long[] and double[] were never affected: at eight bytes `le-long` wraps into
+;; the sign naturally, which is exactly why the defect hid -- two of the five
+;; tags are correct by construction.
+;;
+;; It hid for a second reason too: every fixture in `typed_nav_test` was built
+;; from `(range n)`, so the tests pinned the boxing over the sign-free half of
+;; the domain and the docstring above claimed the pinning was total.
+(def ^:private typed-array-tags
+  {77 {:size 2 :read (fn [^bytes b] (Short/valueOf (unchecked-short (le-long b 2))))}
+   78 {:size 4 :read (fn [^bytes b] (Integer/valueOf (unchecked-int (le-long b 4))))}
+   79 {:size 8 :read (fn [^bytes b] (Long/valueOf (le-long b 8)))}
+   85 {:size 4 :read (fn [^bytes b] (Float/valueOf (Float/intBitsToFloat
+                                                    (unchecked-int (le-long b 4)))))}
+   86 {:size 8 :read (fn [^bytes b] (Double/valueOf (Double/longBitsToDouble
+                                                     (le-long b 8))))}})
+
+(defn- typed-view
+  "SCALAR-DECODING. Elements are packed into a byte string rather than written
+  as CBOR items, so element i is at `data + i*size` -- arithmetic, with no walk
+  and no index. Reaching one element used to build the whole primitive array:
+  70.90 us on a 100 000-element long[] against 1.766 us, flat in length."
+  [^Nav nav ^long off ^long tag]
+  (when-let [spec (typed-array-tags tag)]
+    (let [^Reader r (.rdr nav)
+          bs (.headEndAt r off)]
+      ;; must wrap a DEFINITE-LENGTH byte string, as the reader requires; an
+      ;; indefinite one has no count on the wire
+      (when (and (= 2 (.majorAt r bs)) (not= 31 (.infoAt r bs)))
+        (let [blen (.headArgAt r bs)
+              size (long (:size spec))
+              rd (:read spec)
+              data (.headEndAt r bs)]
+          ;; THE PAYLOAD MUST ACTUALLY BE THERE. `Reader.readTypedArray` bounds
+          ;; the declared byte-string length against what remains
+          ;; (`checkCount`); this did not, so a tag-79 header claiming 1 MiB
+          ;; over eight real bytes reported `count` 131072 and FABRICATED an
+          ;; element from `nth 0` -- a value `decode` refuses with
+          ;; :boring/bad-count. Not an out-of-bounds read, since `bytesBetween`
+          ;; is range-checked, but a wrong answer, which is worse.
+          (when (and (<= 0 blen) (zero? (rem blen size))
+                     (<= (+ data blen) (.size r)))
+            (let [n (quot blen size)
+                  at (fn [^long i]
+                       (if (or (neg? i) (>= i n))
+                         ::miss
+                         (let [p (+ data (* i size))]
+                           (rd (.bytesBetween r p (+ p size))))))]
+              ;; `number?`, not `integer?` -- see the :vector branch of valAt.
+              {:kind :vector :n n :nth at :key-pred number?
+               :items (fn [] (map at (range n)))})))))))
+
+(defn- tag-pair
+  "The two element offsets of a tag whose payload is a definite 2-element array,
+  or nil. `39649([keys, rows])` and `27([name, fields])` are both this shape, and
+  both builders opened by checking it by hand."
+  [^Reader r ^long off]
+  (let [pair (.headEndAt r off)]
+    (when (and (= MAJOR-ARRAY (.majorAt r pair)) (= 2 (.headArgAt r pair)))
+      (let [a (.headEndAt r pair)]
+        [a (skip r a)]))))
+
+(defn- shaped-view
+  "RESTRUCTURING. A shaped array is `39649([keys, [row, ...]])`: the keys are
+  hoisted out and each row is an ARRAY of values matching them positionally. It
+  realises to a VECTOR OF MAPS, so a row cursor has array bytes and map
+  semantics and must carry the shape -- nothing in a row's own bytes says it is
+  a row.
+
+  Returns nil for anything that is not exactly what `writeShapedArray` emits."
+  [^Nav nav ^long off ^long tag]
+  (when (= tag TAG-SHAPED-ARRAY)
+    (let [^Reader r (.rdr nav)
+          pr (tag-pair r off)]
+      (when pr
+        (let [ks-off (nth pr 0)]
+          (when (= MAJOR-ARRAY (.majorAt r ks-off))
+            (let [rows-off (nth pr 1)]
+              (when (= MAJOR-ARRAY (.majorAt r rows-off))
+                (let [k (.headArgAt r ks-off)
+                      n (.headArgAt r rows-off)]
+                  ;; `(pos? k)`: the Reader requires at least one key
+                  ;; (`Reader.java`), and a zero-key shape navigated to `[{}]`
+                  ;; against a `:boring/bad-tag-content` from `decode`.
+                  (when (and (pos? k) (<= 0 n))
+                    (let [ks (loop [i 0 p (.headEndAt r ks-off) acc (transient [])]
+                               (if (= i k)
+                                 (persistent! acc)
+                                 (recur (inc i) (skip r p)
+                                        (conj! acc (realize nav p)))))
+                          ;; DUPLICATE KEYS, which the Reader rejects
+                          ;; unconditionally in `checkShapeKeys`. `:pos` is built
+                          ;; with `assoc!` so the last wins, while `:ks` keeps
+                          ;; both -- one cursor then reported `count` 2 with
+                          ;; `(count (value c))` 1. O(K) once per view, against
+                          ;; keys already realised on the line above.
+                          dup? (not= (count ks) (count (set ks)))
+                          sh {:ks ks
+                              :pos (persistent!
+                                    (reduce-kv (fn [m i kk] (assoc! m kk i))
+                                               (transient {}) ks))}
+                          ;; EVERY ROW IS CHECKED WHEN IT IS REACHED, not when
+                          ;; the view is built. The Reader enforces
+                          ;; `row length == key count`; a 3-value row against 2
+                          ;; keys navigated fine here.
+                          ;;
+                          ;; Deliberately NOT validated up front. Checking every
+                          ;; row eagerly takes shaped `count` from 644 ns to
+                          ;; 10.4 us -- 16x on well-formed data -- and it would
+                          ;; also be WRONG: `count` reads the rows-array header
+                          ;; and touches no row, so a bad row 5 is not in the
+                          ;; subtree it examined. Charging it for that is the
+                          ;; same mistake as charging a partial read for
+                          ;; `:max-items`. On the paths that DO walk rows --
+                          ;; `seq`, `reduce`, `nth i` -- the check comes for
+                          ;; free, 0.68 ns/row, because they are there already.
+                          row-ok? (fn [^long p]
+                                    (and (= MAJOR-ARRAY (.majorAt r p))
+                                         (= k (.headArgAt r p))))
+                          at (fn [^long i]
+                               (let [p (nth-item nav rows-off i)]
+                                 (cond (neg? p) ::miss
+                                       (not (row-ok? p))
+                                       (fail :boring/bad-tag-content
+                                             (str "boring.nav: shaped row " i
+                                                  " does not carry exactly " k
+                                                  " values, which is what its shape declares")
+                                             {:offset p :row i :expected k})
+                                       :else (->Cursor nav p sh))))]
+                      (when-not dup?
+                        {:kind :vector :n n :nth at :key-pred integer?
+                         ;; through `at`, so every row is checked here too
+                         :items (fn [] (map at (range n)))}))))))))))))
+
+(defn- record-view
+  "WRAPPER. A record writes `27([name, {fields}])`, so the field map begins past
+  the tag and the name -- 22 bytes for `clojure/sorted-map`. The cursor stays on
+  the TAG and only the container operations redirect, which is why `value` still
+  realises the record rather than the bare map and `value-type` still says
+  `:tag`. No reconstruction, and no cursor state.
+
+  REFUSES A REGISTERED NAME. `TagRegistry.recordCtor` is an arbitrary `IFn`: it
+  may rename fields, drop them, or -- as datahike's `reconstruct-db` does --
+  resolve storage roots that are not in the bytes at all. Unregistered names
+  decode to `UnknownRecord`, whose `valAt`, `count` and `seq` delegate straight
+  to the field map, so descent is exactly equivalent there.
+
+  The decision reads the SAME registry the reader will use, so the two cannot
+  drift: a blob read without datahike's registry descends, and realises to an
+  `UnknownRecord` over that same field map, and both agree."
+  [^Nav nav ^long off ^long tag]
+  (when (= tag TAG-RECORD)
+    (let [^Reader r (.rdr nav)
+          pr (tag-pair r off)]
+      (when pr
+        (let [name-off (nth pr 0)]
+          (when (= MAJOR-TEXT (.majorAt r name-off))
+            (let [payload (nth pr 1)]
+              ;; a POSITIONAL record -- datahike's Datom carries a vector --
+              ;; is not a map and gets no descent here
+              (when (= MAJOR-MAP (.majorAt r payload))
+                (let [nm (realize nav name-off)]
+                  ;; THE READER DECIDES. This used to be `recordCtor == nil` here
+                  ;; in Clojure, with a docstring claiming the two could not
+                  ;; drift because both read the same registry. True of the
+                  ;; registry, false of the DECISION: it also depends on the
+                  ;; reserved-name table and on `:on-unknown-record` and
+                  ;; `:auto-construct-records?`, and the mirror was wrong about
+                  ;; all three the day it was written -- `:on-unknown-record` had
+                  ;; been added the day before. Three documented configurations
+                  ;; produced silently wrong values, and a fourth let nav answer
+                  ;; where the reader raises, bypassing a policy gate.
+                  ;;
+                  ;; `Reader.recordDescendable` sits beside the dispatch it has
+                  ;; to agree with and reads the same fields. Nothing here
+                  ;; mirrors anything.
+                  (when (and (string? nm)
+                             (.recordDescendable r ^String nm))
+                    ;; NO SORTED-MAP SPECIAL CASE ANY MORE. `clojure/sorted-map`
+                    ;; is a reserved name and `recordDescendable` refuses it, so
+                    ;; the compare-versus-equals dance that used to live here is
+                    ;; gone with it.
+                    ;;
+                    ;; That gives up a measured 73x on sorted-map lookups, which
+                    ;; is a real loss and worth stating plainly. The reason is
+                    ;; that descent was only sound for sorted-maps BORING WROTE.
+                    ;; Clojure cannot build a sorted-map whose keys are not
+                    ;; mutually comparable, and the writer refuses a custom
+                    ;; comparator -- but a hand-crafted document can claim the
+                    ;; name over any keys at all, and then `decode` raises while
+                    ;; `count` and `seq` answer. Establishing comparability means
+                    ;; realising every key when the view is built, which is O(K)
+                    ;; on the operation the descent exists to make O(log K).
+                    ;;
+                    ;; Revisitable: the shaped-row watermark shows how to verify
+                    ;; incrementally instead. Not worth it until someone stores
+                    ;; sorted-maps hot.
+                    {:kind :map
+                     :n (head-count nav payload)
+                     :lookup
+                     (fn [k]
+                       (let [p (lookup-map nav payload k)]
+                         (if (neg? p) ::miss (cursor-at nav p))))
+                     :entries
+                     (fn []
+                       (map (fn [[kp vp]]
+                              (clojure.lang.MapEntry. (realize nav kp)
+                                                      (cursor-at nav vp)))
+                            (partition 2 (child-offsets nav payload))))}))))))))))
+
+;; Dispatch by TAG NUMBER, not by trying each in turn. Three sequential probes
+;; ran on every tag cursor before this; one lookup replaces them, so unifying
+;; is cheaper than the special cases were.
+;;
+;; THIS IS WHERE A NEW DESCENT GOES, which is not the same as an extension
+;; point: the table is private, the sentinels are private, and a builder would
+;; have to return a `Cursor`, which nothing outside this namespace can construct.
+;; `declare-navigable-record` is the extension point users actually have.
+;;
+;; A handler that knows its reader preserves
+;; structure -- datahike's TxReport is registered with `identity`, and so
+;; qualifies -- belongs here rather than in a growing `cond`.
+(def ^:private tag-view-builders
+  (merge {TAG-SHAPED-ARRAY shaped-view
+          TAG-RECORD       record-view}
+         (zipmap (keys typed-array-tags) (repeat typed-view))))
+
+(defn- tag-view
+  "The navigation view for the tag at `off`, or nil meaning opaque -- realise,
+  exactly as before any descent existed.
+
+  Cached per Nav by offset, because building one realises the shape's keys or
+  the record's name and a caller walking rows would otherwise pay per row.
+
+  ANY exception yields nil. Damaged bytes mean \"not a form I recognise\", never
+  a throw out of `get`; the realising fallback still answers."
+  [^Nav nav ^long off]
+  (let [slot (.views nav)
+        hit @slot]
+    (if (and hit (= (nth hit 0) off))
+      (let [v (nth hit 1)] (when-not (identical? ::none v) v))
+      (let [v (try
+                (when (= MAJOR-TAG (major nav off))
+                  (let [tag (.headArgAt ^Reader (.rdr nav) off)]
+                    (when-let [build (tag-view-builders tag)]
+                      (build nav off tag))))
+                (catch Exception _ nil))]
+        (vreset! slot [off (if (nil? v) ::none v)])
+        v))))
 
 ;; --------------------------------------------------------------- public API
+
+(defn container?
+  "Whether `x` is a cursor something can be descended INTO -- an array, a map,
+  or a tag with a descent.
+
+  Exists so `zipper` and the Cursor cannot disagree about that. They did:
+  `zipper`'s `branch?` tested `value-type`, which answers `:tag` for a shaped
+  array, a record and a typed array, so `zip/down` was nil on exactly the values
+  `count`, `seq`, `get`, `nth` and `reduce` had learned to enter. Before
+  descents existed the two agreed, because every tag was opaque everywhere."
+  [x]
+  (and (instance? Cursor x)
+       (let [^Cursor c x
+             nav (.nav c) off (.off c)]
+         (or (some? (.shape c))
+             (let [mj (major nav off)]
+               (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP)
+                   (and (= mj MAJOR-TAG) (some? (tag-view nav off)))))))))
 
 (defn cursor?
   "True if `x` is a cursor -- something `get`, `nth`, `seq` or `reduce` handed
@@ -642,15 +1366,29 @@
   returned unchanged."
   [c]
   (if (instance? Cursor c)
-    (let [^Cursor c c] (realize (.nav c) (.off c)))
+    (let [^Cursor c c
+          sh (.shape c)]
+      (if sh
+        ;; A ROW OF A SHAPED ARRAY IS A MAP, and its bytes are an array.
+        ;; Realising the offset alone would hand back the values without their
+        ;; keys -- a wrong value, not a slow one -- so the shape is reapplied
+        ;; here. This is the whole reason the shape rides on the cursor.
+        (let [nav (.nav c)]
+          (zipmap (:ks sh)
+                  (mapv #(realize nav (long %)) (child-offsets nav (.off c)))))
+        (realize (.nav c) (.off c))))
     c))
 
 (defn value-type
   "What is at the cursor, without decoding it: :map :array :text :bytes :tag
   :int :float-or-simple."
   [^Cursor c]
-  (case (int (major (.nav c) (.off c)))
-    0 :int, 1 :int, 2 :bytes, 3 :text, 4 :array, 5 :map, 6 :tag, :float-or-simple))
+  ;; A shaped row's BYTES are an array and its VALUE is a map. Reporting the
+  ;; bytes would contradict `value`, `seq` and `count`, all of which say map.
+  (if (.shape c)
+    :map
+    (case (int (major (.nav c) (.off c)))
+      0 :int, 1 :int, 2 :bytes, 3 :text, 4 :array, 5 :map, 6 :tag, :float-or-simple)))
 
 (defn byte-span
   "`[start end]` of the value at the cursor. `end` is exclusive. This is what
@@ -687,6 +1425,7 @@
 
 (def ^:private shorts-class (class (short-array 0)))
 (def ^:private ints-class (class (int-array 0)))
+(def ^:private longs-class (class (long-array 0)))
 
 (defn- expand-slot
   "A slot's deltas, back to the absolute offsets every lookup path expects.
@@ -745,6 +1484,177 @@
             (aset out k v)
             (recur (inc k) v)))))))
 
+(defn- node-valid?
+  "Does index node `i` describe the data it claims to?
+
+  Split out of `index-payload` so it can be run PER NODE, on demand, instead of
+  over every node at load. That is the whole cost of an index on a short-lived
+  source: the checks below read the file -- `skip` walks up to a stride of
+  items to pin the far end -- so validating a 12 000-container frame cost
+  ~1 ms before a single lookup ran, and a caller that touches one key paid all
+  of it. Deferring makes the price proportional to what is actually navigated.
+
+  The checks themselves are unchanged, and each was reachable: a slot shorter
+  than its count made `nth` walk off the end, a zero-length slot made the binary
+  search index -1, and an anchor outside the data section reached
+  `Reader.skipFrom`, which does an unchecked array access and throws a raw
+  AIOOBE at the caller."
+  [^Reader r ptr c cnt st ^longs a]
+  (let [ptr (long ptr) c (long c) cnt (long cnt) st (long st)
+        want (if (zero? cnt) 0 (inc (quot (dec cnt) st)))]
+    (and (= (alength a) want)
+                 ;; The node must describe a container that IS THERE
+                 ;; and has the entry count it claims, and its first
+                 ;; anchor must be that container's first entry.
+                 ;; All O(1) -- read from the head -- and together
+                 ;; they reject an index whose offsets are internally
+                 ;; tidy but point at the wrong places, which passed
+                 ;; every earlier check and silently returned a
+                 ;; neighbouring value.
+         (if (neg? c)
+                   ;; the sequence node: its first item is byte 0
+           (or (zero? want) (zero? (aget a 0)))
+           (and (< c ptr)
+                (#{4 5} (.majorAt r c))
+                (= cnt (.headArgAt r c))
+                (or (zero? want)
+                    (= (long (aget a 0)) (.headEndAt r c)))))
+                 ;; anchors ascend, sit inside the data section, and
+                 ;; for a real container start after its own header
+         (loop [k 0 prev -1]
+           (if (>= k (alength a))
+             true
+             (let [v (long (aget a k))]
+               (if (and (> v prev) (<= 0 v) (< v ptr)
+                        (or (neg? c) (> v c)))
+                 (recur (inc k) v)
+                 false))))
+                 ;; AND THE FAR END, which nothing pinned.
+                 ;;
+                 ;; Every check above is about the START of the node
+                 ;; and about the anchors being tidy among
+                 ;; themselves. None of them says the node describes
+                 ;; THIS data. Two measured consequences:
+                 ;;
+                 ;;   Splice one sealed file's data section under
+                 ;;   another's footer of the same byte length but
+                 ;;   different item boundaries -- an interrupted
+                 ;;   append and a retry, a restore taking the body
+                 ;;   from one snapshot and the tail from another.
+                 ;;   Every gate passed. `nth items 16` returned the
+                 ;;   string "gaaaa", `nth 32` returned the record
+                 ;;   written at 32-9, and `decode-seq` over the same
+                 ;;   bytes was correct throughout, so two code paths
+                 ;;   in one application disagreed about the file.
+                 ;;
+                 ;;   The item total was never compared with the
+                 ;;   data at all -- the slot-length rule
+                 ;;   `want = 1 + (cnt-1)/stride` cannot see a change
+                 ;;   anywhere inside a whole stride. One flipped bit
+                 ;;   made `count` report 501 for a 500-item file;
+                 ;;   deflating it left ten written records present
+                 ;;   in the file, returned by `decode-seq`, and
+                 ;;   unreachable through `count`/`nth`.
+                 ;;
+                 ;; The check is exact and costs at most one stride
+                 ;; of skips per node, never a walk of the container:
+                 ;; the slot-length rule above already forces
+                 ;; `remaining` into [1, stride]. From the last
+                 ;; anchor, stepping over the items it covers must
+                 ;; land EXACTLY on the node's end -- the data
+                 ;; section's end for the sequence, the container's
+                 ;; own end otherwise.
+         (let [m (alength a)]
+           (or (if (neg? c)
+                         ;; A SEQUENCE NODE CLAIMING ZERO ITEMS has
+                         ;; no anchors, so the far-end check below
+                         ;; short-circuits and never looks at the
+                         ;; data -- and `count` then returned 0 and
+                         ;; `nth` nil over a file holding all 60 of
+                         ;; its records. Zero items is only honest
+                         ;; if the data section is empty, which is
+                         ;; one comparison.
+                 (and (zero? m) (zero? ptr))
+                 (zero? m))
+               (let [covered (* st (dec m))
+                     remaining (- cnt covered)
+                     per (if (and (not (neg? c)) (= MAJOR-MAP (.majorAt r c)))
+                           2 1)
+                     n (* per remaining)
+                     want-end (if (neg? c) ptr (skip r c))]
+                 (and (pos? remaining)
+                      (= want-end
+                         (loop [k 0 p (long (aget a (dec m)))]
+                           (if (= k n) p (recur (inc k) (skip r p))))))))))))
+
+(defn- slot-at
+  "Absolute anchors for node `i`, expanded on first use and memoized.
+
+  `boring.core/delta-slot` writes anchors as deltas, so this is the prefix sum
+  back to the offsets every lookup path expects. Doing it here rather than at
+  load is what keeps an index off the critical path of a source that is read
+  once."
+  ^longs [ix ^long i]
+  (let [^AtomicReferenceArray cache (:slot-cache ix)
+        hit (.get cache (int i))]
+    (or hit
+        (let [^longs cs (:containers ix)
+              a (expand-slot (nth (:raw-slots ix) i)
+                             (max 0 (long (aget cs (int i)))))]
+          ;; CAS so every thread observes the same array; a loser discards its
+          ;; own copy rather than publishing a second one.
+          (.compareAndSet cache (int i) nil a)
+          (.get cache (int i))))))
+
+(defn- node-sound?
+  "Is index node `i` usable? Checked once, then remembered.
+
+  An unsound node is not an error: `node-slot` reports -1 and the caller walks
+  the container, which is the path taken whenever a container is simply not
+  indexed. So a malformed node costs speed, never correctness -- the same
+  contract `read-index` keeps for a corrupt back-pointer.
+
+  `:trust-index :trusted` skips the check; `:ignore` skips the index altogether.
+  Two ends of one dial, and `:trusted` was previously accepted by the option
+  validator while having no effect anywhere -- an option taken and ignored."
+  [^Nav nav ix ^long i]
+  (if (= :trusted (:trust-index (.opts nav)))
+    ;; TRUSTED: skip the check entirely.
+    ;;
+    ;; This is the single lever that decides whether an index pays. Measured on
+    ;; a 1000-entry map: decoding the frame costs 3-7 us and expanding a node's
+    ;; deltas 0.13 us, but validating one node costs 47 us -- because the
+    ;; far-end check SKIPS THE WHOLE CONTAINER to pin where it ends. That is
+    ;; exactly the walk the index exists to avoid, so a source read once pays a
+    ;; full container walk for the privilege of not walking the container.
+    ;;
+    ;; The check is not pointless -- it catches a data section spliced under a
+    ;; foreign footer, which every cheaper gate passes (see `node-valid?`). But
+    ;; that threat is about files of unknown provenance. A store that owns its
+    ;; own bytes, and sits on a page-checksummed engine, is paying for a
+    ;; guarantee it already has.
+    true
+    (let [^booleans done (:node-checked ix)
+          ^booleans okv (:node-ok ix)]
+      (if (aget done (int i))
+        (aget okv (int i))
+        (let [^Reader r (.rdr nav)
+              ^longs cs (:containers ix)
+              ^ints cnts (:counts ix)
+              v (boolean
+                 (try
+                   (node-valid? r (long (:data-end ix))
+                                (long (aget cs (int i)))
+                                (long (aget cnts (int i)))
+                                (long (:stride ix))
+                                (slot-at ix i))
+                   ;; Any failure reading a malformed node means "unusable",
+                   ;; not "throw at the caller of `get`".
+                   (catch Exception _ false)))]
+          (aset okv (int i) v)
+          (aset done (int i) true)
+          v)))))
+
 (defn- index-payload
   "The usable index in the tag-27 frame at `ptr`, or nil meaning \"scan\".
 
@@ -757,8 +1667,19 @@
   honest response to a payload we cannot use is to ignore it and walk, never to
   throw at the caller of `nav/source`. That matters more than it did: slots are
   expanded eagerly below, so without this one malformed slot would take down a
-  cursor that never went near the container it belongs to."
-  [^Reader r ^long ptr]
+  cursor that never went near the container it belongs to.
+
+  `trusted?` is `:trust-index :trusted`, and it skips the two checks below that
+  are O(NODE COUNT). It had been honoured only per node, by `node-sound?`; the
+  FRAME-level structure was re-verified on every `nav/source` regardless, which
+  is the same defect one level up -- an option accepted and then ignored.
+
+  That cost is not marginal, because it is paid per SOURCE and a document store
+  opens one source per blob and does one lookup. Measured on 4096 scalars: the
+  indexed lookup itself is 0.22 us against 24.97 us scanning, but opening the
+  source and doing that one lookup came to 8.67 us -- so nearly all of what the
+  index saved was spent proving the index was well-formed."
+  [^Reader r ^long ptr trusted?]
   (try
     ;; `frame-payload`, not `record-fields`: an unregistered tag-27 frame
     ;; decodes to an UnknownRecord when its payload is a map and a
@@ -821,14 +1742,48 @@
                  ;; together. A frame that decodes but whose parts disagree used
                  ;; to be trusted, and produced raw IndexOutOfBoundsException at
                  ;; the caller of `get`, or -- worse -- a wrong subtree.
+                 ;; STAYS UNCONDITIONAL even when trusted. Disagreeing lengths
+                 ;; are the one frame fault that costs O(1) to detect and would
+                 ;; otherwise surface as a raw IndexOutOfBoundsException from
+                 ;; inside `get` rather than as "no usable index, scan instead".
                  (= (alength containers) (alength counts)
                     (count slots) (count sorted))
-                 ;; `node-slot` BINARY-SEARCHES containers, so they must ascend.
-                 (loop [k 1]
-                   (cond (>= k (alength containers)) true
-                         (>= (aget containers (dec k)) (aget containers k)) false
-                         :else (recur (inc k))))
-                 (every? nat-int? (seq counts)))
+                 ;; AND SO DOES THIS, for exactly the same reason -- which the
+                 ;; comment above stated and then did not carry through to its
+                 ;; sibling. `expand-slot` dispatches on the four widths
+                 ;; `delta-slot` writes and hints the fall-through `^longs`, so a
+                 ;; slot that decoded as anything else -- a TaggedValue, from one
+                 ;; flipped byte -- became a raw ClassCastException. Under the
+                 ;; default path `node-sound?` forces `slot-at` inside a `try`
+                 ;; and swallows it; `:trusted` skips that, and `lookup-map` and
+                 ;; `nth-item` then call `slot-at` unguarded. Six of 222
+                 ;; single-byte footer mutants escaped untyped this way.
+                 ;;
+                 ;; O(node count) rather than O(1), so it is not free -- but it
+                 ;; is one `instance?` per node against a walk of the whole
+                 ;; container, and the alternative is an untyped throwable the
+                 ;; contract says cannot happen.
+                 (every? (fn [sl]
+                           (or (bytes? sl)
+                               (instance? shorts-class sl)
+                               (instance? ints-class sl)
+                               (instance? longs-class sl)))
+                         slots)
+                 (or
+                  trusted?
+                  (and
+                   ;; `node-slot` BINARY-SEARCHES containers, so they must ascend.
+                   (loop [k 1]
+                     (cond (>= k (alength containers)) true
+                           (>= (aget containers (dec k)) (aget containers k)) false
+                           :else (recur (inc k))))
+                   ;; `(every? nat-int? (seq counts))` walked an int[] as a
+                   ;; boxed seq -- one Integer per node, on the path taken for
+                   ;; every source opened. Same predicate, no allocation.
+                   (loop [k 0]
+                     (cond (>= k (alength counts)) true
+                           (neg? (aget counts k)) false
+                           :else (recur (inc k)))))))
         ;; One uniform node list. The SEQUENCE is the node at the sentinel
         ;; offset -1: it has no container header on the wire but behaves like
         ;; one, and a sentinel avoids carrying two shapes for the same idea.
@@ -836,126 +1791,61 @@
                          (cond (>= k (alength containers)) nil
                                (= -1 (aget containers k)) k
                                :else (recur (inc k))))
-              ;; Deltas to absolutes, once, against each slot's own base: its
-              ;; container's offset, or 0 for the sequence, whose sentinel -1
-              ;; is not a position.
-              abs-slots (vec (map-indexed
-                              (fn [i s]
-                                (expand-slot s (max 0 (long (aget containers (int i))))))
-                              slots))
+              n (alength containers)
               st (long stride)
-              ;; Every node, checked against the file it claims to describe.
-              ;; Each of these was reachable: a slot shorter than its count made
-              ;; `nth` walk off the end, a zero-length slot made the binary
-              ;; search index -1, and an anchor pointing outside the data
-              ;; section reached `Reader.skipFrom`, which does an unchecked
-              ;; array access and throws a raw AIOOBE at the caller.
-              ok? (every?
-                   (fn [i]
-                     (let [c (long (aget containers (int i)))
-                           cnt (long (aget counts (int i)))
-                           ^longs a (nth abs-slots i)
-                           want (if (zero? cnt) 0 (inc (quot (dec cnt) st)))]
-                       (and (= (alength a) want)
-                            ;; The node must describe a container that IS THERE
-                            ;; and has the entry count it claims, and its first
-                            ;; anchor must be that container's first entry.
-                            ;; All O(1) -- read from the head -- and together
-                            ;; they reject an index whose offsets are internally
-                            ;; tidy but point at the wrong places, which passed
-                            ;; every earlier check and silently returned a
-                            ;; neighbouring value.
-                            (if (neg? c)
-                              ;; the sequence node: its first item is byte 0
-                              (or (zero? want) (zero? (aget a 0)))
-                              (and (< c ptr)
-                                   (#{4 5} (.majorAt r c))
-                                   (= cnt (.headArgAt r c))
-                                   (or (zero? want)
-                                       (= (long (aget a 0)) (.headEndAt r c)))))
-                            ;; anchors ascend, sit inside the data section, and
-                            ;; for a real container start after its own header
-                            (loop [k 0 prev -1]
-                              (if (>= k (alength a))
-                                true
-                                (let [v (long (aget a k))]
-                                  (if (and (> v prev) (<= 0 v) (< v ptr)
-                                           (or (neg? c) (> v c)))
-                                    (recur (inc k) v)
-                                    false))))
-                            ;; AND THE FAR END, which nothing pinned.
-                            ;;
-                            ;; Every check above is about the START of the node
-                            ;; and about the anchors being tidy among
-                            ;; themselves. None of them says the node describes
-                            ;; THIS data. Two measured consequences:
-                            ;;
-                            ;;   Splice one sealed file's data section under
-                            ;;   another's footer of the same byte length but
-                            ;;   different item boundaries -- an interrupted
-                            ;;   append and a retry, a restore taking the body
-                            ;;   from one snapshot and the tail from another.
-                            ;;   Every gate passed. `nth items 16` returned the
-                            ;;   string "gaaaa", `nth 32` returned the record
-                            ;;   written at 32-9, and `decode-seq` over the same
-                            ;;   bytes was correct throughout, so two code paths
-                            ;;   in one application disagreed about the file.
-                            ;;
-                            ;;   The item total was never compared with the
-                            ;;   data at all -- the slot-length rule
-                            ;;   `want = 1 + (cnt-1)/stride` cannot see a change
-                            ;;   anywhere inside a whole stride. One flipped bit
-                            ;;   made `count` report 501 for a 500-item file;
-                            ;;   deflating it left ten written records present
-                            ;;   in the file, returned by `decode-seq`, and
-                            ;;   unreachable through `count`/`nth`.
-                            ;;
-                            ;; The check is exact and costs at most one stride
-                            ;; of skips per node, never a walk of the container:
-                            ;; the slot-length rule above already forces
-                            ;; `remaining` into [1, stride]. From the last
-                            ;; anchor, stepping over the items it covers must
-                            ;; land EXACTLY on the node's end -- the data
-                            ;; section's end for the sequence, the container's
-                            ;; own end otherwise.
-                            (let [m (alength a)]
-                              (or (if (neg? c)
-                                    ;; A SEQUENCE NODE CLAIMING ZERO ITEMS has
-                                    ;; no anchors, so the far-end check below
-                                    ;; short-circuits and never looks at the
-                                    ;; data -- and `count` then returned 0 and
-                                    ;; `nth` nil over a file holding all 60 of
-                                    ;; its records. Zero items is only honest
-                                    ;; if the data section is empty, which is
-                                    ;; one comparison.
-                                    (and (zero? m) (zero? ptr))
-                                    (zero? m))
-                                  (let [covered (* st (dec m))
-                                        remaining (- cnt covered)
-                                        per (if (and (not (neg? c)) (= MAJOR-MAP (.majorAt r c)))
-                                              2 1)
-                                        n (* per remaining)
-                                        want-end (if (neg? c) ptr (skip r c))]
-                                    (and (pos? remaining)
-                                         (= want-end
-                                            (loop [k 0 p (long (aget a (dec m)))]
-                                              (if (= k n) p (recur (inc k) (skip r p))))))))))))
-                   (range (alength containers)))]
-          (when ok?
-            {:stride st
-             :containers containers
-             :counts counts
-             :slots abs-slots
-             :sorted (vec sorted)
-             :data-end ptr
-             :total (when seq-slot (long (aget counts seq-slot)))
-             :offsets (when seq-slot (nth abs-slots seq-slot))
-             ;; The per-anchor verdict cache -- see `anchor-sound?`. Allocated
-             ;; once with the index, so a lookup allocates nothing.
-             :anchor-checked (when seq-slot
-                               (boolean-array (alength ^longs (nth abs-slots seq-slot))))
-             :anchor-ok (when seq-slot
-                          (boolean-array (alength ^longs (nth abs-slots seq-slot))))}))))
+              raw (vec slots)
+              ;; LAZY, memoized per node. `expand-slot` is a prefix sum over a
+              ;; node's anchors and `node-valid?` reads the file, so doing both
+              ;; for every node at load made an index cost more than it saved on
+              ;; a source used for ONE lookup -- which is every read of a
+              ;; document store. Measured on a 1.37 MB nested map: 1140 us
+              ;; indexed against 129 us unindexed, the gap widening with size
+              ;; because both passes scale with container count.
+              ;;
+              ;; `expand-slot`'s docstring argues the eager pass is free because
+              ;; the index is materialised once per source. That is true when
+              ;; the source is REUSED and exactly inverted when it is not.
+              ;;
+              ;; AtomicReferenceArray rather than a plain object array: a forked
+              ;; Nav shares this realised index across threads, and publishing a
+              ;; freshly built long[] through a non-volatile write would be a
+              ;; data race. The boolean memos below tolerate their race -- the
+              ;; worst case is recomputing a verdict -- which is the same trade
+              ;; `anchor-checked` already makes.
+              cache (AtomicReferenceArray. n)
+              ix {:stride st
+                  :containers containers
+                  :counts counts
+                  :raw-slots raw
+                  :slot-cache cache
+                  :node-checked (boolean-array n)
+                  :node-ok (boolean-array n)
+                  :sorted (vec sorted)
+                  :data-end ptr}
+              ;; THE SEQUENCE NODE STAYS EAGER, alone. `count` and `nth` consult
+              ;; it immediately, a wrong `:total` is the silent-corruption case
+              ;; documented in `node-valid?`, and it is a single node rather
+              ;; than one per container. A sequence is also the shape whose
+              ;; source is reused, so there is nothing to amortise away.
+              seq-anchors (when seq-slot (slot-at ix (long seq-slot)))
+              ;; Trusted skips this for the same reason `node-sound?` does: it
+              ;; walks the file to prove the sequence node honest, and a caller
+              ;; who wrote the bytes has already answered that question.
+              seq-ok? (or trusted?
+                          (nil? seq-slot)
+                          (node-valid? r ptr
+                                       (long (aget containers (int seq-slot)))
+                                       (long (aget counts (int seq-slot)))
+                                       st seq-anchors))]
+          (when seq-ok?
+            (assoc ix
+                   :total (when seq-slot (long (aget counts (int seq-slot))))
+                   :offsets seq-anchors
+                   ;; The per-anchor verdict cache -- see `anchor-sound?`.
+                   :anchor-checked (when seq-slot
+                                     (boolean-array (alength ^longs seq-anchors)))
+                   :anchor-ok (when seq-slot
+                                (boolean-array (alength ^longs seq-anchors))))))))
     (catch Exception _ nil)))
 
 (defn- read-index
@@ -1047,7 +1937,9 @@
               ;; the pointer is in range, and the frame ends exactly at EOF.
               ;; An unusable payload means SCAN, and scanning still has to stop
               ;; in the right place.
-              (merge {:data-end ptr} (index-payload r ptr)))))))))
+              (merge {:data-end ptr}
+                     (index-payload r ptr
+                                    (= :trusted (:trust-index (.opts nav))))))))))))
 
 (defn- anchor-sound?
   "Whether sequence anchor `k` is where it claims to be. Cached per anchor.
@@ -1072,8 +1964,9 @@
   ;; No primitive hints: five args with three of them primitive is one past
   ;; what Clojure allows, and the boxing here is once per anchor, not per item.
   [^Nav nav ^longs offsets stride k]
-  (let [^booleans done (:anchor-checked (.idx nav))
-        ^booleans okv (:anchor-ok (.idx nav))]
+  (let [ix (nav-idx nav)
+        ^booleans done (:anchor-checked ix)
+        ^booleans okv (:anchor-ok ix)]
     (if (or (nil? done) (>= (long k) (alength done)))
       true                                    ; no cache: nothing to verify against
       (if (aget done (int k))
@@ -1228,7 +2121,7 @@
   ([src] (items src nil))
   ([src opts]
    (let [nav (nav-of src (or opts {}))]
-     (Items. nav (.idx nav)))))
+     (Items. nav (nav-idx nav)))))
 
 (defn fork
   "A view of the same source for ANOTHER THREAD.
@@ -1261,7 +2154,7 @@
     (instance? Cursor x) (let [^Cursor c x] (cursor-at (fork-nav (.nav c)) (.off c)))
     (instance? Items x)  (let [^Items i x
                                n (fork-nav (.nav i))]
-                           (Items. n (.idx i)))
+                           (Items. n (nav-idx n)))
     :else (fail :boring/unsupported-source
                 "boring.nav/fork: expected a cursor or the result of `items`"
                 {:got (class x)})))
@@ -1290,7 +2183,12 @@
   reader would reach for first."
   [^Cursor c]
   (zip/zipper
-   (fn branch? [^Cursor x] (contains? #{:array :map} (value-type x)))
+   ;; `container?`, not a `value-type` test. `value-type` reports `:tag` for a
+   ;; shaped array, a record and a typed array -- deliberately, since that is
+   ;; what they ARE -- so a zipper could not descend into any of them while
+   ;; `count`, `seq`, `get`, `nth` and `reduce` all could. Before descents
+   ;; existed the two agreed, because every tag was opaque everywhere.
+   (fn branch? [^Cursor x] (container? x))
    (fn children* [^Cursor x]
      (seq (map (fn [e] (if (instance? clojure.lang.MapEntry e) (val e) e))
                (seq x))))

@@ -1255,6 +1255,86 @@ public final class Reader {
         return wire.substring(0, i).replace('-', '_') + "." + wire.substring(i + 1);
     }
 
+    /**
+     * The tag-27 names the reader resolves ITSELF, before any registry lookup
+     * matters. Each builds something that is not the field map -- a sorted map,
+     * a set, a queue, a char, an ex-info, a Java array, a Period -- or refuses
+     * outright, so none of them can be navigated as though the payload were the
+     * value.
+     *
+     * <p>Kept next to the switch it mirrors, and it is the only mirroring here:
+     * one list of strings, in one file, checked by test against the switch.
+     */
+    static boolean isReservedRecordName(String name) {
+        switch (name) {
+            case "clojure/sorted-map":
+            case "clojure/sorted-set":
+            case "clojure/with-meta":
+            case "clojure/char":
+            case "clojure/ex-info":
+            case "clojure/queue":
+            case "java/throwable":
+            case "java/boolean-array":
+            case "java/char-array":
+            case "java/string-array":
+            case "java/object-array":
+            case "java/period":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** Whether a static create(IPersistentMap) exists for `name`. Same cache. */
+    private static boolean hasRecordCreate(String name) {
+        Object cached = CTOR_CACHE.get(name);
+        if (cached == null) {
+            cached = resolveRecordCreate(name);
+            if (CTOR_CACHE.size() < CTOR_CACHE_MAX) CTOR_CACHE.putIfAbsent(name, cached);
+        }
+        return cached != NOT_A_RECORD;
+    }
+
+    /**
+     * May `boring.nav` answer a tag-27 record from its FIELD MAP, instead of
+     * building the value this reader would build?
+     *
+     * <p>Only when the two are the same thing. `boring.nav` cannot decide that
+     * for itself: it depends on the registry, on the reserved-name table above,
+     * and on two options -- and nav's own gate consulted only the first of those
+     * and was wrong about three documented configurations the day it was
+     * written. So the decision lives HERE, beside the dispatch it has to agree
+     * with, reading the same fields that dispatch reads.
+     *
+     * <p>The four ways it can be false:
+     * <ul>
+     *   <li>a REGISTERED name -- the constructor is arbitrary and may rename or
+     *       drop fields, or resolve state that is not in the bytes at all --
+     *       unless its author declared otherwise via `withNavigableRecord`;
+     *   <li>a RESERVED name, which builds something else entirely;
+     *   <li>`autoConstructRecords` with a record type that exists, because the
+     *       built value defaults missing fields to nil and follows the basis
+     *       order rather than the wire order;
+     *   <li>`onUnknownRecord` set to `:error` (the reader refuses, so nav must
+     *       not answer) or to a function (which may reshape the map).
+     * </ul>
+     *
+     * <p>Conservative on purpose in one place: `tryConstructRecord` returns null
+     * when `create` throws, and the reader then falls through to
+     * `onUnknownRecord`. Whether it throws cannot be known without calling it,
+     * so the existence of a `create` is enough to refuse.
+     *
+     * <p>What remains true is the fallback: an unregistered, unreserved name
+     * with `:on-unknown-record :fallback` becomes an UnknownRecord, whose
+     * `valAt`, `count` and `seq` delegate straight to the field map.
+     */
+    public boolean recordDescendable(String name) {
+        if (registry.recordCtor(name) != null) return registry.isNavigableRecord(name);
+        if (isReservedRecordName(name)) return false;
+        if (autoConstructRecords && hasRecordCreate(name)) return false;
+        return onUnknownRecord == KW_FALLBACK || onUnknownRecord == null;
+    }
+
     private static Object tryConstructRecord(String name, Object fields) {
         Object cached = CTOR_CACHE.get(name);
         if (cached == null) {

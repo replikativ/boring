@@ -260,6 +260,45 @@
   ^TagRegistry [^TagRegistry reg ctors]
   (.withRecords reg ^java.util.Map ctors))
 
+(defn declare-navigable-record
+  "Declare that `wire-name`'s constructor PRESERVES STRUCTURE, letting
+  `boring.nav` answer from the field map on the wire instead of building the
+  record. Returns a NEW registry.
+
+  The claim is precise, and it is three claims:
+
+    (get (ctor fields) k)  =  (get fields k)     for every k
+    (count (ctor fields))  =  (count fields)
+    (seq (ctor fields))    =  (seq fields)       same entries, same order
+
+  A `map->Record` factory satisfies all three, which is the common case.
+
+  WHY THIS IS OPT-IN. A constructor is an arbitrary function. It may rename
+  fields, drop them, or resolve state that is not in the bytes at all --
+  datahike's `reconstruct-db` resolves storage roots through registered storage
+  -- and answering past one of those returns a value the reader would never have
+  produced. `boring.nav` therefore treats every REGISTERED name as opaque and
+  realises it, which is always correct and sometimes slow. This is how the
+  handler's author, who is the only one who knows, says otherwise.
+
+  It is worth something: on a 2000-entry field map, a lookup that descends costs
+  7.91 us against 577.18 us realising, and stays flat as the record grows.
+
+  NO DECLARATION IS NEEDED FOR AN UNREGISTERED NAME. Without a constructor a
+  record decodes to a `boring.data/UnknownRecord`, whose `get`, `count` and
+  `seq` already delegate to the field map, so it is navigable by construction.
+
+  THE DECLARATION IS A CLAIM, AND A WRONG ONE RETURNS WRONG VALUES SILENTLY --
+  not an exception, not a slow path. Check it rather than assert it:
+
+    (require '[boring.nav-conformance :as nc])
+    (nc/check-record registry \"my.ns.Point\" [(->Point 1 2) (->Point 3 4)])
+
+  JVM-only, because `boring.nav` is. A `.cljc` registration shared with
+  ClojureScript should call this from a JVM-only branch."
+  ^TagRegistry [^TagRegistry reg ^String wire-name]
+  (.withNavigableRecord reg wire-name))
+
 (defn register-record-class
   "JVM-only convenience: derive both the wire name and the `map->Name`
   constructor from `cls` by reflection. Returns a NEW registry.
@@ -560,43 +599,66 @@
                                "ByteSource, got " (pr-str (type src)))
                           {:type :boring/bad-argument :entry entry}))))
 
+(defn ^:no-doc reader-config
+  "The eleven decode options a Reader carries, resolved ONCE into an array.
+
+  Split out of `configure-reader!` because those eleven `get`s are per SOURCE,
+  and a caller that opens one source per document -- which is every scan over a
+  document store -- repeats them per document for an answer fixed before the
+  scan began. 4000 blobs meant 44 000 map lookups. Worse than it looks: a small
+  options map is a PersistentArrayMap, whose `get` is a linear scan, so each
+  lookup walks the map.
+
+  `configure-reader!` still goes through here, so there is ONE definition of
+  which option lands in which field. Callers holding a config across documents
+  -- `boring.nav/context` -- resolve once and apply many times.
+
+  Not part of the supported API."
+  ^objects [opts]
+  (doto (object-array 11)
+    (aset 0 ^Object (Boolean/valueOf (boolean (get opts :tolerate-unknown-tags true))))
+    (aset 1 (get opts :on-unknown-record :fallback))
+    (aset 2 (let [it (get opts :instant-type :date)]
+              (when-not (#{:date :instant} it) it)))
+    (aset 3 ^Object (Boolean/valueOf (not= :instant (get opts :instant-type :date))))
+    (aset 4 ^Object (Boolean/valueOf (= :sql-date (get opts :date-type :local-date))))
+    (aset 5 ^Object (Integer/valueOf (int (get opts :max-depth 1024))))
+    (aset 6 ^Object (Long/valueOf (long (get opts :max-items 0))))
+    (aset 7 ^Object (Boolean/valueOf (boolean (get opts :validate-utf8 true))))
+    (aset 8 ^Object (Boolean/valueOf (boolean (get opts :check-duplicate-keys true))))
+    (aset 9 ^Object (Boolean/valueOf (boolean (get opts :auto-construct-records? false))))
+    (aset 10 (or (:registry opts) TagRegistry/EMPTY))))
+
+(defn ^:no-doc apply-reader-config! ^Reader [^Reader r ^objects c]
+  (set! (.-tolerateUnknownTags r) (boolean (aget c 0)))
+  (set! (.-onUnknownRecord r) (aget c 1))
+  (set! (.-instantFn r) (aget c 2))
+  (set! (.-instantAsDate r) (boolean (aget c 3)))
+  (set! (.-fullDateAsSqlDate r) (boolean (aget c 4)))
+  (set! (.-maxDepth r) (int (aget c 5)))
+  (set! (.-maxItems r) (long (aget c 6)))
+  (set! (.-validateUtf8 r) (boolean (aget c 7)))
+  (set! (.-checkDuplicateKeys r) (boolean (aget c 8)))
+  (set! (.-autoConstructRecords r) (boolean (aget c 9)))
+  (set! (.-registry r) ^TagRegistry (aget c 10))
+  r)
+
 (defn ^:no-doc configure-reader!
   "Apply decode options to a Reader. Public only so `boring.nav` can apply the
   SAME options its docstrings promise -- it realises values through this reader,
   so a differently-configured one would decode differently from `decode`.
-  Not part of the supported API."
+  Not part of the supported API.
+
+  DELEGATES, so there is exactly one definition of which option lands in which
+  field. It used to be a second, independent implementation, defended on the
+  grounds that going through `reader-config` would put an array allocation on
+  the `decode` path. Measured: `configure-reader!` 11.6 ns, the delegating shape
+  12.1 ns -- 0.5 ns, against 140 ns for a `decode` of the smallest realistic
+  document. That is 0.4% of one decode, and the thing it bought was a second
+  place for an option to be honoured on one path and ignored on the other, which
+  is the defect shape this codebase keeps finding."
   ^Reader [^Reader r opts]
-  (set! (.-tolerateUnknownTags r) (boolean (get opts :tolerate-unknown-tags true)))
-  ;; Passed through as-is: `:fallback`, `:error`, or a function of
-  ;; [name payload]. The Reader distinguishes them, and deliberately does NOT
-  ;; use `ifn?` to do it -- see `Reader.onUnknownRecord`.
-  (set! (.-onUnknownRecord r) (get opts :on-unknown-record :fallback))
-  (let [it (get opts :instant-type :date)]
-    ;; A FUNCTION is legal on both platforms -- see `Reader.instantFn`. This
-    ;; honoured only the two keywords, so a portable caller passing a
-    ;; constructor got their type on ClojureScript and a `Date` here.
-    ;; NOT bare `ifn?`: a keyword satisfies it, so `:date` and `:instant`
-    ;; were invoked as constructors and every instant decoded to nil.
-    (set! (.-instantFn r) (when-not (#{:date :instant} it) it))
-    (set! (.-instantAsDate r) (not= :instant it)))
-  (set! (.-fullDateAsSqlDate r) (= :sql-date (get opts :date-type :local-date)))
-  (set! (.-maxDepth r) (int (get opts :max-depth 1024)))
-  ;; 0 = unlimited, which is the default. See Reader.maxItems for why the budget
-  ;; counts ITEMS rather than bytes.
-  (set! (.-maxItems r) (long (get opts :max-items 0)))
-  (set! (.-validateUtf8 r) (boolean (get opts :validate-utf8 true)))
-  ;; WIRED, having been documented and then never applied. doc/SECURITY.md
-  ;; describes `:check-duplicate-keys false` as the way to turn duplicate
-  ;; rejection off; the Java field existed and defaulted to true, but no entry
-  ;; point ever set it, so the option was silently ignored and a duplicate map
-  ;; still threw with it set. A documented safety control that does nothing is
-  ;; worse than one that does not exist.
-  (set! (.-checkDuplicateKeys r) (boolean (get opts :check-duplicate-keys true)))
-  (set! (.-autoConstructRecords r)
-        (boolean (get opts :auto-construct-records? false)))
-  ;; ALWAYS set, never `when-let` -- see `configure!`.
-  (set! (.-registry r) (or (:registry opts) TagRegistry/EMPTY))
-  r)
+  (apply-reader-config! r (reader-config opts)))
 
 (defn decode
   "Decode the first CBOR item in `bs`.
@@ -795,6 +857,28 @@
   items and no container clearing the bar means no frame and no ~37 bytes. This
   paragraph used to promise the opposite -- \"always costs ~37 bytes\" -- which
   stopped being true when `encode-indexed` and `write-seq!` were made to agree.
+
+  WHAT IT REALLY PRICES IS NODE COUNT, not container size. Opening an index
+  costs about 25 ns PER NODE -- a slots entry, a memo cell and two verdict
+  bytes each -- and that is paid once per `nav/source`, while a lookup visits
+  only the containers on ONE path. So a node is a certain cost against a
+  possible saving, and lowering the bar buys nodes that are never visited.
+
+  Measured, reaching the last element with `:trust-index :trusted`:
+
+    4096 x 4-key maps   :index-min 4    4097 nodes   105.14 us    1.7x
+    4096 x 4-key maps   :index-min 16      1 node      3.03 us   54.9x
+     256 x 64-key maps  :index-min 16    257 nodes    19.71 us    7.4x
+     256 x 64-key maps  :index-min 65      1 node     13.72 us   10.6x
+
+  The per-node figure held to within 10% across all three shapes. So the
+  failure mode of a LOW `:index-min` is not a slightly bigger file, it is a
+  35x slower lookup -- and the default of 16 is not conservative, it is
+  roughly where store-shaped data stops adding nodes it will not use.
+
+  Raising it further is safe and sometimes better: 16, 32, 64, 128 and 512 were
+  within noise of each other on 2000 record-shaped documents (~30-33x), because
+  none of them changed the node count for that data.
 
   `:index` FORCES `:stringref false`. `boring.nav` cannot resolve a string
   reference from an offset alone -- a stringref indexes a table built from every

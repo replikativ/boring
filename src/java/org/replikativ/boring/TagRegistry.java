@@ -1,7 +1,9 @@
 package org.replikativ.boring;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * User-extensible tag handlers, in both directions.
@@ -46,19 +48,57 @@ public final class TagRegistry {
     private final Map<String, clojure.lang.IFn> recordCtors;
     /** Optional override of the wire name for a class. */
     private final Map<Class<?>, String> recordNames;
+    /**
+     * Wire names whose constructor is declared STRUCTURE-PRESERVING, so that
+     * `boring.nav` may answer lookups from the field map on the wire instead of
+     * building the record.
+     *
+     * <p>Opt-in because a constructor is an arbitrary IFn. It may rename fields,
+     * drop them, or resolve state that is not in the bytes at all -- datahike's
+     * `reconstruct-db` resolves storage roots -- and answering past one of those
+     * returns a value the reader would never have produced. So the default is
+     * that a registered name is opaque, and the handler's author, who is the
+     * only one who knows, says otherwise.
+     *
+     * <p>The declaration is a CLAIM, and a wrong one returns wrong values
+     * silently. `boring.nav-conformance/check-record` exists to test it.
+     */
+    private final Set<String> navigableRecords;
 
     /** The empty registry. Safe to share: nothing can mutate it. */
     public static final TagRegistry EMPTY = new TagRegistry(
-        Map.of(), Map.of(), Map.of(), Map.of());
+        Map.of(), Map.of(), Map.of(), Map.of(), Set.of());
 
     private TagRegistry(Map<Class<?>, TagWriter> writers,
                         Map<Long, clojure.lang.IFn> readers,
                         Map<String, clojure.lang.IFn> recordCtors,
-                        Map<Class<?>, String> recordNames) {
+                        Map<Class<?>, String> recordNames,
+                        Set<String> navigableRecords) {
         this.writers = writers;
         this.readers = readers;
         this.recordCtors = recordCtors;
         this.recordNames = recordNames;
+        this.navigableRecords = navigableRecords;
+    }
+
+    /**
+     * Declare that `name`'s constructor preserves structure: that looking a key
+     * up in the realised value gives what looking it up in the field map gives,
+     * and likewise for count and seq.
+     *
+     * <p>Returns a NEW registry. Declaring a name that is not registered is
+     * harmless -- an unregistered name already decodes to an UnknownRecord over
+     * the field map, which is navigable without any declaration.
+     */
+    public TagRegistry withNavigableRecord(String name) {
+        Set<String> copy = new HashSet<>(navigableRecords);
+        copy.add(name);
+        return new TagRegistry(writers, readers, recordCtors, recordNames, copy);
+    }
+
+    /** Whether `name` was declared structure-preserving. */
+    public boolean isNavigableRecord(String name) {
+        return navigableRecords.contains(name);
     }
 
     private static <K, V> Map<K, V> plus(Map<K, V> m, K k, V v) {
@@ -114,14 +154,14 @@ public final class TagRegistry {
                 + " silently did nothing. Wrap the value in a type of your own, or"
                 + " use :encode-fallback.");
         return new TagRegistry(plus(writers, cls, new TagWriter(tag, writeFn)),
-                               readers, recordCtors, recordNames);
+                               readers, recordCtors, recordNames, navigableRecords);
     }
 
     /** @param readFn (fn [decoded-content] -> value) */
     public TagRegistry withReader(long tag, clojure.lang.IFn readFn) {
         checkTag(tag);
         return new TagRegistry(writers, plus(readers, tag, readFn),
-                               recordCtors, recordNames);
+                               recordCtors, recordNames, navigableRecords);
     }
 
     // ---- records (tag 27) --------------------------------------------------
@@ -133,7 +173,8 @@ public final class TagRegistry {
 
     public TagRegistry withRecord(String name, clojure.lang.IFn ctor) {
         return new TagRegistry(writers, readers,
-                               plus(recordCtors, name, ctor), recordNames);
+                               plus(recordCtors, name, ctor), recordNames,
+                               navigableRecords);
     }
 
     /** Override the wire name emitted for `cls`, for the encode direction. */
@@ -158,12 +199,12 @@ public final class TagRegistry {
         for (Map.Entry<?, ?> e : ctors.entrySet()) {
             copy.put(String.valueOf(e.getKey()), (clojure.lang.IFn) e.getValue());
         }
-        return new TagRegistry(writers, readers, copy, recordNames);
+        return new TagRegistry(writers, readers, copy, recordNames, navigableRecords);
     }
 
     public TagRegistry withRecordName(Class<?> cls, String name) {
         return new TagRegistry(writers, readers, recordCtors,
-                               plus(recordNames, cls, name));
+                               plus(recordNames, cls, name), navigableRecords);
     }
 
     /**

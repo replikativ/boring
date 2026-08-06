@@ -318,6 +318,50 @@ of that table with no knob. Compression also forecloses zero-copy — a chunk
 must be decompressed to the heap — so it and the blob win are alternatives for
 the same bytes.
 
+## Optimisations that did not work
+
+Four attempts to close the gap against Postgres JSONB on small documents
+(0.11 µs/row for a three-step path extraction). One worked. The three that did
+not are recorded because each is an idea that looks obviously right, and the
+reason all three failed is the same.
+
+Baseline: navigating a 229-byte blob, three-step path, ~0.2–0.5 µs/document
+depending on run. Machine was loaded and on the `powersave` governor, so the
+ratios below are within-run comparisons; absolute figures are not publishable.
+
+| attempt | result |
+|---|---|
+| Shared encoded-key cache (`nav/context`) | **2.4× faster** — shipped |
+| Pack records into one indexed CBOR sequence | 0.80× — *worse* |
+| Compiled path: no `Cursor`, no probe lookup, primitive offsets | 0.78× — *worse* |
+| Reuse one `Reader` across documents via `reset` | 1.00× microbench, 0.92× in a real LMDB scan |
+
+**What separates the one that worked from the three that did not:** the probe
+cache removed repeated WORK — encoding the same four keywords 4000 times. The
+other three removed repeated ALLOCATION and DISPATCH, which on the JVM is
+already close to free. TLAB allocation is a pointer bump and young-gen
+collection of short-lived objects costs little, so removing it buys nothing and
+the indirection added to remove it costs something.
+
+The compiled path is the sharpest example: it cut navigation allocation from
+208 B to 80 B per document, a 2.6× reduction, and still ran slower.
+
+Reader reuse is worth a note of its own. In a tight microbenchmark it was 1.26×
+on the first round, 1.24× on the second and 1.00× on the third — the reusing
+path was flat while the ordinary path CONVERGED DOWN to meet it, because the JIT
+eventually eliminates the per-document Reader itself. Measuring one round would
+have "proved" a 1.26× win that does not exist at steady state. It also loses in
+a real LMDB scan, where the loop body is large enough that the saving is noise.
+
+The generalisable rule: **on the JVM, look for repeated work, not repeated
+allocation.** A C intuition about `palloc` does not transfer.
+
+Where the remaining gap against Postgres actually is: a hand-written LMDB
+cursor loop costs 0.10–0.12 µs/document, which is Postgres's entire budget for
+the same query. Panama is not the overhead. The gap is boring's per-document
+navigation, and none of the three attempts above touched it in a way the JVM
+had not already handled.
+
 ## Where boring loses
 
 ### Deeply nested maps — 1.4× bigger, 1.6× slower

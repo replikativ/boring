@@ -246,6 +246,69 @@
                              (filter map? (into [] (map nav/value) (nav/items bs opts)))))
             (str label ": and the data must read back unchanged"))))))
 
+(deftest trusted-and-validated-agree-on-a-well-formed-index
+  (testing ":trust-index :trusted skips the FRAME-level structural checks, not
+            only the per-node ones. Those checks are O(node count) and were run
+            on every `nav/source` regardless of the option -- ~42 us to open a
+            16 384-element index against ~2 us trusted, paid per source, which
+            a document store pays once per blob for a single lookup.
+
+            Skipping them may not change a single answer on an index boring
+            itself wrote. This is the invariant that makes the option safe, so
+            it is asserted across shapes rather than argued."
+    (let [trusted (assoc opts :trust-index :trusted)]
+      (doseq [[label v path]
+              [["flat scalars"        (vec (range 400))            [399]]
+               ["short array"         (vec (range 3))              [2]]
+               ["strings"             (mapv #(str "s-" %) (range 300)) [299]]
+               ["nested maps"         (vec (for [i (range 120)]
+                                             {:a i :b {:c (* i 2)}}))  [119 :b :c]]
+               ["mixed depths"        (vec (for [i (range 90)]
+                                             [i {:k (str i)} [i i]]))  [89 1 :k]]
+               ["empty array"         [[] [] []]                   [1]]]]
+        (let [bs (boring/encode-indexed v (assoc opts :index 16 :index-min 4))
+              reach (fn [o] (nav/value (reduce #(get %1 %2) (nav/source bs o) path)))]
+          (is (= (get-in v path) (reach opts)) (str label ": validated path"))
+          (is (= (get-in v path) (reach trusted)) (str label ": trusted path"))
+          ;; whole-document realisation too, not just the one path -- a skipped
+          ;; check that corrupted `:total` or `:data-end` shows up here first
+          (is (= v (nav/value (nav/source bs trusted)))
+              (str label ": trusted realises the whole document unchanged"))
+          (is (= (nav/value (nav/source bs opts))
+                 (nav/value (nav/source bs trusted)))
+              (str label ": the two settings must not disagree")))))))
+
+(deftest a-tagged-container-is-realised-not-navigated
+  (testing "a tag-27 record puts its payload past the tag, so the root cursor is
+            the TAG and no index node matches its offset -- the lookup realises
+            the whole container instead. Correct, but O(container), and it is
+            why `:shapes` costs projection. Pinned because the ANSWERS must stay
+            identical however the value was encoded; only the cost differs."
+    (let [pairs (for [j (range 60)] [(str "f" (format "%03d" j)) j])
+          o (assoc opts :index 16 :index-min 8 :profile :canonical)
+          bare (boring/encode-indexed (into {} pairs) o)
+          tagged (boring/encode-indexed (into (sorted-map) pairs) o)]
+      ;; the shapes really are different on the wire, or the test proves nothing
+      (is (not= 6 (bit-shift-right (bit-and (aget ^bytes bare 0) 0xff) 5))
+          "a plain map must encode as a bare CBOR map")
+      (is (= 6 (bit-shift-right (bit-and (aget ^bytes tagged 0) 0xff) 5))
+          "a sorted-map must encode as a tag")
+      (doseq [[label bs] [["bare" bare] ["tagged" tagged]]
+              trust [:trusted :ignore]]
+        (let [s (nav/source bs (assoc opts :trust-index trust))]
+          (is (= 0 (nav/value (get s "f000"))) (str label " " trust " first key"))
+          (is (= 59 (nav/value (get s "f059"))) (str label " " trust " last key"))
+          (is (nil? (get s "nope")) (str label " " trust " absent key")))))))
+
+(deftest trusted-still-refuses-a-frame-whose-lengths-disagree
+  (testing "the one frame check that stays unconditional. Disagreeing lengths
+            cost O(1) to detect and would otherwise surface as a raw
+            IndexOutOfBoundsException from inside `get` rather than as
+            \"no usable index, scan instead\"."
+    (let [bs (crafted [1 (int-array [-1]) (int-array [3]) [] [false]])]
+      (is (= 3 (count (into [] (nav/items bs (assoc opts :trust-index :trusted)))))
+          "trusted must still fall back to scanning, not index into nothing"))))
+
 (deftest a-consistent-crafted-payload-is-still-used
   (testing "the control: validation must reject inconsistency, not everything.
             Three 4-byte items at stride 1 means three anchors at 0, 4 and 8."
@@ -1098,8 +1161,11 @@
                 the lookup path"
         (is (some? at) "the slot's delta bytes were found")
         (let [ix (#'boring.nav/read-index (#'boring.nav/nav-of damaged o))]
-          (is (some? (:slots ix)) "the damaged index is accepted")
-          (is (= [2 22 43 62 82 102] (vec (take 6 (first (:slots ix)))))
+          (is (some? (:raw-slots ix)) "the damaged index is accepted")
+          ;; Slots are expanded on demand now, so ask for node 0 rather than
+          ;; reading a pre-expanded vector.
+          (is (= [2 22 43 62 82 102]
+                 (vec (take 6 (#'boring.nav/slot-at ix 0))))
               "and anchor[2] really is one byte off")))
       (testing "yet every present key still reads back correctly"
         (let [src (nav/source damaged o)]
@@ -1521,3 +1587,70 @@
                  (try (do (nav/source bs (assoc o :trust-index bad)) nil)
                       (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
               (pr-str bad)))))))
+
+(deftest trusted-skips-validation-but-not-correctness
+  (testing ":trust-index :trusted skips the per-node far-end check, which is
+            the single dominant cost of an index on a short-lived source --
+            measured 47 us of a node's ~50 us. On sound data it must return
+            exactly what the validated path returns."
+    (let [m (into {} (for [i (range 200)] [(format "k%03d" i) {:v i :s (str "s" i)}]))
+          o {:stringref false}
+          bs (boring/encode-indexed m (assoc o :index 16))]
+      (doseq [k (map #(format "k%03d" %) (range 200))]
+        (is (= (some-> (get (nav/source bs o) k) nav/value)
+               (some-> (get (nav/source bs (assoc o :trust-index :trusted)) k)
+                       nav/value))
+            (str "trusted and validated must agree on " k)))
+      (testing "and an absent key is absent under both"
+        (is (nil? (get (nav/source bs o) "nope")))
+        (is (nil? (get (nav/source bs (assoc o :trust-index :trusted)) "nope")))))))
+
+(deftest validation-is-per-node-not-per-index
+  (testing "an unsound node must not disable the index for containers that are
+            fine -- validation moved from a load-time gate over every node to a
+            per-node verdict taken on first use"
+    (let [m {"a" (into {} (for [i (range 40)] [(format "a%02d" i) i]))
+             "b" (into {} (for [i (range 40)] [(format "b%02d" i) i]))}
+          o {:stringref false}
+          bs (boring/encode-indexed m (assoc o :index 4 :index-min 4))
+          src (nav/source bs o)]
+      ;; Both containers read correctly, and the index carries a node for each.
+      (let [ix (#'boring.nav/read-index (#'boring.nav/nav-of bs o))]
+        (is (>= (alength ^longs (:containers ix)) 2) "both containers indexed")
+        (is (some? (:node-checked ix)) "and each carries its own verdict slot"))
+      (doseq [i (range 40)]
+        (is (= i (some-> (get (get src "a") (format "a%02d" i)) nav/value)))
+        (is (= i (some-> (get (get src "b") (format "b%02d" i)) nav/value)))))))
+
+(deftest get-and-nth-agree-on-arrays
+  (testing "`get` with an integer index on an array cursor fell through to
+            not-found -- a PRESENT element reported absent, and `contains?`
+            false for a valid index -- while `nth` returned it. It survived
+            because it depends on the ENCODING, not the data: under :shapes an
+            array is a tag cursor and clojure.core answered correctly, so a
+            caller's get-in over an indexed path worked or silently returned nil
+            according to how the document happened to be written."
+    (let [v {:rows (vec (for [i (range 40)] {:e i :v (str "val-" i)}))}]
+      (doseq [[label o] [["plain"  {:stringref false}]
+                         ["shapes" {:stringref false :shapes true}]
+                         ["indexed" {:stringref false :index 4 :index-min 4}]]]
+        (let [bs (if (:index o) (boring/encode-indexed v o) (boring/encode v o))
+              rows (get (nav/source bs o) :rows)]
+          (doseq [i (range 40)]
+            (is (= {:e i :v (str "val-" i)} (nav/value (get rows i)))
+                (str label ": get " i))
+            (is (= (nav/value (nth rows i)) (nav/value (get rows i)))
+                (str label ": nth and get agree at " i))
+            (is (contains? rows i) (str label ": contains? " i)))
+          (testing (str label ": out of range and non-integer keys are absent")
+            (is (= :nf (get rows 40 :nf)))
+            (is (= :nf (get rows -1 :nf)))
+            (is (= :nf (get rows :not-an-index :nf)))
+            (is (not (contains? rows 40)))))))))
+
+(deftest get-in-works-through-an-indexed-path
+  (testing "the shape a consumer actually writes"
+    (let [v {:a {:b [{:c 1} {:c 2} {:c 3}]}}
+          o {:stringref false}
+          src (nav/source (boring/encode v o) o)]
+      (is (= 2 (nav/value (-> src (get :a) (get :b) (get 1) (get :c))))))))
