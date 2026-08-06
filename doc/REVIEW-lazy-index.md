@@ -205,9 +205,14 @@ No defects. 200 threads on a shared context: 0 mismatches. `fork` across 16
 threads: correct. The deliberately-raced verdict arrays fail conservatively in
 both write orderings. `slot-at` uses `AtomicReferenceArray` + CAS correctly.
 
-- [ ] **S12** Minor: without `fork`, 1 of 16 threads produced a raw
+- [-] **S12** Minor: without `fork`, 1 of 16 threads produced a raw
       `NullPointerException` alongside 13 `:boring/concurrent-use`. Documented-
       unsafe territory, but the detector is described as naming the overlap.
+      NOT DOING for this merge. Concurrent use of one cursor without `fork` is
+      documented-unsafe, the detector catches 13 of 16 and is described as
+      catching it "often enough to name it" rather than always. Closing the last
+      case means a lock on the read path, which is the wrong trade for a
+      diagnostic. Worth an issue, not a blocker.
 
 ## 5. API, redundancy, consolidation
 
@@ -257,7 +262,7 @@ both write orderings. `slot-at` uses `AtomicReferenceArray` + CAS correctly.
 - [x] **A13** `Cursor.count` is misindented and calls `(major nav off)` twice.
 - [x] **A14** Stale `declare` (`nav.clj:70`): only `->Cursor`, `cursor-at`,
       `read-index`, `read-index*`, `tag-view` need forward declaration.
-- [ ] **A15** `shaped-view` and `record-view` duplicate a "tag wraps a definite
+- [x] **A15** `shaped-view` and `record-view` duplicate a "tag wraps a definite
       2-element array" prologue; all three builders re-test the tag they were
       dispatched on, which is now dead.
 - [x] **A16** `shaped_nav_test` and `typed_nav_test` hand-roll their comparisons
@@ -288,10 +293,10 @@ both write orderings. `slot-at` uses `AtomicReferenceArray` + CAS correctly.
       wrapper. This is the third time this trap has come up in one session --
       it also produced a phantom failure in `nav-conformance` and one in the
       shaped-array benchmark.
-- [ ] **Q2** Suspicion: `child-offsets` (`nav.clj:527`) compares the declared
+- [x] **Q2** Suspicion: `child-offsets` (`nav.clj:527`) compares the declared
       count against `room` **before** doubling for maps, while `Cursor.count`
       compares `2n`. Cosmetic (both typed) but the guards should agree.
-- [ ] **Q3** Suspicion: a `:sorted` index node over a `clojure/sorted-map`
+- [x] **Q3** Suspicion: a `:sorted` index node over a `clojure/sorted-map`
       payload is ordered by Clojure `compare`, not canonical CBOR byte order, so
       the binary search runs over an array not sorted by its comparison function.
       Believed safe only because `confirm` re-derives every negative by an honest

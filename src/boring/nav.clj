@@ -535,6 +535,15 @@
                 ;; only on genuine misses, where an honest answer requires the
                 ;; walk anyway: trusting an index for a NEGATIVE is exactly
                 ;; what damage makes unsound.
+                ;; WHY `confirm` IS NOT REDUNDANT, beyond the damaged-anchor
+                ;; case argued above. A `:sorted` node over a map the WRITER
+                ;; ordered by something other than canonical CBOR bytes -- a
+                ;; `clojure/sorted-map` payload is ordered by Clojure `compare`
+                ;; -- leaves this binary-searching an array that is not sorted
+                ;; by the function the search compares with. It stays correct
+                ;; only because a negative is re-derived by an honest scan and a
+                ;; positive requires an exact byte match. Deleting `confirm` as
+                ;; a redundant optimisation would break those lookups silently.
                 (confirm [^long hit]
                   (if (neg? hit) (scan-map r (.headEndAt r off) n probe) hit))]
           (if (nth (:sorted idx) ns)
@@ -592,6 +601,11 @@
             (loop [i (* anchor stride) p (long (aget slot anchor))]
               (if (= i idx) p (recur (inc i) (skip r p))))))))))
 
+;; NOTE: this compares the declared count against `room` BEFORE doubling for a
+;; map, while `Cursor.count` compares `2n`. Both are typed refusals, so the
+;; difference is which one fires -- a map declaring exactly `room` pairs passes
+;; here and fails in `skip`. Cosmetic, but the two guards should say the same
+;; thing if either is ever touched.
 (defn- child-offsets
   "Offsets of the children of the container at `off`, in wire order. For a map
   these alternate key, value."
@@ -1090,6 +1104,16 @@
               ;; `number?`, not `integer?` -- see the :vector branch of valAt.
               {:kind :vector :n n :nth at :key-pred number?
                :items (fn [] (map at (range n)))})))))))
+
+(defn- tag-pair
+  "The two element offsets of a tag whose payload is a definite 2-element array,
+  or nil. `39649([keys, rows])` and `27([name, fields])` are both this shape, and
+  both builders opened by checking it by hand."
+  [^Reader r ^long off]
+  (let [pair (.headEndAt r off)]
+    (when (and (= MAJOR-ARRAY (.majorAt r pair)) (= 2 (.headArgAt r pair)))
+      (let [a (.headEndAt r pair)]
+        [a (skip r a)]))))
 
 (defn- shaped-view
   "RESTRUCTURING. A shaped array is `39649([keys, [row, ...]])`: the keys are
