@@ -67,13 +67,13 @@
 
 (set! *warn-on-reflection* true)
 
-(declare ->Cursor cursor-at read-index read-index* shape-at typed-at typed-nth
-         record-at record-key-ok? nth-item realize lookup-map head-count child-offsets)
+(declare ->Cursor cursor-at read-index read-index* tag-view
+         nth-item realize lookup-map head-count child-offsets)
 
 ;; A shaped array is `39649([keys, [row, row, ...]])`, where each row is an
 ;; ARRAY of values positionally matching `keys`. It REALISES to a vector of
 ;; maps, so a cursor on one has to present that shape without building it --
-;; see `shape-at`.
+;; see `shaped-view`.
 (def ^:private ^:const TAG-SHAPED-ARRAY 39649)
 
 (defn- fail [type msg data]
@@ -592,28 +592,24 @@
         ;; guessing wrong returns a wrong value rather than a slow one. A shaped
         ;; array is the case where boring knows, because boring wrote it.
           (= mj MAJOR-TAG)
-          ;; A SHAPED ARRAY REALISES TO A VECTOR OF MAPS, so an integer key is
-          ;; an index into the rows and every other key is absent -- which is
-          ;; what `(get [{...}] :k)` answers.
-          (if-some [sh (shape-at nav off)]
-            (if (integer? k)
-              (let [p (nth-item nav (long (:rows sh)) (int k))]
-                (if (neg? p) nf (->Cursor nav p sh)))
-              nf)
-            ;; `clojure.core/get` on a realised primitive array indexes it, so
-            ;; an integer key has to keep meaning the same thing here.
-            (if-some [t (typed-at nav off)]
-              (if (integer? k) (typed-nth nav t (long k) nf) nf)
-              ;; A record's field map is an ordinary indexed container; only
-              ;; the cursor was standing in front of it.
-              (if-some [rc (record-at nav off)]
-                (if (record-key-ok? rc k)
-                  (let [p (lookup-map nav (long (:payload rc)) k)]
-                    (if (neg? p) nf (cursor-at nav p)))
-                  (try (get (realize nav off) k nf)
-                       (catch ClassCastException _ nf)))
-                (try (get (realize nav off) k nf)
-                     (catch ClassCastException _ nf)))))
+          (let [v (tag-view nav off)
+                ;; `clojure.core/get` is total EXCEPT on a sorted collection,
+                ;; where an incomparable key throws; a lookup handed a
+                ;; not-found value must not throw.
+                fallback #(try (get (realize nav off) k nf)
+                               (catch ClassCastException _ nf))]
+            (case (:kind v)
+              ;; A vector-kinded tag answers integer keys and nothing else,
+              ;; which is what `(get [x] :k)` does.
+              :vector (if (integer? k)
+                        (let [r ((:nth v) (long k))]
+                          (if (identical? ::miss r) nf r))
+                        nf)
+              :map (let [r ((:lookup v) k)]
+                     (cond (identical? ::miss r) nf
+                           (identical? ::realise r) (fallback)
+                           :else r))
+              (fallback)))
           :else nf))))
 
   clojure.lang.Indexed
@@ -641,25 +637,19 @@
         ;; realised keyword or set EVEN with a not-found argument, which leaked
         ;; an untyped error out of the arity whose whole point is not to throw.
           (= mj MAJOR-TAG)
-          (if-some [sh (shape-at nav off)]
-            (let [p (nth-item nav (long (:rows sh)) i)]
-              (if (neg? p) nf (->Cursor nav p sh)))
-            ;; A typed array's elements are packed, so this is arithmetic
-            ;; rather than a walk -- and rather than building the whole
-            ;; primitive array to read one of them.
-            (if-some [t (typed-at nav off)]
-              (typed-nth nav t i nf)
-              ;; A record realises to a map or an UnknownRecord, neither of
-              ;; which is Indexed, so this was already not-found -- but it
-              ;; realised the whole record to discover that.
-              (if (record-at nav off)
-                nf
-                (let [v (realize nav off)]
-                  (if (or (nil? v) (instance? clojure.lang.Indexed v)
-                          (instance? java.util.List v) (string? v)
-                          (and (some? v) (.isArray (class v))))
-                    (nth v i nf)
-                    nf)))))
+          (let [v (tag-view nav off)]
+            (case (:kind v)
+              :vector (let [r ((:nth v) i)] (if (identical? ::miss r) nf r))
+              ;; A map-kinded tag realises to a map or an UnknownRecord,
+              ;; neither of which is Indexed, so this was already not-found --
+              ;; but it realised the whole value to discover that.
+              :map nf
+              (let [rv (realize nav off)]
+                (if (or (nil? rv) (instance? clojure.lang.Indexed rv)
+                        (instance? java.util.List rv) (string? rv)
+                        (and (some? rv) (.isArray (class rv))))
+                  (nth rv i nf)
+                  nf))))
           :else nf))))
 
   ;; Honest O(1): the count is in the head, and head-count refuses the
@@ -670,20 +660,12 @@
       ;; A row counts its KEYS. The bytes say the same number -- one value per
       ;; key -- but going through the shape says why.
       (count (:ks shape))
-      ;; `if-let`, not `if-some`: the `and` yields FALSE for a non-tag, and
-      ;; `if-some` counts false as present and then reads `:n` off it.
-      ;;
-      ;; A shaped array counts its ROWS and a typed array its ELEMENTS, both
-      ;; being the length of the collection they realise to. `count` used to
-      ;; refuse every tag while `nth` on a typed array worked through the
-      ;; realising path -- countable by nobody, indexable by anyone.
-      (if-let [sh (and (= MAJOR-TAG (major nav off))
-                       (or (shape-at nav off) (typed-at nav off)
-                           ;; A record counts its FIELDS, as UnknownRecord and
-                           ;; sorted-map both do.
-                           (when-let [rc (record-at nav off)]
-                             {:n (head-count nav (long (:payload rc)))})))]
-        (int (:n sh))
+      ;; A navigable tag counts what the value it realises to counts: rows for
+      ;; a shaped array, elements for a typed one, fields for a record.
+      ;; `count` used to refuse every tag while `nth` on a typed array worked
+      ;; through the realising path -- countable by nobody, indexable by anyone.
+      (if-let [v (and (= MAJOR-TAG (major nav off)) (tag-view nav off))]
+        (int (:n v))
         (let [mj (major nav off)]
         (if (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP))
         ;; CHECKED against the data, which this was the one entry point not to
@@ -735,17 +717,16 @@
           (seq (mapv (fn [[kp vp]]
                        (clojure.lang.MapEntry. (realize nav kp) (cursor-at nav vp)))
                      (partition 2 (child-offsets nav off))))
-          ;; A shaped array seqs as its ROWS, like the vector it realises to;
-          ;; a record seqs as its FIELDS. Both keep the wire order, which is
-          ;; already the order the realised value would give -- a sorted-map is
-          ;; written in its own iteration order, which is sorted.
+          ;; A navigable tag seqs as the collection it realises to: rows for a
+          ;; shaped array, elements for a typed one, entries for a record. Wire
+          ;; order is already the realised order -- a sorted-map is written in
+          ;; its own iteration order, which is sorted.
           (= mj MAJOR-TAG)
-          (if-some [sh (shape-at nav off)]
-            (seq (mapv #(->Cursor nav % sh) (child-offsets nav (long (:rows sh)))))
-            (when-some [rc (record-at nav off)]
-              (seq (mapv (fn [[kp vp]]
-                           (clojure.lang.MapEntry. (realize nav kp) (cursor-at nav vp)))
-                         (partition 2 (child-offsets nav (long (:payload rc))))))))
+          (let [v (tag-view nav off)]
+            (case (:kind v)
+              :vector (seq (vec ((:items v))))
+              :map (seq (vec ((:entries v))))
+              nil))
           :else nil))))
 
   ;; IReduce as well as IReduceInit: `(reduce f coll)` -- the arity everyone
@@ -765,8 +746,7 @@
     ;; A non-shaped tag must still fall through to the `:else` below, which
     ;; refuses. Testing MAJOR-TAG alone would have turned that typed refusal
     ;; into a silent `init`.
-    (if (or shape (and (= MAJOR-TAG (major nav off))
-                       (or (shape-at nav off) (record-at nav off))))
+    (if (or shape (and (= MAJOR-TAG (major nav off)) (tag-view nav off)))
       ;; Both shaped forms go through `seq`, which already knows how to present
       ;; them. Duplicating the walk here would be a second place for the
       ;; key-to-position mapping to drift from the first.
@@ -798,6 +778,49 @@
 
 (defn- cursor-at [^Nav nav ^long off] (->Cursor nav off nil))
 
+;; ------------------------------------------------------- navigating a tag
+;;
+;; A CBOR tag is structurally uniform -- one tag number wrapping one data item
+;; -- and semantically anything at all, because the reader maps (tag, payload)
+;; to a host value through an arbitrary function. Descending is sound only when
+;; that function COMMUTES with the operation:
+;;
+;;     get(R(payload), k) == R_child(get_payload(payload, translate(k)))
+;;
+;; for the reader `R`. Which is why there is no single rule, and why the tags
+;; below fall into distinct kinds:
+;;
+;;   WRAPPER            R preserves structure. Navigate the payload; `value`
+;;                      still realises at the TAG, so nothing is reconstructed.
+;;                      Records are this.
+;;   RESTRUCTURING      R rearranges. Needs a key-to-position translation AND
+;;                      explicit reconstruction, because realising at the tag
+;;                      no longer describes a child. Shaped rows are this, and
+;;                      it is why they carry state on the cursor.
+;;   SCALAR-DECODING    Elements are packed rather than written as items, so
+;;                      access is arithmetic and yields VALUES, never cursors.
+;;                      Typed arrays are this.
+;;   OPERATION-CHANGING The operation means something else -- `get` on a set is
+;;                      MEMBERSHIP. No generic form; these stay opaque.
+;;   EXTERNALLY-RESOLVED The value is not a function of the bytes at all, as
+;;                      with a reader that resolves storage roots. Never
+;;                      navigable, and the reason "tag plus value" is not
+;;                      enough on its own.
+;;
+;; A VIEW is what a navigable tag produces: built once per (nav, offset),
+;; cached, and holding closures that have already captured both. Everything
+;; unknown yields nil and realises, so this is a pure optimisation with no
+;; correctness cliff -- a tag boring has never heard of behaves exactly as it
+;; did before any of this existed.
+;;
+;;   {:kind :map    :n <count> :lookup (fn [k]) :entries (fn [])}
+;;   {:kind :vector :n <count> :nth (fn [i])    :items   (fn [])}
+;;
+;; `:lookup` and `:nth` return a child cursor, a realised value, `::miss` for
+;; absent, or `::realise` to fall back for this key alone.
+
+(def ^:private ^:const TAG-RECORD 27)
+
 ;; RFC 8746 typed arrays boring WRITES: signed little-endian integers plus f32
 ;; and f64 LE. `Reader.readTypedArray` can read all 21 with a lossless JVM
 ;; representation, but descent is implemented only for these five.
@@ -808,200 +831,175 @@
 ;; one. The five below are the ones boring's own data uses and the ones whose
 ;; boxing is pinned by test against `realize`; everything else falls back to
 ;; realising, which is what already worked.
+(defn- le-long ^long [^bytes b ^long n]
+  (loop [i 0 acc 0] (if (= i n) acc
+                        (recur (inc i)
+                               (bit-or acc (bit-shift-left
+                                            (bit-and (long (aget b i)) 0xFF)
+                                            (* 8 i)))))))
+
 (def ^:private typed-array-tags
-  {77 {:size 2 :read (fn [^bytes b] (Short/valueOf (short (bit-or (bit-and (aget b 0) 0xFF)
-                                                           (bit-shift-left (aget b 1) 8)))))}
-   78 {:size 4 :read (fn [^bytes b]
-                       (Integer/valueOf (int (areduce b i acc (int 0)
-                                               (bit-or acc (bit-shift-left
-                                                            (bit-and (aget b i) 0xFF)
-                                                            (* 8 i)))))))}
-   79 {:size 8 :read (fn [^bytes b]
-                       (Long/valueOf (long (areduce b i acc (long 0)
-                                       (bit-or acc (bit-shift-left
-                                                    (bit-and (long (aget b i)) 0xFF)
-                                                    (* 8 i)))))))}
-   85 {:size 4 :read (fn [^bytes b]
-                       (Float/valueOf (Float/intBitsToFloat
-                                (int (areduce b i acc (int 0)
-                                              (bit-or acc (bit-shift-left
-                                                           (bit-and (aget b i) 0xFF)
-                                                           (* 8 i))))))))}
-   86 {:size 8 :read (fn [^bytes b]
-                       (Double/valueOf (Double/longBitsToDouble
-                                 (areduce b i acc (long 0)
-                                          (bit-or acc (bit-shift-left
-                                                       (bit-and (long (aget b i)) 0xFF)
-                                                       (* 8 i)))))))}})
+  {77 {:size 2 :read (fn [^bytes b] (Short/valueOf (short (le-long b 2))))}
+   78 {:size 4 :read (fn [^bytes b] (Integer/valueOf (int (le-long b 4))))}
+   79 {:size 8 :read (fn [^bytes b] (Long/valueOf (le-long b 8)))}
+   85 {:size 4 :read (fn [^bytes b] (Float/valueOf (Float/intBitsToFloat
+                                                   (int (le-long b 4)))))}
+   86 {:size 8 :read (fn [^bytes b] (Double/valueOf (Double/longBitsToDouble
+                                                    (le-long b 8))))}})
 
-(defn- typed-at
-  "Description of the RFC 8746 typed array tagged at `off`, or nil.
+(defn- typed-view
+  "SCALAR-DECODING. Elements are packed into a byte string rather than written
+  as CBOR items, so element i is at `data + i*size` -- arithmetic, with no walk
+  and no index. Reaching one element used to build the whole primitive array:
+  70.90 us on a 100 000-element long[] against 1.766 us, flat in length."
+  [^Nav nav ^long off ^long tag]
+  (when-let [spec (typed-array-tags tag)]
+    (let [^Reader r (.rdr nav)
+          bs (.headEndAt r off)]
+      ;; must wrap a DEFINITE-LENGTH byte string, as the reader requires; an
+      ;; indefinite one has no count on the wire
+      (when (and (= 2 (.majorAt r bs)) (not= 31 (.infoAt r bs)))
+        (let [blen (.headArgAt r bs)
+              size (long (:size spec))
+              rd (:read spec)
+              data (.headEndAt r bs)]
+          (when (and (<= 0 blen) (zero? (rem blen size)))
+            (let [n (quot blen size)
+                  at (fn [^long i]
+                       (if (or (neg? i) (>= i n))
+                         ::miss
+                         (let [p (+ data (* i size))]
+                           (rd (.bytesBetween r p (+ p size))))))]
+              {:kind :vector :n n :nth at
+               :items (fn [] (map at (range n)))})))))))
 
-  `{:read <fn of the element bytes> :size <element bytes> :data <first payload
-  byte> :n <element count>}`
+(defn- shaped-view
+  "RESTRUCTURING. A shaped array is `39649([keys, [row, ...]])`: the keys are
+  hoisted out and each row is an ARRAY of values matching them positionally. It
+  realises to a VECTOR OF MAPS, so a row cursor has array bytes and map
+  semantics and must carry the shape -- nothing in a row's own bytes says it is
+  a row.
 
-  A typed array's elements are PACKED, not CBOR items, so element i is at
-  `data + i*size` -- arithmetic, with no walking and no index. That is why this
-  is worth having even though the array already realises correctly: reaching one
-  element used to build the whole primitive array, so a single lookup into a
-  100 000-element `long[]` allocated 800 KB.
+  Returns nil for anything that is not exactly what `writeShapedArray` emits."
+  [^Nav nav ^long off ^long tag]
+  (when (= tag TAG-SHAPED-ARRAY)
+    (let [^Reader r (.rdr nav)
+          pair (.headEndAt r off)]
+      (when (and (= MAJOR-ARRAY (.majorAt r pair)) (= 2 (.headArgAt r pair)))
+        (let [ks-off (.headEndAt r pair)]
+          (when (= MAJOR-ARRAY (.majorAt r ks-off))
+            (let [rows-off (skip r ks-off)]
+              (when (= MAJOR-ARRAY (.majorAt r rows-off))
+                (let [k (.headArgAt r ks-off)
+                      n (.headArgAt r rows-off)]
+                  (when (and (<= 0 k) (<= 0 n))
+                    (let [ks (loop [i 0 p (.headEndAt r ks-off) acc (transient [])]
+                               (if (= i k)
+                                 (persistent! acc)
+                                 (recur (inc i) (skip r p)
+                                        (conj! acc (realize nav p)))))
+                          sh {:ks ks
+                              :pos (persistent!
+                                    (reduce-kv (fn [m i kk] (assoc! m kk i))
+                                               (transient {}) ks))}
+                          at (fn [^long i]
+                               (let [p (nth-item nav rows-off i)]
+                                 (if (neg? p) ::miss (->Cursor nav p sh))))]
+                      {:kind :vector :n n :nth at :shape sh
+                       :items (fn [] (map #(->Cursor nav % sh)
+                                          (child-offsets nav rows-off)))})))))))))))
 
-  Cached like `shape-at`, and nil for any tag whose widening is not mirrored
-  below -- see `typed-array-tags`."
+(defn- record-view
+  "WRAPPER. A record writes `27([name, {fields}])`, so the field map begins past
+  the tag and the name -- 22 bytes for `clojure/sorted-map`. The cursor stays on
+  the TAG and only the container operations redirect, which is why `value` still
+  realises the record rather than the bare map and `value-type` still says
+  `:tag`. No reconstruction, and no cursor state.
+
+  REFUSES A REGISTERED NAME. `TagRegistry.recordCtor` is an arbitrary `IFn`: it
+  may rename fields, drop them, or -- as datahike's `reconstruct-db` does --
+  resolve storage roots that are not in the bytes at all. Unregistered names
+  decode to `UnknownRecord`, whose `valAt`, `count` and `seq` delegate straight
+  to the field map, so descent is exactly equivalent there.
+
+  The decision reads the SAME registry the reader will use, so the two cannot
+  drift: a blob read without datahike's registry descends, and realises to an
+  `UnknownRecord` over that same field map, and both agree."
+  [^Nav nav ^long off ^long tag]
+  (when (= tag TAG-RECORD)
+    (let [^Reader r (.rdr nav)
+          pair (.headEndAt r off)]
+      (when (and (= MAJOR-ARRAY (.majorAt r pair)) (= 2 (.headArgAt r pair)))
+        (let [name-off (.headEndAt r pair)]
+          (when (= MAJOR-TEXT (.majorAt r name-off))
+            (let [payload (skip r name-off)]
+              ;; a POSITIONAL record -- datahike's Datom carries a vector --
+              ;; is not a map and gets no descent here
+              (when (= MAJOR-MAP (.majorAt r payload))
+                (let [nm (realize nav name-off)]
+                  (when (and (string? nm)
+                             (nil? (.recordCtor (.registry r) ^String nm)))
+                    (let [sorted? (= nm "clojure/sorted-map")]
+                      {:kind :map
+                       :n (head-count nav payload)
+                       :lookup
+                       (fn [k]
+                         ;; A sorted-map looks up by `compare`, not `=`, and the
+                         ;; two disagree across numeric types:
+                         ;; `(get (sorted-map 1 :a) 1.0)` is `:a` because
+                         ;; `(compare 1 1.0)` is 0, while a byte probe for 1.0
+                         ;; matches nothing -- and the same trap is reachable
+                         ;; inside a vector key, since `(compare [1] [1.0])` is
+                         ;; 0 too. So sorted lookups descend only where the two
+                         ;; agree, and everything else realises.
+                         ;;
+                         ;; A custom comparator cannot arrive here at all:
+                         ;; `Writer.requireDefaultComparator` refuses to encode
+                         ;; one.
+                         (if (and sorted?
+                                  (not (or (keyword? k) (symbol? k) (string? k))))
+                           ::realise
+                           (let [p (lookup-map nav payload k)]
+                             (if (neg? p) ::miss (cursor-at nav p)))))
+                       :entries
+                       (fn []
+                         (map (fn [[kp vp]]
+                                (clojure.lang.MapEntry. (realize nav kp)
+                                                        (cursor-at nav vp)))
+                              (partition 2 (child-offsets nav payload))))})))))))))))
+
+;; Dispatch by TAG NUMBER, not by trying each in turn. Three sequential probes
+;; ran on every tag cursor before this; one lookup replaces them, so unifying
+;; is cheaper than the special cases were.
+;;
+;; This is the extension point. A handler that knows its reader preserves
+;; structure -- datahike's TxReport is registered with `identity`, and so
+;; qualifies -- belongs here rather than in a growing `cond`.
+(def ^:private tag-view-builders
+  (merge {TAG-SHAPED-ARRAY shaped-view
+          TAG-RECORD       record-view}
+         (zipmap (keys typed-array-tags) (repeat typed-view))))
+
+(defn- tag-view
+  "The navigation view for the tag at `off`, or nil meaning opaque -- realise,
+  exactly as before any descent existed.
+
+  Cached per Nav by offset, because building one realises the shape's keys or
+  the record's name and a caller walking rows would otherwise pay per row.
+
+  ANY exception yields nil. Damaged bytes mean \"not a form I recognise\", never
+  a throw out of `get`; the realising fallback still answers."
   [^Nav nav ^long off]
-  (let [cache (.shapes nav)
-        ck [:typed off]]
-    (if-some [hit (get @cache ck)]
-      (when-not (= ::none hit) hit)
-      (let [^Reader r (.rdr nav)
-            v (try
+  (let [cache (.shapes nav)]
+    (if-some [hit (get @cache off)]
+      (when-not (identical? ::none hit) hit)
+      (let [v (try
                 (when (= MAJOR-TAG (major nav off))
-                  (when-let [spec (typed-array-tags (.headArgAt r off))]
-                    (let [bs (.headEndAt r off)]
-                      ;; must wrap a DEFINITE-LENGTH byte string, as the reader
-                      ;; requires; an indefinite one has no count on the wire
-                      (when (and (= 2 (.majorAt r bs)) (not= 31 (.infoAt r bs)))
-                        (let [blen (.headArgAt r bs)
-                              size (long (:size spec))]
-                          (when (and (<= 0 blen) (zero? (rem blen size)))
-                            {:read (:read spec) :size size
-                             :data (.headEndAt r bs) :n (quot blen size)}))))))
+                  (let [tag (.headArgAt ^Reader (.rdr nav) off)]
+                    (when-let [build (tag-view-builders tag)]
+                      (build nav off tag))))
                 (catch Exception _ nil))]
-        (swap! cache assoc ck (if (nil? v) ::none v))
-        v))))
-
-(defn- typed-nth
-  "Element `i` of the typed array described by `t`, or `nf`.
-
-  Returns a VALUE, not a cursor: a packed element is not a CBOR item and has no
-  offset to point at. `nth` through the realising path returned a value too, so
-  this is the same contract."
-  [^Nav nav t ^long i nf]
-  (if (or (neg? i) (>= i (long (:n t))))
-    nf
-    (let [p (+ (long (:data t)) (* i (long (:size t))))]
-      ((:read t) (.bytesBetween ^Reader (.rdr nav) p (+ p (long (:size t))))))))
-
-(defn- record-at
-  "Description of the tag-27 record at `off` whose payload is a MAP, or nil.
-
-  `{:payload <offset of the field map> :sorted? <is it clojure/sorted-map>}`
-
-  A record puts its field map past the tag and the name -- 22 bytes for
-  `clojure/sorted-map` -- so the cursor stands on the TAG, `node-slot` is asked
-  about the tag's offset, and no index node matches. Measured on 2000 keys:
-  550 us realising against 0.26 us for the same pairs as a bare map.
-
-  The CURSOR STAYS ON THE TAG. Only the container operations redirect to the
-  payload, so `value` still realises the record rather than the bare map and
-  `value-type` still says `:tag`. That is why this needs no cursor state, unlike
-  the shaped-row case.
-
-  REFUSES A REGISTERED NAME. `TagRegistry.recordCtor` is an arbitrary `IFn`: a
-  handler may rename fields, drop them or return something that is not a map at
-  all, and descending past it would answer from bytes the reader would never
-  have produced. Unregistered names decode to `UnknownRecord`, whose `valAt`,
-  `count` and `seq` delegate straight to the field map -- so descent is exactly
-  equivalent there. Letting a registered handler DECLARE itself
-  structure-preserving is the extension point this leaves open."
-  [^Nav nav ^long off]
-  (let [cache (.shapes nav)
-        ck [:record off]]
-    (if-some [hit (get @cache ck)]
-      (when-not (= ::none hit) hit)
-      (let [^Reader r (.rdr nav)
-            v (try
-                (when (and (= MAJOR-TAG (major nav off))
-                           (= 27 (.headArgAt r off)))
-                  (let [pair (.headEndAt r off)]
-                    (when (and (= MAJOR-ARRAY (.majorAt r pair))
-                               (= 2 (.headArgAt r pair)))
-                      (let [name-off (.headEndAt r pair)]
-                        (when (= MAJOR-TEXT (.majorAt r name-off))
-                          (let [payload (skip r name-off)]
-                            (when (= MAJOR-MAP (.majorAt r payload))
-                              (let [nm (realize nav name-off)]
-                                (when (and (string? nm)
-                                           (nil? (.recordCtor (.registry r) ^String nm)))
-                                  {:payload payload
-                                   :sorted? (= nm "clojure/sorted-map")})))))))))
-                (catch Exception _ nil))]
-        (swap! cache assoc ck (if (nil? v) ::none v))
-        v))))
-
-(defn- record-key-ok?
-  "Whether descending answers `k` the same way realising would.
-
-  Always, for an unsorted record: `UnknownRecord` looks its field map up by
-  EQUALITY, which is what `lookup-map` does.
-
-  A `sorted-map` COMPARES instead, and the two disagree across numeric types --
-  `(get (sorted-map 1 :a) 1.0)` is `:a` because `(compare 1 1.0)` is 0, while
-  `(= 1 1.0)` is false and a byte probe for 1.0 matches nothing. The same trap
-  is reachable inside a vector key, since `(compare [1] [1.0])` is 0 too.
-
-  So sorted lookups descend only for keywords, symbols and strings, where
-  `compare` and `=` agree. Anything else realises. A custom comparator cannot
-  arrive here at all -- `Writer.requireDefaultComparator` refuses to encode one."
-  [rc k]
-  (or (not (:sorted? rc))
-      (keyword? k) (symbol? k) (string? k)))
-
-(defn- shape-at
-  "Description of the shaped array tagged at `off`, or nil if that is not what
-  is there.
-
-  `{:ks [k0 ..] :pos {k0 0 ..} :rows <offset of the rows array> :n <row count>}`
-
-  WHY THIS EXISTS. `valAt` on a tag realises the whole value, which for a
-  shaped array means building every row of every map to answer one lookup --
-  measured at 550 us on 2000 entries where the same data unshaped answers in
-  0.26 us. The bytes needed to avoid that are all present: the keys are written
-  once, and the rows array is an ordinary indexed container.
-
-  CACHED PER NAV, because the keys must be realised to compare against a
-  lookup key and a caller walking rows would otherwise pay for that per row.
-  The cache is keyed by the TAG's offset, which identifies the shape uniquely
-  within a document.
-
-  Returns nil for anything that is not exactly the shape `writeShapedArray`
-  emits. That is deliberate: an unrecognised tag falls back to realising, so a
-  wrong guess here costs speed and never correctness."
-  [^Nav nav ^long off]
-  (let [cache (.shapes nav)
-        ck [:shape off]]
-    (if-some [hit (get @cache ck)]
-      (when-not (= ::none hit) hit)
-      (let [^Reader r (.rdr nav)
-            v (try
-                (when (and (= MAJOR-TAG (major nav off))
-                           (= TAG-SHAPED-ARRAY (.headArgAt r off)))
-                  (let [pair (.headEndAt r off)]
-                    (when (and (= MAJOR-ARRAY (.majorAt r pair))
-                               (= 2 (.headArgAt r pair)))
-                      (let [ks-off (.headEndAt r pair)]
-                        (when (= MAJOR-ARRAY (.majorAt r ks-off))
-                          (let [rows-off (skip r ks-off)]
-                            (when (= MAJOR-ARRAY (.majorAt r rows-off))
-                              (let [k (.headArgAt r ks-off)
-                                    n (.headArgAt r rows-off)]
-                                (when (and (<= 0 k) (<= 0 n))
-                                  (let [ks (loop [i 0 p (.headEndAt r ks-off)
-                                                  acc (transient [])]
-                                             (if (= i k)
-                                               (persistent! acc)
-                                               (recur (inc i) (skip r p)
-                                                      (conj! acc (realize nav p)))))]
-                                    {:ks ks
-                                     :pos (persistent!
-                                           (reduce-kv (fn [m i kk] (assoc! m kk i))
-                                                      (transient {}) ks))
-                                     :rows rows-off
-                                     :n n}))))))))))
-                ;; Damaged bytes mean "not a shape I recognise", never a throw
-                ;; out of `get`. The realising fallback still answers.
-                (catch Exception _ nil))]
-        (swap! cache assoc ck (if (nil? v) ::none v))
+        (swap! cache assoc off (if (nil? v) ::none v))
         v))))
 
 ;; --------------------------------------------------------------- public API
