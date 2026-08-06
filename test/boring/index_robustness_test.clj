@@ -246,6 +246,47 @@
                              (filter map? (into [] (map nav/value) (nav/items bs opts)))))
             (str label ": and the data must read back unchanged"))))))
 
+(deftest trusted-and-validated-agree-on-a-well-formed-index
+  (testing ":trust-index :trusted skips the FRAME-level structural checks, not
+            only the per-node ones. Those checks are O(node count) and were run
+            on every `nav/source` regardless of the option -- ~42 us to open a
+            16 384-element index against ~2 us trusted, paid per source, which
+            a document store pays once per blob for a single lookup.
+
+            Skipping them may not change a single answer on an index boring
+            itself wrote. This is the invariant that makes the option safe, so
+            it is asserted across shapes rather than argued."
+    (let [trusted (assoc opts :trust-index :trusted)]
+      (doseq [[label v path]
+              [["flat scalars"        (vec (range 400))            [399]]
+               ["short array"         (vec (range 3))              [2]]
+               ["strings"             (mapv #(str "s-" %) (range 300)) [299]]
+               ["nested maps"         (vec (for [i (range 120)]
+                                             {:a i :b {:c (* i 2)}}))  [119 :b :c]]
+               ["mixed depths"        (vec (for [i (range 90)]
+                                             [i {:k (str i)} [i i]]))  [89 1 :k]]
+               ["empty array"         [[] [] []]                   [1]]]]
+        (let [bs (boring/encode-indexed v (assoc opts :index 16 :index-min 4))
+              reach (fn [o] (nav/value (reduce #(get %1 %2) (nav/source bs o) path)))]
+          (is (= (get-in v path) (reach opts)) (str label ": validated path"))
+          (is (= (get-in v path) (reach trusted)) (str label ": trusted path"))
+          ;; whole-document realisation too, not just the one path -- a skipped
+          ;; check that corrupted `:total` or `:data-end` shows up here first
+          (is (= v (nav/value (nav/source bs trusted)))
+              (str label ": trusted realises the whole document unchanged"))
+          (is (= (nav/value (nav/source bs opts))
+                 (nav/value (nav/source bs trusted)))
+              (str label ": the two settings must not disagree")))))))
+
+(deftest trusted-still-refuses-a-frame-whose-lengths-disagree
+  (testing "the one frame check that stays unconditional. Disagreeing lengths
+            cost O(1) to detect and would otherwise surface as a raw
+            IndexOutOfBoundsException from inside `get` rather than as
+            \"no usable index, scan instead\"."
+    (let [bs (crafted [1 (int-array [-1]) (int-array [3]) [] [false]])]
+      (is (= 3 (count (into [] (nav/items bs (assoc opts :trust-index :trusted)))))
+          "trusted must still fall back to scanning, not index into nothing"))))
+
 (deftest a-consistent-crafted-payload-is-still-used
   (testing "the control: validation must reject inconsistency, not everything.
             Three 4-byte items at stride 1 means three anchors at 0, 4 and 8."

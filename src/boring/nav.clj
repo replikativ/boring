@@ -980,8 +980,19 @@
   honest response to a payload we cannot use is to ignore it and walk, never to
   throw at the caller of `nav/source`. That matters more than it did: slots are
   expanded eagerly below, so without this one malformed slot would take down a
-  cursor that never went near the container it belongs to."
-  [^Reader r ^long ptr]
+  cursor that never went near the container it belongs to.
+
+  `trusted?` is `:trust-index :trusted`, and it skips the two checks below that
+  are O(NODE COUNT). It had been honoured only per node, by `node-sound?`; the
+  FRAME-level structure was re-verified on every `nav/source` regardless, which
+  is the same defect one level up -- an option accepted and then ignored.
+
+  That cost is not marginal, because it is paid per SOURCE and a document store
+  opens one source per blob and does one lookup. Measured on 4096 scalars: the
+  indexed lookup itself is 0.22 us against 24.97 us scanning, but opening the
+  source and doing that one lookup came to 8.67 us -- so nearly all of what the
+  index saved was spent proving the index was well-formed."
+  [^Reader r ^long ptr trusted?]
   (try
     ;; `frame-payload`, not `record-fields`: an unregistered tag-27 frame
     ;; decodes to an UnknownRecord when its payload is a map and a
@@ -1044,14 +1055,27 @@
                  ;; together. A frame that decodes but whose parts disagree used
                  ;; to be trusted, and produced raw IndexOutOfBoundsException at
                  ;; the caller of `get`, or -- worse -- a wrong subtree.
+                 ;; STAYS UNCONDITIONAL even when trusted. Disagreeing lengths
+                 ;; are the one frame fault that costs O(1) to detect and would
+                 ;; otherwise surface as a raw IndexOutOfBoundsException from
+                 ;; inside `get` rather than as "no usable index, scan instead".
                  (= (alength containers) (alength counts)
                     (count slots) (count sorted))
-                 ;; `node-slot` BINARY-SEARCHES containers, so they must ascend.
-                 (loop [k 1]
-                   (cond (>= k (alength containers)) true
-                         (>= (aget containers (dec k)) (aget containers k)) false
-                         :else (recur (inc k))))
-                 (every? nat-int? (seq counts)))
+                 (or
+                  trusted?
+                  (and
+                   ;; `node-slot` BINARY-SEARCHES containers, so they must ascend.
+                   (loop [k 1]
+                     (cond (>= k (alength containers)) true
+                           (>= (aget containers (dec k)) (aget containers k)) false
+                           :else (recur (inc k))))
+                   ;; `(every? nat-int? (seq counts))` walked an int[] as a
+                   ;; boxed seq -- one Integer per node, on the path taken for
+                   ;; every source opened. Same predicate, no allocation.
+                   (loop [k 0]
+                     (cond (>= k (alength counts)) true
+                           (neg? (aget counts k)) false
+                           :else (recur (inc k)))))))
         ;; One uniform node list. The SEQUENCE is the node at the sentinel
         ;; offset -1: it has no container header on the wire but behaves like
         ;; one, and a sentinel avoids carrying two shapes for the same idea.
@@ -1096,7 +1120,11 @@
               ;; than one per container. A sequence is also the shape whose
               ;; source is reused, so there is nothing to amortise away.
               seq-anchors (when seq-slot (slot-at ix (long seq-slot)))
-              seq-ok? (or (nil? seq-slot)
+              ;; Trusted skips this for the same reason `node-sound?` does: it
+              ;; walks the file to prove the sequence node honest, and a caller
+              ;; who wrote the bytes has already answered that question.
+              seq-ok? (or trusted?
+                          (nil? seq-slot)
                           (node-valid? r ptr
                                        (long (aget containers (int seq-slot)))
                                        (long (aget counts (int seq-slot)))
@@ -1201,7 +1229,9 @@
               ;; the pointer is in range, and the frame ends exactly at EOF.
               ;; An unusable payload means SCAN, and scanning still has to stop
               ;; in the right place.
-              (merge {:data-end ptr} (index-payload r ptr)))))))))
+              (merge {:data-end ptr}
+                     (index-payload r ptr
+                                    (= :trusted (:trust-index (.opts nav))))))))))))
 
 (defn- anchor-sound?
   "Whether sequence anchor `k` is where it claims to be. Cached per anchor.
