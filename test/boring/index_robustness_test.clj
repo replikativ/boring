@@ -278,6 +278,28 @@
                  (nav/value (nav/source bs trusted)))
               (str label ": the two settings must not disagree")))))))
 
+(deftest a-tagged-container-is-realised-not-navigated
+  (testing "a tag-27 record puts its payload past the tag, so the root cursor is
+            the TAG and no index node matches its offset -- the lookup realises
+            the whole container instead. Correct, but O(container), and it is
+            why `:shapes` costs projection. Pinned because the ANSWERS must stay
+            identical however the value was encoded; only the cost differs."
+    (let [pairs (for [j (range 60)] [(str "f" (format "%03d" j)) j])
+          o (assoc opts :index 16 :index-min 8 :profile :canonical)
+          bare (boring/encode-indexed (into {} pairs) o)
+          tagged (boring/encode-indexed (into (sorted-map) pairs) o)]
+      ;; the shapes really are different on the wire, or the test proves nothing
+      (is (not= 6 (bit-shift-right (bit-and (aget ^bytes bare 0) 0xff) 5))
+          "a plain map must encode as a bare CBOR map")
+      (is (= 6 (bit-shift-right (bit-and (aget ^bytes tagged 0) 0xff) 5))
+          "a sorted-map must encode as a tag")
+      (doseq [[label bs] [["bare" bare] ["tagged" tagged]]
+              trust [:trusted :ignore]]
+        (let [s (nav/source bs (assoc opts :trust-index trust))]
+          (is (= 0 (nav/value (get s "f000"))) (str label " " trust " first key"))
+          (is (= 59 (nav/value (get s "f059"))) (str label " " trust " last key"))
+          (is (nil? (get s "nope")) (str label " " trust " absent key")))))))
+
 (deftest trusted-still-refuses-a-frame-whose-lengths-disagree
   (testing "the one frame check that stays unconditional. Disagreeing lengths
             cost O(1) to detect and would otherwise surface as a raw

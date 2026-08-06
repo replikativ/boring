@@ -528,6 +528,30 @@
         ;; `clojure.core/get` is total EXCEPT on a sorted collection, where an
         ;; incomparable key throws a raw ClassCastException; a lookup that was
         ;; handed a not-found value must not throw.
+        ;;
+        ;; THIS IS O(CONTAINER), AND IT IS THE ONE PLACE NAVIGATION IS NOT.
+        ;; Realising defeats the index completely -- not because the index is
+        ;; missing but because the cursor never reaches the container it
+        ;; describes. A tag-27 record puts its payload 22 bytes in, so the root
+        ;; cursor is the TAG, `node-slot` is asked about the tag's offset, and
+        ;; no node matches it.
+        ;;
+        ;; Measured on 2000 keys, reaching the last one: a bare map is 0.26 us
+        ;; against 13.47 us walking (52x, and FLAT in size), while the same
+        ;; pairs as a `sorted-map` -- which round-trips as a tag-27 record --
+        ;; cost 550 us with the index and 541 us without it. Position does not
+        ;; matter either: the FIRST key costs the same as the last, which is the
+        ;; signature of realisation rather than a scan that short-circuits.
+        ;;
+        ;; So it is not only `sorted-map`. Records, sets and `:shapes` arrays
+        ;; are all tag cursors, which is why `:shapes` costs projection roughly
+        ;; 4x. Anything navigated hot wants a profile that leaves its containers
+        ;; bare.
+        ;;
+        ;; Fixing it means navigating INTO a tag whose reader is known to
+        ;; preserve structure, which is a registry question rather than a
+        ;; format one, and is deliberately not attempted here: guessing wrong
+        ;; returns a wrong value rather than a slow one.
         (= mj MAJOR-TAG) (try (get (realize nav off) k nf)
                               (catch ClassCastException _ nf))
         :else nf)))
