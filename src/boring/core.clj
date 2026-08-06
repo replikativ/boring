@@ -796,6 +796,28 @@
   paragraph used to promise the opposite -- \"always costs ~37 bytes\" -- which
   stopped being true when `encode-indexed` and `write-seq!` were made to agree.
 
+  WHAT IT REALLY PRICES IS NODE COUNT, not container size. Opening an index
+  costs about 25 ns PER NODE -- a slots entry, a memo cell and two verdict
+  bytes each -- and that is paid once per `nav/source`, while a lookup visits
+  only the containers on ONE path. So a node is a certain cost against a
+  possible saving, and lowering the bar buys nodes that are never visited.
+
+  Measured, reaching the last element with `:trust-index :trusted`:
+
+    4096 x 4-key maps   :index-min 4    4097 nodes   105.14 us    1.7x
+    4096 x 4-key maps   :index-min 16      1 node      3.03 us   54.9x
+     256 x 64-key maps  :index-min 16    257 nodes    19.71 us    7.4x
+     256 x 64-key maps  :index-min 65      1 node     13.72 us   10.6x
+
+  The per-node figure held to within 10% across all three shapes. So the
+  failure mode of a LOW `:index-min` is not a slightly bigger file, it is a
+  35x slower lookup -- and the default of 16 is not conservative, it is
+  roughly where store-shaped data stops adding nodes it will not use.
+
+  Raising it further is safe and sometimes better: 16, 32, 64, 128 and 512 were
+  within noise of each other on 2000 record-shaped documents (~30-33x), because
+  none of them changed the node count for that data.
+
   `:index` FORCES `:stringref false`. `boring.nav` cannot resolve a string
   reference from an offset alone -- a stringref indexes a table built from every
   preceding string -- so the two options describe incompatible documents, and
