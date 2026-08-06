@@ -302,9 +302,15 @@ both write orderings. `slot-at` uses `AtomicReferenceArray` + CAS correctly.
       Believed safe only because `confirm` re-derives every negative by an honest
       scan. Needs an explicit comment, or deleting `confirm` as "redundant" later
       silently breaks sorted-map lookups.
-- [ ] **Q4** Perf, optional: the `typed-array-tags` Clojure map lookup costs
+- [-] **Q4** DEFERRED. Perf, optional: the `typed-array-tags` Clojure map lookup costs
       20.6 ns — 3x the entire validation and a third of the view build. The
       target if descent build time ever matters.
+      Not now. The view is cached in one slot, so the lookup happens once per
+      SOURCE rather than per element -- ~20 ns of a ~500 ns document read, about
+      4%. Four micro-optimisations in this session were measured and reverted
+      because they were slower or invisible (see doc/PERFORMANCE.md), and this
+      one is explicitly optional. A `case` on the tag number is the obvious form
+      if it is ever worth it.
 - [-] **Q5** A public tag extension point. Not now: `:nth` may return a cursor, a
       realised value, or a private sentinel, and users cannot construct a Cursor.
 - [-] **Q6** Split `boring.nav.index` into its own namespace (~550 lines,
