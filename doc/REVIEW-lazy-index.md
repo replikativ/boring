@@ -214,10 +214,23 @@ both write orderings. `slot-at` uses `AtomicReferenceArray` + CAS correctly.
       realised value, or a private sentinel, and users cannot construct a Cursor.
 - [-] **Q6** Split `boring.nav.index` into its own namespace (~550 lines,
       mechanical). Only if `nav.clj` keeps growing.
-- [ ] **Q7** The deep one: `nav/context` solves a library-wide problem locally.
-      `boring/decode` still pays `check-opts` + eleven `get`s per call, and
-      `boring/writer` already embodies "resolve once, reuse". A resolved-opts
-      handle in `boring.core`, accepted anywhere opts are, would shrink
-      `nav/context` to "that plus a probe cache" — or delete it. Cheapest to
-      answer before `context` ships, since absorbing it later is breaking.
-      **Needs a decision, not a patch.**
+- [x] **Q7** DECIDED: do not generalise. The symmetry with `boring/writer` is
+      superficial — a Writer exists because it OWNS A BUFFER, a real resource;
+      resolving options is incidental to it. A context owns CACHES. Generalising
+      across them would add a third concept justified by neither.
+
+      The performance case does not survive measurement either: option
+      resolution is 11.6 ns against a 140 ns decode of the smallest realistic
+      document, and ~1.6 us for a 229-byte blob. That is 0.7%, invisible. It
+      mattered in nav only because `nav/source` is 29 ns in total and does
+      almost nothing else.
+
+      Also rejected: making the cache invisible, with `source` looking up a
+      resolved context behind the scenes. Keying on opts-map equality means
+      hashing the map per source, which costs more than the resolution it saves,
+      and adds hidden global state.
+
+      So: `boring.core` unchanged, `decode` keeps taking a plain map,
+      `nav/context` stays public in `nav` under that name, and the public
+      surface stays two functions. The polymorphic opts slot is a real defect
+      and is tracked separately as **A8**.
