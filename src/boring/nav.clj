@@ -938,7 +938,13 @@
               (when (= MAJOR-MAP (.majorAt r payload))
                 (let [nm (realize nav name-off)]
                   (when (and (string? nm)
-                             (nil? (.recordCtor (.registry r) ^String nm)))
+                             (or (nil? (.recordCtor (.registry r) ^String nm))
+                                 ;; ...or its author declared it
+                                 ;; structure-preserving. See
+                                 ;; `boring/declare-navigable-record`, and
+                                 ;; `boring.nav-conformance/check-record` for
+                                 ;; testing the claim rather than trusting it.
+                                 (.isNavigableRecord (.registry r) ^String nm)))
                     (let [sorted? (= nm "clojure/sorted-map")]
                       {:kind :map
                        :n (head-count nav payload)

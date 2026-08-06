@@ -260,6 +260,45 @@
   ^TagRegistry [^TagRegistry reg ctors]
   (.withRecords reg ^java.util.Map ctors))
 
+(defn declare-navigable-record
+  "Declare that `wire-name`'s constructor PRESERVES STRUCTURE, letting
+  `boring.nav` answer from the field map on the wire instead of building the
+  record. Returns a NEW registry.
+
+  The claim is precise, and it is three claims:
+
+    (get (ctor fields) k)  =  (get fields k)     for every k
+    (count (ctor fields))  =  (count fields)
+    (seq (ctor fields))    =  (seq fields)       same entries, same order
+
+  A `map->Record` factory satisfies all three, which is the common case.
+
+  WHY THIS IS OPT-IN. A constructor is an arbitrary function. It may rename
+  fields, drop them, or resolve state that is not in the bytes at all --
+  datahike's `reconstruct-db` resolves storage roots through registered storage
+  -- and answering past one of those returns a value the reader would never have
+  produced. `boring.nav` therefore treats every REGISTERED name as opaque and
+  realises it, which is always correct and sometimes slow. This is how the
+  handler's author, who is the only one who knows, says otherwise.
+
+  It is worth something: on a 2000-entry field map, a lookup that descends costs
+  7.91 us against 577.18 us realising, and stays flat as the record grows.
+
+  NO DECLARATION IS NEEDED FOR AN UNREGISTERED NAME. Without a constructor a
+  record decodes to a `boring.data/UnknownRecord`, whose `get`, `count` and
+  `seq` already delegate to the field map, so it is navigable by construction.
+
+  THE DECLARATION IS A CLAIM, AND A WRONG ONE RETURNS WRONG VALUES SILENTLY --
+  not an exception, not a slow path. Check it rather than assert it:
+
+    (require '[boring.nav-conformance :as nc])
+    (nc/check-record registry \"my.ns.Point\" [(->Point 1 2) (->Point 3 4)])
+
+  JVM-only, because `boring.nav` is. A `.cljc` registration shared with
+  ClojureScript should call this from a JVM-only branch."
+  ^TagRegistry [^TagRegistry reg ^String wire-name]
+  (.withNavigableRecord reg wire-name))
+
 (defn register-record-class
   "JVM-only convenience: derive both the wire name and the `map->Name`
   constructor from `cls` by reflection. Returns a NEW registry.

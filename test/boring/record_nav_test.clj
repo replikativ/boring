@@ -29,7 +29,8 @@
             [clojure.test.check.properties :as prop]
             [boring.core :as boring]
             [boring.data]
-            [boring.nav :as nav]))
+            [boring.nav :as nav]
+            [boring.nav-conformance :as nc]))
 
 (def ^:private opts {:stringref false})
 (def ^:private trusted (assoc opts :trust-index :trusted))
@@ -110,6 +111,61 @@
       (is (= 7 (nav/value (get c :x))))
       (is (= 2 (count c)))
       (is (= {:x 7 :y 8} (into {} (map (fn [[k v]] [k (nav/value v)])) (seq c)))))))
+
+(def ^:private pt-name (boring.data/record-type-name (->Pt 1 2)))
+
+(deftest a-declared-name-descends
+  (testing "`declare-navigable-record` is how a handler's author says the
+            constructor preserves structure. `map->Pt` does, so descent must
+            engage AND agree -- value still realises the RECORD."
+    (let [reg (-> (boring/tag-registry)
+                  (boring/register-record pt-name map->Pt)
+                  (boring/declare-navigable-record pt-name))
+          o (assoc opts :registry reg)
+          c (nav/source (boring/encode (->Pt 1 2) o) o)]
+      (is (= (->Pt 1 2) (nav/value c)) "value realises the record, not the map")
+      (is (= :tag (nav/value-type c)))
+      (is (= 2 (count c)) "count descends -- it refused every tag before")
+      (is (= 1 (nav/value (get c :x))))
+      (is (= ::nf (nav/value (get c :nope ::nf))))
+      (is (= {:x 1 :y 2} (into {} (map (fn [[k v]] [k (nav/value v)])) (seq c)))))))
+
+(deftest conformance-catches-a-declaration-that-is-not-true
+  (testing "the declaration is a CLAIM, and a wrong one returns wrong values
+            silently -- no exception, no slow path. This is the check that
+            makes it testable rather than assertable."
+    (let [;; a constructor that invents a field: structure NOT preserved
+          liar (fn [m] (assoc m :extra 99))
+          reg (-> (boring/tag-registry)
+                  (boring/register-record pt-name liar)
+                  (boring/declare-navigable-record pt-name))
+          r (nc/check-record reg pt-name [(->Pt 1 2)])]
+      (is (some? r) "a lying declaration must not pass")
+      (is (= :count (:check r)))
+      (is (= 3 (:expected r)) "the realised value has the invented field")
+      (is (= 2 (:actual r)) "the wire has only what was written")))
+
+  (testing "an honest declaration passes"
+    (let [reg (-> (boring/tag-registry)
+                  (boring/register-record pt-name map->Pt)
+                  (boring/declare-navigable-record pt-name))]
+      (is (nil? (nc/check-record reg pt-name [(->Pt 1 2) (->Pt 0 0)])))))
+
+  (testing "and a check that would be VACUOUS says so rather than passing --
+            an undeclared name never descends, so agreeing proves nothing"
+    (let [reg (-> (boring/tag-registry) (boring/register-record pt-name map->Pt))
+          r (nc/check-record reg pt-name [(->Pt 1 2)])]
+      (is (= :declared (:check r))))))
+
+(deftest conformance-checks-the-built-in-descents
+  (testing "check-value is the same property the shaped, typed and record tests
+            assert by hand, exposed for handler authors to run on their own data"
+    (is (nil? (nc/check-value (into (sorted-map) {:a 1 :b 2}) opts)))
+    (is (nil? (nc/check-value (vec (for [i (range 40)] {:id i :n (str i)}))
+                              (assoc opts :shapes true))))
+    (is (nil? (nc/check-value (long-array (range 50)) opts)))
+    (is (nil? (nc/check-value {:a 1 :b [1 2 3]} opts)))
+    (is (nil? (nc/check-value #{1 2 3} opts)) "an opaque tag must pass too")))
 
 (defspec record-descent-agrees-with-realising 150
   (prop/for-all
