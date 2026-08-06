@@ -1558,3 +1558,36 @@
       (doseq [i (range 40)]
         (is (= i (some-> (get (get src "a") (format "a%02d" i)) nav/value)))
         (is (= i (some-> (get (get src "b") (format "b%02d" i)) nav/value)))))))
+
+(deftest get-and-nth-agree-on-arrays
+  (testing "`get` with an integer index on an array cursor fell through to
+            not-found -- a PRESENT element reported absent, and `contains?`
+            false for a valid index -- while `nth` returned it. It survived
+            because it depends on the ENCODING, not the data: under :shapes an
+            array is a tag cursor and clojure.core answered correctly, so a
+            caller's get-in over an indexed path worked or silently returned nil
+            according to how the document happened to be written."
+    (let [v {:rows (vec (for [i (range 40)] {:e i :v (str "val-" i)}))}]
+      (doseq [[label o] [["plain"  {:stringref false}]
+                         ["shapes" {:stringref false :shapes true}]
+                         ["indexed" {:stringref false :index 4 :index-min 4}]]]
+        (let [bs (if (:index o) (boring/encode-indexed v o) (boring/encode v o))
+              rows (get (nav/source bs o) :rows)]
+          (doseq [i (range 40)]
+            (is (= {:e i :v (str "val-" i)} (nav/value (get rows i)))
+                (str label ": get " i))
+            (is (= (nav/value (nth rows i)) (nav/value (get rows i)))
+                (str label ": nth and get agree at " i))
+            (is (contains? rows i) (str label ": contains? " i)))
+          (testing (str label ": out of range and non-integer keys are absent")
+            (is (= :nf (get rows 40 :nf)))
+            (is (= :nf (get rows -1 :nf)))
+            (is (= :nf (get rows :not-an-index :nf)))
+            (is (not (contains? rows 40)))))))))
+
+(deftest get-in-works-through-an-indexed-path
+  (testing "the shape a consumer actually writes"
+    (let [v {:a {:b [{:c 1} {:c 2} {:c 3}]}}
+          o {:stringref false}
+          src (nav/source (boring/encode v o) o)]
+      (is (= 2 (nav/value (-> src (get :a) (get :b) (get 1) (get :c))))))))

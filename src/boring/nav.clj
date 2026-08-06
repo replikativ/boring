@@ -508,6 +508,21 @@
       (cond
         (= mj MAJOR-MAP) (let [p (lookup-map nav off k)]
                            (if (neg? p) nf (cursor-at nav p)))
+        ;; AN INTEGER KEY ON AN ARRAY IS AN INDEX, as it is for a Clojure
+        ;; vector. This fell through to not-found, so `get` reported a PRESENT
+        ;; element absent and `contains?` -- which is defined in terms of
+        ;; `valAt` two forms up -- reported false for a valid index, while
+        ;; `nth` returned the element. Undamaged data, no error.
+        ;;
+        ;; It survived because it depends on the ENCODING rather than the data:
+        ;; under `:shapes` an array is a tag cursor, so the MAJOR-TAG branch
+        ;; below realised it and clojure.core answered correctly. A consumer
+        ;; writing `get-in` over a path with an index therefore worked or
+        ;; silently returned nil according to how the document happened to be
+        ;; written.
+        (and (= mj MAJOR-ARRAY) (integer? k))
+        (let [p (nth-item nav off (int k))]
+          (if (neg? p) nf (cursor-at nav p)))
         ;; A tag's reader is arbitrary, so structure does not imply semantics.
         ;; Realise and let clojure.core decide -- correct for every registry.
         ;; `clojure.core/get` is total EXCEPT on a sorted collection, where an
