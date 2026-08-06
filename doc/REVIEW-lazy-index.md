@@ -215,36 +215,40 @@ both write orderings. `slot-at` uses `AtomicReferenceArray` + CAS correctly.
       reference implementation", which this branch's central feature contradicts.
       The `WHAT IS IMPLEMENTED` table omits descents, `context`, and
       `nav-conformance`. (Do together with **I0**.)
-- [ ] **A2** `zipper` never learned about descents (`nav.clj:1913`): `branch?`
+- [x] **A2** `zipper` never learned about descents (`nav.clj:1913`): `branch?`
       tests `value-type`, which returns `:tag`, so `zip/down` is nil where
       `count`/`seq`/`get`/`nth`/`reduce` all descend. Fix: a shared `container?`
       predicate; add a zipper leg to `check-value`, whose absence is why this
       survived.
-- [ ] **A3** The two reader-config paths. `core.clj:612` claims
+- [x] **A3** The two reader-config paths. `core.clj:612` claims
       `configure-reader!` "goes through here" — it does not; they are independent
       implementations. The justification I wrote (an allocation on the decode
       path) measures **0.5 ns** against a 140 ns decode of the smallest realistic
       document. Delegate. Consider a `deftype ReaderConfig` with named primitive
       fields so the pairing is compiler-checked rather than eleven positional
       `aset`/`aget`.
-- [ ] **A4** `apply-reader-config!` (`core.clj:632`) is the only new function with
+      FIXED: `configure-reader!` delegates. The duplication is gone and
+      `reader_config_test` keeps guarding against re-splitting. (The
+      `deftype ReaderConfig` idea is not done — the array is now written and read
+      in one place each, so the positional pairing has one home.)
+- [x] **A4** `apply-reader-config!` (`core.clj:632`) is the only new function with
       no docstring, and its body is eleven magic indices that must match
       `reader-config`'s eleven positionally.
-- [ ] **A5** Dead: `:shape` in the view map (`nav.clj:970`) is never read.
-- [ ] **A6** `::realise` is honoured in `valAt`'s `:map` branch but not `:vector`
+- [x] **A5** Dead `:shape` in the view map — removed when `:key-pred` was added.
+- [x] **A6** `::realise` is honoured in `valAt`'s `:map` branch but not `:vector`
       (`nav.clj:663-674, 703-708`), so a future builder returning it from `:nth`
       leaks `:boring.nav/realise` to the user. Handle it, or state that it is
       `:map`-only.
-- [ ] **A7** "This is the extension point" (`nav.clj:1043`) overstates: the table
+- [x] **A7** "This is the extension point" (`nav.clj:1043`) overstates: the table
       is `^:private`, and a user could not construct a `Cursor` to return anyway.
 - [ ] **A8** `source` and `items` accept a `NavContext` in the opts position but
       only `context`'s docstring says so; a wrong value fails absurdly
       (`:boring/read-only ... assoc is not supported`). Guard and document.
-- [ ] **A9** `reduce` over a navigable tag routes through `seq`, and `seq` for
+- [x] **A9** `reduce` over a navigable tag routes through `seq`, and `seq` for
       `:vector` is `(seq (vec ((:items v))))` — a materialised vector, against the
       ns docstring's "no intermediate seq". For a 100k typed array that boxes
       100k numbers. Cheapest honest fix: drop the `vec`.
-- [ ] **A10** `fork` drops the context's pre-resolved config (`nav.clj:263`).
+- [x] **A10** `fork` drops the context's pre-resolved config (`nav.clj:263`).
 - [x] **A11** `fork-nav`'s fresh view cache is load-bearing — cached views close
       over the parent's Reader, so sharing would share the Reader, the one thing
       `fork` exists to prevent — and is undocumented.

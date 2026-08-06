@@ -293,7 +293,12 @@
   (let [src (.src n)
         ^Reader r (cond (bytes? src) (Reader. ^bytes src)
                         :else (Reader. ^ByteSource src))]
-    (boring/configure-reader! r (.opts n))
+    ;; Resolved once here rather than reading the options map, for the same
+    ;; reason `context` does it: `configure-reader!` is eleven `get`s on a
+    ;; PersistentArrayMap, whose `get` is a linear scan. Once per fork, so the
+    ;; saving is nil -- but a path that forgot is how the option surface drifts,
+    ;; and this file has found that shape three times already.
+    (boring/apply-reader-config! r (boring/reader-config (.opts n)))
     ;; A FRESH VIEW SLOT, and that is load-bearing rather than tidy: a cached
     ;; view holds closures over the parent's `nav`, hence over the parent's
     ;; Reader. Sharing the slot across a fork would share the Reader, which is
@@ -710,7 +715,16 @@
               ;; here was stricter than the thing it mirrors.
               :vector (if ((:key-pred v) k)
                         (let [r ((:nth v) (long k))]
-                          (if (identical? ::miss r) nf r))
+                          (cond (identical? ::miss r) nf
+                                ;; `::realise` is part of the view contract for
+                                ;; BOTH kinds, and only `:map` honoured it -- so
+                                ;; a vector-kinded builder returning it would
+                                ;; have handed the caller the keyword
+                                ;; `:boring.nav/realise`. No builder does today;
+                                ;; the next one would have found out the hard
+                                ;; way.
+                                (identical? ::realise r) (fallback)
+                                :else r))
                         nf)
               :map (let [r ((:lookup v) k)]
                      (cond (identical? ::miss r) nf
@@ -746,7 +760,16 @@
           (= mj MAJOR-TAG)
           (let [v (tag-view nav off)]
             (case (:kind v)
-              :vector (let [r ((:nth v) i)] (if (identical? ::miss r) nf r))
+              :vector (let [r ((:nth v) i)]
+                        (cond (identical? ::miss r) nf
+                              (identical? ::realise r)
+                              (let [rv (realize nav off)]
+                                (if (or (nil? rv) (instance? clojure.lang.Indexed rv)
+                                        (instance? java.util.List rv) (string? rv)
+                                        (and (some? rv) (.isArray (class rv))))
+                                  (nth rv i nf)
+                                  nf))
+                              :else r))
               ;; A map-kinded tag realises to a map or an UnknownRecord,
               ;; neither of which is Indexed, so this was already not-found --
               ;; but it realised the whole value to discover that.
@@ -848,8 +871,13 @@
           (= mj MAJOR-TAG)
           (let [v (tag-view nav off)]
             (case (:kind v)
-              :vector (seq (vec ((:items v))))
-              :map (seq (vec ((:entries v))))
+              ;; NOT `(seq (vec ...))`. The `:items`/`:entries` closures already
+              ;; return lazy seqs, and pouring them through a vector first
+              ;; boxed every element of a 100k typed array before `reduce` saw
+              ;; one -- against this namespace's own promise to reduce over
+              ;; children with no intermediate seq.
+              :vector (seq ((:items v)))
+              :map (seq ((:entries v)))
               nil))
           :else nil))))
 
@@ -1174,7 +1202,12 @@
 ;; ran on every tag cursor before this; one lookup replaces them, so unifying
 ;; is cheaper than the special cases were.
 ;;
-;; This is the extension point. A handler that knows its reader preserves
+;; THIS IS WHERE A NEW DESCENT GOES, which is not the same as an extension
+;; point: the table is private, the sentinels are private, and a builder would
+;; have to return a `Cursor`, which nothing outside this namespace can construct.
+;; `declare-navigable-record` is the extension point users actually have.
+;;
+;; A handler that knows its reader preserves
 ;; structure -- datahike's TxReport is registered with `identity`, and so
 ;; qualifies -- belongs here rather than in a growing `cond`.
 (def ^:private tag-view-builders
@@ -1206,6 +1239,24 @@
         v))))
 
 ;; --------------------------------------------------------------- public API
+
+(defn container?
+  "Whether `x` is a cursor something can be descended INTO -- an array, a map,
+  or a tag with a descent.
+
+  Exists so `zipper` and the Cursor cannot disagree about that. They did:
+  `zipper`'s `branch?` tested `value-type`, which answers `:tag` for a shaped
+  array, a record and a typed array, so `zip/down` was nil on exactly the values
+  `count`, `seq`, `get`, `nth` and `reduce` had learned to enter. Before
+  descents existed the two agreed, because every tag was opaque everywhere."
+  [x]
+  (and (instance? Cursor x)
+       (let [^Cursor c x
+             nav (.nav c) off (.off c)]
+         (or (some? (.shape c))
+             (let [mj (major nav off)]
+               (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP)
+                   (and (= mj MAJOR-TAG) (some? (tag-view nav off)))))))))
 
 (defn cursor?
   "True if `x` is a cursor -- something `get`, `nth`, `seq` or `reduce` handed
@@ -2067,7 +2118,12 @@
   reader would reach for first."
   [^Cursor c]
   (zip/zipper
-   (fn branch? [^Cursor x] (contains? #{:array :map} (value-type x)))
+   ;; `container?`, not a `value-type` test. `value-type` reports `:tag` for a
+   ;; shaped array, a record and a typed array -- deliberately, since that is
+   ;; what they ARE -- so a zipper could not descend into any of them while
+   ;; `count`, `seq`, `get`, `nth` and `reduce` all could. Before descents
+   ;; existed the two agreed, because every tag was opaque everywhere.
+   (fn branch? [^Cursor x] (container? x))
    (fn children* [^Cursor x]
      (seq (map (fn [e] (if (instance? clojure.lang.MapEntry e) (val e) e))
                (seq x))))
