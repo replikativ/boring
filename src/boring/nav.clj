@@ -166,7 +166,12 @@
 ;; means something only within one document -- offset 22 is a different
 ;; container in the next blob -- so a shared one would hand a cursor another
 ;; document's shape and return wrong values. Each source gets its own.
-(deftype NavContext [opts probes])
+;; `cfg` is the reader configuration resolved ONCE. `configure-reader!` reads
+;; eleven options from a Clojure map, and a scan that opens a source per document
+;; repeated that per document -- 44 000 map lookups over 4000 blobs, each one a
+;; linear scan of a PersistentArrayMap, for an answer fixed before the scan
+;; began. Same shape as the encoded-key cache this type already carries.
+(deftype NavContext [opts probes ^objects cfg])
 
 (defn context
   "A reusable navigation context for `opts`, to be passed to `source` in place
@@ -188,7 +193,8 @@
   Thread-safe: the cache is an atom, and the worst a race can do is encode the
   same key twice."
   [opts]
-  (NavContext. (assoc (opt/check-opts opts) :stringref false) (atom {})))
+  (let [o (assoc (opt/check-opts opts) :stringref false)]
+    (NavContext. o (atom {}) (boring/reader-config o))))
 
 (defn- nav-of ^Nav [src opts]
   ;; VALIDATED like every other decode entry point. This was the one that was
@@ -206,6 +212,7 @@
         ;; A context has already been checked and had `:stringref false`
         ;; applied; re-doing it per source would put the per-document cost back.
         probes (if ctx? (.probes ^NavContext opts) (atom {}))
+        ^objects cfg (when ctx? (.cfg ^NavContext opts))
         opts (if ctx?
                (.opts ^NavContext opts)
                (assoc (opt/check-opts opts) :stringref false))
@@ -223,7 +230,9 @@
         ;; ordinary reader, same registry, same records" and `source`'s that
         ;; `opts` "are the decode options realisation will use". A caller's
         ;; `:max-depth`, which is a security bound, was not enforced here at all.
-        _ (boring/configure-reader! r opts)]
+        ;; A context applies its pre-resolved config; everything else resolves
+        ;; the map here, exactly as before.
+        _ (if cfg (boring/apply-reader-config! r cfg) (boring/configure-reader! r opts))]
     (when (.hasStringrefRoot r)
       (fail :boring/stringref-not-navigable
             (str "boring.nav: this document opens a stringref namespace, and a "

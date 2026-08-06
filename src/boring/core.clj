@@ -599,6 +599,50 @@
                                "ByteSource, got " (pr-str (type src)))
                           {:type :boring/bad-argument :entry entry}))))
 
+(defn ^:no-doc reader-config
+  "The eleven decode options a Reader carries, resolved ONCE into an array.
+
+  Split out of `configure-reader!` because those eleven `get`s are per SOURCE,
+  and a caller that opens one source per document -- which is every scan over a
+  document store -- repeats them per document for an answer fixed before the
+  scan began. 4000 blobs meant 44 000 map lookups. Worse than it looks: a small
+  options map is a PersistentArrayMap, whose `get` is a linear scan, so each
+  lookup walks the map.
+
+  `configure-reader!` still goes through here, so there is ONE definition of
+  which option lands in which field. Callers holding a config across documents
+  -- `boring.nav/context` -- resolve once and apply many times.
+
+  Not part of the supported API."
+  ^objects [opts]
+  (doto (object-array 11)
+    (aset 0 ^Object (Boolean/valueOf (boolean (get opts :tolerate-unknown-tags true))))
+    (aset 1 (get opts :on-unknown-record :fallback))
+    (aset 2 (let [it (get opts :instant-type :date)]
+              (when-not (#{:date :instant} it) it)))
+    (aset 3 ^Object (Boolean/valueOf (not= :instant (get opts :instant-type :date))))
+    (aset 4 ^Object (Boolean/valueOf (= :sql-date (get opts :date-type :local-date))))
+    (aset 5 ^Object (Integer/valueOf (int (get opts :max-depth 1024))))
+    (aset 6 ^Object (Long/valueOf (long (get opts :max-items 0))))
+    (aset 7 ^Object (Boolean/valueOf (boolean (get opts :validate-utf8 true))))
+    (aset 8 ^Object (Boolean/valueOf (boolean (get opts :check-duplicate-keys true))))
+    (aset 9 ^Object (Boolean/valueOf (boolean (get opts :auto-construct-records? false))))
+    (aset 10 (or (:registry opts) TagRegistry/EMPTY))))
+
+(defn ^:no-doc apply-reader-config! ^Reader [^Reader r ^objects c]
+  (set! (.-tolerateUnknownTags r) (boolean (aget c 0)))
+  (set! (.-onUnknownRecord r) (aget c 1))
+  (set! (.-instantFn r) (aget c 2))
+  (set! (.-instantAsDate r) (boolean (aget c 3)))
+  (set! (.-fullDateAsSqlDate r) (boolean (aget c 4)))
+  (set! (.-maxDepth r) (int (aget c 5)))
+  (set! (.-maxItems r) (long (aget c 6)))
+  (set! (.-validateUtf8 r) (boolean (aget c 7)))
+  (set! (.-checkDuplicateKeys r) (boolean (aget c 8)))
+  (set! (.-autoConstructRecords r) (boolean (aget c 9)))
+  (set! (.-registry r) ^TagRegistry (aget c 10))
+  r)
+
 (defn ^:no-doc configure-reader!
   "Apply decode options to a Reader. Public only so `boring.nav` can apply the
   SAME options its docstrings promise -- it realises values through this reader,
