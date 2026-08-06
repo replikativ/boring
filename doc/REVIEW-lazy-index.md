@@ -33,7 +33,7 @@ what the reader accepts". It is:
 That last clause is a deliberate, documented exception. Writing it down is what
 stops it being refiled as a defect.
 
-- [ ] **I0** Restate the invariant in the `boring.nav` ns docstring.
+- [x] **I0** Restate the invariant in the `boring.nav` ns docstring.
 
 ## 0b. Why every one of these shipped
 
@@ -211,7 +211,7 @@ both write orderings. `slot-at` uses `AtomicReferenceArray` + CAS correctly.
 
 ## 5. API, redundancy, consolidation
 
-- [ ] **A1** The ns docstring still says "TAGS ARE OPAQUE ... the slow path IS the
+- [x] **A1** The ns docstring still says "TAGS ARE OPAQUE ... the slow path IS the
       reference implementation", which this branch's central feature contradicts.
       The `WHAT IS IMPLEMENTED` table omits descents, `context`, and
       `nav-conformance`. (Do together with **I0**.)
@@ -241,7 +241,7 @@ both write orderings. `slot-at` uses `AtomicReferenceArray` + CAS correctly.
       `:map`-only.
 - [x] **A7** "This is the extension point" (`nav.clj:1043`) overstates: the table
       is `^:private`, and a user could not construct a `Cursor` to return anyway.
-- [ ] **A8** `source` and `items` accept a `NavContext` in the opts position but
+- [x] **A8** `source` and `items` accept a `NavContext` in the opts position but
       only `context`'s docstring says so; a wrong value fails absurdly
       (`:boring/read-only ... assoc is not supported`). Guard and document.
 - [x] **A9** `reduce` over a navigable tag routes through `seq`, and `seq` for
@@ -254,13 +254,13 @@ both write orderings. `slot-at` uses `AtomicReferenceArray` + CAS correctly.
       `fork` exists to prevent — and is undocumented.
 - [x] **A12** `shapes` field name and comment are stale; it caches all three kinds
       plus negatives. Rename to `views`.
-- [ ] **A13** `Cursor.count` is misindented and calls `(major nav off)` twice.
-- [ ] **A14** Stale `declare` (`nav.clj:70`): only `->Cursor`, `cursor-at`,
+- [x] **A13** `Cursor.count` is misindented and calls `(major nav off)` twice.
+- [x] **A14** Stale `declare` (`nav.clj:70`): only `->Cursor`, `cursor-at`,
       `read-index`, `read-index*`, `tag-view` need forward declaration.
 - [ ] **A15** `shaped-view` and `record-view` duplicate a "tag wraps a definite
       2-element array" prologue; all three builders re-test the tag they were
       dispatched on, which is now dead.
-- [ ] **A16** `shaped_nav_test` and `typed_nav_test` hand-roll their comparisons
+- [x] **A16** `shaped_nav_test` and `typed_nav_test` hand-roll their comparisons
       instead of calling `check-value`.
 
 ## 6. Open questions and deferred

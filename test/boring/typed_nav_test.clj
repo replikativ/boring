@@ -20,7 +20,8 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [boring.core :as boring]
-            [boring.nav :as nav]))
+            [boring.nav :as nav]
+            [boring.nav-conformance :as nc]))
 
 (def ^:private opts {:stringref false})
 
@@ -53,6 +54,20 @@
         (is (nil? (nth c n nil)) "one past the end")
         (is (nil? (nth c -1 nil)) "negative index")
         (is (nil? (get c :nope)) "a keyword key is absent")))))
+
+(deftest conformance-agrees-on-typed-arrays
+  (testing "through the helper, and over the SIGNED half of the domain -- the
+            fixtures below build from `(range n)`, which is exactly how S1 hid:
+            checked casts only throw once a value goes negative."
+    (doseq [[label mk] kinds
+            n [0 1 5 64]]
+      (is (nil? (nc/check-value (mk n) opts)) (str label " " n " non-negative"))))
+  (doseq [[label a] [["short[]" (short-array (map short [-2 -1 0 1]))]
+                     ["int[]" (int-array [-2 -1 0 1])]
+                     ["long[]" (long-array [-2 -1 0 1])]
+                     ["float[]" (float-array [-1.5 0.0 1.5])]
+                     ["double[]" (double-array [-1.5 0.0 1.5])]]]
+    (is (nil? (nc/check-value a opts)) (str label " with negatives"))))
 
 (deftest a-typed-array-of-bytes-still-realises
   (testing "boring writes uint8 payloads as a plain byte string, and tags whose

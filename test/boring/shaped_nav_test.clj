@@ -20,7 +20,8 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [boring.core :as boring]
-            [boring.nav :as nav]))
+            [boring.nav :as nav]
+            [boring.nav-conformance :as nc]))
 
 (def ^:private opts {:stringref false})
 (def ^:private trusted (assoc opts :trust-index :trusted))
@@ -85,6 +86,16 @@
             (is (= (nav/value (get (nth cp i) k))
                    (nav/value (get (nth cs i) k)))
                 (str n "/" i " key " (pr-str k)))))))))
+
+(deftest conformance-agrees-on-shaped-arrays
+  (testing "the same navigate-equals-realise property the assertions below check
+            by hand, through the helper downstream users are told to run. Its
+            absence here is why A2 -- `zipper` never learning about descents --
+            survived: nothing exercised the whole surface in one place."
+    (doseq [n [0 1 2 40]]
+      (let [v (vec (for [i (range n)] {:id i :name (str "u" i) :ok (even? i)}))]
+        (is (nil? (nc/check-value v (assoc opts :shapes true)))
+            (str n " shaped rows"))))))
 
 (deftest a-tag-with-no-descent-still-realises
   (testing "descent is an optimisation for forms boring itself writes. A tag

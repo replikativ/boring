@@ -23,6 +23,14 @@
     IReduceInit  `reduce` over children with no intermediate seq
     zipper       via `zipper`, read-only: make-node throws
 
+    source       open a document; takes options or a `context`
+    context      resolved options plus an encoded-key cache, for a SCAN that
+                 opens one source per document -- 2.4x on 4000 blobs
+    value        realise what a cursor points at
+    container?   whether a cursor can be descended into
+    items        top-level items of an RFC 8742 sequence
+    fork         a cursor usable from another thread
+
   NOT IDeref. `@cursor` would read as a cheap field access while doing
   arbitrary decode work, and IDeref means a reference type with changing
   identity or a caching pending computation -- a cursor is neither. `value` is
@@ -50,12 +58,40 @@
      so this can only arrive from a foreign streaming encoder. Decode such a
      document with `boring/decode`, which handles them fine.
 
-  TAGS ARE OPAQUE. `get` on a tagged value realises it through the normal
-  reader and continues with clojure.core/get on the result. A tag's reader is
-  an arbitrary function, so there is no general relationship between the wire
-  shape and the logical shape of what it returns -- descending structurally
-  could disagree with decoding, silently. The slow path IS the reference
-  implementation, which is what makes the fast path safe to trust."
+  TAGS ARE OPAQUE BY DEFAULT, WITH THREE EXCEPTIONS. `get` on a tagged value
+  realises it through the normal reader and continues with clojure.core/get on
+  the result. A tag's reader is an arbitrary function, so there is no general
+  relationship between the wire shape and the logical shape of what it returns
+  -- descending structurally could disagree with decoding, silently.
+
+  Three forms are descended into anyway, because boring WROTE them and knows
+  what they mean: shaped arrays (tag 39649), RFC 8746 typed arrays, and tag-27
+  records. Each is worth 36-73x on the shape it covers, and each refuses
+  wherever equivalence is not provable -- see the taxonomy above
+  `tag-view-builders`. A record's gate is `Reader.recordDescendable`, which
+  lives beside the dispatch it must agree with rather than mirroring it here.
+
+  Everything else still realises, and realising is still the reference
+  implementation.
+
+  A HANDLER CAN OPT IN. `boring/declare-navigable-record` says a registered
+  constructor preserves structure; `boring.nav-conformance` checks that claim
+  against your own data, because a wrong one returns wrong values silently.
+
+  THE INVARIANT, stated carefully, because the obvious version is false:
+
+    For a document the configured reader would decode successfully, every nav
+    answer equals the realised answer. Where the reader would raise on the
+    SUBTREE a nav operation actually touches, nav raises the same typed error.
+    Nav may also DECLINE -- `count` on an opaque tag refuses -- which is sound;
+    what it may never do is answer differently.
+
+  Nav does NOT charge document-wide resource budgets for a partial read.
+  `:max-items` and `:max-depth` bound a whole decode; a lookup that reads three
+  items is not charged for the other ten thousand, so `(get c :a)` can succeed
+  where `decode` raises `:boring/max-items-exceeded`. That is deliberate, it
+  predates every descent, and charging them would defeat this namespace.
+  `boring.nav-divergence-test` asserts the rest."
   (:require [boring.core :as boring]
             [boring.data]
             [boring.errors :as err]
@@ -237,7 +273,12 @@
   ;; resolution is deliberately not idempotent, because a resolved map has
   ;; `:canonical` in it and re-resolving reads that as the caller trying to
   ;; override what the profile locks.
-  (let [ctx? (instance? NavContext opts)
+  (let [_ (when-not (or (map? opts) (nil? opts) (instance? NavContext opts))
+            (fail :boring/bad-options
+                  (str "boring.nav: expected an options map or a `nav/context`, got "
+                       (some-> opts class .getName))
+                  {:got (class opts)}))
+        ctx? (instance? NavContext opts)
         ;; A context has already been checked and had `:stringref false`
         ;; applied; re-doing it per source would put the per-document cost back.
         probes (if ctx? (.probes ^NavContext opts) (atom {}))
@@ -794,6 +835,7 @@
       ;; a shaped array, elements for a typed one, fields for a record.
       ;; `count` used to refuse every tag while `nth` on a typed array worked
       ;; through the realising path -- countable by nobody, indexable by anyone.
+      ;; `major` read ONCE. It was called here and again in the `let` below.
       (if-let [v (and (= MAJOR-TAG (major nav off)) (tag-view nav off))]
         ;; CHECKED, exactly as the array and map branch below is. This branch
         ;; did not check, which reproduced verbatim the defect that comment
