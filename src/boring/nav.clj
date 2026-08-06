@@ -67,7 +67,8 @@
 
 (set! *warn-on-reflection* true)
 
-(declare ->Cursor cursor-at read-index read-index* shape-at nth-item realize)
+(declare ->Cursor cursor-at read-index read-index* shape-at typed-at typed-nth
+         nth-item realize)
 
 ;; A shaped array is `39649([keys, [row, row, ...]])`, where each row is an
 ;; ARRAY of values positionally matching `keys`. It REALISES to a vector of
@@ -593,8 +594,12 @@
               (let [p (nth-item nav (long (:rows sh)) (int k))]
                 (if (neg? p) nf (->Cursor nav p sh)))
               nf)
-            (try (get (realize nav off) k nf)
-                 (catch ClassCastException _ nf)))
+            ;; `clojure.core/get` on a realised primitive array indexes it, so
+            ;; an integer key has to keep meaning the same thing here.
+            (if-some [t (typed-at nav off)]
+              (if (integer? k) (typed-nth nav t (long k) nf) nf)
+              (try (get (realize nav off) k nf)
+                   (catch ClassCastException _ nf))))
           :else nf))))
 
   clojure.lang.Indexed
@@ -625,12 +630,17 @@
           (if-some [sh (shape-at nav off)]
             (let [p (nth-item nav (long (:rows sh)) i)]
               (if (neg? p) nf (->Cursor nav p sh)))
-            (let [v (realize nav off)]
-              (if (or (nil? v) (instance? clojure.lang.Indexed v)
-                      (instance? java.util.List v) (string? v)
-                      (and (some? v) (.isArray (class v))))
-                (nth v i nf)
-                nf)))
+            ;; A typed array's elements are packed, so this is arithmetic
+            ;; rather than a walk -- and rather than building the whole
+            ;; primitive array to read one of them.
+            (if-some [t (typed-at nav off)]
+              (typed-nth nav t i nf)
+              (let [v (realize nav off)]
+                (if (or (nil? v) (instance? clojure.lang.Indexed v)
+                        (instance? java.util.List v) (string? v)
+                        (and (some? v) (.isArray (class v))))
+                  (nth v i nf)
+                  nf))))
           :else nf))))
 
   ;; Honest O(1): the count is in the head, and head-count refuses the
@@ -643,8 +653,13 @@
       (count (:ks shape))
       ;; `if-let`, not `if-some`: the `and` yields FALSE for a non-tag, and
       ;; `if-some` counts false as present and then reads `:n` off it.
-      (if-let [sh (and (= MAJOR-TAG (major nav off)) (shape-at nav off))]
-        ;; A shaped array counts its ROWS, like the vector it realises to.
+      ;;
+      ;; A shaped array counts its ROWS and a typed array its ELEMENTS, both
+      ;; being the length of the collection they realise to. `count` used to
+      ;; refuse every tag while `nth` on a typed array worked through the
+      ;; realising path -- countable by nobody, indexable by anyone.
+      (if-let [sh (and (= MAJOR-TAG (major nav off))
+                       (or (shape-at nav off) (typed-at nav off)))]
         (int (:n sh))
         (let [mj (major nav off)]
         (if (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP))
@@ -752,6 +767,90 @@
 
 (defn- cursor-at [^Nav nav ^long off] (->Cursor nav off nil))
 
+;; RFC 8746 typed arrays boring WRITES: signed little-endian integers plus f32
+;; and f64 LE. `Reader.readTypedArray` can read all 21 with a lossless JVM
+;; representation, but descent is implemented only for these five.
+;;
+;; NOT for lack of ambition. Each of the other tags has its own widening rule --
+;; uint8 becomes short[], not byte[], so that 200 does not read back as -56 --
+;; and mirroring a rule wrongly here returns a WRONG NUMBER rather than a slow
+;; one. The five below are the ones boring's own data uses and the ones whose
+;; boxing is pinned by test against `realize`; everything else falls back to
+;; realising, which is what already worked.
+(def ^:private typed-array-tags
+  {77 {:size 2 :read (fn [^bytes b] (Short/valueOf (short (bit-or (bit-and (aget b 0) 0xFF)
+                                                           (bit-shift-left (aget b 1) 8)))))}
+   78 {:size 4 :read (fn [^bytes b]
+                       (Integer/valueOf (int (areduce b i acc (int 0)
+                                               (bit-or acc (bit-shift-left
+                                                            (bit-and (aget b i) 0xFF)
+                                                            (* 8 i)))))))}
+   79 {:size 8 :read (fn [^bytes b]
+                       (Long/valueOf (long (areduce b i acc (long 0)
+                                       (bit-or acc (bit-shift-left
+                                                    (bit-and (long (aget b i)) 0xFF)
+                                                    (* 8 i)))))))}
+   85 {:size 4 :read (fn [^bytes b]
+                       (Float/valueOf (Float/intBitsToFloat
+                                (int (areduce b i acc (int 0)
+                                              (bit-or acc (bit-shift-left
+                                                           (bit-and (aget b i) 0xFF)
+                                                           (* 8 i))))))))}
+   86 {:size 8 :read (fn [^bytes b]
+                       (Double/valueOf (Double/longBitsToDouble
+                                 (areduce b i acc (long 0)
+                                          (bit-or acc (bit-shift-left
+                                                       (bit-and (long (aget b i)) 0xFF)
+                                                       (* 8 i)))))))}})
+
+(defn- typed-at
+  "Description of the RFC 8746 typed array tagged at `off`, or nil.
+
+  `{:read <fn of the element bytes> :size <element bytes> :data <first payload
+  byte> :n <element count>}`
+
+  A typed array's elements are PACKED, not CBOR items, so element i is at
+  `data + i*size` -- arithmetic, with no walking and no index. That is why this
+  is worth having even though the array already realises correctly: reaching one
+  element used to build the whole primitive array, so a single lookup into a
+  100 000-element `long[]` allocated 800 KB.
+
+  Cached like `shape-at`, and nil for any tag whose widening is not mirrored
+  below -- see `typed-array-tags`."
+  [^Nav nav ^long off]
+  (let [cache (.shapes nav)
+        ck [:typed off]]
+    (if-some [hit (get @cache ck)]
+      (when-not (= ::none hit) hit)
+      (let [^Reader r (.rdr nav)
+            v (try
+                (when (= MAJOR-TAG (major nav off))
+                  (when-let [spec (typed-array-tags (.headArgAt r off))]
+                    (let [bs (.headEndAt r off)]
+                      ;; must wrap a DEFINITE-LENGTH byte string, as the reader
+                      ;; requires; an indefinite one has no count on the wire
+                      (when (and (= 2 (.majorAt r bs)) (not= 31 (.infoAt r bs)))
+                        (let [blen (.headArgAt r bs)
+                              size (long (:size spec))]
+                          (when (and (<= 0 blen) (zero? (rem blen size)))
+                            {:read (:read spec) :size size
+                             :data (.headEndAt r bs) :n (quot blen size)}))))))
+                (catch Exception _ nil))]
+        (swap! cache assoc ck (if (nil? v) ::none v))
+        v))))
+
+(defn- typed-nth
+  "Element `i` of the typed array described by `t`, or `nf`.
+
+  Returns a VALUE, not a cursor: a packed element is not a CBOR item and has no
+  offset to point at. `nth` through the realising path returned a value too, so
+  this is the same contract."
+  [^Nav nav t ^long i nf]
+  (if (or (neg? i) (>= i (long (:n t))))
+    nf
+    (let [p (+ (long (:data t)) (* i (long (:size t))))]
+      ((:read t) (.bytesBetween ^Reader (.rdr nav) p (+ p (long (:size t))))))))
+
 (defn- shape-at
   "Description of the shaped array tagged at `off`, or nil if that is not what
   is there.
@@ -773,8 +872,9 @@
   emits. That is deliberate: an unrecognised tag falls back to realising, so a
   wrong guess here costs speed and never correctness."
   [^Nav nav ^long off]
-  (let [cache (.shapes nav)]
-    (if-some [hit (get @cache off)]
+  (let [cache (.shapes nav)
+        ck [:shape off]]
+    (if-some [hit (get @cache ck)]
       (when-not (= ::none hit) hit)
       (let [^Reader r (.rdr nav)
             v (try
@@ -805,7 +905,7 @@
                 ;; Damaged bytes mean "not a shape I recognise", never a throw
                 ;; out of `get`. The realising fallback still answers.
                 (catch Exception _ nil))]
-        (swap! cache assoc off (if (nil? v) ::none v))
+        (swap! cache assoc ck (if (nil? v) ::none v))
         v))))
 
 ;; --------------------------------------------------------------- public API
