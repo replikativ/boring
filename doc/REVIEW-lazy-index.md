@@ -44,11 +44,30 @@ itself. The divergences live entirely in the complement: bytes boring did not
 write, and options other than the default. Not one row below is reachable from
 the existing generators.
 
-- [ ] **G1** Cross `test/boring/option_matrix.cljc` x `test/boring/hostile.cljc`
+- [x] **G1** DONE -- `test/boring/nav_divergence_test.clj`. Cross `test/boring/option_matrix.cljc` x `test/boring/hostile.cljc`
       x `check-value`: every option combination x mutated-byte document, assert
       nav agrees with realise **or both raise**. Ships with the open rows below
       listed as known divergences, so the suite is green and each fix removes an
       entry. A ratchet, not a wish list.
+
+      Four properties, because the obvious one is false (see section 0):
+      P1 no untyped throwable, ever, on any input; P2 `value` agrees with
+      `decode`; P3 when `decode` SUCCEEDS every other operation agrees; P4
+      `count` never exceeds the remaining bytes. P1 and P4 are absolute; P2/P3
+      are conditioned on the reader succeeding, which is what makes room for the
+      budget exception without weakening them.
+
+      It independently reproduced **S1**, **S2** and the `:on-unknown-record fn`
+      half of **S6** -- 100 failures on first run -- and all three are now
+      ratcheted.
+
+      WHAT IT CANNOT REACH, recorded so the gap is not mistaken for coverage:
+      the rest of **S6** and all of **S7** -- descending into a tag the reader
+      would REFUSE -- violate none of P1-P4. Both `decode` and `nav/value` raise,
+      so P2 agrees, and P3 does not run. The divergence is that `(get c :a)`
+      answers. That cannot be made generic without forbidding a shallow lookup
+      on a document with one deep malformed element, which is what lazy
+      navigation is for. It is a per-descent obligation and belongs in PR 3.
 
 ---
 
