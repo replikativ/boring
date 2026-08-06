@@ -16,6 +16,7 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.properties :as prop]
             [boring.core :as b]
+            [boring.nav :as nav]
             [boring.generative-test :refer [gen-value]])
   (:import [org.replikativ.boring Reader]
            [java.util Arrays]))
@@ -131,3 +132,27 @@
                  (= (attempt #(fresh bs k))
                     (attempt #(through-buffer r buf bs k))))
                (range 0 n (max 1 (quot n 40))))))))
+
+;;; source-at
+
+(deftest source-at-navigates-an-item-behind-a-prefix
+  (testing "the case it exists for: a format that puts its own bytes in front
+            of a CBOR item, so the item does not have to be nested inside a
+            container purely to be findable."
+    (let [a (b/encode {:aaa 1 :bbb "x"} opts)
+          c (b/encode {:ccc [1 2 3] :ddd :e} opts)
+          blob (byte-array (+ 5 (alength ^bytes a) (alength ^bytes c)))]
+      (System/arraycopy a 0 blob 5 (alength ^bytes a))
+      (System/arraycopy c 0 blob (+ 5 (alength ^bytes a)) (alength ^bytes c))
+      (is (= 1 (nav/value (get (nav/source-at blob 5 opts) :aaa))))
+      (is (= "x" (nav/value (get (nav/source-at blob 5 opts) :bbb))))
+      (let [second-off (+ 5 (alength ^bytes a))]
+        (is (= [1 2 3] (nav/value (get (nav/source-at blob second-off opts) :ccc))))
+        (is (= :e (nav/value (get (nav/source-at blob second-off opts) :ddd)))))
+      (testing "and realising the whole item at an offset equals decoding it alone"
+        (is (= {:aaa 1 :bbb "x"} (nav/value (nav/source-at blob 5 opts))))))))
+
+(deftest source-at-zero-is-source
+  (let [bs (b/encode {:a 1 :b [2 3]} opts)]
+    (is (= (nav/value (nav/source bs opts))
+           (nav/value (nav/source-at bs 0 opts))))))

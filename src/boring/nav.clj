@@ -103,7 +103,7 @@
 
 (set! *warn-on-reflection* true)
 
-(declare ->Cursor cursor-at read-index read-index* tag-view
+(declare ->Cursor cursor-at read-index read-index* source-at tag-view
          nth-item realize lookup-map head-count child-offsets)
 
 ;; A shaped array is `39649([keys, [row, row, ...]])`, where each row is an
@@ -373,7 +373,31 @@
   case, because a caller may legitimately navigate a value sitting in an
   oversized scratch buffer."
   ([src] (source src nil))
-  ([src opts] (cursor-at (nav-of src (or opts {})) 0)))
+  ([src opts] (source-at src 0 opts)))
+
+(defn source-at
+  "A navigable view over the item at byte offset `off` in `src`.
+
+  `source` is this with `off` 0.
+
+  THE OFFSET IS FOR FORMATS THAT PREFIX AN ITEM WITH SOMETHING OF THEIR OWN --
+  a length, a header, another item. The alternative is to nest the item inside
+  a container purely so that it can be found, and then every read pays to skip
+  whatever shares that container. konserve-lmdb's store blobs are
+  `<header><meta item><value item>` for exactly this reason: both items are
+  reachable in constant time, where a two-entry map forces one of them to walk
+  past the other on every read. Measured there, one field out of 20k rows:
+  0.163 us/row through the map against 0.091 through the offset.
+
+  `off` is TRUSTED, like every other positional entry point in this namespace.
+  A wrong offset lands mid-item and reports whatever the bytes there happen to
+  encode -- the reader is bounded, so it cannot read past the source, but it
+  can very much return a plausible wrong value. Callers derive offsets from the
+  format, not from user input.
+
+  Addresses ONE item, the one starting at `off`. See `source` on sequences."
+  ([src off] (source-at src off nil))
+  ([src off opts] (cursor-at (nav-of src (or opts {})) (long off))))
 
 ;; ------------------------------------------------------------- wire queries
 
