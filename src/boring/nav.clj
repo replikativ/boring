@@ -62,7 +62,8 @@
             [boring.frame :as frame]
             [boring.options :as opt]
             [clojure.zip :as zip])
-  (:import (org.replikativ.boring Reader ByteSource)))
+  (:import (org.replikativ.boring Reader ByteSource)
+           (java.util.concurrent.atomic AtomicReferenceArray)))
 
 (set! *warn-on-reflection* true)
 
@@ -73,7 +74,25 @@
 
 ;; ---------------------------------------------------------------- the source
 
+(declare slot-at node-sound?)
+
 (deftype Nav [^Reader rdr opts probes idx src])
+
+(defn- nav-idx
+  "The decoded index, parsed on first use.
+
+  `idx` holds a DELAY, not the index. Parsing the frame is the expensive part
+  -- measured 8.5 us of the 11.0 us a per-call indexed lookup took, against
+  2.5 us once the source is reused -- and a caller that only touches a
+  top-level key never needs it. A store hands out a fresh blob per read and so
+  constructs a source per read, which made an index cost more than it saved:
+  an indexed binary search ran 11.0 us per call against 2.5 us reused, and a
+  shallow `:meta` lookup went from 0.95 us unindexed to 7.5 us indexed.
+
+  Deferring it makes an index free for the lookups that do not consult it, and
+  unchanged for the ones that do."
+  [^Nav n]
+  (when-let [d (.idx n)] @d))
 
 (defn- node-slot
   "Position of the index node covering the container at `off`, or -1.
@@ -91,16 +110,24 @@
   ;; unusable now yields `{:data-end ptr}` alone -- the two questions are
   ;; answered separately, see `read-index*` -- so an index can be present and
   ;; carry no nodes at all.
-  (if-let [^longs cs (some-> ^Nav nav .idx :containers)]
-    (loop [lo 0 hi (dec (alength cs))]
-      (if (> lo hi)
-        -1
-        (let [mid (quot (+ lo hi) 2)
-              c (aget cs mid)]
-          (cond (= c off) mid
-                (< c off) (recur (inc mid) hi)
-                :else (recur lo (dec mid))))))
-    -1))
+  (let [ix (nav-idx nav)]
+    (if-let [^longs cs (:containers ix)]
+      (loop [lo 0 hi (dec (alength cs))]
+        (if (> lo hi)
+          -1
+          (let [mid (quot (+ lo hi) 2)
+                c (aget cs mid)]
+            (cond
+              ;; VALIDATED HERE, not at load. The node is checked against the
+              ;; data the first time a lookup lands on it, and an unsound one
+              ;; reports -1 -- which every caller already treats as "no index,
+              ;; walk it". So the fallback path is the one that always existed
+              ;; and the failure mode is unchanged; only the moment of
+              ;; discovery moved. See `index-payload`.
+              (= c off) (if (node-sound? nav ix mid) mid -1)
+              (< c off) (recur (inc mid) hi)
+              :else (recur lo (dec mid))))))
+      -1)))
 
 (defn- probe-for
   "The encoded bytes of `k`, cached. Key matching compares bytes rather than
@@ -153,7 +180,11 @@
       ;; the reference implementation the indexed paths are checked against, so
       ;; this is the one setting whose correctness needs no separate argument.
       (Nav. r opts (atom {})
-            (when-not (= :ignore (:trust-index opts)) (read-index nav))
+            ;; A DELAY. Detection is deferred with the parse: a document
+            ;; with no frame costs nothing to find that out, and one with a
+            ;; frame pays only if something consults it.
+            (when-not (= :ignore (:trust-index opts))
+              (delay (read-index nav)))
             src))))
 
 (defn- fork-nav ^Nav [^Nav n]
@@ -166,7 +197,13 @@
     ;; Reader. A fresh probe cache rather than a shared one, because it is the
     ;; only other mutable field and contending an atom to save a key encode is
     ;; the wrong trade.
-    (Nav. r (.opts n) (atom {}) (.idx n) src)))
+    ;; FORCED HERE, then shared as a realised value. Sharing the delay itself
+    ;; would let the forked thread parse the frame through the PARENT's
+    ;; Reader, which is the one thing `fork` exists to avoid. Forcing on the
+    ;; forking thread keeps the sharing -- 145 us for a 20 000-item index --
+    ;; without the aliasing.
+    (let [ix (nav-idx n)]
+      (Nav. r (.opts n) (atom {}) (when ix (delay ix)) src))))
 
 (defn source
   "A navigable view over `src` -- a byte[], or a ByteSource such as
@@ -306,7 +343,7 @@
   (let [^Reader r (.rdr nav)
         n (head-count nav off)
         ^bytes probe (probe-for nav k)
-        idx (.idx nav)
+        idx (nav-idx nav)
         ns (node-slot nav off)]
     ;; A node with NO anchors means nothing to jump to -- walk instead. Empty
     ;; containers legitimately produce one (`:index-min 0` will index a `{}`),
@@ -314,9 +351,9 @@
     ;; `(max 0 (min (dec m) hi))` still yields 0 and `aget` threw straight at
     ;; the caller of `get`. Cheaper to notice here than to special-case both
     ;; branches, and it also covers any future node that turns out empty.
-    (if (or (neg? ns) (zero? (alength ^longs (nth (:slots idx) ns))))
+    (if (or (neg? ns) (zero? (alength ^longs (slot-at idx ns))))
       (scan-map r (.headEndAt r off) n probe)
-      (let [^longs slot (nth (:slots idx) ns)
+      (let [^longs slot (slot-at idx ns)
             stride (long (:stride idx))
             m (alength slot)]
         ;; Entries after anchor a, which is NOT always `stride`: the last
@@ -390,12 +427,12 @@
         n (head-count nav off)]
     (if (or (neg? idx) (>= idx n))
       -1
-      (let [ix (.idx nav)
+      (let [ix (nav-idx nav)
             ns (node-slot nav off)]
         (if (neg? ns)
           (loop [i 0 p (.headEndAt r off)]
             (if (= i idx) p (recur (inc i) (skip r p))))
-          (let [^longs slot (nth (:slots ix) ns)
+          (let [^longs slot (slot-at ix ns)
                 stride (long (:stride ix))
                 anchor (quot idx stride)]
             (loop [i (* anchor stride) p (long (aget slot anchor))]
@@ -745,6 +782,177 @@
             (aset out k v)
             (recur (inc k) v)))))))
 
+(defn- node-valid?
+  "Does index node `i` describe the data it claims to?
+
+  Split out of `index-payload` so it can be run PER NODE, on demand, instead of
+  over every node at load. That is the whole cost of an index on a short-lived
+  source: the checks below read the file -- `skip` walks up to a stride of
+  items to pin the far end -- so validating a 12 000-container frame cost
+  ~1 ms before a single lookup ran, and a caller that touches one key paid all
+  of it. Deferring makes the price proportional to what is actually navigated.
+
+  The checks themselves are unchanged, and each was reachable: a slot shorter
+  than its count made `nth` walk off the end, a zero-length slot made the binary
+  search index -1, and an anchor outside the data section reached
+  `Reader.skipFrom`, which does an unchecked array access and throws a raw
+  AIOOBE at the caller."
+  [^Reader r ptr c cnt st ^longs a]
+  (let [ptr (long ptr) c (long c) cnt (long cnt) st (long st)]
+(let [want (if (zero? cnt) 0 (inc (quot (dec cnt) st)))]
+            (and (= (alength a) want)
+                 ;; The node must describe a container that IS THERE
+                 ;; and has the entry count it claims, and its first
+                 ;; anchor must be that container's first entry.
+                 ;; All O(1) -- read from the head -- and together
+                 ;; they reject an index whose offsets are internally
+                 ;; tidy but point at the wrong places, which passed
+                 ;; every earlier check and silently returned a
+                 ;; neighbouring value.
+                 (if (neg? c)
+                   ;; the sequence node: its first item is byte 0
+                   (or (zero? want) (zero? (aget a 0)))
+                   (and (< c ptr)
+                        (#{4 5} (.majorAt r c))
+                        (= cnt (.headArgAt r c))
+                        (or (zero? want)
+                            (= (long (aget a 0)) (.headEndAt r c)))))
+                 ;; anchors ascend, sit inside the data section, and
+                 ;; for a real container start after its own header
+                 (loop [k 0 prev -1]
+                   (if (>= k (alength a))
+                     true
+                     (let [v (long (aget a k))]
+                       (if (and (> v prev) (<= 0 v) (< v ptr)
+                                (or (neg? c) (> v c)))
+                         (recur (inc k) v)
+                         false))))
+                 ;; AND THE FAR END, which nothing pinned.
+                 ;;
+                 ;; Every check above is about the START of the node
+                 ;; and about the anchors being tidy among
+                 ;; themselves. None of them says the node describes
+                 ;; THIS data. Two measured consequences:
+                 ;;
+                 ;;   Splice one sealed file's data section under
+                 ;;   another's footer of the same byte length but
+                 ;;   different item boundaries -- an interrupted
+                 ;;   append and a retry, a restore taking the body
+                 ;;   from one snapshot and the tail from another.
+                 ;;   Every gate passed. `nth items 16` returned the
+                 ;;   string "gaaaa", `nth 32` returned the record
+                 ;;   written at 32-9, and `decode-seq` over the same
+                 ;;   bytes was correct throughout, so two code paths
+                 ;;   in one application disagreed about the file.
+                 ;;
+                 ;;   The item total was never compared with the
+                 ;;   data at all -- the slot-length rule
+                 ;;   `want = 1 + (cnt-1)/stride` cannot see a change
+                 ;;   anywhere inside a whole stride. One flipped bit
+                 ;;   made `count` report 501 for a 500-item file;
+                 ;;   deflating it left ten written records present
+                 ;;   in the file, returned by `decode-seq`, and
+                 ;;   unreachable through `count`/`nth`.
+                 ;;
+                 ;; The check is exact and costs at most one stride
+                 ;; of skips per node, never a walk of the container:
+                 ;; the slot-length rule above already forces
+                 ;; `remaining` into [1, stride]. From the last
+                 ;; anchor, stepping over the items it covers must
+                 ;; land EXACTLY on the node's end -- the data
+                 ;; section's end for the sequence, the container's
+                 ;; own end otherwise.
+                 (let [m (alength a)]
+                   (or (if (neg? c)
+                         ;; A SEQUENCE NODE CLAIMING ZERO ITEMS has
+                         ;; no anchors, so the far-end check below
+                         ;; short-circuits and never looks at the
+                         ;; data -- and `count` then returned 0 and
+                         ;; `nth` nil over a file holding all 60 of
+                         ;; its records. Zero items is only honest
+                         ;; if the data section is empty, which is
+                         ;; one comparison.
+                         (and (zero? m) (zero? ptr))
+                         (zero? m))
+                       (let [covered (* st (dec m))
+                             remaining (- cnt covered)
+                             per (if (and (not (neg? c)) (= MAJOR-MAP (.majorAt r c)))
+                                   2 1)
+                             n (* per remaining)
+                             want-end (if (neg? c) ptr (skip r c))]
+                         (and (pos? remaining)
+                              (= want-end
+                                 (loop [k 0 p (long (aget a (dec m)))]
+                                   (if (= k n) p (recur (inc k) (skip r p)))))))))))))
+
+(defn- slot-at
+  "Absolute anchors for node `i`, expanded on first use and memoized.
+
+  `boring.core/delta-slot` writes anchors as deltas, so this is the prefix sum
+  back to the offsets every lookup path expects. Doing it here rather than at
+  load is what keeps an index off the critical path of a source that is read
+  once."
+  ^longs [ix ^long i]
+  (let [^AtomicReferenceArray cache (:slot-cache ix)
+        hit (.get cache (int i))]
+    (or hit
+        (let [^longs cs (:containers ix)
+              a (expand-slot (nth (:raw-slots ix) i)
+                             (max 0 (long (aget cs (int i)))))]
+          ;; CAS so every thread observes the same array; a loser discards its
+          ;; own copy rather than publishing a second one.
+          (.compareAndSet cache (int i) nil a)
+          (.get cache (int i))))))
+
+(defn- node-sound?
+  "Is index node `i` usable? Checked once, then remembered.
+
+  An unsound node is not an error: `node-slot` reports -1 and the caller walks
+  the container, which is the path taken whenever a container is simply not
+  indexed. So a malformed node costs speed, never correctness -- the same
+  contract `read-index` keeps for a corrupt back-pointer.
+
+  `:trust-index :trusted` skips the check; `:ignore` skips the index altogether.
+  Two ends of one dial, and `:trusted` was previously accepted by the option
+  validator while having no effect anywhere -- an option taken and ignored."
+  [^Nav nav ix ^long i]
+  (if (= :trusted (:trust-index (.opts nav)))
+    ;; TRUSTED: skip the check entirely.
+    ;;
+    ;; This is the single lever that decides whether an index pays. Measured on
+    ;; a 1000-entry map: decoding the frame costs 3-7 us and expanding a node's
+    ;; deltas 0.13 us, but validating one node costs 47 us -- because the
+    ;; far-end check SKIPS THE WHOLE CONTAINER to pin where it ends. That is
+    ;; exactly the walk the index exists to avoid, so a source read once pays a
+    ;; full container walk for the privilege of not walking the container.
+    ;;
+    ;; The check is not pointless -- it catches a data section spliced under a
+    ;; foreign footer, which every cheaper gate passes (see `node-valid?`). But
+    ;; that threat is about files of unknown provenance. A store that owns its
+    ;; own bytes, and sits on a page-checksummed engine, is paying for a
+    ;; guarantee it already has.
+    true
+    (let [^booleans done (:node-checked ix)
+          ^booleans okv (:node-ok ix)]
+      (if (aget done (int i))
+        (aget okv (int i))
+        (let [^Reader r (.rdr nav)
+              ^longs cs (:containers ix)
+              ^ints cnts (:counts ix)
+              v (boolean
+                 (try
+                   (node-valid? r (long (:data-end ix))
+                                (long (aget cs (int i)))
+                                (long (aget cnts (int i)))
+                                (long (:stride ix))
+                                (slot-at ix i))
+                   ;; Any failure reading a malformed node means "unusable",
+                   ;; not "throw at the caller of `get`".
+                   (catch Exception _ false)))]
+          (aset okv (int i) v)
+          (aset done (int i) true)
+          v)))))
+
 (defn- index-payload
   "The usable index in the tag-27 frame at `ptr`, or nil meaning \"scan\".
 
@@ -836,126 +1044,57 @@
                          (cond (>= k (alength containers)) nil
                                (= -1 (aget containers k)) k
                                :else (recur (inc k))))
-              ;; Deltas to absolutes, once, against each slot's own base: its
-              ;; container's offset, or 0 for the sequence, whose sentinel -1
-              ;; is not a position.
-              abs-slots (vec (map-indexed
-                              (fn [i s]
-                                (expand-slot s (max 0 (long (aget containers (int i))))))
-                              slots))
+              n (alength containers)
               st (long stride)
-              ;; Every node, checked against the file it claims to describe.
-              ;; Each of these was reachable: a slot shorter than its count made
-              ;; `nth` walk off the end, a zero-length slot made the binary
-              ;; search index -1, and an anchor pointing outside the data
-              ;; section reached `Reader.skipFrom`, which does an unchecked
-              ;; array access and throws a raw AIOOBE at the caller.
-              ok? (every?
-                   (fn [i]
-                     (let [c (long (aget containers (int i)))
-                           cnt (long (aget counts (int i)))
-                           ^longs a (nth abs-slots i)
-                           want (if (zero? cnt) 0 (inc (quot (dec cnt) st)))]
-                       (and (= (alength a) want)
-                            ;; The node must describe a container that IS THERE
-                            ;; and has the entry count it claims, and its first
-                            ;; anchor must be that container's first entry.
-                            ;; All O(1) -- read from the head -- and together
-                            ;; they reject an index whose offsets are internally
-                            ;; tidy but point at the wrong places, which passed
-                            ;; every earlier check and silently returned a
-                            ;; neighbouring value.
-                            (if (neg? c)
-                              ;; the sequence node: its first item is byte 0
-                              (or (zero? want) (zero? (aget a 0)))
-                              (and (< c ptr)
-                                   (#{4 5} (.majorAt r c))
-                                   (= cnt (.headArgAt r c))
-                                   (or (zero? want)
-                                       (= (long (aget a 0)) (.headEndAt r c)))))
-                            ;; anchors ascend, sit inside the data section, and
-                            ;; for a real container start after its own header
-                            (loop [k 0 prev -1]
-                              (if (>= k (alength a))
-                                true
-                                (let [v (long (aget a k))]
-                                  (if (and (> v prev) (<= 0 v) (< v ptr)
-                                           (or (neg? c) (> v c)))
-                                    (recur (inc k) v)
-                                    false))))
-                            ;; AND THE FAR END, which nothing pinned.
-                            ;;
-                            ;; Every check above is about the START of the node
-                            ;; and about the anchors being tidy among
-                            ;; themselves. None of them says the node describes
-                            ;; THIS data. Two measured consequences:
-                            ;;
-                            ;;   Splice one sealed file's data section under
-                            ;;   another's footer of the same byte length but
-                            ;;   different item boundaries -- an interrupted
-                            ;;   append and a retry, a restore taking the body
-                            ;;   from one snapshot and the tail from another.
-                            ;;   Every gate passed. `nth items 16` returned the
-                            ;;   string "gaaaa", `nth 32` returned the record
-                            ;;   written at 32-9, and `decode-seq` over the same
-                            ;;   bytes was correct throughout, so two code paths
-                            ;;   in one application disagreed about the file.
-                            ;;
-                            ;;   The item total was never compared with the
-                            ;;   data at all -- the slot-length rule
-                            ;;   `want = 1 + (cnt-1)/stride` cannot see a change
-                            ;;   anywhere inside a whole stride. One flipped bit
-                            ;;   made `count` report 501 for a 500-item file;
-                            ;;   deflating it left ten written records present
-                            ;;   in the file, returned by `decode-seq`, and
-                            ;;   unreachable through `count`/`nth`.
-                            ;;
-                            ;; The check is exact and costs at most one stride
-                            ;; of skips per node, never a walk of the container:
-                            ;; the slot-length rule above already forces
-                            ;; `remaining` into [1, stride]. From the last
-                            ;; anchor, stepping over the items it covers must
-                            ;; land EXACTLY on the node's end -- the data
-                            ;; section's end for the sequence, the container's
-                            ;; own end otherwise.
-                            (let [m (alength a)]
-                              (or (if (neg? c)
-                                    ;; A SEQUENCE NODE CLAIMING ZERO ITEMS has
-                                    ;; no anchors, so the far-end check below
-                                    ;; short-circuits and never looks at the
-                                    ;; data -- and `count` then returned 0 and
-                                    ;; `nth` nil over a file holding all 60 of
-                                    ;; its records. Zero items is only honest
-                                    ;; if the data section is empty, which is
-                                    ;; one comparison.
-                                    (and (zero? m) (zero? ptr))
-                                    (zero? m))
-                                  (let [covered (* st (dec m))
-                                        remaining (- cnt covered)
-                                        per (if (and (not (neg? c)) (= MAJOR-MAP (.majorAt r c)))
-                                              2 1)
-                                        n (* per remaining)
-                                        want-end (if (neg? c) ptr (skip r c))]
-                                    (and (pos? remaining)
-                                         (= want-end
-                                            (loop [k 0 p (long (aget a (dec m)))]
-                                              (if (= k n) p (recur (inc k) (skip r p))))))))))))
-                   (range (alength containers)))]
-          (when ok?
-            {:stride st
-             :containers containers
-             :counts counts
-             :slots abs-slots
-             :sorted (vec sorted)
-             :data-end ptr
-             :total (when seq-slot (long (aget counts seq-slot)))
-             :offsets (when seq-slot (nth abs-slots seq-slot))
-             ;; The per-anchor verdict cache -- see `anchor-sound?`. Allocated
-             ;; once with the index, so a lookup allocates nothing.
-             :anchor-checked (when seq-slot
-                               (boolean-array (alength ^longs (nth abs-slots seq-slot))))
-             :anchor-ok (when seq-slot
-                          (boolean-array (alength ^longs (nth abs-slots seq-slot))))}))))
+              raw (vec slots)
+              ;; LAZY, memoized per node. `expand-slot` is a prefix sum over a
+              ;; node's anchors and `node-valid?` reads the file, so doing both
+              ;; for every node at load made an index cost more than it saved on
+              ;; a source used for ONE lookup -- which is every read of a
+              ;; document store. Measured on a 1.37 MB nested map: 1140 us
+              ;; indexed against 129 us unindexed, the gap widening with size
+              ;; because both passes scale with container count.
+              ;;
+              ;; `expand-slot`'s docstring argues the eager pass is free because
+              ;; the index is materialised once per source. That is true when
+              ;; the source is REUSED and exactly inverted when it is not.
+              ;;
+              ;; AtomicReferenceArray rather than a plain object array: a forked
+              ;; Nav shares this realised index across threads, and publishing a
+              ;; freshly built long[] through a non-volatile write would be a
+              ;; data race. The boolean memos below tolerate their race -- the
+              ;; worst case is recomputing a verdict -- which is the same trade
+              ;; `anchor-checked` already makes.
+              cache (AtomicReferenceArray. n)
+              ix {:stride st
+                  :containers containers
+                  :counts counts
+                  :raw-slots raw
+                  :slot-cache cache
+                  :node-checked (boolean-array n)
+                  :node-ok (boolean-array n)
+                  :sorted (vec sorted)
+                  :data-end ptr}
+              ;; THE SEQUENCE NODE STAYS EAGER, alone. `count` and `nth` consult
+              ;; it immediately, a wrong `:total` is the silent-corruption case
+              ;; documented in `node-valid?`, and it is a single node rather
+              ;; than one per container. A sequence is also the shape whose
+              ;; source is reused, so there is nothing to amortise away.
+              seq-anchors (when seq-slot (slot-at ix (long seq-slot)))
+              seq-ok? (or (nil? seq-slot)
+                          (node-valid? r ptr
+                                       (long (aget containers (int seq-slot)))
+                                       (long (aget counts (int seq-slot)))
+                                       st seq-anchors))]
+          (when seq-ok?
+            (assoc ix
+                   :total (when seq-slot (long (aget counts (int seq-slot))))
+                   :offsets seq-anchors
+                   ;; The per-anchor verdict cache -- see `anchor-sound?`.
+                   :anchor-checked (when seq-slot
+                                     (boolean-array (alength ^longs seq-anchors)))
+                   :anchor-ok (when seq-slot
+                                (boolean-array (alength ^longs seq-anchors))))))))
     (catch Exception _ nil)))
 
 (defn- read-index
@@ -1072,8 +1211,9 @@
   ;; No primitive hints: five args with three of them primitive is one past
   ;; what Clojure allows, and the boxing here is once per anchor, not per item.
   [^Nav nav ^longs offsets stride k]
-  (let [^booleans done (:anchor-checked (.idx nav))
-        ^booleans okv (:anchor-ok (.idx nav))]
+  (let [ix (nav-idx nav)
+        ^booleans done (:anchor-checked ix)
+        ^booleans okv (:anchor-ok ix)]
     (if (or (nil? done) (>= (long k) (alength done)))
       true                                    ; no cache: nothing to verify against
       (if (aget done (int k))
@@ -1228,7 +1368,7 @@
   ([src] (items src nil))
   ([src opts]
    (let [nav (nav-of src (or opts {}))]
-     (Items. nav (.idx nav)))))
+     (Items. nav (nav-idx nav)))))
 
 (defn fork
   "A view of the same source for ANOTHER THREAD.
@@ -1261,7 +1401,7 @@
     (instance? Cursor x) (let [^Cursor c x] (cursor-at (fork-nav (.nav c)) (.off c)))
     (instance? Items x)  (let [^Items i x
                                n (fork-nav (.nav i))]
-                           (Items. n (.idx i)))
+                           (Items. n (nav-idx n)))
     :else (fail :boring/unsupported-source
                 "boring.nav/fork: expected a cursor or the result of `items`"
                 {:got (class x)})))

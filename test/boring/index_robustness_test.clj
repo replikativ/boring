@@ -1098,8 +1098,11 @@
                 the lookup path"
         (is (some? at) "the slot's delta bytes were found")
         (let [ix (#'boring.nav/read-index (#'boring.nav/nav-of damaged o))]
-          (is (some? (:slots ix)) "the damaged index is accepted")
-          (is (= [2 22 43 62 82 102] (vec (take 6 (first (:slots ix)))))
+          (is (some? (:raw-slots ix)) "the damaged index is accepted")
+          ;; Slots are expanded on demand now, so ask for node 0 rather than
+          ;; reading a pre-expanded vector.
+          (is (= [2 22 43 62 82 102]
+                 (vec (take 6 (#'boring.nav/slot-at ix 0))))
               "and anchor[2] really is one byte off")))
       (testing "yet every present key still reads back correctly"
         (let [src (nav/source damaged o)]
@@ -1521,3 +1524,37 @@
                  (try (do (nav/source bs (assoc o :trust-index bad)) nil)
                       (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
               (pr-str bad)))))))
+
+(deftest trusted-skips-validation-but-not-correctness
+  (testing ":trust-index :trusted skips the per-node far-end check, which is
+            the single dominant cost of an index on a short-lived source --
+            measured 47 us of a node's ~50 us. On sound data it must return
+            exactly what the validated path returns."
+    (let [m (into {} (for [i (range 200)] [(format "k%03d" i) {:v i :s (str "s" i)}]))
+          o {:stringref false}
+          bs (boring/encode-indexed m (assoc o :index 16))]
+      (doseq [k (map #(format "k%03d" %) (range 200))]
+        (is (= (some-> (get (nav/source bs o) k) nav/value)
+               (some-> (get (nav/source bs (assoc o :trust-index :trusted)) k)
+                       nav/value))
+            (str "trusted and validated must agree on " k)))
+      (testing "and an absent key is absent under both"
+        (is (nil? (get (nav/source bs o) "nope")))
+        (is (nil? (get (nav/source bs (assoc o :trust-index :trusted)) "nope")))))))
+
+(deftest validation-is-per-node-not-per-index
+  (testing "an unsound node must not disable the index for containers that are
+            fine -- validation moved from a load-time gate over every node to a
+            per-node verdict taken on first use"
+    (let [m {"a" (into {} (for [i (range 40)] [(format "a%02d" i) i]))
+             "b" (into {} (for [i (range 40)] [(format "b%02d" i) i]))}
+          o {:stringref false}
+          bs (boring/encode-indexed m (assoc o :index 4 :index-min 4))
+          src (nav/source bs o)]
+      ;; Both containers read correctly, and the index carries a node for each.
+      (let [ix (#'boring.nav/read-index (#'boring.nav/nav-of bs o))]
+        (is (>= (alength ^longs (:containers ix)) 2) "both containers indexed")
+        (is (some? (:node-checked ix)) "and each carries its own verdict slot"))
+      (doseq [i (range 40)]
+        (is (= i (some-> (get (get src "a") (format "a%02d" i)) nav/value)))
+        (is (= i (some-> (get (get src "b") (format "b%02d" i)) nav/value)))))))
