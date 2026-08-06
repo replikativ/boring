@@ -179,7 +179,7 @@ The contract is that only `ex-info` with a `:boring/...` type escapes.
 
 ## 3. Leaks and unbounded growth
 
-- [ ] **S10** The tag-view cache (`nav.clj:1051-1070`) grows one entry per tag
+- [x] **S10** The tag-view cache (`nav.clj:1051-1070`) grows one entry per tag
       **offset touched**, `::none` included. Measured: 2000 entries after a
       `reduce` over `nav/items` of 2000 records; 2000 useless entries for 2000
       *sets*. Contradicts `items`' own promise (`nav.clj:1826`) that "nothing
@@ -187,10 +187,17 @@ The contract is that only `ex-info` with a `:boring/...` type escapes.
       branch was built for. Its stated motivation — a caller walking rows — is
       satisfied by a single-slot `volatile!` of `[off view]`, since all rows of
       one shaped array share one tag offset.
-- [ ] **S11** The probe cache on a `NavContext` is shared across every source and
+      FIXED exactly that way. Verified: walking 200 shaped rows leaves ONE entry
+      where it left 200. Shaped projection unchanged — 33.5x against
+      realise-first at 5000 rows.
+- [x] **S11** The probe cache on a `NavContext` is shared across every source and
       never bounded: 5000 entries after 5000 distinct keys. With computed keys
       that is a leak for the life of the scan. Bound it, or say so in the
       docstring.
+      FIXED: bounded at 1024. Past the bound the encoding still happens and is
+      simply not remembered, so it costs a re-encode and never an answer. A path
+      is a handful of keys; a working set that large is not a path. Verified:
+      1024 after 3000 distinct keys.
 
 ## 4. Concurrency — clean
 
@@ -238,10 +245,10 @@ both write orderings. `slot-at` uses `AtomicReferenceArray` + CAS correctly.
       ns docstring's "no intermediate seq". For a 100k typed array that boxes
       100k numbers. Cheapest honest fix: drop the `vec`.
 - [ ] **A10** `fork` drops the context's pre-resolved config (`nav.clj:263`).
-- [ ] **A11** `fork-nav`'s fresh view cache is load-bearing — cached views close
+- [x] **A11** `fork-nav`'s fresh view cache is load-bearing — cached views close
       over the parent's Reader, so sharing would share the Reader, the one thing
       `fork` exists to prevent — and is undocumented.
-- [ ] **A12** `shapes` field name and comment are stale; it caches all three kinds
+- [x] **A12** `shapes` field name and comment are stale; it caches all three kinds
       plus negatives. Rename to `views`.
 - [ ] **A13** `Cursor.count` is misindented and calls `(major nav off)` twice.
 - [ ] **A14** Stale `declare` (`nav.clj:70`): only `->Cursor`, `cursor-at`,

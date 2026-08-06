@@ -83,11 +83,24 @@
 
 (declare slot-at node-sound?)
 
-;; `shapes` caches shaped-array descriptions by tag offset. Separate from
-;; `probes` rather than sharing it: `probes` is keyed by USER key values, so a
-;; caller whose key happened to equal a shape cache key would get a description
-;; map where encoded bytes were expected. A field costs one pointer.
-(deftype Nav [^Reader rdr opts probes idx src shapes])
+;; `views` is a ONE-SLOT cache of the last tag view built, as `[offset view]`.
+;;
+;; It was an unbounded `atom {}` keyed by offset, and it grew one entry per tag
+;; offset TOUCHED -- `::none` for non-navigable ones included. A `reduce` over
+;; `nav/items` of 2000 records retained 2000 entries; 2000 sets retained 2000
+;; useless ones. That contradicts `items`' own promise that nothing before the
+;; cursor you are holding stays live, on exactly the workload the descents were
+;; built for.
+;;
+;; One slot is enough for what the cache is FOR. Every row of one shaped array
+;; shares a single tag offset, so a caller walking rows hits the slot every
+;; time; a caller walking many different tags gains nothing from memoising each
+;; one, and a miss is `majorAt` + `headArgAt` + a map lookup.
+;;
+;; Separate from `probes` rather than sharing it: `probes` is keyed by USER key
+;; values, so a caller whose key happened to equal a cache key would get a view
+;; where encoded bytes were expected.
+(deftype Nav [^Reader rdr opts probes idx src views])
 
 (defn- nav-idx
   "The decoded index, parsed on first use.
@@ -140,15 +153,31 @@
               :else (recur lo (dec mid))))))
       -1)))
 
+(def ^:private ^:const max-cached-probes
+  "How many encoded keys one context remembers. Generous for the intended use --
+  a path is a handful of keys -- and a bound rather than a target."
+  1024)
+
 (defn- probe-for
   "The encoded bytes of `k`, cached. Key matching compares bytes rather than
   decoding keys, which is sound because encoding is deterministic for a given
   profile -- so byte equality is value equality."
   ^bytes [^Nav nav k]
-  (let [p (.probes nav)]
-    (or (get @p k)
+  (let [p (.probes nav)
+        m @p]
+    (or (get m k)
         (let [bs (boring/encode k (.opts nav))]
-          (swap! p assoc k bs)
+          ;; BOUNDED. A context is documented as reusable for as long as its
+          ;; options hold, and its cache is shared by every source opened
+          ;; through it -- so with computed keys (`(str "id-" i)`) this grew for
+          ;; the life of the scan: 5000 entries after 5000 distinct keys. Past
+          ;; the bound the encoding still happens, it is simply not remembered,
+          ;; which costs a re-encode and never an answer.
+          ;;
+          ;; The cache exists for a PATH's keys, which is a handful repeated per
+          ;; document. A working set that large is not a path, it is a leak.
+          (when (< (count m) max-cached-probes)
+            (swap! p assoc k bs))
           bs))))
 
 ;; A reusable navigation context: resolved options plus the PROBE CACHE, shared
@@ -256,7 +285,7 @@
           ;; only if something consults it.
           idx (when-not (= :ignore (:trust-index opts))
                 (delay (read-index @holder)))
-          nav (Nav. r opts probes idx src (atom {}))]
+          nav (Nav. r opts probes idx src (volatile! nil))]
       (vreset! holder nav)
       nav)))
 
@@ -265,6 +294,11 @@
         ^Reader r (cond (bytes? src) (Reader. ^bytes src)
                         :else (Reader. ^ByteSource src))]
     (boring/configure-reader! r (.opts n))
+    ;; A FRESH VIEW SLOT, and that is load-bearing rather than tidy: a cached
+    ;; view holds closures over the parent's `nav`, hence over the parent's
+    ;; Reader. Sharing the slot across a fork would share the Reader, which is
+    ;; the one thing `fork` exists to prevent.
+    ;;
     ;; The decoded INDEX is shared -- it is immutable once built and it is the
     ;; expensive part: 145 us for a 20 000-item index against 175 ns for a
     ;; Reader. A fresh probe cache rather than a shared one, because it is the
@@ -276,7 +310,7 @@
     ;; forking thread keeps the sharing -- 145 us for a 20 000-item index --
     ;; without the aliasing.
     (let [ix (nav-idx n)]
-      (Nav. r (.opts n) (atom {}) (when ix (delay ix)) src (atom {})))))
+      (Nav. r (.opts n) (atom {}) (when ix (delay ix)) src (volatile! nil)))))
 
 (defn source
   "A navigable view over `src` -- a byte[], or a ByteSource such as
@@ -1158,16 +1192,17 @@
   ANY exception yields nil. Damaged bytes mean \"not a form I recognise\", never
   a throw out of `get`; the realising fallback still answers."
   [^Nav nav ^long off]
-  (let [cache (.shapes nav)]
-    (if-some [hit (get @cache off)]
-      (when-not (identical? ::none hit) hit)
+  (let [slot (.views nav)
+        hit @slot]
+    (if (and hit (= (nth hit 0) off))
+      (let [v (nth hit 1)] (when-not (identical? ::none v) v))
       (let [v (try
                 (when (= MAJOR-TAG (major nav off))
                   (let [tag (.headArgAt ^Reader (.rdr nav) off)]
                     (when-let [build (tag-view-builders tag)]
                       (build nav off tag))))
                 (catch Exception _ nil))]
-        (swap! cache assoc off (if (nil? v) ::none v))
+        (vreset! slot [off (if (nil? v) ::none v)])
         v))))
 
 ;; --------------------------------------------------------------- public API
