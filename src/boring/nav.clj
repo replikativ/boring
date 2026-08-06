@@ -968,7 +968,15 @@
               size (long (:size spec))
               rd (:read spec)
               data (.headEndAt r bs)]
-          (when (and (<= 0 blen) (zero? (rem blen size)))
+          ;; THE PAYLOAD MUST ACTUALLY BE THERE. `Reader.readTypedArray` bounds
+          ;; the declared byte-string length against what remains
+          ;; (`checkCount`); this did not, so a tag-79 header claiming 1 MiB
+          ;; over eight real bytes reported `count` 131072 and FABRICATED an
+          ;; element from `nth 0` -- a value `decode` refuses with
+          ;; :boring/bad-count. Not an out-of-bounds read, since `bytesBetween`
+          ;; is range-checked, but a wrong answer, which is worse.
+          (when (and (<= 0 blen) (zero? (rem blen size))
+                     (<= (+ data blen) (.size r)))
             (let [n (quot blen size)
                   at (fn [^long i]
                        (if (or (neg? i) (>= i n))
@@ -998,22 +1006,58 @@
               (when (= MAJOR-ARRAY (.majorAt r rows-off))
                 (let [k (.headArgAt r ks-off)
                       n (.headArgAt r rows-off)]
-                  (when (and (<= 0 k) (<= 0 n))
+                  ;; `(pos? k)`: the Reader requires at least one key
+                  ;; (`Reader.java`), and a zero-key shape navigated to `[{}]`
+                  ;; against a `:boring/bad-tag-content` from `decode`.
+                  (when (and (pos? k) (<= 0 n))
                     (let [ks (loop [i 0 p (.headEndAt r ks-off) acc (transient [])]
                                (if (= i k)
                                  (persistent! acc)
                                  (recur (inc i) (skip r p)
                                         (conj! acc (realize nav p)))))
+                          ;; DUPLICATE KEYS, which the Reader rejects
+                          ;; unconditionally in `checkShapeKeys`. `:pos` is built
+                          ;; with `assoc!` so the last wins, while `:ks` keeps
+                          ;; both -- one cursor then reported `count` 2 with
+                          ;; `(count (value c))` 1. O(K) once per view, against
+                          ;; keys already realised on the line above.
+                          dup? (not= (count ks) (count (set ks)))
                           sh {:ks ks
                               :pos (persistent!
                                     (reduce-kv (fn [m i kk] (assoc! m kk i))
                                                (transient {}) ks))}
+                          ;; EVERY ROW IS CHECKED WHEN IT IS REACHED, not when
+                          ;; the view is built. The Reader enforces
+                          ;; `row length == key count`; a 3-value row against 2
+                          ;; keys navigated fine here.
+                          ;;
+                          ;; Deliberately NOT validated up front. Checking every
+                          ;; row eagerly takes shaped `count` from 644 ns to
+                          ;; 10.4 us -- 16x on well-formed data -- and it would
+                          ;; also be WRONG: `count` reads the rows-array header
+                          ;; and touches no row, so a bad row 5 is not in the
+                          ;; subtree it examined. Charging it for that is the
+                          ;; same mistake as charging a partial read for
+                          ;; `:max-items`. On the paths that DO walk rows --
+                          ;; `seq`, `reduce`, `nth i` -- the check comes for
+                          ;; free, 0.68 ns/row, because they are there already.
+                          row-ok? (fn [^long p]
+                                    (and (= MAJOR-ARRAY (.majorAt r p))
+                                         (= k (.headArgAt r p))))
                           at (fn [^long i]
                                (let [p (nth-item nav rows-off i)]
-                                 (if (neg? p) ::miss (->Cursor nav p sh))))]
-                      {:kind :vector :n n :nth at :key-pred integer?
-                       :items (fn [] (map #(->Cursor nav % sh)
-                                          (child-offsets nav rows-off)))})))))))))))
+                                 (cond (neg? p) ::miss
+                                       (not (row-ok? p))
+                                       (fail :boring/bad-tag-content
+                                             (str "boring.nav: shaped row " i
+                                                  " does not carry exactly " k
+                                                  " values, which is what its shape declares")
+                                             {:offset p :row i :expected k})
+                                       :else (->Cursor nav p sh))))]
+                      (when-not dup?
+                        {:kind :vector :n n :nth at :key-pred integer?
+                         ;; through `at`, so every row is checked here too
+                         :items (fn [] (map at (range n)))}))))))))))))
 
 (defn- record-view
   "WRAPPER. A record writes `27([name, {fields}])`, so the field map begins past

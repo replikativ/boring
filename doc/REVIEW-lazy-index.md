@@ -154,19 +154,28 @@ The contract is that only `ex-info` with a `:boring/...` type escapes.
       Proving comparability means realising every key at view-build: O(K) on the
       operation the descent made O(log K). Revisitable via the shaped-row
       watermark pattern if anyone stores sorted-maps hot.
-- [ ] **S8** `typed-view` (`nav.clj:928`) never bounds the payload against the
+- [x] **S8** `typed-view` (`nav.clj:928`) never bounds the payload against the
       source. Tag 79 declaring 1 MiB with 8 bytes present: `count` -> 131072,
       `nth 0` fabricates an element; `decode` -> `:boring/bad-count`.
       `readTypedArray` checks this via `checkCount` (`Reader.java:2073`).
-- [ ] **S9** `shaped-view` (`nav.clj:938`) does not enforce **row length == key
+      FIXED: the view is refused unless `data + blen` fits the source. The
+      crafted cases now report `:boring/bad-count` from nav and decode alike.
+- [x] **S9** `shaped-view` (`nav.clj:938`) does not enforce **row length == key
       count** (`Reader.java:2554`), does not reject **duplicate shape keys**
       (`checkShapeKeys`, `Reader.java:1785`), and does not require **n >= 1**.
       A 3-value row against 2 keys navigates; a duplicate-key shape gives
       `count` 2 with `(count (value c))` 1 on one cursor.
-      Row-length checking must be **incremental** — a validated-up-to watermark
-      in the cached view. Eagerly it takes shaped `count` from 644 ns to 10.4 us
-      (16x) on well-formed data, while on any path that already walks rows
-      (`seq`, `reduce`, `nth i`) it is free: 0.68 ns/row.
+      FIXED, and the row check is PER ROW ON ACCESS rather than the watermark
+      the review proposed. Same cost on the walking paths, and simpler — but the
+      reason to prefer it is correctness, not simplicity: `count` reads the
+      rows-array header and touches no row, so a bad row 5 is not in the subtree
+      it examined, and charging it for one is the same mistake as charging a
+      partial read for `:max-items`. Verified: a document whose row 1 is
+      malformed answers `count` 2 and `nth 0` normally, while `nth 1` and
+      `value` raise exactly what `decode` raises.
+
+      `n >= 1` and duplicate-key rejection are at view build, O(K) once, against
+      keys already realised there.
 
 ## 3. Leaks and unbounded growth
 
