@@ -57,9 +57,13 @@ PY
 }
 
 echo "──▶ index-mutants"
-check "index load"            "          (when ok?" "          (when (and ok? false)"
+# The variable is `seq-ok?` since per-node validation landed -- `ok?` named a
+# whole-index verdict that no longer exists.
+check "index load"            "          (when seq-ok?" "          (when (and seq-ok? false)"
 check "Items.nth anchors"     "(if-not (anchor-sound? nav offsets stride anchor)" "(if-not true"
-check "lookup-map (map key)"  "    (if (or (neg? ns) (zero? (alength ^longs (nth (:slots idx) ns))))" "    (if true"
+# `(:slots idx)` became `slot-at`, which expands and memoizes per node rather
+# than eagerly for every node at load.
+check "lookup-map (map key)"  "    (if (or (neg? ns) (zero? (alength ^longs (slot-at idx ns))))" "    (if true"
 check "nth-item (array elem)" "        (if (neg? ns)" "        (if true"
 restore
 

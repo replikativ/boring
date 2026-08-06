@@ -98,7 +98,7 @@
                 (and (some? realised) (.isArray (class realised))))
         (or
          (let [want (count (if (and (some? realised) (.isArray (class realised)))
-                            (seq realised) realised))
+                             (seq realised) realised))
                got (try (count c) (catch Exception e e))]
            (when-not (or (declined? got) (same? want got))
              (fail :count want got)))

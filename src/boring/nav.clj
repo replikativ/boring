@@ -709,9 +709,9 @@
         ;; 2^31, where `clojure.core/get` on the realised vector is total and
         ;; simply answers not-found. `nth-item` already range-checks against the
         ;; container's own count, so the long reaches it and comes back -1.
-        (and (= mj MAJOR-ARRAY) (integer? k))
-        (let [p (nth-item nav off (long k))]
-          (if (neg? p) nf (cursor-at nav p)))
+          (and (= mj MAJOR-ARRAY) (integer? k))
+          (let [p (nth-item nav off (long k))]
+            (if (neg? p) nf (cursor-at nav p)))
         ;; A tag's reader is arbitrary, so structure does not imply semantics.
         ;; Realise and let clojure.core decide -- correct for every registry.
         ;; `clojure.core/get` is total EXCEPT on a sorted collection, where an
@@ -870,7 +870,7 @@
                   {:offset off :declared n}))
           (int n))
         (let [mj (major nav off)]
-        (if (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP))
+          (if (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP))
         ;; CHECKED against the data, which this was the one entry point not to
         ;; do. `(int n)` on a head declaring 2^31 entries threw an untyped
         ;; ArithmeticException, and below that it returned an IMPOSSIBLE number
@@ -891,18 +891,18 @@
         ;;
         ;; One entry is at least one byte, so a count larger than the bytes
         ;; that follow cannot be honest.
-        (let [n (head-count nav off)
-              room (- (.size ^Reader (.rdr nav)) (.headEndAt ^Reader (.rdr nav) off))
-              need (if (= mj MAJOR-MAP) (* 2 n) n)]
-          (when (or (neg? n) (> need room))
-            (fail :boring/bad-count
-                  (str "boring.nav: a container declaring " n
-                       " entries cannot fit in the " room " bytes that follow")
-                  {:offset off :declared n}))
-          (int n))
-        (fail :boring/not-a-container
-              "boring.nav: count is only defined for arrays and maps"
-              {:offset off :major mj}))))))
+            (let [n (head-count nav off)
+                  room (- (.size ^Reader (.rdr nav)) (.headEndAt ^Reader (.rdr nav) off))
+                  need (if (= mj MAJOR-MAP) (* 2 n) n)]
+              (when (or (neg? n) (> need room))
+                (fail :boring/bad-count
+                      (str "boring.nav: a container declaring " n
+                           " entries cannot fit in the " room " bytes that follow")
+                      {:offset off :declared n}))
+              (int n))
+            (fail :boring/not-a-container
+                  "boring.nav: count is only defined for arrays and maps"
+                  {:offset off :major mj}))))))
 
   clojure.lang.Seqable
   (seq [_]
@@ -965,18 +965,18 @@
             n (head-count nav off)]
         (cond
           (= mj MAJOR-ARRAY)
-        (loop [i 0 p (.headEndAt r off) acc init]
-          (if (or (= i n) (reduced? acc))
-            (unreduced acc)
-            (recur (inc i) (skip r p) (f acc (cursor-at nav p)))))
-        (= mj MAJOR-MAP)
-        (loop [i 0 p (.headEndAt r off) acc init]
-          (if (or (= i n) (reduced? acc))
-            (unreduced acc)
-            (let [vp (skip r p)]
-              (recur (inc i) (skip r vp)
-                     (f acc (clojure.lang.MapEntry. (realize nav p)
-                                                    (cursor-at nav vp)))))))
+          (loop [i 0 p (.headEndAt r off) acc init]
+            (if (or (= i n) (reduced? acc))
+              (unreduced acc)
+              (recur (inc i) (skip r p) (f acc (cursor-at nav p)))))
+          (= mj MAJOR-MAP)
+          (loop [i 0 p (.headEndAt r off) acc init]
+            (if (or (= i n) (reduced? acc))
+              (unreduced acc)
+              (let [vp (skip r p)]
+                (recur (inc i) (skip r vp)
+                       (f acc (clojure.lang.MapEntry. (realize nav p)
+                                                      (cursor-at nav vp)))))))
           :else (fail :boring/not-a-container
                       "boring.nav: reduce is only defined for arrays and maps"
                       {:offset off :major mj})))))
@@ -1066,9 +1066,9 @@
    78 {:size 4 :read (fn [^bytes b] (Integer/valueOf (unchecked-int (le-long b 4))))}
    79 {:size 8 :read (fn [^bytes b] (Long/valueOf (le-long b 8)))}
    85 {:size 4 :read (fn [^bytes b] (Float/valueOf (Float/intBitsToFloat
-                                                   (unchecked-int (le-long b 4)))))}
+                                                    (unchecked-int (le-long b 4)))))}
    86 {:size 8 :read (fn [^bytes b] (Double/valueOf (Double/longBitsToDouble
-                                                    (le-long b 8))))}})
+                                                     (le-long b 8))))}})
 
 (defn- typed-view
   "SCALAR-DECODING. Elements are packed into a byte string rather than written
@@ -1126,11 +1126,11 @@
   [^Nav nav ^long off ^long tag]
   (when (= tag TAG-SHAPED-ARRAY)
     (let [^Reader r (.rdr nav)
-          pair (.headEndAt r off)]
-      (when (and (= MAJOR-ARRAY (.majorAt r pair)) (= 2 (.headArgAt r pair)))
-        (let [ks-off (.headEndAt r pair)]
+          pr (tag-pair r off)]
+      (when pr
+        (let [ks-off (nth pr 0)]
           (when (= MAJOR-ARRAY (.majorAt r ks-off))
-            (let [rows-off (skip r ks-off)]
+            (let [rows-off (nth pr 1)]
               (when (= MAJOR-ARRAY (.majorAt r rows-off))
                 (let [k (.headArgAt r ks-off)
                       n (.headArgAt r rows-off)]
@@ -1206,11 +1206,11 @@
   [^Nav nav ^long off ^long tag]
   (when (= tag TAG-RECORD)
     (let [^Reader r (.rdr nav)
-          pair (.headEndAt r off)]
-      (when (and (= MAJOR-ARRAY (.majorAt r pair)) (= 2 (.headArgAt r pair)))
-        (let [name-off (.headEndAt r pair)]
+          pr (tag-pair r off)]
+      (when pr
+        (let [name-off (nth pr 0)]
           (when (= MAJOR-TEXT (.majorAt r name-off))
-            (let [payload (skip r name-off)]
+            (let [payload (nth pr 1)]
               ;; a POSITIONAL record -- datahike's Datom carries a vector --
               ;; is not a map and gets no descent here
               (when (= MAJOR-MAP (.majorAt r payload))
@@ -1250,19 +1250,18 @@
                     ;; Revisitable: the shaped-row watermark shows how to verify
                     ;; incrementally instead. Not worth it until someone stores
                     ;; sorted-maps hot.
-                    (do
-                      {:kind :map
-                       :n (head-count nav payload)
-                       :lookup
-                       (fn [k]
-                         (let [p (lookup-map nav payload k)]
-                           (if (neg? p) ::miss (cursor-at nav p))))
-                       :entries
-                       (fn []
-                         (map (fn [[kp vp]]
-                                (clojure.lang.MapEntry. (realize nav kp)
-                                                        (cursor-at nav vp)))
-                              (partition 2 (child-offsets nav payload))))})))))))))))
+                    {:kind :map
+                     :n (head-count nav payload)
+                     :lookup
+                     (fn [k]
+                       (let [p (lookup-map nav payload k)]
+                         (if (neg? p) ::miss (cursor-at nav p))))
+                     :entries
+                     (fn []
+                       (map (fn [[kp vp]]
+                              (clojure.lang.MapEntry. (realize nav kp)
+                                                      (cursor-at nav vp)))
+                            (partition 2 (child-offsets nav payload))))}))))))))))
 
 ;; Dispatch by TAG NUMBER, not by trying each in turn. Three sequential probes
 ;; ran on every tag cursor before this; one lookup replaces them, so unifying
@@ -1501,9 +1500,9 @@
   `Reader.skipFrom`, which does an unchecked array access and throws a raw
   AIOOBE at the caller."
   [^Reader r ptr c cnt st ^longs a]
-  (let [ptr (long ptr) c (long c) cnt (long cnt) st (long st)]
-(let [want (if (zero? cnt) 0 (inc (quot (dec cnt) st)))]
-            (and (= (alength a) want)
+  (let [ptr (long ptr) c (long c) cnt (long cnt) st (long st)
+        want (if (zero? cnt) 0 (inc (quot (dec cnt) st)))]
+    (and (= (alength a) want)
                  ;; The node must describe a container that IS THERE
                  ;; and has the entry count it claims, and its first
                  ;; anchor must be that container's first entry.
@@ -1512,24 +1511,24 @@
                  ;; tidy but point at the wrong places, which passed
                  ;; every earlier check and silently returned a
                  ;; neighbouring value.
-                 (if (neg? c)
+         (if (neg? c)
                    ;; the sequence node: its first item is byte 0
-                   (or (zero? want) (zero? (aget a 0)))
-                   (and (< c ptr)
-                        (#{4 5} (.majorAt r c))
-                        (= cnt (.headArgAt r c))
-                        (or (zero? want)
-                            (= (long (aget a 0)) (.headEndAt r c)))))
+           (or (zero? want) (zero? (aget a 0)))
+           (and (< c ptr)
+                (#{4 5} (.majorAt r c))
+                (= cnt (.headArgAt r c))
+                (or (zero? want)
+                    (= (long (aget a 0)) (.headEndAt r c)))))
                  ;; anchors ascend, sit inside the data section, and
                  ;; for a real container start after its own header
-                 (loop [k 0 prev -1]
-                   (if (>= k (alength a))
-                     true
-                     (let [v (long (aget a k))]
-                       (if (and (> v prev) (<= 0 v) (< v ptr)
-                                (or (neg? c) (> v c)))
-                         (recur (inc k) v)
-                         false))))
+         (loop [k 0 prev -1]
+           (if (>= k (alength a))
+             true
+             (let [v (long (aget a k))]
+               (if (and (> v prev) (<= 0 v) (< v ptr)
+                        (or (neg? c) (> v c)))
+                 (recur (inc k) v)
+                 false))))
                  ;; AND THE FAR END, which nothing pinned.
                  ;;
                  ;; Every check above is about the START of the node
@@ -1565,8 +1564,8 @@
                  ;; land EXACTLY on the node's end -- the data
                  ;; section's end for the sequence, the container's
                  ;; own end otherwise.
-                 (let [m (alength a)]
-                   (or (if (neg? c)
+         (let [m (alength a)]
+           (or (if (neg? c)
                          ;; A SEQUENCE NODE CLAIMING ZERO ITEMS has
                          ;; no anchors, so the far-end check below
                          ;; short-circuits and never looks at the
@@ -1575,18 +1574,18 @@
                          ;; its records. Zero items is only honest
                          ;; if the data section is empty, which is
                          ;; one comparison.
-                         (and (zero? m) (zero? ptr))
-                         (zero? m))
-                       (let [covered (* st (dec m))
-                             remaining (- cnt covered)
-                             per (if (and (not (neg? c)) (= MAJOR-MAP (.majorAt r c)))
-                                   2 1)
-                             n (* per remaining)
-                             want-end (if (neg? c) ptr (skip r c))]
-                         (and (pos? remaining)
-                              (= want-end
-                                 (loop [k 0 p (long (aget a (dec m)))]
-                                   (if (= k n) p (recur (inc k) (skip r p)))))))))))))
+                 (and (zero? m) (zero? ptr))
+                 (zero? m))
+               (let [covered (* st (dec m))
+                     remaining (- cnt covered)
+                     per (if (and (not (neg? c)) (= MAJOR-MAP (.majorAt r c)))
+                           2 1)
+                     n (* per remaining)
+                     want-end (if (neg? c) ptr (skip r c))]
+                 (and (pos? remaining)
+                      (= want-end
+                         (loop [k 0 p (long (aget a (dec m)))]
+                           (if (= k n) p (recur (inc k) (skip r p))))))))))))
 
 (defn- slot-at
   "Absolute anchors for node `i`, expanded on first use and memoized.
