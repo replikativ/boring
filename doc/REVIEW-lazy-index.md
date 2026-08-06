@@ -265,8 +265,29 @@ both write orderings. `slot-at` uses `AtomicReferenceArray` + CAS correctly.
 
 ## 6. Open questions and deferred
 
-- [ ] **Q1** Audit `frame.cljc` and the index path for the same "what we emit vs
-      what we accept" gap. It held three-for-three in `nav.clj`.
+- [x] **Q1** AUDITED, clean. Detection is already shared: `boring.frame` exists
+      precisely because "is this boring's index footer" had FOUR
+      implementations, and its docstring records what each weaker copy cost.
+      `nav/read-index*` uses `frame/prefix-array` rather than a fifth.
+
+      Payload acceptance was the open question -- `nav/index-payload` decides
+      whether a frame is USABLE while `decode-seq` uses `frame/index-frame?` to
+      decide whether to HIDE it, and a disagreement would make a document lose
+      or gain an item. Swept every single-byte mutation of the footer of a
+      40-item sealed sequence (159 mutants) comparing `decode-seq` against
+      `nav/items`: **no disagreements**, in count or in values.
+
+      METHOD NOTE, because it nearly produced a false report. The first three
+      runs showed 64 "disagreements" that were all the same artefact: `=`
+      compares Java arrays by IDENTITY, the frame payload is full of
+      `int[]`/`short[]`, and a broken footer is yielded as a DATA item -- so two
+      decodes of identical bytes never compared equal. A hand-written deep
+      equality fixed the top level and failed again inside a TaggedLiteral's
+      payload. Comparing RE-ENCODED BYTES is the robust form: encoding is
+      deterministic, so equal bytes is equal values, and it sees through every
+      wrapper. This is the third time this trap has come up in one session --
+      it also produced a phantom failure in `nav-conformance` and one in the
+      shaped-array benchmark.
 - [ ] **Q2** Suspicion: `child-offsets` (`nav.clj:527`) compares the declared
       count against `room` **before** doubling for maps, while `Cursor.count`
       compares `2n`. Cosmetic (both typed) but the guards should agree.
