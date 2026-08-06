@@ -402,6 +402,57 @@ public final class Reader {
         resetState();
     }
 
+    /**
+     * Point at the FIRST `len` bytes of `b`, treating the rest as absent.
+     *
+     * <p><b>Why the one-argument form is not enough.</b> {@link #reset(byte[])}
+     * takes the array's whole length as the limit -- there is nothing else it
+     * could take. A caller reading many short messages through ONE REUSED
+     * BUFFER therefore left the limit at the buffer's capacity, and every
+     * truncation check ran against bytes the PREVIOUS message had left behind.
+     * A damaged message then decoded as whatever was still lying there:
+     *
+     * <pre>
+     *   fresh reader on a truncated row:  boring: declared count 27 needs at
+     *                                     least 27 bytes but only 21 remain
+     *   reused buffer, same bytes:        {:aaa 1, :bbb "hello world ..."}
+     *                                     -- silently the PREVIOUS row
+     * </pre>
+     *
+     * That is the reader's stated contract inverted. Damaged input is supposed
+     * to become a typed error, and instead it became a plausible wrong value,
+     * which is the one outcome a decoder must never produce.
+     *
+     * <p>{@link #reset(ByteSource)} never had this problem -- {@code bind}
+     * takes {@code s.size()} -- so it was only ever the array path, and only
+     * when the array outlives the message in it.
+     *
+     * <p>The other caller is {@code decode-seq-from}, which copied its buffer
+     * on EVERY refill purely for want of this method: 3.2x to 5.5x the
+     * allocation of decoding the same bytes from memory, rising with item size.
+     * A length argument makes the copy unnecessary.
+     *
+     * <p>Fields are assigned directly rather than through {@code bindArray},
+     * which would set the limit to the array's length and have to be corrected
+     * -- and rather than through the same-array shortcut in
+     * {@link #reset(byte[])}, which would leave a stale {@code src} behind if
+     * the previous bind came from a ByteSource whose {@code heapArray} was this
+     * array.
+     *
+     * @param len bytes of `b` that are valid, from offset 0
+     * @throws IllegalArgumentException if `len` is negative or past the array
+     */
+    public void reset(byte[] b, int len) {
+        if (len < 0 || len > b.length)
+            throw new IllegalArgumentException(
+                "reset length " + len + " outside an array of " + b.length);
+        this.src = null;
+        this.arr = b;
+        this.pos = 0;
+        this.limit = len;
+        resetState();
+    }
+
     public void reset(ByteSource s) {
         bind(s);
         resetState();

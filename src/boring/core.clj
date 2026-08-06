@@ -1646,24 +1646,28 @@
   memory to be a Clojure value at all, so streaming can only ever mean a
   sequence of items -- which is exactly what a datahike dump is.
 
-  The CONSTANT on that bound is several, not one, and this used to say \"plus
-  the chunk size\" as though it were one. `refill!` ends with
-  `(.reset r (Arrays/copyOf buf new-limit))`: `Reader.reset` has no
-  `(byte[], off, len)` form, so every refill allocates a full second copy of a
-  buffer `grow` has already doubled to hold the largest item. Measured as
-  bytes allocated per byte of file, over 32 MiB of byte-string items, with
-  `decode-seq` on the same bytes in the same run as the control:
+  The CONSTANT on that bound is more than one, and it rises with item size.
+  Measured as bytes allocated per byte of file, over 32 MiB of byte-string
+  items, against `decode-seq` on the same bytes in the same run:
 
       item size    decode-seq-from     decode-seq (control)
-      1 MiB              3.2x                 1.00x
-      4 MiB              3.6x                 1.00x
-     16 MiB              5.5x                 1.00x
+      1 MiB              1.13x                1.00x
+      4 MiB              1.50x                1.00x
+     16 MiB              3.00x                1.00x
 
   Linear in the file, not quadratic -- I looked for that specifically -- but
-  rising with item size, because the copied buffer tracks the largest item
-  rather than the chunk. ClojureScript's refill hands its reader
-  `(.subarray buf 0 new-limit)` -- a view over the same storage, not a copy --
-  so it pays the buffer's growth and nothing on top of it.
+  tracking the LARGEST ITEM rather than the chunk, because that is what `grow`
+  sizes the buffer for.
+
+  `refill!` used to end with `(.reset r (Arrays/copyOf buf new-limit))`,
+  allocating a full second copy of that already-doubled buffer on EVERY refill,
+  purely because `Reader.reset` had no length form and an array's own length
+  was the only limit it could take. `Reader.reset(byte[], int)` removes the
+  copy -- the reader is pointed at the first `new-limit` bytes of the buffer it
+  already has. That is what ClojureScript's refill always did with
+  `(.subarray buf 0 new-limit)`, so the two now agree in shape as well as in
+  result. (The figures above are after the change; the ones this docstring
+  carried before it were 3.2x, 3.6x and 5.5x, from a separate run.)
 
   The reader's hot path is untouched. Refilling happens between items, not
   inside `u8()`, so this costs nothing when decoding from a byte array.
@@ -1715,7 +1719,11 @@
                  (vreset! state {:buf buf :limit new-limit :last-good 0
                                  :base (+ base last-good)
                                  :eof? (or eof? (neg? n))})
-                 (.reset r (java.util.Arrays/copyOf buf (int new-limit)))
+                 ;; The buffer itself, bounded -- not a copy of it. Anything
+                 ;; past `new-limit` is the previous refill's leftovers, and
+                 ;; the length argument is what keeps the reader from reading
+                 ;; them as though they were data.
+                 (.reset r buf (int new-limit))
                  (pos? n)))
              (step []
                (lazy-seq
