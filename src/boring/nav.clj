@@ -68,7 +68,7 @@
 (set! *warn-on-reflection* true)
 
 (declare ->Cursor cursor-at read-index read-index* shape-at typed-at typed-nth
-         nth-item realize)
+         record-at record-key-ok? nth-item realize lookup-map head-count child-offsets)
 
 ;; A shaped array is `39649([keys, [row, row, ...]])`, where each row is an
 ;; ARRAY of values positionally matching `keys`. It REALISES to a vector of
@@ -235,6 +235,7 @@
 
 ;; ------------------------------------------------------------- wire queries
 
+(def ^:private ^:const MAJOR-TEXT 3)
 (def ^:private ^:const MAJOR-ARRAY 4)
 (def ^:private ^:const MAJOR-MAP 5)
 (def ^:private ^:const MAJOR-TAG 6)
@@ -570,16 +571,21 @@
         ;; matter either: the FIRST key costs the same as the last, which is the
         ;; signature of realisation rather than a scan that short-circuits.
         ;;
-        ;; So it is not only `sorted-map`. Records and sets are tag cursors too,
-        ;; and until a descent exists for them, anything navigated hot wants a
-        ;; profile that leaves its containers bare.
+        ;; DESCENTS NOW EXIST FOR THREE OF THESE, each measured reaching the
+        ;; last element and each FLAT in size where realising grew:
         ;;
-        ;; SHAPED ARRAYS ARE NO LONGER AMONG THEM. `:shapes` used to cost
-        ;; projection roughly 4x for its ~2x size win; descending instead of
-        ;; realising made it 36.9x faster on 5000 rows (5.60 us against 206.83)
-        ;; and FLAT in row count, which puts it level with the unshaped
-        ;; encoding at half the bytes. The fork users had to choose between --
-        ;; small or navigable -- is gone for this shape.
+        ;;   shaped arrays   5.60 us against 206.83   (5000 rows)   36.9x
+        ;;   typed arrays    1.77 us against  70.90   (100k longs)    40x
+        ;;   records         7.91 us against 577.18   (2000 keys)     73x
+        ;;
+        ;; `:shapes` used to cost projection roughly 4x for its ~2x size win,
+        ;; so the fork users had to choose between -- small or navigable -- is
+        ;; gone for that shape.
+        ;;
+        ;; SETS ARE NOT AMONG THEM, and a registered tag-27 name is not either:
+        ;; `get` on a set means MEMBERSHIP, which no structural descent
+        ;; reproduces, and a registered ctor is an arbitrary `IFn`. Both still
+        ;; realise, which is what already worked.
         ;;
         ;; Descending into a tag in general means knowing its reader preserves
         ;; structure, which is a registry question rather than a format one, and
@@ -598,8 +604,16 @@
             ;; an integer key has to keep meaning the same thing here.
             (if-some [t (typed-at nav off)]
               (if (integer? k) (typed-nth nav t (long k) nf) nf)
-              (try (get (realize nav off) k nf)
-                   (catch ClassCastException _ nf))))
+              ;; A record's field map is an ordinary indexed container; only
+              ;; the cursor was standing in front of it.
+              (if-some [rc (record-at nav off)]
+                (if (record-key-ok? rc k)
+                  (let [p (lookup-map nav (long (:payload rc)) k)]
+                    (if (neg? p) nf (cursor-at nav p)))
+                  (try (get (realize nav off) k nf)
+                       (catch ClassCastException _ nf)))
+                (try (get (realize nav off) k nf)
+                     (catch ClassCastException _ nf)))))
           :else nf))))
 
   clojure.lang.Indexed
@@ -635,12 +649,17 @@
             ;; primitive array to read one of them.
             (if-some [t (typed-at nav off)]
               (typed-nth nav t i nf)
-              (let [v (realize nav off)]
-                (if (or (nil? v) (instance? clojure.lang.Indexed v)
-                        (instance? java.util.List v) (string? v)
-                        (and (some? v) (.isArray (class v))))
-                  (nth v i nf)
-                  nf))))
+              ;; A record realises to a map or an UnknownRecord, neither of
+              ;; which is Indexed, so this was already not-found -- but it
+              ;; realised the whole record to discover that.
+              (if (record-at nav off)
+                nf
+                (let [v (realize nav off)]
+                  (if (or (nil? v) (instance? clojure.lang.Indexed v)
+                          (instance? java.util.List v) (string? v)
+                          (and (some? v) (.isArray (class v))))
+                    (nth v i nf)
+                    nf)))))
           :else nf))))
 
   ;; Honest O(1): the count is in the head, and head-count refuses the
@@ -659,7 +678,11 @@
       ;; refuse every tag while `nth` on a typed array worked through the
       ;; realising path -- countable by nobody, indexable by anyone.
       (if-let [sh (and (= MAJOR-TAG (major nav off))
-                       (or (shape-at nav off) (typed-at nav off)))]
+                       (or (shape-at nav off) (typed-at nav off)
+                           ;; A record counts its FIELDS, as UnknownRecord and
+                           ;; sorted-map both do.
+                           (when-let [rc (record-at nav off)]
+                             {:n (head-count nav (long (:payload rc)))})))]
         (int (:n sh))
         (let [mj (major nav off)]
         (if (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP))
@@ -712,10 +735,17 @@
           (seq (mapv (fn [[kp vp]]
                        (clojure.lang.MapEntry. (realize nav kp) (cursor-at nav vp)))
                      (partition 2 (child-offsets nav off))))
-          ;; A shaped array seqs as its ROWS, like the vector it realises to.
+          ;; A shaped array seqs as its ROWS, like the vector it realises to;
+          ;; a record seqs as its FIELDS. Both keep the wire order, which is
+          ;; already the order the realised value would give -- a sorted-map is
+          ;; written in its own iteration order, which is sorted.
           (= mj MAJOR-TAG)
-          (when-some [sh (shape-at nav off)]
-            (seq (mapv #(->Cursor nav % sh) (child-offsets nav (long (:rows sh))))))
+          (if-some [sh (shape-at nav off)]
+            (seq (mapv #(->Cursor nav % sh) (child-offsets nav (long (:rows sh)))))
+            (when-some [rc (record-at nav off)]
+              (seq (mapv (fn [[kp vp]]
+                           (clojure.lang.MapEntry. (realize nav kp) (cursor-at nav vp)))
+                         (partition 2 (child-offsets nav (long (:payload rc))))))))
           :else nil))))
 
   ;; IReduce as well as IReduceInit: `(reduce f coll)` -- the arity everyone
@@ -735,7 +765,8 @@
     ;; A non-shaped tag must still fall through to the `:else` below, which
     ;; refuses. Testing MAJOR-TAG alone would have turned that typed refusal
     ;; into a silent `init`.
-    (if (or shape (and (= MAJOR-TAG (major nav off)) (shape-at nav off)))
+    (if (or shape (and (= MAJOR-TAG (major nav off))
+                       (or (shape-at nav off) (record-at nav off))))
       ;; Both shaped forms go through `seq`, which already knows how to present
       ;; them. Duplicating the walk here would be a second place for the
       ;; key-to-position mapping to drift from the first.
@@ -850,6 +881,71 @@
     nf
     (let [p (+ (long (:data t)) (* i (long (:size t))))]
       ((:read t) (.bytesBetween ^Reader (.rdr nav) p (+ p (long (:size t))))))))
+
+(defn- record-at
+  "Description of the tag-27 record at `off` whose payload is a MAP, or nil.
+
+  `{:payload <offset of the field map> :sorted? <is it clojure/sorted-map>}`
+
+  A record puts its field map past the tag and the name -- 22 bytes for
+  `clojure/sorted-map` -- so the cursor stands on the TAG, `node-slot` is asked
+  about the tag's offset, and no index node matches. Measured on 2000 keys:
+  550 us realising against 0.26 us for the same pairs as a bare map.
+
+  The CURSOR STAYS ON THE TAG. Only the container operations redirect to the
+  payload, so `value` still realises the record rather than the bare map and
+  `value-type` still says `:tag`. That is why this needs no cursor state, unlike
+  the shaped-row case.
+
+  REFUSES A REGISTERED NAME. `TagRegistry.recordCtor` is an arbitrary `IFn`: a
+  handler may rename fields, drop them or return something that is not a map at
+  all, and descending past it would answer from bytes the reader would never
+  have produced. Unregistered names decode to `UnknownRecord`, whose `valAt`,
+  `count` and `seq` delegate straight to the field map -- so descent is exactly
+  equivalent there. Letting a registered handler DECLARE itself
+  structure-preserving is the extension point this leaves open."
+  [^Nav nav ^long off]
+  (let [cache (.shapes nav)
+        ck [:record off]]
+    (if-some [hit (get @cache ck)]
+      (when-not (= ::none hit) hit)
+      (let [^Reader r (.rdr nav)
+            v (try
+                (when (and (= MAJOR-TAG (major nav off))
+                           (= 27 (.headArgAt r off)))
+                  (let [pair (.headEndAt r off)]
+                    (when (and (= MAJOR-ARRAY (.majorAt r pair))
+                               (= 2 (.headArgAt r pair)))
+                      (let [name-off (.headEndAt r pair)]
+                        (when (= MAJOR-TEXT (.majorAt r name-off))
+                          (let [payload (skip r name-off)]
+                            (when (= MAJOR-MAP (.majorAt r payload))
+                              (let [nm (realize nav name-off)]
+                                (when (and (string? nm)
+                                           (nil? (.recordCtor (.registry r) ^String nm)))
+                                  {:payload payload
+                                   :sorted? (= nm "clojure/sorted-map")})))))))))
+                (catch Exception _ nil))]
+        (swap! cache assoc ck (if (nil? v) ::none v))
+        v))))
+
+(defn- record-key-ok?
+  "Whether descending answers `k` the same way realising would.
+
+  Always, for an unsorted record: `UnknownRecord` looks its field map up by
+  EQUALITY, which is what `lookup-map` does.
+
+  A `sorted-map` COMPARES instead, and the two disagree across numeric types --
+  `(get (sorted-map 1 :a) 1.0)` is `:a` because `(compare 1 1.0)` is 0, while
+  `(= 1 1.0)` is false and a byte probe for 1.0 matches nothing. The same trap
+  is reachable inside a vector key, since `(compare [1] [1.0])` is 0 too.
+
+  So sorted lookups descend only for keywords, symbols and strings, where
+  `compare` and `=` agree. Anything else realises. A custom comparator cannot
+  arrive here at all -- `Writer.requireDefaultComparator` refuses to encode one."
+  [rc k]
+  (or (not (:sorted? rc))
+      (keyword? k) (symbol? k) (string? k)))
 
 (defn- shape-at
   "Description of the shaped array tagged at `off`, or nil if that is not what

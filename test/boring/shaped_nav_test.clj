@@ -86,16 +86,22 @@
                    (nav/value (get (nth cs i) k)))
                 (str n "/" i " key " (pr-str k)))))))))
 
-(deftest a-tag-that-is-not-a-shape-still-realises
-  (testing "descent is an optimisation for a form boring itself writes. Every
-            other tag must keep the realising behaviour, including the typed
-            refusal from `reduce`."
-    (let [bs (boring/encode-indexed (into (sorted-map) {:a 1 :b 2}) opts)
+(deftest a-tag-with-no-descent-still-realises
+  (testing "descent is an optimisation for forms boring itself writes. A tag
+            with no descent must keep realising, including the typed refusal
+            from `reduce` -- which must not decay into a silent empty result.
+
+            A SET is the example, not a sorted-map: sorted-maps grew a descent
+            of their own in `boring.record-nav-test`, and this test asserted
+            they had none. Sets keep `get`-as-membership semantics that no
+            structural descent reproduces, so they are the honest case."
+    (let [bs (boring/encode-indexed #{1 2 3} opts)
           c (nav/source bs trusted)]
-      (is (= {:a 1 :b 2} (nav/value c)))
-      (is (= 1 (nav/value (get c :a))) "realised lookup still works")
+      (is (= #{1 2 3} (nav/value c)))
+      (is (= 1 (nav/value (get c 1))) "membership still answers through realising")
+      (is (nil? (get c 99)) "and a non-member is absent")
       (is (thrown? clojure.lang.ExceptionInfo (reduce (fn [a _] a) nil c))
-          "a non-shaped tag is still refused by reduce, not silently empty"))))
+          "a tag with no descent is still refused by reduce, not silently empty"))))
 
 (defspec navigating-a-shaped-array-agrees-with-realising-it 150
   (prop/for-all
