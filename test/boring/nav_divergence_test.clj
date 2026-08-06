@@ -86,16 +86,8 @@
    Both entries below are option-INDEPENDENT, hence `:any`: they are arithmetic
    defects that no reader option reaches. Discovering that is itself worth
    something -- it says the fix is local and cannot need an option gate."
-  #{;; S1 -- `typed-array-tags` accumulates unsigned then applies CHECKED casts,
-    ;; so every negative element of a short[]/int[]/float[] throws. long[] and
-    ;; double[] are unaffected: 8-byte `le-long` wraps naturally.
-    [:any "short[]" :untyped]
-    [:any "int[]" :untyped]
-    [:any "float[]" :untyped]
-    ;; S2 -- `(int k)` on an integer key past 2^31, where `clojure.core/get` on
-    ;; the realised vector is total.
-    [:any "vector" :untyped]
-    [:any "shaped rows" :untyped]
+  #{;; S1 and S2 were here and are FIXED -- the ratchet turned red and named
+    ;; them, which is the whole point of listing rather than skipping.
     ;; S6 -- `record-view` descends on `recordCtor == nil` without consulting
     ;; `:on-unknown-record`, so a handler that RESHAPES the field map leaves nav
     ;; answering from the wire. `value` agrees (it realises through the reader);

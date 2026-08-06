@@ -75,23 +75,30 @@ the existing generators.
 
 The contract is that only `ex-info` with a `:boring/...` type escapes.
 
-- [ ] **S1** `typed-array-tags` (`nav.clj:896-910`) accumulates unsigned then
+- [x] **S1** `typed-array-tags` (`nav.clj:896-910`) accumulates unsigned then
       applies **checked** casts, so every negative element of a `short[]`,
       `int[]` or `float[]` throws. `(short-array [-1])` -> `IllegalArgumentException`;
       `(int-array [-1])` and `(float-array [-1.0])` -> `ArithmeticException`;
       `decode` returns the value fine. Tag 85 fails for *every* negative float.
-      Fix: `unchecked-short` / `unchecked-int`.
+      FIXED: `unchecked-short` / `unchecked-int`. Verified against `realize` for
+      value AND class at the boundaries (Short/MIN, Integer/MIN, -0.0).
       Why missed: fixtures built from `(range n)` — the sign-free half.
-- [ ] **S2** `(get cursor 2147483648)` -> `ArithmeticException` (`nav.clj:613`,
+- [x] **S2** `(get cursor 2147483648)` -> `ArithmeticException` (`nav.clj:613`,
       from `816e64d`). `(get [1 2 3] 3e9)` on the realised vector is total.
-      Fix: range-test before `(int k)`, or use `(long k)` and let `nth-item`
-      bound it.
-- [ ] **S3** `Cursor.count` on a tag (`nav.clj:729`) skips the `room` guard the
+      FIXED: `(long k)`; `nth-item` already range-checks. Verified that nav now
+      agrees with `clojure.core/get` on the realised value for 0, -1, 2^31,
+      3e9, 0.0, 1.0 and a keyword, across vector / long[] / shaped rows.
+- [x] **S3** `Cursor.count` on a tag (`nav.clj:729`) skips the `room` guard the
       array/map branch applies, reproducing verbatim the bug its own neighbouring
       comment describes. A tag-27 frame around a map declaring 2^20 pairs over
       two bytes: `count` -> 1048576, `decode` -> `:boring/bad-count`. Above 2^31
       the `(int ...)` throws. Reachable for record, typed and shaped views.
-- [ ] **S4** Under `:trust-index :trusted`, 6 of 222 single-byte footer mutants
+      FIXED: the same `room` check, with `(quot room 2)` for map-kinded views
+      because the multiplication is what overflows on the counts worth
+      rejecting. All four crafted documents now report `:boring/bad-count` from
+      both nav and decode. This also closes the `count` half of **S8**; the
+      `nth` half is still open.
+- [x] **S4** Under `:trust-index :trusted`, 6 of 222 single-byte footer mutants
       escape untyped, e.g. `ClassCastException: TaggedValue cannot be cast to [J`.
       `index-payload`'s own comment says the O(1) length check stays
       unconditional to prevent exactly this class; the sibling O(1) check — that
@@ -99,10 +106,17 @@ The contract is that only `ex-info` with a `:boring/...` type escapes.
       made nowhere, and `expand-slot` (`nav.clj:1226`) blindly hints `^longs`.
       Under the default path `node-sound?` forces `slot-at` inside a `try`;
       `:trusted` skips that, and `lookup-map`/`nth-item` then call it unguarded.
-- [ ] **S5** Minor: `(get typed-cursor 0.0)` -> nil, `(get (realize c) 0.0)` -> the
+      FIXED: the slot element-type check joins the unconditional block. O(nodes)
+      rather than O(1), but one `instance?` per node against a whole-container
+      walk. Re-swept: **0 untyped in both trust modes**.
+- [x] **S5** Minor: `(get typed-cursor 0.0)` -> nil, `(get (realize c) 0.0)` -> the
       element. `RT.getFrom` on a Java array tests `instanceof Number`, not
       `Util.isInteger`, so the `(integer? k)` guard is stricter than the thing it
       mirrors. Vectors are unaffected.
+      FIXED: the key predicate moved onto the VIEW (`:key-pred`), because the two
+      vector-kinded descents realise to different host types — a shaped array to
+      a Clojure vector (`integer?`), a typed array to a Java array (`number?`).
+      Hard-coding one guard for both was the bug.
 
 ## 2. Silently wrong values on undamaged data
 

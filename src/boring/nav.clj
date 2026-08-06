@@ -591,7 +591,7 @@
       ;; then indexed like any other array. A key the shape does not carry is
       ;; absent -- `writeShapedArray` only emits rows whose key sets match.
       (if-some [i (get (:pos shape) k)]
-        (let [p (nth-item nav off (int i))]
+        (let [p (nth-item nav off (long i))]
           (if (neg? p) nf (cursor-at nav p)))
         nf)
       (let [mj (major nav off)]
@@ -610,8 +610,13 @@
         ;; writing `get-in` over a path with an index therefore worked or
         ;; silently returned nil according to how the document happened to be
         ;; written.
+        ;; `(long k)`, NOT `(int k)`. The checked int cast threw
+        ;; ArithmeticException -- untyped, out of `get` -- for any index past
+        ;; 2^31, where `clojure.core/get` on the realised vector is total and
+        ;; simply answers not-found. `nth-item` already range-checks against the
+        ;; container's own count, so the long reaches it and comes back -1.
         (and (= mj MAJOR-ARRAY) (integer? k))
-        (let [p (nth-item nav off (int k))]
+        (let [p (nth-item nav off (long k))]
           (if (neg? p) nf (cursor-at nav p)))
         ;; A tag's reader is arbitrary, so structure does not imply semantics.
         ;; Realise and let clojure.core decide -- correct for every registry.
@@ -661,9 +666,15 @@
                 fallback #(try (get (realize nav off) k nf)
                                (catch ClassCastException _ nf))]
             (case (:kind v)
-              ;; A vector-kinded tag answers integer keys and nothing else,
-              ;; which is what `(get [x] :k)` does.
-              :vector (if (integer? k)
+              ;; WHICH KEYS A VECTOR-KINDED TAG ANSWERS IS THE VIEW'S BUSINESS,
+              ;; because the two of them realise to different host types and
+              ;; `clojure.core/get` treats those differently. A shaped array
+              ;; realises to a Clojure vector, which uses `Util.isInteger` and
+              ;; answers not-found for 0.0; a typed array realises to a JAVA
+              ;; ARRAY, and `RT.getFrom` tests `instanceof Number` there, so
+              ;; `(get (long-array [10]) 0.0)` is 10. Hard-coding `integer?`
+              ;; here was stricter than the thing it mirrors.
+              :vector (if ((:key-pred v) k)
                         (let [r ((:nth v) (long k))]
                           (if (identical? ::miss r) nf r))
                         nf)
@@ -727,7 +738,24 @@
       ;; `count` used to refuse every tag while `nth` on a typed array worked
       ;; through the realising path -- countable by nobody, indexable by anyone.
       (if-let [v (and (= MAJOR-TAG (major nav off)) (tag-view nav off))]
-        (int (:n v))
+        ;; CHECKED, exactly as the array and map branch below is. This branch
+        ;; did not check, which reproduced verbatim the defect that comment
+        ;; describes -- "an IMPOSSIBLE number, 1048576 entries from a five-byte
+        ;; document" -- simply by wrapping the same map in a tag-27 frame. And
+        ;; above 2^31 the `(int ...)` threw ArithmeticException, untyped, where
+        ;; `decode` reports :boring/bad-count.
+        ;;
+        ;; `(quot room 2)` rather than `(* 2 n)`: the multiplication is what
+        ;; overflows on the counts worth rejecting.
+        (let [n (long (:n v))
+              room (- (.size ^Reader (.rdr nav)) off)
+              too-many? (if (= :map (:kind v)) (> n (quot room 2)) (> n room))]
+          (when (or (neg? n) too-many?)
+            (fail :boring/bad-count
+                  (str "boring.nav: a tagged container declaring " n
+                       " entries cannot fit in the " room " bytes that follow")
+                  {:offset off :declared n}))
+          (int n))
         (let [mj (major nav off)]
         (if (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP))
         ;; CHECKED against the data, which this was the one entry point not to
@@ -900,12 +928,27 @@
                                             (bit-and (long (aget b i)) 0xFF)
                                             (* 8 i)))))))
 
+;; UNCHECKED casts, and that is the whole point. `le-long` accumulates bytes as
+;; UNSIGNED, so a two-byte element holding -1 arrives as 65535 and a four-byte
+;; one as 4294967295. Clojure's `short` and `int` are CHECKED: they threw
+;; `IllegalArgumentException` and `ArithmeticException` respectively, untyped,
+;; straight out of `get`/`nth`/`seq`/`reduce` -- on undamaged data that `decode`
+;; round-trips perfectly. Every negative element of a short[] or int[], and
+;; EVERY negative float, since tag 85 goes through the same int.
+;;
+;; long[] and double[] were never affected: at eight bytes `le-long` wraps into
+;; the sign naturally, which is exactly why the defect hid -- two of the five
+;; tags are correct by construction.
+;;
+;; It hid for a second reason too: every fixture in `typed_nav_test` was built
+;; from `(range n)`, so the tests pinned the boxing over the sign-free half of
+;; the domain and the docstring above claimed the pinning was total.
 (def ^:private typed-array-tags
-  {77 {:size 2 :read (fn [^bytes b] (Short/valueOf (short (le-long b 2))))}
-   78 {:size 4 :read (fn [^bytes b] (Integer/valueOf (int (le-long b 4))))}
+  {77 {:size 2 :read (fn [^bytes b] (Short/valueOf (unchecked-short (le-long b 2))))}
+   78 {:size 4 :read (fn [^bytes b] (Integer/valueOf (unchecked-int (le-long b 4))))}
    79 {:size 8 :read (fn [^bytes b] (Long/valueOf (le-long b 8)))}
    85 {:size 4 :read (fn [^bytes b] (Float/valueOf (Float/intBitsToFloat
-                                                   (int (le-long b 4)))))}
+                                                   (unchecked-int (le-long b 4)))))}
    86 {:size 8 :read (fn [^bytes b] (Double/valueOf (Double/longBitsToDouble
                                                     (le-long b 8))))}})
 
@@ -932,7 +975,8 @@
                          ::miss
                          (let [p (+ data (* i size))]
                            (rd (.bytesBetween r p (+ p size))))))]
-              {:kind :vector :n n :nth at
+              ;; `number?`, not `integer?` -- see the :vector branch of valAt.
+              {:kind :vector :n n :nth at :key-pred number?
                :items (fn [] (map at (range n)))})))))))
 
 (defn- shaped-view
@@ -967,7 +1011,7 @@
                           at (fn [^long i]
                                (let [p (nth-item nav rows-off i)]
                                  (if (neg? p) ::miss (->Cursor nav p sh))))]
-                      {:kind :vector :n n :nth at :shape sh
+                      {:kind :vector :n n :nth at :key-pred integer?
                        :items (fn [] (map #(->Cursor nav % sh)
                                           (child-offsets nav rows-off)))})))))))))))
 
@@ -1174,6 +1218,7 @@
 
 (def ^:private shorts-class (class (short-array 0)))
 (def ^:private ints-class (class (int-array 0)))
+(def ^:private longs-class (class (long-array 0)))
 
 (defn- expand-slot
   "A slot's deltas, back to the absolute offsets every lookup path expects.
@@ -1496,6 +1541,27 @@
                  ;; inside `get` rather than as "no usable index, scan instead".
                  (= (alength containers) (alength counts)
                     (count slots) (count sorted))
+                 ;; AND SO DOES THIS, for exactly the same reason -- which the
+                 ;; comment above stated and then did not carry through to its
+                 ;; sibling. `expand-slot` dispatches on the four widths
+                 ;; `delta-slot` writes and hints the fall-through `^longs`, so a
+                 ;; slot that decoded as anything else -- a TaggedValue, from one
+                 ;; flipped byte -- became a raw ClassCastException. Under the
+                 ;; default path `node-sound?` forces `slot-at` inside a `try`
+                 ;; and swallows it; `:trusted` skips that, and `lookup-map` and
+                 ;; `nth-item` then call `slot-at` unguarded. Six of 222
+                 ;; single-byte footer mutants escaped untyped this way.
+                 ;;
+                 ;; O(node count) rather than O(1), so it is not free -- but it
+                 ;; is one `instance?` per node against a walk of the whole
+                 ;; container, and the alternative is an untyped throwable the
+                 ;; contract says cannot happen.
+                 (every? (fn [sl]
+                           (or (bytes? sl)
+                               (instance? shorts-class sl)
+                               (instance? ints-class sl)
+                               (instance? longs-class sl)))
+                         slots)
                  (or
                   trusted?
                   (and
