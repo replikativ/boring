@@ -231,17 +231,25 @@
                  "with {:stringref false} to navigate it, or decode it whole "
                  "with boring/decode.")
             {}))
-    (let [nav (Nav. r opts probes nil src (atom {}))]
-      ;; `:trust-index :ignore` skips the index entirely and scans. The scan is
-      ;; the reference implementation the indexed paths are checked against, so
-      ;; this is the one setting whose correctness needs no separate argument.
-      (Nav. r opts probes
-            ;; A DELAY. Detection is deferred with the parse: a document
-            ;; with no frame costs nothing to find that out, and one with a
-            ;; frame pays only if something consults it.
-            (when-not (= :ignore (:trust-index opts))
-              (delay (read-index nav)))
-            src (atom {})))))
+    ;; ONE Nav, not two. The delay has to close over the Nav it will read from,
+    ;; and the Nav has to hold the delay, so this used to build a throwaway Nav
+    ;; purely to be captured -- two Navs and two shape atoms per source, on a
+    ;; path a document store walks once per blob. A volatile breaks the cycle
+    ;; without changing what anything sees: the delay cannot run before the
+    ;; vreset!, because only the returned Nav is reachable.
+    ;;
+    ;; `:trust-index :ignore` skips the index entirely and scans. The scan is
+    ;; the reference implementation the indexed paths are checked against, so
+    ;; this is the one setting whose correctness needs no separate argument.
+    (let [holder (volatile! nil)
+          ;; A DELAY. Detection is deferred with the parse: a document with no
+          ;; frame costs nothing to find that out, and one with a frame pays
+          ;; only if something consults it.
+          idx (when-not (= :ignore (:trust-index opts))
+                (delay (read-index @holder)))
+          nav (Nav. r opts probes idx src (atom {}))]
+      (vreset! holder nav)
+      nav)))
 
 (defn- fork-nav ^Nav [^Nav n]
   (let [src (.src n)
