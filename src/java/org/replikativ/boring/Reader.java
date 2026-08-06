@@ -635,6 +635,24 @@ public final class Reader {
     public int infoAt(long p) { return b(p) & 0x1F; }
 
     /**
+     * The unsigned byte at `p`, 0-255.
+     *
+     * <p>For a caller reading its OWN bytes rather than CBOR's -- a container
+     * format that puts a tag or a length in front of the item, and wants to
+     * read it through the same bounds-checked accessor the decoder uses rather
+     * than reaching around the Reader to the buffer. {@code majorAt} and
+     * {@code infoAt} are this byte split in two, and reassembling it from them
+     * is two virtual calls and a shift to recover something already at hand.
+     */
+    public int byteAt(long p) { return b(p); }
+
+    /** Big-endian unsigned 32-bit value at `p`. Unaligned. Same purpose as
+     *  {@link #byteAt}: a length a container format wrote itself. */
+    public long u32At(long p) {
+        return ((long) b(p) << 24) | (b(p + 1) << 16) | (b(p + 2) << 8) | b(p + 3);
+    }
+
+    /**
      * The head's argument at `p`: element count for an array, pair count for a
      * map, byte length for a string. -1 for an indefinite-length item, whose
      * count is not on the wire.

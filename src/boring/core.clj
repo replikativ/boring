@@ -696,6 +696,24 @@
    (with-decode-errors (.read (configure-reader! (reader-of src "decode")
                                                  (opt/check-opts opts))))))
 
+(defn decode-at
+  "Decode the CBOR item starting at byte offset `off` in `src`.
+
+  `decode` is this with `off` 0. The companion of `boring.nav/source-at`, for
+  the same reason: a format that puts a header, a length or another item in
+  front of the one you want should not have to nest it in a container purely so
+  it can be found. See `source-at` for the case that motivated both.
+
+  `off` is TRUSTED. A wrong offset lands mid-item and decodes whatever the
+  bytes there happen to encode -- bounded by the source, so it cannot read past
+  the end, but perfectly capable of returning a plausible wrong value. Derive
+  offsets from your format, not from input."
+  ([src off] (decode-at src off nil))
+  ([src off opts]
+   (with-decode-errors
+     (.readFrom (configure-reader! (reader-of src "decode-at") (opt/check-opts opts))
+                (long off)))))
+
 (defn decode-with
   "Decode using a reusable Reader.
 
