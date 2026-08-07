@@ -119,6 +119,22 @@
 
 (declare slot-at node-sound? sorted-at?)
 
+;; RESOLVED ONCE, not per index open. `(Class/forName "[I")` is a classloader
+;; lookup, and `read-index` made four of them every time it opened a frame --
+;; on the path that decides whether an index is usable at all, so every
+;; navigable source paid for them whether or not it went on to use the index.
+;;
+;; Measured on a ONE-NODE frame, where nothing else about the open scales:
+;; 6.26 us to 3.94, so 2.3 us and 37% of a fixed cost that had nothing to do
+;; with the index's size. A cold indexed lookup on that frame went 10.12 to
+;; 7.86.
+;;
+;; `[J` and `[I` are how `containers` arrives -- sint64 or sint32, narrowest
+;; that fits -- and `[I` again is `counts`. There is no literal syntax for a
+;; primitive array class, so these cannot simply be inlined as constants.
+(def ^:private longs-array-class (Class/forName "[J"))
+(def ^:private ints-array-class (Class/forName "[I"))
+
 ;; `views` is a ONE-SLOT cache of the last tag view built, as `[offset view]`.
 ;;
 ;; It was an unbounded `atom {}` keyed by offset, and it grew one entry per tag
@@ -1937,9 +1953,9 @@
           ;; deltas have always used. Normalising to long here means one shape
           ;; downstream and no width test in the binary search.
           ^longs containers (cond
-                              (instance? (Class/forName "[J") raw-containers)
+                              (instance? longs-array-class raw-containers)
                               raw-containers
-                              (instance? (Class/forName "[I") raw-containers)
+                              (instance? ints-array-class raw-containers)
                               (let [^ints a raw-containers
                                     out (long-array (alength a))]
                                 (dotimes [i (alength a)] (aset out i (long (aget a i))))
@@ -1952,13 +1968,13 @@
           ;; happens to visit. Guarded on the types it indexes with, because it
           ;; runs BEFORE the checks below.
           ^longs starts (when (and (bytes? packed)
-                                   (instance? (Class/forName "[I") counts)
+                                   (instance? ints-array-class counts)
                                    (int? stride) (pos? (long stride)))
                           (try (slot-starts packed (alength ^ints counts)
                                             counts (long stride))
                                (catch Exception _ nil)))]
       (when (and (int? stride) (pos? (long stride)) containers
-                 (instance? (Class/forName "[I") counts)
+                 (instance? ints-array-class counts)
                  ;; A BYTE STRING WHERE AN ARRAY USED TO BE. This is what makes
                  ;; the layout change safe in both directions: a frame written
                  ;; by an older writer arrives as a Clojure vector of typed
