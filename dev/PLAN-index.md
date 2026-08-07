@@ -248,10 +248,32 @@ Note these two and "use a high stride" are the same design decision seen from
 different sides: deltas + stride 1 optimise the WARM case, absolutes + high
 stride optimise the COLD case, and both consumers are cold.
 
-**Next experiment (in progress):** prototype in-place reads against the CURRENT
-format, to separate the copying cost from the format question. If removing
-materialisation alone gets cold indexed well under plain scan at n=128, the
-start-table/absolutes decision gets easier and may not be needed at all.
+**Prototype result (done).** Reading node 0's anchors straight out of the
+buffer -- positional reads only, no `.readFrom` of any payload element, no memo
+arrays, no map -- against the CURRENT format, 1 node / 128 entries / stride 16:
+
+    MATERIALISE  read-index (the open)   2.701 us   2760 B
+    IN PLACE     anchors for node 0      0.211 us    304 B
+
+Identical anchors, 12.8x faster, 9x less allocation, and the 304 B is almost
+entirely the long[8] of anchors it returns. NO FORMAT CHANGE was needed for
+this. The open's cost is materialisation, essentially in full.
+
+Two caveats on generalising it:
+
+- The prototype has ONE node, so it says nothing about the O(N) slot-start
+  problem. Reaching node i's segment still costs O(i) without a start table, so
+  in-place reads alone fix the copying and NOT the scaling. Both are needed for
+  documents with many nodes; only the first is needed for few.
+- Removing the open does not close the whole cold gap. At n=128, cold is 6.80 us
+  against 1.11 us warm; the open is ~2.4 of that difference and roughly 3 us
+  remains, which tracks the extra 5024 B the cold path allocates (6224 vs 1200)
+  rather than any single computation. Lower allocation should recover part of
+  that too, but it must be MEASURED end to end, not extrapolated from this.
+
+So the sequencing is: do in-place reads first (no format change, provable win),
+re-measure, and only then decide whether the start table or absolute anchors are
+still worth a format change.
 
 ---
 
