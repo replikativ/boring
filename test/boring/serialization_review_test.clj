@@ -8,7 +8,8 @@
             [boring.core :as boring]
             [boring.data :as data]
             [boring.conformance :as c]
-            [boring.nav :as nav]))
+            [boring.nav :as nav])
+  (:import (org.replikativ.boring Reader)))
 
 (def o {:stringref false})
 (def canonical {:profile :canonical})
@@ -759,3 +760,37 @@
           (is (instance? clojure.lang.ExceptionInfo r)
               (str "stack " stack " depth " n " gave " (class r)))
           (is (= :boring/max-depth-exceeded (:type (ex-data r)))))))))
+
+(deftest an-offset-inside-a-stringref-namespace-is-refused-not-missed
+  (testing "`source`/`source-at` refuse a document that OPENS a stringref
+            namespace, but that check reads byte 0 of the BUFFER and knows
+            nothing about the offset. So an offset landing INSIDE a namespace
+            got past it -- and then reported every referenced key ABSENT.
+
+            Reachable exactly where `source-at` is useful: a container format
+            that puts its own bytes in front, so byte 0 is not `d9 01 00`.
+            konserve-lmdb's blobs are that shape. It never reaches the bad case,
+            because every offset it navigates from is an item START, but nothing
+            in the type says so.
+
+            A present key answered `nil`, with no error. That is the failure
+            mode this codebase treats as worse than a crash, so it is now a
+            typed refusal on the miss path."
+    (let [doc {:aaaa "alexander" :zzzz 1 :inner {:aaaa "alexander" :zzzz 2}}
+          body (boring/encode doc {:stringref true})
+          ;; a five-byte prefix, so byte 0 is not the namespace tag
+          blob (byte-array (+ 5 (alength ^bytes body)))
+          _ (System/arraycopy body 0 blob 5 (alength ^bytes body))
+          r (Reader. blob)
+          mroot (.headEndAt r 5)
+          inner (loop [p (.headEndAt r mroot)]
+                  (let [vp (.skipFrom r p)]
+                    (if (= 5 (.majorAt r vp)) vp (recur (.skipFrom r vp)))))]
+      (is (not= 0xD9 (bit-and (aget blob 0) 0xff))
+          "the document-level guard cannot fire on this buffer")
+      (is (= {:aaaa "alexander" :zzzz 2} (:inner doc)) "truth")
+      (doseq [k [:aaaa :zzzz]]
+        (let [got (try (nav/value (get (nav/source-at blob inner {:stringref false}) k))
+                       (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))]
+          (is (= :boring/stringref-not-navigable got)
+              (str "key " k " must be refused, not reported absent")))))))

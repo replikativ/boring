@@ -457,6 +457,19 @@
   ;; premise is reading documents somebody else wrote.
   (err/with-decode-errors (.readFrom ^Reader (.rdr nav) off)))
 
+(defn- stringref-key?
+  "Whether the map key at `p` is a stringref REFERENCE rather than a literal.
+
+   Both shapes: a bare `tag 25`, and a repeated KEYWORD, which boring writes as
+   `tag 39` wrapping the reference."
+  [^Reader r ^long p]
+  (and (= MAJOR-TAG (.majorAt r p))
+       (let [a (.headArgAt r p)]
+         (or (= 25 a)
+             (and (= 39 a)
+                  (let [q (.headEndAt r p)]
+                    (and (= MAJOR-TAG (.majorAt r q)) (= 25 (.headArgAt r q)))))))))
+
 (defn- scan-map
   "Linear walk of a map's entries from `start`, at most `limit` of them.
 
@@ -492,6 +505,28 @@
           -1
           (if (.bytesEqualAt r p probe)
             (skip r p)
+            ;; A KEY THAT IS A STRINGREF REFERENCE CANNOT BE COMPARED, so a miss
+            ;; on one is not an answer. It is the cursor reporting that it
+            ;; stands INSIDE a namespace whose table it does not have.
+            ;;
+            ;; `source`/`source-at` refuse a document that OPENS a namespace,
+            ;; but that check reads byte 0 of the BUFFER and knows nothing about
+            ;; the offset. An offset landing inside a namespace -- reachable
+            ;; whenever a container format puts its own bytes in front, which is
+            ;; exactly what `source-at` exists for -- sailed past it and then
+            ;; reported every referenced key ABSENT. A present key, a wrong
+            ;; answer, no error.
+            ;;
+            ;; One `majorAt` on the miss path, where a memcmp and two skips have
+            ;; already happened.
+            (if (stringref-key? r p)
+              (fail :boring/stringref-not-navigable
+                    (str "boring.nav: the key at offset " p " is a stringref "
+                         "reference, so this cursor stands inside a stringref "
+                         "namespace and cannot resolve it. Navigating from an "
+                         "offset only works outside one -- re-encode with "
+                         "{:stringref false}, or decode this item whole.")
+                    {:offset p})
             ;; THE LAST ENTRY OF A WALK NEEDS NO ADVANCE, and computing one is
             ;; not free -- `skip` past a VALUE is a structural walk of that
             ;; value's whole subtree. This used to advance unconditionally and
@@ -506,10 +541,10 @@
             ;; whole tree: scanning that one-entry span cost 26.0 us against
             ;; 0.018 us for the same call one anchor later. The index's jump was
             ;; being taken correctly and then thrown away by this line.
-            (if (>= (inc i) limit)
-              -1
-              (let [q (skip r (skip r p))]
-                (if (or (<= q p) (> q end)) -1 (recur (inc i) q)))))))
+              (if (>= (inc i) limit)
+                -1
+                (let [q (skip r (skip r p))]
+                  (if (or (<= q p) (> q end)) -1 (recur (inc i) q))))))))
       (catch IndexOutOfBoundsException _ -1))))
 
 (defn- lookup-map
