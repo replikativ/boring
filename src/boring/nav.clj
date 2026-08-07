@@ -2163,9 +2163,20 @@
               ;; the pointer is in range, and the frame ends exactly at EOF.
               ;; An unusable payload means SCAN, and scanning still has to stop
               ;; in the right place.
-              (merge {:data-end ptr}
-                     (index-payload r ptr
-                                    (= :trusted (:trust-index (.opts nav))))))))))))
+              ;; `or`, not `merge`. A usable payload ALREADY carries
+              ;; `:data-end ptr` -- it is set on `ix` and there is one non-nil
+              ;; return path -- so the merge rebuilt a 15-key map to overwrite
+              ;; one key with the value it already held. Measured at 1.70 us
+              ;; against the 1.36 that parsing the whole payload cost: the most
+              ;; expensive single step in opening an index was a no-op.
+              ;;
+              ;; The nil branch is the one that meant anything, and it still
+              ;; does: detection has succeeded by here, so an UNUSABLE payload
+              ;; must still yield `:data-end` or `items` walks past the data
+              ;; section and republishes the footer as a data item.
+              (or (index-payload r ptr
+                                 (= :trusted (:trust-index (.opts nav))))
+                  {:data-end ptr}))))))))
 
 (defn- anchor-sound?
   "Whether sequence anchor `k` is where it claims to be. Cached per anchor.
