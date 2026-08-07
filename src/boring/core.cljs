@@ -613,29 +613,115 @@
 
 (def ^:private INDEX-WALK-MAX-DEPTH 200)
 
-(defn- delta-slot
-  "Entry offsets as deltas, in the narrowest CBOR form that holds them.
+(defn- anchor-count
+  "How many anchors a container of `n` entries carries at `stride`. Mirrors the
+  JVM's `anchor-count` and `Writer.anchorCount`: the reader DERIVES each node's
+  segment length from this rather than reading it, so a disagreement between
+  platforms would shift every subsequent node's anchors.
 
-  Mirrors the JVM's `delta-slot` exactly, including the tier boundaries: a byte
-  string for 0..255, tag 77 (sint16) to 0x7FFF, tag 78 (sint32) beyond. The tag
-  IS the width declaration, so this adds no format surface -- and a reader
-  cannot tell which platform produced the slot, which is the point.
+  An empty container needs no anchors -- `((0 - 1) / stride) + 1` is 1 under
+  truncating division, which would claim a phantom anchor at offset 0."
+  [n stride]
+  (if (<= n 0) 0 (if (== stride 1) n (inc (js/Math.floor (/ (dec n) stride))))))
 
-  `base` is what the first delta is measured from: the container's own offset,
-  or 0 for the sequence node."
-  [offs base]
-  (let [n (count offs)
-        d (js/Array. n)]
-    (loop [i 0 prev base mn js/Number.MAX_SAFE_INTEGER mx js/Number.MIN_SAFE_INTEGER]
+(defn- slot-width-code
+  "The narrowest of four widths that holds every delta: 0 = u8, 1 = u16,
+  2 = i32, 3 = i64. Mirrors the JVM's `slot-width-code`."
+  [d]
+  (let [n (alength d)]
+    (loop [i 0 mn js/Number.MAX_SAFE_INTEGER mx js/Number.MIN_SAFE_INTEGER]
       (if (== i n)
         (cond
-          (or (zero? n) (and (>= mn 0) (<= mx 0xFF)))
-          (js/Uint8Array.from d)
-          (and (>= mn 0) (<= mx 0x7FFF)) (js/Int16Array.from d)
-          :else (js/Int32Array.from d))
-        (let [v (nth offs i) delta (- v prev)]
-          (aset d i delta)
-          (recur (inc i) v (min mn delta) (max mx delta)))))))
+          (or (zero? n) (and (>= mn 0) (<= mx 0xFF))) 0
+          (and (>= mn 0) (<= mx 0xFFFF)) 1
+          (and (>= mn -2147483648) (<= mx 2147483647)) 2
+          :else 3)
+        (let [v (aget d i)]
+          (recur (inc i) (min mn v) (max mx v)))))))
+
+(defn- pack-slots
+  "Every node's anchor deltas as ONE byte string:
+
+      [ 2-bit width code per node | node 0's deltas | node 1's deltas | ... ]
+
+  Mirrors the JVM's `pack-slots` BYTE FOR BYTE -- see its docstring for why the
+  shape is this and not one typed array per node, or one flat array at a single
+  width. Little-endian, node `i`'s width at bit `(* 2 (rem i 4))` of byte
+  `(quot i 4)`, and no per-node length: that is `anchor-count` of the entry
+  count the frame already carries.
+
+  `base` for each node is the container's own offset, or 0 for the sequence
+  node, whose sentinel offset is -1."
+  [slots containers counts stride]
+  (let [n (count slots)
+        ds (js/Array. n)
+        ws (js/Array. n)]
+    (dotimes [i n]
+      (let [offs (nth slots i)
+            m (count offs)
+            d (js/Array. m)]
+        ;; THE INVARIANT THE WHOLE LAYOUT RESTS ON -- see the JVM's `pack-slots`.
+        ;; No segment length goes on the wire, so a walk that emitted a
+        ;; different anchor count would shift every LATER node's deltas rather
+        ;; than corrupt this one. Checked on both platforms because the two
+        ;; walks are separate implementations of the same rule.
+        (when-not (== m (anchor-count (nth counts i) stride))
+          (throw (ex-info (str "boring: index node " i " has " m " anchors but "
+                               (nth counts i) " entries at stride " stride
+                               " implies " (anchor-count (nth counts i) stride)
+                               ". The index walk and `anchor-count` disagree.")
+                          {:type :boring/bad-index :node i :anchors m
+                           :entries (nth counts i) :stride stride})))
+        (loop [k 0 prev (max 0 (nth containers i))]
+          (when (< k m)
+            (let [v (nth offs k)]
+              (aset d k (- v prev))
+              (recur (inc k) v))))
+        (aset ds i d)
+        (aset ws i (slot-width-code d))))
+    (let [wbytes (js/Math.ceil (/ n 4))
+          total (loop [i 0 t wbytes]
+                  (if (== i n)
+                    t
+                    (recur (inc i) (+ t (* (alength (aget ds i))
+                                           (bit-shift-left 1 (aget ws i)))))))
+          out (js/Uint8Array. total)]
+      (dotimes [i n]
+        (let [b (js/Math.floor (/ i 4))]
+          (aset out b (bit-or (aget out b)
+                              (bit-shift-left (aget ws i) (* 2 (mod i 4)))))))
+      (loop [i 0 p wbytes]
+        (if (== i n)
+          out
+          (let [d (aget ds i)
+                sz (bit-shift-left 1 (aget ws i))
+                m (alength d)]
+            (dotimes [k m]
+              (let [v (aget d k)
+                    o (+ p (* k sz))]
+                ;; NOT `bit-shift-right`: it is 32-BIT on ClojureScript, so the
+                ;; i64 tier would silently write the low word twice. Dividing
+                ;; by 256 and flooring is exact to 2^53, which is past any file
+                ;; length, and agrees with the JVM's shifts on every tier.
+                (loop [j 0 rem-v v]
+                  (when (< j sz)
+                    (aset out (+ o j) (bit-and (js/Math.floor rem-v) 0xFF))
+                    (recur (inc j) (/ rem-v 256))))))
+            (recur (inc i) (+ p (* m sz)))))))))
+
+(defn- pack-sorted
+  "One bit per node -- does this container's keys ascend -- as a byte string,
+  node `i` at bit `(rem i 8)` of byte `(quot i 8)`. Mirrors the JVM's
+  `pack-sorted`."
+  [sorted]
+  (let [v (vec sorted)
+        n (count v)
+        out (js/Uint8Array. (js/Math.ceil (/ n 8)))]
+    (dotimes [i n]
+      (when (nth v i)
+        (let [b (js/Math.floor (/ i 8))]
+          (aset out b (bit-or (aget out b) (bit-shift-left 1 (mod i 8)))))))
+    out))
 
 (defn- frame-payload-array?
   "Is the container at `p` the 2-element `[name, args]` array of a TAG-27 FRAME?
@@ -773,9 +859,7 @@
         ;; then jumps by the claimed stride and the index is dead: 39 skips
         ;; where 3 would do, with no error. The JVM has always taken it from
         ;; the index map."
-        stride (or (:stride index) (get opts :index default-index-stride))
-        packed (vec (map-indexed (fn [i s] (delta-slot s (max 0 (nth containers i))))
-                                 slots))]
+        stride (or (:stride index) (get opts :index default-index-stride))]
     ;; TYPED ARRAYS, not plain vectors. `boring.nav/read-index*` requires
     ;; `containers` and `counts` to arrive as int arrays -- tag 78 on the wire
     ;; -- and silently IGNORES an index whose shape it does not recognise. So
@@ -786,7 +870,8 @@
     (encode (data/unknown-record index-name
                                  [stride (js/Int32Array.from (clj->js containers))
                                   (js/Int32Array.from (clj->js counts))
-                                  packed (vec sorted)
+                                  (pack-slots slots containers counts stride)
+                                  (pack-sorted sorted)
                                   (long->8-bytes data-len)])
             (assoc (or opts {}) :stringref false))))
 

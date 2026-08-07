@@ -117,7 +117,7 @@
 
 ;; ---------------------------------------------------------------- the source
 
-(declare slot-at node-sound?)
+(declare slot-at node-sound? sorted-at?)
 
 ;; `views` is a ONE-SLOT cache of the last tag view built, as `[offset view]`.
 ;;
@@ -637,7 +637,7 @@
                 ;; a redundant optimisation would break those lookups silently.
                 (confirm [^long hit]
                   (if (neg? hit) (scan-map r (.headEndAt r off) n probe) hit))]
-          (if (nth (:sorted idx) ns)
+          (if (sorted-at? (:sorted idx) ns)
             ;; Sorted keys: binary search the anchors, then a bounded walk.
             ;;
             ;; The PROBE is bounds-checked as well as the walk. Validation
@@ -1570,67 +1570,6 @@
   scalar back instead of an error. `cursor?` is how you tell the two apart."
   [^Cursor c] c)
 
-(def ^:private shorts-class (class (short-array 0)))
-(def ^:private ints-class (class (int-array 0)))
-(def ^:private longs-class (class (long-array 0)))
-
-(defn- expand-slot
-  "A slot's deltas, back to the absolute offsets every lookup path expects.
-
-  `boring.core/delta-slot` writes each slot as differences from the previous
-  entry, in the narrowest of a byte string, sint16 or sint32 -- so the element
-  type carries the width and nothing else has to.
-
-  Expanding HERE, once per index, is what keeps this free. A prefix sum is the
-  obvious cost of delta encoding, and the obvious place to pay it is in the
-  binary search, up to a stride of additions per probe. There is no need: the
-  index is already materialised off the wire before any lookup runs, so one pass
-  at load time leaves `lookup-map`, `nth` and `node-slot` reading a plain
-  `int[]` exactly as before. Postgres pays per probe because it reads its
-  offsets in place from a TOAST'd datum and never gets a load-time pass at all.
-
-  Bytes are masked because Java's are signed; shorts are not, because the writer
-  only narrows to sint16 within the positive range."
-  ^longs [s ^long base]
-  (cond
-    (bytes? s)
-    (let [^bytes a s n (alength a) out (long-array n)]
-      (loop [k 0 acc base]
-        (if (= k n)
-          out
-          (let [v (+ acc (bit-and (aget a k) 0xFF))]
-            (aset out k v)
-            (recur (inc k) v)))))
-
-    (instance? shorts-class s)
-    (let [^shorts a s n (alength a) out (long-array n)]
-      (loop [k 0 acc base]
-        (if (= k n)
-          out
-          (let [v (+ acc (aget a k))]
-            (aset out k v)
-            (recur (inc k) v)))))
-
-    (instance? ints-class s)
-    (let [^ints a s n (alength a) out (long-array n)]
-      (loop [k 0 acc base]
-        (if (= k n)
-          out
-          (let [v (+ acc (aget a k))]
-            (aset out k v)
-            (recur (inc k) v)))))
-
-    ;; sint64 (tag 79), the fourth width. Only written when two anchors are more
-    ;; than 2 GiB apart, but a reader must accept what a writer may emit.
-    :else
-    (let [^longs a s n (alength a) out (long-array n)]
-      (loop [k 0 acc base]
-        (if (= k n)
-          out
-          (let [v (+ acc (aget a k))]
-            (aset out k v)
-            (recur (inc k) v)))))))
-
 (defn- node-valid?
   "Does index node `i` describe the data it claims to?
 
@@ -1734,17 +1673,20 @@
                          (loop [k 0 p (long (aget a (dec m)))]
                            (if (= k n) p (recur (inc k) (skip r p))))))))))))
 
-(defn- slot-offsets
-  "Byte offset of every element of the frame's `slots` array, decoding none of
-   them.
+(defn- payload-offsets
+  "Byte offset of each of the frame payload's first five elements, decoding none
+   of them.
 
    The frame is `27([\"boring/index\", [stride containers counts slots sorted
    end]])`, so this walks: past the tag, into the two-element array, past the
-   name, into the payload, then past stride/containers/counts to land on
-   `slots` -- and records where each of its elements begins.
+   name, into the payload, then element to element.
 
    Everything here is `headEndAt`/`skipFrom`: a head read and a jump per step,
-   never a decode."
+   never a decode. It USED TO descend into `slots` as well and record where each
+   of its elements began, because `slots` was one typed array per node and
+   decoding them all to serve a lookup that visits one or two was half the cost
+   of opening an index. `slots` is now a single byte string (`core/pack-slots`),
+   so there is nothing to locate -- one bulk read gets all of it."
   [^Reader r ^long ptr]
   (let [pair (.headEndAt r ptr)                 ; ["boring/index", payload]
         nm (.headEndAt r pair)                  ; the name
@@ -1753,47 +1695,110 @@
         e1 (.skipFrom r e0)                     ; containers
         e2 (.skipFrom r e1)                     ; counts
         e3 (.skipFrom r e2)                     ; slots
-        n (.headArgAt r e3)]
-    [(loop [i 0 p (.headEndAt r e3) acc (transient [])]
-       (if (= i n) (persistent! acc) (recur (inc i) (.skipFrom r p) (conj! acc p))))
-     e0 e1 e2 (.skipFrom r e3)]))
+        e4 (.skipFrom r e3)]                    ; sorted
+    [e0 e1 e2 e3 e4]))
+
+(defn- anchor-count
+  "How many anchors a container of `n` entries carries at `stride`. Must agree
+  exactly with `boring.core/anchor-count` and `Writer.anchorCount` -- this is
+  what replaces a stored per-node segment length."
+  ^long [^long n ^long stride]
+  (if (<= n 0) 0 (if (= stride 1) n (inc (quot (dec n) stride)))))
+
+(defn- width-code
+  "Node `i`'s 2-bit width code, out of the table at the head of `packed`."
+  ^long [^bytes packed ^long i]
+  (bit-and 3 (bit-shift-right (aget packed (int (quot i 4)))
+                              (int (* 2 (rem i 4))))))
+
+(defn- slot-starts
+  "Byte offset in `packed` where each node's deltas begin, or nil if the widths
+  and the entry counts do not describe `packed` exactly.
+
+  ONE PREFIX SUM, at open, over integers only -- no decoding, and no per-node
+  array to locate. That it must land EXACTLY on `(alength packed)` is the
+  structural check this layout gets for free, and it is stronger than the
+  per-slot type check it replaced: a frame whose widths, counts and byte length
+  disagree anywhere is refused whole, rather than at the node that happens to be
+  visited. Six of 222 single-byte footer mutants escaped the old check untyped."
+  ^longs [^bytes packed ^long n ^ints counts ^long stride]
+  (let [wbytes (quot (+ n 3) 4)]
+    (when (>= (alength packed) wbytes)
+      (let [starts (long-array (inc n))]
+        ;; This is 5.3 ns per node, against 0.9 for a bare add loop over the
+        ;; same array. The gap is the dependent chain -- each offset needs the
+        ;; previous one plus two array loads -- NOT the two var calls: writing
+        ;; both bodies out inline measured 5.6, i.e. no change. Left as calls,
+        ;; because the inline copy of `anchor-count` is exactly the kind that
+        ;; drifts from the writer's and silently shifts every node's anchors.
+        (loop [i 0 p (long wbytes)]
+          (aset starts i p)
+          (if (= i n)
+            (when (= p (alength packed)) starts)
+            (recur (inc i)
+                   (+ p (* (anchor-count (aget counts (int i)) stride)
+                           (bit-shift-left 1 (width-code packed i)))))))))))
+
+(defn- delta-at
+  "The delta at byte `p` of `packed`, at width code `w`, little-endian.
+
+  u8 and u16 are UNSIGNED -- nothing here is a CBOR typed array, so the second
+  tier is not forced signed the way tag 77 was, and 32 KiB..64 KiB deltas stay
+  two bytes. i32 and i64 are signed, which is what makes a negative delta a
+  representable absurdity rather than a silent wrap."
+  ^long [^bytes packed ^long p ^long w]
+  (case (int w)
+    0 (bit-and (aget packed (int p)) 0xFF)
+    1 (bit-or (bit-and (aget packed (int p)) 0xFF)
+              (bit-shift-left (bit-and (aget packed (int (+ p 1))) 0xFF) 8))
+    2 (long (unchecked-int
+             (bit-or (bit-and (aget packed (int p)) 0xFF)
+                     (bit-shift-left (bit-and (aget packed (int (+ p 1))) 0xFF) 8)
+                     (bit-shift-left (bit-and (aget packed (int (+ p 2))) 0xFF) 16)
+                     (bit-shift-left (bit-and (aget packed (int (+ p 3))) 0xFF) 24))))
+    (loop [j 0 acc 0]
+      (if (= j 8)
+        acc
+        (recur (inc j)
+               (bit-or acc (bit-shift-left (bit-and (aget packed (int (+ p j))) 0xFF)
+                                           (* 8 j))))))))
+
+(defn- sorted-at?
+  "Whether node `i`'s keys ascend, out of the `sorted` bitset."
+  [^bytes sorted ^long i]
+  (not (zero? (bit-and (bit-and (aget sorted (int (quot i 8))) 0xFF)
+                       (bit-shift-left 1 (int (rem i 8)))))))
 
 (defn- slot-at
   "Absolute anchors for node `i`, expanded on first use and memoized.
 
-  `boring.core/delta-slot` writes anchors as deltas, so this is the prefix sum
+  `boring.core/pack-slots` writes anchors as deltas, so this is the prefix sum
   back to the offsets every lookup path expects. Doing it here rather than at
   load is what keeps an index off the critical path of a source that is read
-  once."
+  once.
+
+  NO DECODE AND NO ALLOCATION BEYOND THE RESULT. The deltas are already in
+  memory -- `slots` is one byte string read whole at open -- so this reads them
+  in place at the node's own width. It used to `.readFrom` a typed array per
+  node and then type-check what came back; `slot-starts` now settles the whole
+  array's structure once, so there is nothing left to check per node."
   ^longs [ix ^long i]
   (let [^AtomicReferenceArray cache (:slot-cache ix)
         hit (.get cache (int i))]
     (or hit
         (let [^longs cs (:containers ix)
-              ;; DECODED HERE, not at load. `slots` is one typed array PER NODE,
-              ;; so decoding the frame whole materialised a Java array for every
-              ;; container in the document to serve a lookup that visits one or
-              ;; two. Measured on a 767-node frame: 44 us of the 85 us it cost
-              ;; to open an index was this.
-              raw (.readFrom ^Reader (:rdr ix) (long (nth (:slot-offs ix) i)))
-              ;; AND TYPE-CHECKED HERE. This ran at load as an `every?` over all
-              ;; slots -- four `instance?` calls per node, on data most lookups
-              ;; never touch. `expand-slot` dispatches on the four widths
-              ;; `delta-slot` writes and hints the fall-through `^longs`, so a
-              ;; slot that decoded as anything else -- a TaggedValue, from one
-              ;; flipped byte -- became a raw ClassCastException. Six of 222
-              ;; single-byte footer mutants escaped untyped that way, so the
-              ;; check has to stay; it just does not have to be eager.
-              _ (when-not (or (bytes? raw)
-                              (instance? shorts-class raw)
-                              (instance? ints-class raw)
-                              (instance? longs-class raw))
-                  (fail :boring/bad-index
-                        (str "boring.nav: index node " i " has a slot of type "
-                             (some-> raw class .getName)
-                             ", which is not one of the four widths delta-slot writes")
-                        {:node i}))
-              a (expand-slot raw (max 0 (long (aget cs (int i)))))]
+              ^bytes packed (:slots ix)
+              ^longs starts (:slot-starts ix)
+              ^ints counts (:counts ix)
+              m (anchor-count (aget counts (int i)) (long (:stride ix)))
+              w (width-code packed i)
+              sz (bit-shift-left 1 w)
+              a (long-array m)
+              _ (loop [k 0 p (aget starts (int i)) acc (max 0 (aget cs (int i)))]
+                  (when (< k m)
+                    (let [v (+ acc (delta-at packed p w))]
+                      (aset a k v)
+                      (recur (inc k) (+ p sz) v))))]
           ;; CAS so every thread observes the same array; a loser discards its
           ;; own copy rather than publishing a second one.
           (.compareAndSet cache (int i) nil a)
@@ -1908,20 +1913,20 @@
           savedMax (.-maxItems r)
           savedN (.-items r)
           _ (set! (.-maxItems r) 0)
-          ;; SLOTS ARE NOT DECODED HERE. Everything else in the payload is a
-          ;; single value; `slots` is one typed array per node, and decoding
-          ;; them all to serve a lookup that visits one or two was half the cost
-          ;; of opening an index -- 44 us of 85 on a 767-node frame. They are
-          ;; located positionally instead and read in `slot-at`, on first use.
-          [slot-offs off-stride off-containers off-counts off-sorted]
-          (try (slot-offsets r ptr)
+          ;; FIVE BULK READS. `slots` and `sorted` are byte strings now
+          ;; (`core/pack-slots`, `core/pack-sorted`), so every payload element
+          ;; is a single value and there is nothing to decode lazily: what used
+          ;; to be one typed array per node, located positionally and read on
+          ;; first use, is one `.readFrom` of a contiguous run of bytes.
+          [off-stride off-containers off-counts off-slots off-sorted]
+          (try (payload-offsets r ptr)
                (catch Exception _ [nil nil nil nil nil]))
-          [stride raw-containers ^ints counts n-slots sorted]
-          (when slot-offs
+          [stride raw-containers ^ints counts packed sorted]
+          (when off-stride
             (try [(.readFrom r (long off-stride))
                   (.readFrom r (long off-containers))
                   (.readFrom r (long off-counts))
-                  (count slot-offs)
+                  (.readFrom r (long off-slots))
                   (.readFrom r (long off-sorted))]
                  (finally (set! (.-maxDepth r) (int saved))
                           (set! (.-maxItems r) savedMax)
@@ -1939,10 +1944,27 @@
                                     out (long-array (alength a))]
                                 (dotimes [i (alength a)] (aset out i (long (aget a i))))
                                 out)
-                              :else nil)]
+                              :else nil)
+          ;; THE PREFIX SUM IS ALSO THE STRUCTURE CHECK. `slot-starts` returns
+          ;; nil unless the width codes and the derived anchor counts describe
+          ;; `packed` to the byte, so a frame that decodes but whose parts
+          ;; disagree is refused here rather than at whichever node a lookup
+          ;; happens to visit. Guarded on the types it indexes with, because it
+          ;; runs BEFORE the checks below.
+          ^longs starts (when (and (bytes? packed)
+                                   (instance? (Class/forName "[I") counts)
+                                   (int? stride) (pos? (long stride)))
+                          (try (slot-starts packed (alength ^ints counts)
+                                            counts (long stride))
+                               (catch Exception _ nil)))]
       (when (and (int? stride) (pos? (long stride)) containers
                  (instance? (Class/forName "[I") counts)
-                 (sequential? slot-offs) (sequential? sorted)
+                 ;; A BYTE STRING WHERE AN ARRAY USED TO BE. This is what makes
+                 ;; the layout change safe in both directions: a frame written
+                 ;; by an older writer arrives as a Clojure vector of typed
+                 ;; arrays, fails here, and the caller scans. It cannot be read
+                 ;; wrongly, only not read.
+                 (bytes? packed) (bytes? sorted) starts
                  ;; STRUCTURE, not just decodability. Detection proves something
                  ;; MEANT to be an index; none of it proves the payload hangs
                  ;; together. A frame that decodes but whose parts disagree used
@@ -1952,13 +1974,10 @@
                  ;; are the one frame fault that costs O(1) to detect and would
                  ;; otherwise surface as a raw IndexOutOfBoundsException from
                  ;; inside `get` rather than as "no usable index, scan instead".
-                 (= (alength containers) (alength counts)
-                    (long n-slots) (count sorted))
-                 ;; The per-slot TYPE CHECK that used to live here has moved
-                 ;; into `slot-at`, which is where the slot is now decoded. Same
-                 ;; guarantee -- a slot of the wrong shape is a typed refusal
-                 ;; rather than a raw ClassCastException out of `expand-slot` --
-                 ;; paid per node visited instead of per node present.
+                 (= (alength containers) (alength counts))
+                 ;; `sorted` is a bit per node, so its byte length is exact --
+                 ;; `(quot (+ n 7) 8)` -- and an equality rather than a bound.
+                 (= (alength ^bytes sorted) (quot (+ (alength counts) 7) 8))
                  (or
                   trusted?
                   (and
@@ -1983,8 +2002,7 @@
                                :else (recur (inc k))))
               n (alength containers)
               st (long stride)
-              _ slot-offs
-              ;; LAZY, memoized per node. `expand-slot` is a prefix sum over a
+              ;; LAZY, memoized per node. `slot-at` is a prefix sum over a
               ;; node's anchors and `node-valid?` reads the file, so doing both
               ;; for every node at load made an index cost more than it saved on
               ;; a source used for ONE lookup -- which is every read of a
@@ -2006,12 +2024,13 @@
               ix {:stride st
                   :containers containers
                   :counts counts
-                  :slot-offs slot-offs
+                  :slots packed
+                  :slot-starts starts
                   :rdr r
                   :slot-cache cache
                   :node-checked (boolean-array n)
                   :node-ok (boolean-array n)
-                  :sorted (vec sorted)
+                  :sorted sorted
                   :data-end ptr}
               ;; THE SEQUENCE NODE STAYS EAGER, alone. `count` and `nth` consult
               ;; it immediately, a wrong `:total` is the silent-corruption case

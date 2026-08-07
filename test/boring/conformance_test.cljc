@@ -2716,23 +2716,31 @@
             konserve is portable and content-addressed: two platforms must not
             disagree about the bytes.
 
-            These two cases differ in ONE byte -- f5 vs f4, the flag itself --
+            These two cases differ in ONE byte -- 01 vs 00, the flag itself --
             which is what makes them a discriminator rather than a smoke test.
             Without the fix the ascending case fails on ClojureScript and
-            passes on the JVM."
+            passes on the JVM.
+
+            The flag used to be a CBOR boolean in an array (`81f5`/`81f4`) and
+            is now a bit in a byte string (`4101`/`4100`); slots likewise went
+            from an array of typed arrays (`814301030381`) to one byte string
+            carrying a 2-bit width code per node ahead of the deltas
+            (`4400010303`: node 0 is width 0 = u8, then deltas 1, 3, 3). Same
+            length here by coincidence, and the same single discriminating
+            byte."
     (let [opts {:index 1 :index-min 3 :shapes false :stringref false}
           asc  (array-map "a" 1 "b" 2 "c" 3)
           desc (array-map "c" 1 "b" 2 "a" 3)]
       (is (= (str "81a3616101616202616303d81b826c626f72696e672f696e646578"
-                  "8601d84e4401000000d84e4403000000814301030381f5"
+                  "8601d84e4401000000d84e440300000044000103034101"
                   "48000000000000000b")
              (c/bytes->hex (boring/encode-indexed [asc] opts)))
-          "ascending keys -> sorted true (f5)")
+          "ascending keys -> sorted true (bit set)")
       (is (= (str "81a3616301616202616103d81b826c626f72696e672f696e646578"
-                  "8601d84e4401000000d84e4403000000814301030381f4"
+                  "8601d84e4401000000d84e440300000044000103034100"
                   "48000000000000000b")
              (c/bytes->hex (boring/encode-indexed [desc] opts)))
-          "descending keys -> sorted false (f4)")
+          "descending keys -> sorted false (bit clear)")
       (testing "the flag is what separates them: same keys, same values, same
                 length, and the frame differs"
         (let [a (c/bytes->hex (boring/encode-indexed [asc] opts))

@@ -1497,64 +1497,161 @@
      (when (pos? (alength ^longs (:containers idx)))
        (assoc idx :stride stride)))))
 
-(defn- delta-slot
-  "A slot's entry offsets, as deltas in the narrowest typed array that holds them.
+(defn- slot-width-code
+  "The narrowest of four widths that holds every delta in `d`: 0 = u8, 1 = u16,
+  2 = i32, 3 = i64.
 
-  Offsets inside a container ascend, so consecutive differences are small and
-  nearly uniform while the absolutes are large and unbounded. That is the whole
-  saving: on 50 000 ~66-byte log records the per-item deltas span 60..67, which
-  is a byte, against int32 absolutes reaching into the millions.
-
-  Widths, narrowest first -- a byte string (no tag at all), sint16 (tag 77),
-  sint32 (tag 78). Every one of these already round-trips through the codec, so
-  this adds NO format surface: the CBOR tag is the width declaration, which is
-  why there is no per-entry flag of the kind Postgres needs for its JEntry
-  array. Postgres reads offsets in place out of a TOAST'd datum; we materialise
-  the index once, so we can afford a representation that must be expanded.
-
-  The 0x7FFF bound, rather than 0xFFFF: tag 77 is SIGNED, and taking the last
-  32 KiB of range back would mean masking on read for a band that only opens up
-  when anchors are 32 KiB apart. Deltas that large take int32, which is what
-  they would have cost anyway.
-
-  `base` is what the first delta is measured from: the container's own offset,
-  or 0 for the sequence node. So slot[0] is a header width rather than a file
-  position, which keeps the first entry as narrow as the rest.
-
-  Falls back to int32 on a negative delta. That cannot arise from a walk --
-  entries ascend and no CBOR item is zero bytes -- but the narrow encodings
-  cannot represent one, so the check is what makes that an assumption about the
-  walk rather than about the file."
-  [^longs offs ^long base]
-  (let [n (alength offs)
-        d (long-array n)]
-    (loop [i 0 prev base mn Long/MAX_VALUE mx Long/MIN_VALUE]
+  On 50 000 ~66-byte log records the per-item deltas span 60..67, which is a
+  byte, against int32 absolutes reaching into the millions -- so the width is
+  worth choosing, and worth choosing PER NODE. See `pack-slots`."
+  ^long [^longs d]
+  (let [n (alength d)]
+    (loop [i 0 mn Long/MAX_VALUE mx Long/MIN_VALUE]
       (if (= i n)
         (cond
-          (or (zero? n) (and (>= mn 0) (<= mx 0xFF)))
-          (let [b (byte-array n)]
-            (dotimes [k n] (aset-byte b k (unchecked-byte (aget d k))))
-            b)
+          (or (zero? n) (and (>= mn 0) (<= mx 0xFF))) 0
+          (and (>= mn 0) (<= mx 0xFFFF)) 1
+          (and (>= mn Integer/MIN_VALUE) (<= mx Integer/MAX_VALUE)) 2
+          ;; The fourth tier. Only reachable when two anchors are more than
+          ;; 2 GiB apart, which needs items that large -- but it costs nothing
+          ;; to have, because a narrower node is still emitted beside it.
+          :else 3)
+        (let [v (aget d i)]
+          (recur (inc i) (min mn v) (max mx v)))))))
 
-          (and (>= mn 0) (<= mx 0x7FFF))
-          (let [s (short-array n)]
-            (dotimes [k n] (aset-short s k (unchecked-short (aget d k))))
-            s)
+(defn- anchor-count
+  "How many anchors a container of `n` entries carries at `stride`.
 
-          (and (>= mn Integer/MIN_VALUE) (<= mx Integer/MAX_VALUE))
-          (let [a (int-array n)]
-            (dotimes [k n] (aset-int a k (unchecked-int (aget d k))))
-            a)
+  The reader derives every node's segment length from this rather than reading
+  it, which is what keeps `slots` a single flat byte string. It must agree
+  EXACTLY with `Writer.anchorCount` and with what the walk emits -- a
+  disagreement would silently shift every subsequent node's anchors. Both index
+  builders were checked against it across strides 1/4/16 and five document
+  shapes before the derivation replaced the stored lengths.
 
-          ;; sint64 (tag 79), the fourth tier. Only reachable when two anchors
-          ;; are more than 2 GiB apart, which needs items that large -- but the
-          ;; tier costs nothing to have, because the CBOR tag declares the width
-          ;; and a narrower slot is still emitted whenever one fits.
-          :else d)
-        (let [v (aget offs i)
-              delta (- v prev)]
-          (aset d i delta)
-          (recur (inc i) v (min mn delta) (max mx delta)))))))
+  An EMPTY container needs no anchors: `((0 - 1) / stride) + 1` is 1 under
+  truncating division, which would claim a phantom anchor at offset 0."
+  ^long [^long n ^long stride]
+  (if (<= n 0) 0 (if (= stride 1) n (inc (quot (dec n) stride)))))
+
+(defn- pack-slots
+  "Every node's anchor deltas, as ONE byte string.
+
+      [ 2-bit width code per node | node 0's deltas | node 1's deltas | ... ]
+
+  The width codes come first, `(quot (+ n 3) 4)` bytes of them, node `i` at bit
+  `(* 2 (rem i 4))` of byte `(quot i 4)`: 0 = u8, 1 = u16, 2 = i32, 3 = i64,
+  little-endian. Then each node's deltas back to back at its own width. A node's
+  segment LENGTH is not stored -- it is `anchor-count` of that node's entry
+  count, which the frame already carries.
+
+  This replaced one typed array PER NODE. That shape cost three ways and this
+  costs none of them: every small array carried its own CBOR head (a byte a
+  node, 33% of the slots on small deltas), decoding them all materialised a Java
+  array per container to serve a lookup that visits one or two, and locating
+  them positionally instead meant a head-read and a jump per node before any
+  lookup could start. Measured on a 767-node frame, the two together were 53.5
+  of the 92 ns per node it cost to open an index; this is 5.3.
+
+  A SINGLE FLAT TYPED ARRAY was the obvious alternative and is the wrong one.
+  It is faster still -- 0.53 ns/node, since it needs no width dispatch -- but
+  one array has one width, so a single container with 32 KiB between anchors
+  promotes every other node to int32. Measured: 33% SMALLER than the old shape
+  when all deltas are small, 166% LARGER when one node among 767 is wide. That
+  is not a corner: a map of small values beside one large blob is the ordinary
+  shape of scraped data. Per-node widths keep the narrow case narrow and make
+  the wide case cost only the node that is wide.
+
+  Unsigned u8 and u16 rather than the byte-string/sint16 pair the typed arrays
+  forced. The old second tier was SIGNED and so capped at 0x7FFF, sending
+  32 KiB..64 KiB deltas to int32; nothing here is a CBOR typed array, so the
+  full 16 bits are usable and that band stays two bytes wide."
+  ^bytes [slots ^longs containers ^ints counts ^long stride]
+  (let [n (count slots)
+        ds (object-array n)
+        ws (byte-array n)]
+    (dotimes [i n]
+      (let [^longs offs (nth slots i)
+            m (alength offs)
+            d (long-array m)]
+        ;; THE INVARIANT THE WHOLE LAYOUT RESTS ON, checked where it is
+        ;; established rather than assumed where it is used. No segment length
+        ;; goes on the wire: the reader slices `packed` by `anchor-count` of
+        ;; each node's entry count, so a walk that ever emitted a different
+        ;; number of anchors would not corrupt one node, it would shift every
+        ;; node after it -- silently, into other nodes' deltas. Cheap: one
+        ;; integer per node, on the writing side, which is the expensive side.
+        (when-not (= m (anchor-count (aget counts i) stride))
+          (throw (ex-info (str "boring: index node " i " has " m " anchors but "
+                               (aget counts i) " entries at stride " stride
+                               " implies " (anchor-count (aget counts i) stride)
+                               ". The index walk and `anchor-count` disagree.")
+                          {:type :boring/bad-index :node i :anchors m
+                           :entries (aget counts i) :stride stride})))
+        ;; Offsets inside a container ascend, so consecutive differences are
+        ;; small and nearly uniform while the absolutes are large and
+        ;; unbounded. That is the whole saving. `base` is the container's own
+        ;; offset, or 0 for the sequence node, whose sentinel offset is -1 --
+        ;; so slot[0] is a header width rather than a file position, which
+        ;; keeps the first delta as narrow as the rest.
+        (loop [k 0 prev (max 0 (aget containers i))]
+          (when (< k m)
+            (let [v (aget offs k)]
+              (aset d k (- v prev))
+              (recur (inc k) v))))
+        (aset ds i d)
+        ;; A negative delta cannot arise from a walk -- entries ascend and no
+        ;; CBOR item is zero bytes -- but u8 and u16 cannot represent one, so
+        ;; `slot-width-code` promotes to a signed tier rather than wrapping.
+        ;; That makes it an assumption about the walk, not about the file.
+        (aset-byte ws i (byte (slot-width-code d)))))
+    (let [wbytes (quot (+ n 3) 4)
+          total (loop [i 0 t (long wbytes)]
+                  (if (= i n)
+                    t
+                    (recur (inc i)
+                           (+ t (* (alength ^longs (aget ds i))
+                                   (bit-shift-left 1 (aget ws i)))))))
+          out (byte-array total)]
+      (dotimes [i n]
+        (let [b (quot i 4)]
+          (aset-byte out b (unchecked-byte
+                            (bit-or (bit-and 0xFF (aget out b))
+                                    (bit-shift-left (aget ws i) (* 2 (rem i 4))))))))
+      (loop [i 0 p (long wbytes)]
+        (if (= i n)
+          out
+          (let [^longs d (aget ds i)
+                sz (bit-shift-left 1 (aget ws i))
+                m (alength d)]
+            (dotimes [k m]
+              (let [v (aget d k)
+                    o (+ p (* k sz))]
+                (dotimes [j sz]
+                  (aset-byte out (+ o j)
+                             (unchecked-byte (bit-shift-right v (* 8 j)))))))
+            (recur (inc i) (+ p (* m sz)))))))))
+
+(defn- pack-sorted
+  "One bit per node -- does this container's keys ascend -- as a byte string,
+  node `i` at bit `(rem i 8)` of byte `(quot i 8)`.
+
+  This was an array of CBOR booleans, one item each. Measured on a 767-node
+  frame: 770 bytes and 8.1 us to decode, against 98 bytes and 0.04 us here.
+  Two hundred times faster and eight times smaller, for a bit vector that CBOR
+  had no compact form for. The byte length is exact -- `(quot (+ n 7) 8)` --
+  which is also what lets the reader check it against the node count."
+  ^bytes [sorted]
+  (let [v (vec sorted)
+        n (count v)
+        out (byte-array (quot (+ n 7) 8))]
+    (dotimes [i n]
+      (when (nth v i)
+        (let [b (quot i 8)]
+          (aset-byte out b (unchecked-byte
+                            (bit-or (bit-and 0xFF (aget out b))
+                                    (bit-shift-left 1 (rem i 8))))))))
+    out))
 
 (defn- long->8-bytes* ^bytes [^long v]
   (let [b (byte-array 8)]
@@ -1575,11 +1672,30 @@
   `sorted` says whether that container's keys ascend -- recorded rather than
   inferred, because the encoding profile is not on the wire.
 
-  Slots go out as DELTAS, in the narrowest typed array that holds them (see
-  `delta-slot`), and a reader expands them back to absolutes once when it loads
-  the index. An int32 slot is therefore deltas too, not absolutes -- the two are
-  indistinguishable on the wire, which is why this had to land before the format
-  was published rather than after.
+  BOTH ARE BYTE STRINGS, not CBOR arrays. `slots` is every node's anchor deltas
+  concatenated, each node at its own width, behind a packed table of 2-bit width
+  codes (`pack-slots`); `sorted` is a bit per node (`pack-sorted`). Neither
+  carries per-node framing, and a node's segment length is DERIVED from the
+  entry count already in `counts`.
+
+  Measured on 768 nodes of 20 entries at stride 1, the same document through
+  both layouts: opening the index went from 91.6 ns per node to 22.2, a little
+  over fourfold. The frame shrank by 1.0% -- 124312 bytes to 123061 -- which is
+  the part NOT to generalise from: the saving is one CBOR head per node plus
+  seven eighths of `sorted`, so it is proportional to the node count and not to
+  the document, and it is worth most exactly where the old shape was worst.
+  Speed is the reason to do this; size is a rebate.
+
+  Slots go out as DELTAS and a reader expands them back to absolutes on first
+  use. Deltas and absolutes are indistinguishable on the wire, which is why this
+  had to land before the format was published rather than after.
+
+  THE PAYLOAD IS STILL SIX ELEMENTS, so `boring.frame/prefix-bytes` -- whose
+  trailing `0x86` is that count -- is unchanged. A reader too old for this shape
+  finds a byte string where it expects an array, fails its own structure check
+  and scans, which is the documented answer for an index it cannot use. A reader
+  new enough finds an array where it expects a byte string and does the same.
+  Neither direction can answer WRONGLY; both lose the index and keep the file.
 
   The trailing element is a byte string of exactly 8 bytes, so it always encodes
   as `0x48` plus 8: a sealed file ends with 9 predictable bytes however large
@@ -1640,15 +1756,11 @@
                               (dotimes [i (alength containers)]
                                 (aset-int a i (unchecked-int (aget containers i))))
                               a))
-          packed (vec (map-indexed
-                       (fn [i s]
-                       ;; The sequence node's sentinel offset is -1, and a file
-                       ;; position is never negative: its deltas start from 0.
-                         (delta-slot s (max 0 (long (aget containers (int i))))))
-                       slots))
           item (data/unknown-record
                 index-name
-                [(long stride) wire-containers counts packed (vec sorted)
+                [(long stride) wire-containers counts
+                 (pack-slots slots containers counts (long stride))
+                 (pack-sorted sorted)
                  (long->8-bytes* (long data-len))])]
     ;; The frame goes out under the SAME options as the data it describes.
     ;; `write-to!`'s 2-arity resolves the WRITER's options instead, so

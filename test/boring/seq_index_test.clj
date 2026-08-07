@@ -166,27 +166,35 @@
 
 ;; ----------------------------------------------------------- delta encoding
 ;;
-;; Slots go on the wire as differences from the previous entry, in the narrowest
-;; of a byte string / sint16 / sint32, and are expanded once when the index
-;; loads. The element type IS the width declaration, so these tests check the
-;; type that came back rather than a flag, and check that every width still
-;; answers identically -- narrowing is a size decision and nothing else.
+;; Slots go on the wire as differences from the previous entry, PER NODE, in the
+;; narrowest of u8 / u16 / i32 / i64 -- all of it inside one byte string whose
+;; head is a 2-bit width code per node (`boring.core/pack-slots`). The width is
+;; a declaration in that table rather than a CBOR element type, so these read
+;; the code back rather than a class, and check that every width still answers
+;; identically: narrowing is a size decision and nothing else.
 
 (defn- index-slots
-  "The slot arrays as they actually sit on the wire, before expansion."
-  [^bytes bs o]
+  "The packed slots byte string as it actually sits on the wire."
+  ^bytes [^bytes bs o]
   (let [item (last (foreign-items bs))
         [_ _ _ slots _ _] (boring.data/frame-payload item)]
-    (vec slots)))
+    slots))
+
+(defn- width-code
+  "Node `i`'s 2-bit width code out of the table at the head of `packed`."
+  [^bytes packed i]
+  (bit-and 3 (bit-shift-right (aget packed (quot i 4)) (* 2 (rem i 4)))))
 
 (deftest slots-narrow-to-the-width-the-data-needs
-  (testing "small, uniform deltas take a byte string -- no tag at all"
-    (let [slots (index-slots (build 1) opts)]
-      (is (= 1 (count slots)) "one node: the sequence")
-      (is (bytes? (first slots))
-          (str "expected a byte string for ~60-byte deltas, got "
-               (.getName (class (first slots)))))))
-  (testing "wider deltas step up to sint16, and wider still to sint32"
+  (testing "small, uniform deltas take the u8 tier"
+    (let [packed (index-slots (build 1) opts)]
+      (is (bytes? packed) "slots are ONE byte string, not an array per node")
+      (is (= 0 (width-code packed 0))
+          "expected the u8 tier for ~60-byte deltas")
+      ;; One node -- the sequence -- so one width byte and 500 one-byte deltas.
+      (is (= (+ 1 500) (alength packed))
+          "the byte string is exactly the width table plus the deltas")))
+  (testing "wider deltas step up to u16, and wider still to i32"
     (let [w (boring/writer 262144 opts)
           mk (fn [len]
                (let [o (ByteArrayOutputStream.)
@@ -194,10 +202,34 @@
                                {"n" i "pad" (apply str (repeat len \x))}))]
                  (boring/write-seq! w vs o (assoc opts :index 1))
                  (.toByteArray o)))]
-      (is (instance? (class (short-array 0)) (first (index-slots (mk 2000) opts)))
-          "~2 KB deltas exceed a byte and fit sint16")
-      (is (instance? (class (int-array 0)) (first (index-slots (mk 40000) opts)))
-          "~40 KB deltas exceed signed 16 bits and fall back to sint32"))))
+      (is (= 1 (width-code (index-slots (mk 2000) opts) 0))
+          "~2 KB deltas exceed a byte and fit u16")
+      ;; 40 KB exceeded the OLD second tier, which was sint16 and so capped at
+      ;; 0x7FFF because tag 77 is signed. Nothing here is a CBOR typed array,
+      ;; so the full 16 bits are usable and this band stays two bytes wide.
+      (is (= 1 (width-code (index-slots (mk 40000) opts) 0))
+          "~40 KB deltas still fit u16, which sint16 could not hold")
+      (is (= 2 (width-code (index-slots (mk 70000) opts) 0))
+          "~70 KB deltas exceed 16 bits and fall back to i32"))))
+
+(deftest each-node-keeps-its-own-width
+  (testing "ONE flat array at a single width was the alternative, and it is why
+            the width table exists: a single container with wide deltas would
+            promote every other node with it. Measured on 767 nodes, that was
+            166% LARGER than the per-node shape when one node was wide. Here a
+            small map beside a large blob must leave the small node at u8."
+    (let [o (ByteArrayOutputStream.)
+          w (boring/writer 262144 opts)
+          vs [(zipmap (map #(str "k" %) (range 40)) (range 40))
+              (zipmap (map #(str "b" %) (range 40))
+                      (repeat (apply str (repeat 3000 \x))))]]
+      (boring/write-seq! w vs o (assoc opts :index 1 :index-min 4))
+      (let [packed (index-slots (.toByteArray o) opts)
+            codes (map #(width-code packed %) (range 3))]
+        (is (some #{0} codes)
+            (str "the small-value node must stay u8; got widths " (vec codes)))
+        (is (some #{1} codes)
+            (str "the 3 KB-value node must widen on its own; got " (vec codes)))))))
 
 (deftest every-width-resolves-identically
   (testing "the fallback to a wider element type is a size decision only"
