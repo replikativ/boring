@@ -347,7 +347,7 @@
    "BOM in the middle"    "a﻿b"
    "two BOMs"             "﻿﻿"
    "empty"                ""
-   "nul"                  " "
+   "nul"                  "\u0000"
    "astral pair"          "💩"
    "combining mark"       "é"
    "lone ascii"           "A"})
