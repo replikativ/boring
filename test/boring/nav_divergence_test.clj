@@ -314,9 +314,16 @@
                     (map (fn [i] [(keyword (str "k" i)) i])) (range 12))
           plain (boring/encode doc {:stringref false})
           idx (boring/encode-indexed doc {:index 1 :index-min 13})
+          ;; THE INDEX IS FORCED BEFORE COUNTING. Opening one now walks the
+          ;; frame positionally to locate each node's slot -- cheaper than
+          ;; decoding them all, but it is `skipFrom` calls, and the counter does
+          ;; not distinguish "found the slots" from "walked the data". The claim
+          ;; under test is that a LOOKUP consults the index, so open is excluded.
           skips (fn [bs]
                   (let [c (nav/source bs o)
-                        ^Reader r (.rdr ^boring.nav.Nav (.nav ^boring.nav.Cursor c))
+                        nv (.nav ^boring.nav.Cursor c)
+                        ^Reader r (.rdr ^boring.nav.Nav nv)
+                        _ (#'nav/nav-idx nv)
                         before (.skips r)]
                     [(nav/value (nav/walk c [:k11])) (- (.skips r) before)]))
           [v-plain n-plain] (skips plain)

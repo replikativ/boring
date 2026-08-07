@@ -240,9 +240,14 @@
                                      (+ prefix (alength ^bytes item))
                                      {:stringref false})
                  (.toByteArray bos))
+          ;; The index is forced before counting: opening one walks the frame
+          ;; positionally to find each node's slot, and those are `skipFrom`
+          ;; calls too. What is being compared here is lookup work.
           probe (fn [^bytes bs ^long off]
                   (let [c (nav/source-at bs off o)
-                        ^Reader r (.rdr ^boring.nav.Nav (.nav ^boring.nav.Cursor c))
+                        nv (.nav ^boring.nav.Cursor c)
+                        ^Reader r (.rdr ^boring.nav.Nav nv)
+                        _ (#'nav/nav-idx nv)
                         before (.skips r)
                         v (nav/value (nav/walk c [:k11]))]
                     {:value v :skips (- (.skips r) before)}))
