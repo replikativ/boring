@@ -135,6 +135,60 @@
 (def ^:private longs-array-class (Class/forName "[J"))
 (def ^:private ints-array-class (Class/forName "[I"))
 
+;; A TYPE, not a fifteen-key map. `index-payload` used to return one, and on a
+;; source that is read ONCE -- which is every read of a store handing out a
+;; fresh blob -- building it was the single largest cost in a cold lookup.
+;;
+;; Profiled, 4M cold indexed lookups through a `nav/context` (so option
+;; validation is out of the picture): 29.7% of samples were Clojure map and
+;; keyword operations, against ~28% doing any CBOR reading at all, and the
+;; TOP LEAF in the whole profile was `PersistentHashMap$BitmapIndexedNode.assoc`
+;; at 9.4% -- this map being built. Fifteen keys is past the array-map
+;; threshold, so it is a bitmap trie: fifteen hashed inserts to construct, and
+;; a hash and a trie descent for every read, of which `slot-at` alone does six.
+;;
+;; Fields are a load. Nothing here ever needed map semantics: it is internal to
+;; this namespace, never printed, never `assoc`ed by a caller, never iterated.
+;;
+;; NIL-PUNNING IS PRESERVED, deliberately. `read-index` returns a DETECTED but
+;; REFUSED frame as an index carrying only `data-end` -- `items` still needs to
+;; know where the data stops, or it walks into the footer and republishes it as
+;; a trailing item. Callers tell the two apart with `(if-let [cs (.containers
+;; ix)] ...)`, exactly as they did when this was a map, so that contract is
+;; unchanged.
+;;
+;; `ILookup` so `(:containers ix)` keeps working. Tests reach in here on
+;; purpose -- `index_layout_test` and `index_robustness_test` assert on
+;; `:slots`, `:sorted`, `:offsets`, `:node-checked` -- and those assertions are
+;; the point of those files, not an accident to be rewritten around. The hot
+;; paths in this namespace use direct field access; `valAt` is for them.
+(deftype Index
+         [^Reader rdr
+          ^long stride
+          ^longs containers
+          ^ints counts
+          ^bytes slots
+          ^longs slot-starts
+          ^bytes sorted
+          ^long data-end
+          ^java.util.concurrent.atomic.AtomicReferenceArray slot-cache
+          ^booleans node-checked
+          ^booleans node-ok
+          total
+          ^longs offsets
+          ^booleans anchor-checked
+          ^booleans anchor-ok]
+  clojure.lang.ILookup
+  (valAt [this k] (.valAt this k nil))
+  (valAt [_ k nf]
+    (case k
+      :rdr rdr :stride stride :containers containers :counts counts
+      :slots slots :slot-starts slot-starts :sorted sorted :data-end data-end
+      :slot-cache slot-cache :node-checked node-checked :node-ok node-ok
+      :total total :offsets offsets
+      :anchor-checked anchor-checked :anchor-ok anchor-ok
+      nf)))
+
 ;; `views` is a ONE-SLOT cache of the last tag view built, as `[offset view]`.
 ;;
 ;; It was an unbounded `atom {}` keyed by offset, and it grew one entry per tag
@@ -1819,6 +1873,30 @@
   (not (zero? (bit-and (bit-and (aget sorted (int (quot i 8))) 0xFF)
                        (bit-shift-left 1 (int (rem i 8)))))))
 
+(defn- expand-anchors
+  "Node `i`'s absolute anchors, as arithmetic over the packed bytes.
+
+  Split out of `slot-at` because `index-payload` needs the SEQUENCE node's
+  anchors while it is still assembling the `Index` that `slot-at` would read
+  them from -- the old map could be built in two steps with `assoc`, a type
+  cannot. Taking the pieces rather than the whole also says what this actually
+  depends on, which is five arrays and a stride."
+  ;; No primitive hints on `stride`/`i`: six args with two of them primitive is
+  ;; one past what Clojure allows, and the boxing here is once per node rather
+  ;; than per anchor. `node-valid?` carries the same note for the same reason.
+  ^longs [^bytes packed ^longs starts ^ints counts ^longs cs stride i]
+  (let [i (long i)
+        m (anchor-count (aget counts (int i)) (long stride))
+        w (width-code packed i)
+        sz (bit-shift-left 1 w)
+        a (long-array m)]
+    (loop [k 0 p (aget starts (int i)) acc (max 0 (aget cs (int i)))]
+      (when (< k m)
+        (let [v (+ acc (delta-at packed p w))]
+          (aset a k v)
+          (recur (inc k) (+ p sz) v))))
+    a))
+
 (defn- slot-at
   "Absolute anchors for node `i`, expanded on first use and memoized.
 
@@ -1832,23 +1910,12 @@
   in place at the node's own width. It used to `.readFrom` a typed array per
   node and then type-check what came back; `slot-starts` now settles the whole
   array's structure once, so there is nothing left to check per node."
-  ^longs [ix ^long i]
-  (let [^AtomicReferenceArray cache (:slot-cache ix)
+  ^longs [^Index ix ^long i]
+  (let [^AtomicReferenceArray cache (.slot-cache ix)
         hit (.get cache (int i))]
     (or hit
-        (let [^longs cs (:containers ix)
-              ^bytes packed (:slots ix)
-              ^longs starts (:slot-starts ix)
-              ^ints counts (:counts ix)
-              m (anchor-count (aget counts (int i)) (long (:stride ix)))
-              w (width-code packed i)
-              sz (bit-shift-left 1 w)
-              a (long-array m)
-              _ (loop [k 0 p (aget starts (int i)) acc (max 0 (aget cs (int i)))]
-                  (when (< k m)
-                    (let [v (+ acc (delta-at packed p w))]
-                      (aset a k v)
-                      (recur (inc k) (+ p sz) v))))]
+        (let [a (expand-anchors (.slots ix) (.slot-starts ix) (.counts ix)
+                                (.containers ix) (.stride ix) i)]
           ;; CAS so every thread observes the same array; a loser discards its
           ;; own copy rather than publishing a second one.
           (.compareAndSet cache (int i) nil a)
@@ -2071,23 +2138,17 @@
               ;; worst case is recomputing a verdict -- which is the same trade
               ;; `anchor-checked` already makes.
               cache (AtomicReferenceArray. n)
-              ix {:stride st
-                  :containers containers
-                  :counts counts
-                  :slots packed
-                  :slot-starts starts
-                  :rdr r
-                  :slot-cache cache
-                  :node-checked (boolean-array n)
-                  :node-ok (boolean-array n)
-                  :sorted sorted
-                  :data-end ptr}
               ;; THE SEQUENCE NODE STAYS EAGER, alone. `count` and `nth` consult
               ;; it immediately, a wrong `:total` is the silent-corruption case
               ;; documented in `node-valid?`, and it is a single node rather
               ;; than one per container. A sequence is also the shape whose
               ;; source is reused, so there is nothing to amortise away.
-              seq-anchors (when seq-slot (slot-at ix (long seq-slot)))
+              ;;
+              ;; Through `expand-anchors` rather than `slot-at`, because the
+              ;; `Index` does not exist yet -- see that function.
+              seq-anchors (when seq-slot
+                            (expand-anchors packed starts counts containers st
+                                            (long seq-slot)))
               ;; Trusted skips this for the same reason `node-sound?` does: it
               ;; walks the file to prove the sequence node honest, and a caller
               ;; who wrote the bytes has already answered that question.
@@ -2098,14 +2159,13 @@
                                        (long (aget counts (int seq-slot)))
                                        st seq-anchors))]
           (when seq-ok?
-            (assoc ix
-                   :total (when seq-slot (long (aget counts (int seq-slot))))
-                   :offsets seq-anchors
-                   ;; The per-anchor verdict cache -- see `anchor-sound?`.
-                   :anchor-checked (when seq-slot
-                                     (boolean-array (alength ^longs seq-anchors)))
-                   :anchor-ok (when seq-slot
-                                (boolean-array (alength ^longs seq-anchors))))))))
+            (Index. r st containers counts packed starts sorted ptr cache
+                    (boolean-array n) (boolean-array n)
+                    (when seq-slot (long (aget counts (int seq-slot))))
+                    seq-anchors
+                    ;; The per-anchor verdict cache -- see `anchor-sound?`.
+                    (when seq-slot (boolean-array (alength ^longs seq-anchors)))
+                    (when seq-slot (boolean-array (alength ^longs seq-anchors))))))))
     (catch Exception _ nil)))
 
 (defn- read-index
@@ -2210,7 +2270,11 @@
               ;; section and republishes the footer as a data item.
               (or (index-payload r ptr
                                  (= :trusted (:trust-index (.opts nav))))
-                  {:data-end ptr}))))))))
+                  ;; DETECTED BUT REFUSED: an Index carrying only `data-end`.
+                  ;; `containers` nil is how every caller tells this apart --
+                  ;; `(if-let [cs (.containers ix)] ...)` -- which is the same
+                  ;; test they used when this was a map with one key.
+                  (Index. r 0 nil nil nil nil nil ptr nil nil nil nil nil nil nil)))))))))
 
 (defn- anchor-sound?
   "Whether sequence anchor `k` is where it claims to be. Cached per anchor.
