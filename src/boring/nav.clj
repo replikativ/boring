@@ -1077,6 +1077,55 @@
 
 (defn- cursor-at [^Nav nav ^long off] (->Cursor nav off nil))
 
+(defn walk
+  "The cursor at `path` from `cursor`, or nil if any step is absent.
+
+  `(walk c [:profile :address :city])` is `(get-in c [...])` with two
+  differences that matter on a hot path:
+
+    * NO INTERMEDIATE CURSOR. `get-in` allocates one per step to throw away;
+      this resolves the whole path against one `Nav`, carrying an offset.
+    * EVERY STEP CONSULTS THE INDEX, because every step goes through the same
+      `lookup-map`/`nth-item` that `get` does.
+
+  That second point is the reason this is public rather than an internal
+  shortcut. A caller that wants a compiled access path -- probe bytes encoded
+  once, no per-row re-encoding -- would otherwise write its own walker over
+  `Reader`'s positional primitives, and such a walker CANNOT reach the index:
+  the index lives on the Nav, and `Reader.skipFrom` knows nothing about it.
+  konserve-lmdb wrote exactly that walker, and it disagreed with this namespace
+  twice -- reporting a present integer key absent, and returning the first
+  VALUE of a map for the path `[1]` where the truth is the value under the key
+  `1`. One walker, one set of answers.
+
+  Probes are cached on the Nav's context, so a path's keys are encoded once per
+  context rather than once per document -- which is the other half of what a
+  compiled path buys.
+
+  An integer step is a POSITION on an array and a KEY on a map, decided from
+  the container. That is `get`'s rule and it is the correct one."
+  [cursor path]
+  (when cursor
+    (let [^Cursor c cursor
+          ^Nav nav (.nav c)]
+      ;; A shaped-array ROW resolves its keys through the shape rather than the
+      ;; wire, so it cannot be walked by offset. Falling back to `get` per step
+      ;; keeps the answer right; such rows are small and rare.
+      (if (.shape c)
+        (reduce (fn [cur k] (when cur (get cur k))) cursor path)
+        (loop [off (.off c) ks (seq path)]
+          (if-not ks
+            (cursor-at nav off)
+            (let [k (first ks)
+                  mj (major nav off)
+                  p (cond
+                      (and (= mj MAJOR-ARRAY) (integer? k)) (nth-item nav off (long k))
+                      (= mj MAJOR-MAP) (lookup-map nav off k)
+                      :else -1)]
+              (if (neg? p)
+                nil
+                (recur p (next ks))))))))))
+
 ;; ------------------------------------------------------- navigating a tag
 ;;
 ;; A CBOR tag is structurally uniform -- one tag number wrapping one data item

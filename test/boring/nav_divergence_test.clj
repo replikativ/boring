@@ -36,7 +36,8 @@
             [boring.core :as boring]
             [boring.nav :as nav]
             [boring.conformance :as c]
-            [boring.hostile :as hostile]))
+            [boring.hostile :as hostile])
+  (:import (org.replikativ.boring Reader)))
 
 ;; ---------------------------------------------------------------- the axes
 
@@ -272,3 +273,62 @@
                     [nk nv] (outcome #(count (nav/source bs o)))]
                 (is (not (and (= :ok dk) (= :ok nk) (= (count dv) nv)))
                     (str "[" axis " " dl "] count now agrees -- delete the row"))))))))))
+
+;;; walk
+
+(deftest walk-agrees-with-get-in-on-every-path
+  (testing "`walk` exists so a caller wanting a compiled access path does not
+            write its own walker over `Reader`'s positional primitives. Such a
+            walker cannot reach the index -- the index lives on the Nav and
+            `skipFrom` knows nothing about it -- and konserve-lmdb wrote one
+            that disagreed with this namespace twice: a present integer key
+            reported absent, and `[1]` into `{0 \"a\" 1 \"b\"}` returning the
+            first VALUE rather than the value under the key `1`.
+
+            So the property is that `walk` and `get-in` are the same function."
+    (let [o {:stringref false}
+          doc {:m {0 "zero" 1 "one" :k "kw"}
+               :v [10 20 30]
+               :deep {:a {:b {:c "found"}}}
+               :mixed [{:x 1} {:x 2}]}
+          bs (boring/encode doc o)
+          c (nav/source bs o)]
+      (doseq [path [[:m 0] [:m 1] [:m :k]
+                    [:v 0] [:v 2] [:v 3]
+                    [:deep :a :b :c] [:deep :a :nope]
+                    [:mixed 1 :x] [:mixed 0 :x]
+                    [] [:nope] [:m] [:v]]]
+        (is (= (nav/value (get-in c path)) (nav/value (nav/walk c path)))
+            (str "walk and get-in disagree on " (pr-str path)))
+        (is (= (get-in doc path) (nav/value (nav/walk c path)))
+            (str "walk disagrees with the decoded truth on " (pr-str path)))))))
+
+(deftest walk-uses-the-index-where-a-positional-walker-cannot
+  (testing "the reason `walk` is public rather than an internal shortcut. A
+            walker built on `Reader.skipFrom` gets no benefit from an index at
+            all -- measured, 33.06 us indexed against 32.15 unindexed on the
+            same document -- while `walk` reaches 4.91. Asserted here as SKIPS,
+            which is deterministic."
+    (let [o {:stringref false :trust-index :trusted}
+          doc (into {:tree (vec (repeatedly 200 #(hash-map :a 1 :b 2)))}
+                    (map (fn [i] [(keyword (str "k" i)) i])) (range 12))
+          plain (boring/encode doc {:stringref false})
+          idx (boring/encode-indexed doc {:index 1 :index-min 13})
+          skips (fn [bs]
+                  (let [c (nav/source bs o)
+                        ^Reader r (.rdr ^boring.nav.Nav (.nav ^boring.nav.Cursor c))
+                        before (.skips r)]
+                    [(nav/value (nav/walk c [:k11])) (- (.skips r) before)]))
+          [v-plain n-plain] (skips plain)
+          [v-idx n-idx] (skips idx)]
+      (is (= 11 v-plain v-idx) "same answer either way")
+      ;; STRICTLY FEWER, not a ratio. `Reader.skips` counts skipFrom CALLS, and
+      ;; skipping a 200-element subtree is one call -- the same wrong unit that
+      ;; made an earlier test pass with a live bug in place. It is enough to
+      ;; prove the index is CONSULTED; the size of the win is a timing claim and
+      ;; lives in the docstring, measured: 4.91 us indexed against 32.15, while
+      ;; a positional walker on the same indexed bytes gets 33.06 -- no benefit
+      ;; at all, which is the thing this function exists to fix.
+      (is (< n-idx n-plain)
+          (str "indexed walk took " n-idx " skips against " n-plain
+               " unindexed; the index is not being consulted")))))
