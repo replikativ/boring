@@ -1117,14 +1117,21 @@
           (if-not ks
             (cursor-at nav off)
             (let [k (first ks)
-                  mj (major nav off)
-                  p (cond
-                      (and (= mj MAJOR-ARRAY) (integer? k)) (nth-item nav off (long k))
-                      (= mj MAJOR-MAP) (lookup-map nav off k)
-                      :else -1)]
-              (if (neg? p)
-                nil
-                (recur p (next ks))))))))))
+                  mj (major nav off)]
+              (if (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP))
+                (let [p (if (and (= mj MAJOR-ARRAY) (integer? k))
+                          (nth-item nav off (long k))
+                          (lookup-map nav off k))]
+                  (if (neg? p) nil (recur p (next ks))))
+                ;; ANYTHING ELSE GOES THROUGH `get`, which is the only place
+                ;; that knows how to descend a TAG -- a record, a shaped array,
+                ;; a set, or a stringref namespace, which has no view and falls
+                ;; back to realising. Walking by offset cannot do that, and
+                ;; skipping the fallback made `walk` answer nil where `get-in`
+                ;; answers correctly. Rare, so the cursor allocation here costs
+                ;; nothing on the paths this function exists for.
+                (when-let [c2 (get (cursor-at nav off) k)]
+                  (reduce (fn [cur kk] (when cur (get cur kk))) c2 (next ks)))))))))))
 
 ;; ------------------------------------------------------- navigating a tag
 ;;
