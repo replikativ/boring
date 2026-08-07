@@ -550,20 +550,33 @@ mistake.
 | `decode-seq-from` (streaming in) | `InputStream` | pull function |
 | `write-seq!` (streaming out) | ✔, streams within an item | ✔, buffers each whole item |
 | `write-to!` / `write-to-buffer!` | ✔ | — |
-| `encode-indexed` / `write-indexed!` / `seal-index!` | ✔ | — |
+| `encode-indexed` / `build-index` / `seal-index!` | ✔ | ✔ |
+| `write-indexed!` (streaming, index captured while encoding) | ✔ | — |
 | `boring.nav` (offset navigation) | ✔ | — |
 | `boring.mmap` (memory mapping) | ✔ | — |
 
-The index is **written** only on the JVM. It is **read past** on both: a
-ClojureScript `decode-seq` recognises a genuine trailing `boring/index` frame
-and does not hand it back as a phantom final item, so the library's own default
-JVM output yields the same N items on either side. It used to yield N there and
-N+1 here, which is the kind of asymmetry that is worth a table.
+The index is **written on both**, and this table said otherwise for longer than
+it was true: `encode-indexed`, `build-index` and `seal-index!` are all in
+`boring.core` on ClojureScript. Only `write-indexed!` is JVM-only, because it
+captures nodes from the writer as it encodes and there is no stream to capture
+from on the other side; ClojureScript reaches the same bytes by the byte walk,
+which is why the two must agree and why `indexed-bytes-are-identical-on-both-platforms`
+exists.
+
+It is **read past** on both: a ClojureScript `decode-seq` recognises a genuine
+trailing `boring/index` frame and does not hand it back as a phantom final item,
+so the library's own default JVM output yields the same N items on either side.
+It used to yield N there and N+1 here, which is the kind of asymmetry that is
+worth a table.
 
 Navigation and memory mapping are absent from ClojureScript because the
 capabilities are: there is no `mmap` in a browser, and offset navigation without
-one buys nothing over decoding the sequence. `write-indexed!` could be ported
-and has not been.
+one buys nothing over decoding the sequence.
+
+So ClojureScript writes an index it cannot itself use. That is deliberate --
+a blob written in the browser or on Node stays navigable to a JVM reader -- but
+no consumer is known to rely on it today, and it costs a third of `core.cljs`
+kept in byte-for-byte agreement with the JVM.
 
 ## Determinism
 
