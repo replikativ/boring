@@ -1591,10 +1591,19 @@
 
   Split out of `index-payload` so it can be run PER NODE, on demand, instead of
   over every node at load. That is the whole cost of an index on a short-lived
-  source: the checks below read the file -- `skip` walks up to a stride of
-  items to pin the far end -- so validating a 12 000-container frame cost
-  ~1 ms before a single lookup ran, and a caller that touches one key paid all
-  of it. Deferring makes the price proportional to what is actually navigated.
+  source: the checks below read the file, so validating a 12 000-container
+  frame cost ~1 ms before a single lookup ran, and a caller that touches one
+  key paid all of it. Deferring makes the price proportional to what is
+  actually navigated.
+
+  IT DOES NOT MAKE IT SMALL. Pinning the far end needs the container's end, and
+  a CBOR container carries no byte length, so finding it walks every item --
+  the work the node exists to avoid. Untrusted, an index therefore cannot beat
+  an unindexed walk on a source read ONCE, at any container size, by
+  construction rather than by a constant: measured flat at ~190 us on 769 maps
+  of 20 wherever the key sat, against 2.2 us unindexed for the first element.
+  `:trust-index :trusted` skips it and runs 20-23 us. See the far-end check
+  below.
 
   The checks themselves are unchanged, and each was reachable: a slot shorter
   than its count made `nth` walk off the end, a zero-length slot made the binary
@@ -1658,14 +1667,39 @@
                  ;;   in the file, returned by `decode-seq`, and
                  ;;   unreachable through `count`/`nth`.
                  ;;
-                 ;; The check is exact and costs at most one stride
-                 ;; of skips per node, never a walk of the container:
-                 ;; the slot-length rule above already forces
-                 ;; `remaining` into [1, stride]. From the last
-                 ;; anchor, stepping over the items it covers must
-                 ;; land EXACTLY on the node's end -- the data
-                 ;; section's end for the sequence, the container's
-                 ;; own end otherwise.
+                 ;; THE STEP FROM THE LAST ANCHOR is bounded by one
+                 ;; stride -- the slot-length rule above forces
+                 ;; `remaining` into [1, stride]. `want-end` is NOT.
+                 ;;
+                 ;; This comment used to claim the check "never
+                 ;; walks the container", and `(skip r c)` below is
+                 ;; precisely a walk of the container: CBOR arrays
+                 ;; and maps carry no byte length, so finding where
+                 ;; one ends means stepping over every item in it.
+                 ;; That is the work the node exists to avoid, paid
+                 ;; to prove the node honest.
+                 ;;
+                 ;; Measured, 769 maps of 20 at stride 1, one cold
+                 ;; lookup: untrusted is FLAT at ~190 us wherever
+                 ;; the key sits, because it walks the outer array
+                 ;; either way, while an unindexed walk runs 2.2 us
+                 ;; to reach element 0 and 240 to reach element 768.
+                 ;; So an untrusted index is 91x SLOWER than none at
+                 ;; the front and only breaks even at the very back.
+                 ;; Trusted is 20-23 us throughout.
+                 ;;
+                 ;; It is memoized per node, so a REUSED source pays
+                 ;; it once and profits after; a source read once --
+                 ;; which is every read of a store handing out a
+                 ;; fresh blob -- pays it and gains nothing. Making
+                 ;; this O(stride) needs the frame to carry each
+                 ;; node's end, which is a format change and not one
+                 ;; to make silently.
+                 ;;
+                 ;; From the last anchor, stepping over the items it
+                 ;; covers must land EXACTLY on the node's end --
+                 ;; the data section's end for the sequence, the
+                 ;; container's own end otherwise.
          (let [m (alength a)]
            (or (if (neg? c)
                          ;; A SEQUENCE NODE CLAIMING ZERO ITEMS has
