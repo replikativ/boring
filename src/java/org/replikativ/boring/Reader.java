@@ -395,10 +395,23 @@ public final class Reader {
     }
 
     public void reset(byte[] b) {
-        // Re-binding the SAME array -- a loop over one scratch buffer, which is
-        // exactly what reading items out of a mapping does -- skips the wrapper
-        // entirely.
-        if (arr != b) bindArray(b); else pos = 0;
+        // ASSIGNS UNCONDITIONALLY. This used to skip `bindArray` when re-binding
+        // the SAME array and set only `pos` -- and `bindArray` is what sets
+        // `limit`. Once reset(byte[], int) existed, a caller could narrow the
+        // limit to a row length and a later reset(byte[]) on that same array
+        // would keep it: the reader then reported the buffer as 4 bytes long
+        // when it was 256, and a decode through it raised :boring/bad-count
+        // where a fresh reader succeeded.
+        //
+        // Fail-safe rather than dangerous -- reset(b, len) guarantees
+        // len <= b.length, so the stale limit is only ever too small, giving a
+        // truncation error and never an over-read. Fixed anyway, because
+        // `decode-with` is public and the shortcut saved nothing measurable
+        // once these are plain field assignments.
+        this.src = null;
+        this.arr = b;
+        this.pos = 0;
+        this.limit = b.length;
         resetState();
     }
 
