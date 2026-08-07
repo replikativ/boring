@@ -25,8 +25,9 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [clojure.set]
-            [boring.core :as boring])
-  (:import (org.replikativ.boring Writer)))
+            [boring.core :as boring]
+            [boring.nav :as nav])
+  (:import (org.replikativ.boring Writer Reader)))
 
 (defn- norm
   "An index as a comparable value: nodes sorted by container offset."
@@ -210,3 +211,54 @@
              (hooked v {:profile :canonical} 16 2))
           "canonical encoding with nested containers inside KEYS-adjacent
            positions must still agree"))))
+
+(deftest an-index-can-be-rooted-at-an-offset
+  (testing "`build-index` folded `base` into the CONTAINER offset and not into
+            the entry offsets, so a non-zero base produced a node pointing at
+            the right container and the wrong entries. The slot-rebasing branch
+            had been deleted as dead code on the grounds that base is always 0.
+
+            It is not always 0. An item embedded behind a prefix -- which is
+            what `nav/source-at` exists for, and what konserve-lmdb's split blob
+            is -- needs its index expressed in the ENCLOSING buffer's
+            coordinates. Without that, `source-at` reads a frame whose every
+            offset is wrong by the prefix, and silently gets no index at all.
+
+            Asserted as: the embedded form answers identically to the standalone
+            one and does the same amount of work."
+    (let [o {:stringref false :trust-index :trusted}
+          doc (into {:tree (vec (repeatedly 200 #(hash-map :a 1 :b 2)))}
+                    (map (fn [i] [(keyword (str "k" i)) i])) (range 12))
+          item (boring/encode doc {:stringref false})
+          prefix 5
+          idx-opts {:index 1 :index-min 13}
+          blob (let [idx (boring/build-index item idx-opts prefix)
+                     bos (java.io.ByteArrayOutputStream.)]
+                 (.write bos (byte-array prefix))
+                 (.write bos ^bytes item)
+                 (boring/seal-index! (boring/writer) bos idx
+                                     (+ prefix (alength ^bytes item))
+                                     {:stringref false})
+                 (.toByteArray bos))
+          probe (fn [^bytes bs ^long off]
+                  (let [c (nav/source-at bs off o)
+                        ^Reader r (.rdr ^boring.nav.Nav (.nav ^boring.nav.Cursor c))
+                        before (.skips r)
+                        v (nav/value (nav/walk c [:k11]))]
+                    {:value v :skips (- (.skips r) before)}))
+          embedded (probe blob prefix)
+          standalone (probe (boring/encode-indexed doc idx-opts) 0)
+          unindexed (probe item 0)]
+      (is (= 11 (:value embedded) (:value standalone) (:value unindexed))
+          "every form gives the same answer")
+      (is (= (:skips embedded) (:skips standalone))
+          "and the embedded index does exactly the work the standalone one does")
+      (is (< (:skips embedded) (:skips unindexed))
+          "which is less than no index at all -- if these were equal the index
+           would be present but unconsulted, which is the state this fixes")
+      (testing "every container offset lands inside the blob, not the item"
+        (let [idx (boring/build-index item idx-opts prefix)
+              ^longs cs (:containers idx)]
+          (is (pos? (alength cs)))
+          (is (every? #(>= % prefix) (seq cs))
+              "a container offset below the prefix is an un-rebased one"))))))

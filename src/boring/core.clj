@@ -1371,12 +1371,29 @@
             (when keep?
                 ;; Decided on RAW offsets, before `base` is folded in: the
                 ;; Reader is positioned over this item's own buffer.
-              (let [sorted (boolean (and srt (aget ^booleans srt 0)))]
-                ;; No `base` rebasing here. `scan-into!` is reached only from
-                ;; `scan-index`, always with base 0, and the branch that used to
-                ;; rebase carried an `^ints` hint that has been wrong since
-                ;; `kept` widened to a long[] -- so it was dead code that would
-                ;; have thrown a ClassCastException had anything reached it.
+              (let [sorted (boolean (and srt (aget ^booleans srt 0)))
+                    ;; SLOTS ARE REBASED TOO, and the container offset alone was
+                    ;; not enough. A node is (container-offset, count, entry
+                    ;; offsets), and every one of those is a position in the
+                    ;; reader's buffer -- so folding `base` into the first and
+                    ;; not the rest produced a node pointing at the right
+                    ;; container and the wrong entries.
+                    ;;
+                    ;; This branch existed once, carried an `^ints` hint that
+                    ;; went stale when `kept` widened to a long[], and was
+                    ;; removed as dead code on the grounds that `base` is always
+                    ;; 0. It is no longer always 0: an item embedded at an
+                    ;; offset -- konserve-lmdb's split blob puts its value after
+                    ;; a five-byte header -- needs its index expressed in the
+                    ;; enclosing buffer's coordinates, or `nav/source-at` finds
+                    ;; a frame whose every offset is wrong by the prefix.
+                    ^longs kept (if (zero? base)
+                                  kept
+                                  (let [^longs k kept
+                                        out (long-array (alength k))]
+                                    (dotimes [i (alength k)]
+                                      (aset out i (+ base (aget k i))))
+                                    out))]
                 (.add acc [(int (+ base p)) (int n) kept sorted])))
             end))))))
 
@@ -1445,8 +1462,9 @@
   entries is already found in well under a microsecond by walking it.
 
   Returns a map ready for `seal-index!`, or nil if nothing was worth indexing."
-  ([^bytes bs] (build-index bs nil))
-  ([^bytes bs opts]
+  ([^bytes bs] (build-index bs nil 0))
+  ([^bytes bs opts] (build-index bs opts 0))
+  ([^bytes bs opts base]
    ;; RESOLVED, like every other public entry point, even though nothing here
    ;; encodes. It read `:index` its own way -- `(if (and i (pos? (long i))) i 16)`
    ;; -- so `:index 0`, the documented off switch, silently became stride 16;
@@ -1468,7 +1486,7 @@
                   i)
          min-entries (long (get opts :index-min 16))
          idx (try
-               (scan-index r 0 (alength bs) stride min-entries 0)
+               (scan-index r 0 (alength bs) stride min-entries (long base))
                (catch StackOverflowError _
                  ;; The depth bound above is deterministic, but it is calibrated
                  ;; against a default stack; a smaller -Xss can still reach the
