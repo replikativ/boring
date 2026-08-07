@@ -554,17 +554,33 @@
 
     indexed + sorted   binary search the node's anchors comparing ENCODED key
                        bytes, then walk at most `stride`-1 entries. O(log n).
-    indexed            jump anchor to anchor, walking only within one stride.
-                       Still never touches a VALUE -- but measured, it does
-                       the same total work as the scan, because without key
-                       order you must try each anchor's stride until the key
-                       turns up. The index does not accelerate an unsorted map
-                       lookup and cannot: 200 keys under the default profile
-                       cost 40 000 skips indexed and 40 000 unindexed, at every
-                       stride from 1 to 1000. It buys file layout, not speed,
-                       here. Sorted keys (`:canonical`, `:archival`) are what
-                       make the branch above reachable, and arrays index
-                       positionally under any profile.
+    indexed            jump anchor to anchor, walking only within one stride,
+                       and never touching a VALUE. Without key order you must
+                       try each anchor's span until the key turns up, so what
+                       this saves is decided entirely by THE STRIDE. Skips to
+                       reach the last of 200 unsorted keys:
+
+                         unindexed    161      stride 4     122
+                         stride 1       2      stride 16    152
+                         stride 2      82      stride 64    160
+
+                       So an unsorted lookup IS accelerated, at stride 1, by
+                       80x. This paragraph used to say it does not and cannot,
+                       at every stride from 1 to 1000 -- and that was true when
+                       it was written, because `scan-map` skipped past the value
+                       of the last entry in every span it examined. A stride-1
+                       span is one entry, so it paid a full value skip to learn
+                       nothing. Fixing that (see `scan-map`) is what made the
+                       stride the lever.
+
+                       Sorted keys (`:canonical`, `:archival`) reach the branch
+                       above and work at ANY stride; measured on a document
+                       whose first key holds a deep subtree, canonical at stride
+                       16 and unsorted at stride 1 both land at ~7.3 us against
+                       34.4 unindexed. Unsorted at the DEFAULT stride is a net
+                       LOSS -- 43.7 us -- because the frame is paid for and the
+                       span containing the big entry is walked anyway. Arrays
+                       index positionally under any profile.
     unindexed          walk every entry, which is what this always did.
 
   All three return the same offset. The index only decides how much is walked."
