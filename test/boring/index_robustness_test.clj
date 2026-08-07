@@ -1654,3 +1654,90 @@
           o {:stringref false}
           src (nav/source (boring/encode v o) o)]
       (is (= 2 (nav/value (-> src (get :a) (get :b) (get 1) (get :c))))))))
+
+(defn- counting-source
+  "A ByteSource over `bs` that counts every byte it is asked for.
+
+   `Reader.skips` is the wrong unit for measuring skip WORK: skipping a
+   20 000-element vector is ONE `skipFrom` call, because the walk recurses
+   inside the reader. Bytes read is the honest measure, and it is exact --
+   no clock, no threshold to tune.
+
+   `heapArray` returns nil deliberately, so the Reader cannot take its byte[]
+   fast path around this."
+  [^bytes bs counter]
+  (let [u (fn [^long p] (bit-and (aget bs (int p)) 0xff))]
+    (reify org.replikativ.boring.ByteSource
+      (size [_] (alength bs))
+      (at [_ p] (swap! counter inc) (aget bs (int p)))
+      (i16 [_ p] (swap! counter + 2)
+        (unchecked-short (bit-or (bit-shift-left (u p) 8) (u (inc p)))))
+      (i32 [_ p] (swap! counter + 4)
+        (unchecked-int (bit-or (bit-shift-left (u p) 24) (bit-shift-left (u (+ p 1)) 16)
+                               (bit-shift-left (u (+ p 2)) 8) (u (+ p 3)))))
+      (i64 [_ p] (swap! counter + 8)
+        (bit-or (bit-shift-left (long (u p)) 56)
+                (bit-shift-left (long (u (+ p 1))) 48)
+                (bit-shift-left (long (u (+ p 2))) 40)
+                (bit-shift-left (long (u (+ p 3))) 32)
+                (bit-shift-left (long (u (+ p 4))) 24)
+                (bit-shift-left (long (u (+ p 5))) 16)
+                (bit-shift-left (long (u (+ p 6))) 8)
+                (long (u (+ p 7)))))
+      (copyTo [_ p dst off n] (swap! counter + n)
+        (System/arraycopy bs (int p) dst (int off) (int n)))
+      (heapArray [_] nil))))
+
+(deftest a-bounded-walk-does-not-skip-past-its-last-entry
+  (testing "`scan-map` walks a span by comparing a key and then advancing past
+            the VALUE -- and advancing past a value is a structural walk of that
+            value's whole subtree. It used to advance unconditionally and then
+            discover on the NEXT iteration that it had reached its limit, so the
+            offset it worked out was thrown away.
+
+            Invisible on flat data and decisive on nested data, because the
+            wasted skip is the size of one subtree. An INDEXED lookup walks a
+            bounded span per anchor, so it paid this on every anchor it tried --
+            which is how a correct index came to make lookups SLOWER than no
+            index at all: measured on a 32 KB document, 39.5 us indexed against
+            34.9 unindexed, and 1.95 once fixed.
+
+            Asserted in BYTES READ, not on a clock: the defect is wasted work
+            and this counts exactly how much."
+    (let [;; The giant sibling is a NEST OF SMALL CONTAINERS, so `:index-min 5`
+          ;; indexes the five-entry root and nothing inside it. A flat 20 000
+          ;; element vector would clear the threshold itself and put 20 000
+          ;; anchors in the frame, which measures the frame rather than the walk
+          ;; -- the first version of this test did exactly that.
+          nest (fn nest [^long d]
+                 (if (zero? d) 0 {:a (nest (dec d)) :b (nest (dec d)) :c (nest (dec d))}))
+          big {:huge (nest 8) :a 1 :b 2 :c 3 :d 4}
+          opts {:index 1 :index-min 5}
+          bs (boring/encode-indexed big opts)
+          plain (boring/encode big {:stringref false})
+          ;; `:trust-index :trusted`, because VALIDATION WALKS THE CONTAINER
+          ;; per node -- that is what it is for -- so under the default an index
+          ;; cannot save a walk by construction. This test is about whether the
+          ;; trusted path, where the index is supposed to pay, actually does.
+          ropts {:stringref false :trust-index :trusted}
+          reads (fn [x k]
+                  (let [c (atom 0)
+                        v (nav/value (get (nav/source (counting-source x c) ropts) k))]
+                    [v @c]))]
+      (testing "every answer is what the unindexed document gives"
+        (doseq [k [:a :b :c :d :absent]]
+          (is (= (first (reads plain k)) (first (reads bs k))) (str "answer for " k))))
+      (testing "and reaching a key AFTER the giant sibling reads a bounded
+                number of bytes, not one per element of it"
+        (doseq [k [:a :b :c :d]]
+          (let [[v n] (reads bs k)
+                [_ unindexed] (reads plain k)]
+            (is (some? v))
+            (is (< n (quot unindexed 10))
+                (str "indexed lookup of " k " read " n " bytes against "
+                     unindexed " unindexed; before the fix the index read MORE "
+                     "than the scan, because every anchor it tried walked the "
+                     "whole 20000-element sibling")))))
+      (testing "a MISS still costs the honest walk, because a negative from a
+                possibly-damaged index is re-derived rather than trusted"
+        (is (nil? (first (reads bs :absent))))))))
