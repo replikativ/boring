@@ -241,13 +241,118 @@
 
             For n uniform entries of s items each, walk = s*(n-1)/2: entry j is
             reached by crossing j entries, and the mean of 0..n-1 is (n-1)/2."
+    ;; Above the threshold throughout, because `walk` is only observable on a
+    ;; node that was KEPT -- which is the rule working, not a limitation.
     (let [o {:profile :clojure :stringref false :index 1 :index-min 2}
           walk-of (fn [v] (first (vals (walked-walks v o))))]
       ;; An array of scalars: one item per entry, so walk = (n-1)/2.
-      (is (= 4 (walk-of (vec (range 10)))) "10 scalars: (10-1)/2 = 4 (floor)")
-      (is (= 49 (walk-of (vec (range 100)))) "100 scalars: (100-1)/2 = 49")
+      (is (= 64 (walk-of (vec (range 129)))) "129 scalars: (129-1)/2 = 64")
+      (is (= 100 (walk-of (vec (range 201)))) "201 scalars: (201-1)/2 = 100")
       ;; A byte string is ONE item however large -- the whole reason the metric
-      ;; is items. Ten 1 KB blobs must walk exactly like ten integers.
-      (is (= (walk-of (vec (range 10)))
-             (walk-of (vec (repeat 10 (byte-array 1024)))))
+      ;; is items. 129 1 KB blobs must walk exactly like 129 integers.
+      (is (= (walk-of (vec (range 129)))
+             (walk-of (vec (repeat 129 (byte-array 1024)))))
           "a 1 KB blob and an integer cost a scan the same: one item"))))
+
+;; --------------------------------------------------------- straddling T
+
+(defn- capture-nodes
+  "The writer's node set as (container-offset -> [count sorted walk])."
+  [v o]
+  (let [ro (#'boring.core/resolve-opts (assoc o :stringref false))
+        ^Writer w (boring/writer 65536 (assoc o :stringref false))]
+    (#'boring.core/configure! w ro)
+    (.setIndex w (int (:index o 16)) (int (:index-min o 16)) 0)
+    (.writeValue w v)
+    (zipmap (seq (.idxContainers w))
+            (map vector (seq (.idxCounts w)) (seq (.idxSorted w)) (seq (.idxWalks w))))))
+
+(defn- walked-nodes
+  "The byte walk's node set, in the same shape."
+  [v o]
+  (let [o (assoc o :stringref false)
+        ix (boring/build-index (boring/encode v o) o)]
+    (if ix
+      (zipmap (seq (:containers ix))
+              (map vector (seq (:counts ix)) (:sorted ix) (:walk ix)))
+      {})))
+
+(deftest the-builders-agree-on-values-that-straddle-the-threshold
+  (testing "A THRESHOLD RULE IS ONLY TESTED WHERE INPUTS STRADDLE IT.
+
+            Every builder-agreement fixture in the suite was written against
+            the rule `index when n >= :index-min`, and none of them lands near
+            `walk`. Once the rule becomes `index when walk >= 64` those
+            fixtures still agree -- trivially, because they are all far to one
+            side -- and would keep agreeing if the comparison were `>` instead
+            of `>=`, or if one builder's accumulator were off by one.
+
+            These are constructed to sit at 63, 64 and 65, where a
+            one-item disagreement between two builders changes whether the
+            node exists. Asserted as the whole NODE SET -- offsets, counts,
+            sorted flags and walks together -- because that is what step 5
+            changes and what must not diverge when it does.
+
+            The walks are exact, not approximate: for n uniform entries of s
+            items, walk = s*(n-1)/2. An array of scalars is s=1, a sorted map
+            of scalar pairs is s=2.
+
+            Asserted as WHETHER THE NODE EXISTS, which is what the threshold
+            decides -- 63 must produce nothing and 64 must produce a node, on
+            values that differ by two entries. A walk comparison would pass
+            just as well with the comparison written `>` instead of `>=`."
+    (doseq [[label v expect-walk indexed?]
+            [;; --- arrays, s=1: walk = (n-1)/2. Always walk-gated.
+             ["array 127 -> 63" (vec (range 127)) 63 false]
+             ["array 129 -> 64" (vec (range 129)) 64 true]
+             ["array 131 -> 65" (vec (range 131)) 65 true]
+             ;; --- SORTED maps, s=2: walk = n-1. Sorted, because an unsorted
+             ;; map is not gated on walk at all -- the reader cannot binary
+             ;; search it, so the rule for those is about stride. `:canonical`
+             ;; sorts the keys.
+             ["map 64 -> 63" (into {} (for [i (range 64)] [(format "k%03d" i) i])) 63 false]
+             ["map 65 -> 64" (into {} (for [i (range 65)] [(format "k%03d" i) i])) 64 true]
+             ["map 66 -> 65" (into {} (for [i (range 66)] [(format "k%03d" i) i])) 65 true]]
+            stride [1 4 16]]
+      (let [o {:profile :canonical :index stride :index-min 2}
+            tag (str label " | stride " stride)
+            cap (capture-nodes v o)
+            wlk (walked-nodes v o)]
+        (is (= cap wlk) (str tag ": the two builders must derive the same nodes"))
+        (if indexed?
+          (do (is (some? (get wlk 0)) (str tag ": must earn a node"))
+              (is (= expect-walk (nth (get wlk 0) 2))
+                  (str tag ": with exactly the constructed walk")))
+          (is (nil? (get wlk 0))
+              (str tag ": must earn NO node -- walk " expect-walk
+                   " is below the threshold")))))))
+
+(deftest a-small-container-can-have-a-large-walk
+  (testing "THE SHAPE `:index-min` HIDES, and the reason the entry-count floor
+            is a decision rather than a default to keep.
+
+            konserve's projection blob is a five-entry root beside a large
+            `:events` sibling. Walking to a late key DOES skip past that
+            sibling, so the root is worth a node -- and there is none, because
+            `:index-min 16` excluded it on entry count alone. A metric-blind
+            floor is exactly the error the `walk` metric exists to correct.
+
+            Three entries whose values are 64-element vectors: n=3, far below
+            any sensible entry floor, and walk 66 -- above the threshold for
+            arrays and sorted maps. Entry count and scan cost point OPPOSITE
+            ways here, which is the whole point."
+    ;; `:canonical` so the map is SORTED and therefore gated on walk -- an
+    ;; unsorted map is not, because the reader cannot binary-search it.
+    (let [v (into {} (for [i (range 3)] [(str "k" i) (vec (range 64))]))
+          o {:profile :canonical :index 16 :index-min 2}
+          wlk (walked-nodes v o)]
+      (is (= 66 (nth (get wlk 0) 2))
+          "three entries, walk 66 -- entry count says tiny, scan cost says index it")
+      (is (= (capture-nodes v o) wlk)
+          "and both builders must see it the same way")
+      ;; The control: the same three entries with SCALAR values are genuinely
+      ;; not worth indexing, and the metric says so.
+      (let [tiny (into {} (for [i (range 3)] [(str "k" i) i]))]
+        (is (nil? (get (walked-nodes tiny o) 0))
+            "three scalar entries walk 2 and earn nothing -- same entry count,
+             opposite answer, which is the metric doing its job")))))

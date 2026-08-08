@@ -766,6 +766,20 @@
                   (recur (rd/head-end-at r q) (rd/head-arg-at r q))
                   t)))))
 
+(def ^:private walk-threshold
+  "Where a binary search starts to repay the frame, in mean prefix items. MUST
+  equal `Writer.WALK_THRESHOLD` and the JVM `walk-threshold` -- three index
+  builders decide with it independently and must decide the same way."
+  64)
+
+(defn- keep-node?
+  "Whether a container is worth an index node. Mirrors `Writer.keepNode` and
+  the JVM `keep-node?` -- see the JVM version for why the two rules differ."
+  [map? sorted walk stride]
+  (if (or (not map?) sorted)
+    (>= walk walk-threshold)
+    (== stride 1)))
+
 (defn- index-walk*
   "Walk the value at `p`, returning where it ends, accumulating nodes into `acc`.
 
@@ -849,8 +863,10 @@
                                    q))))]
             (when keep?
               ;; FLOOR DIVISION, matching `Writer.fillNode` and the JVM walk.
-              (.push acc [(+ p base) n (vec kept) (boolean (and srt (aget srt 0)))
-                          (if (pos? n) (quot (aget walk-acc 0) n) 0)]))
+              (let [sorted (boolean (and srt (aget srt 0)))
+                    walk (if (pos? n) (quot (aget walk-acc 0) n) 0)]
+                (when (keep-node? map? sorted walk stride)
+                  (.push acc [(+ p base) n (vec kept) sorted walk]))))
             end))))))
 
 (defn build-index

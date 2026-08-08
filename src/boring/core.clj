@@ -1234,6 +1234,30 @@
   ;; than by coincidence.
   (index-walk* r p stride min-entries base acc 0 (long-array 1)))
 
+(def ^:private ^:const walk-threshold
+  "Where a binary search starts to repay the frame, in mean prefix items.
+  MUST equal `Writer.WALK_THRESHOLD` -- the two index builders decide with it
+  independently and must decide the same way."
+  64)
+
+(defn- keep-node?
+  "Whether a container is worth an index node. Mirrors `Writer.keepNode`.
+
+  An ARRAY or SORTED MAP is binary-searched, and that repays the frame from
+  `walk-threshold` mean prefix items, so among containers that reach here
+  `walk` decides and the entry count does not. `:index-min` still gates what
+  reaches here -- see `Writer.keepNode` for why that floor is a capture guard
+  doing policy work, and why changing it is a separate decision.
+
+  An UNSORTED MAP cannot be binary-searched, so at a stride above 1
+  `boring.nav` REFUSES the node -- an anchor loop over an unordered map visits
+  every entry exactly as a plain scan does. Writing one is pure cost, measured
+  at 0.43x-0.81x. At stride 1 it is usable and today's behaviour is unchanged."
+  [map? sorted ^long walk ^long stride]
+  (if (or (not map?) sorted)
+    (>= walk walk-threshold)
+    (= stride 1)))
+
 (defn- frame-payload-array?
   "Is the container at `p` the 2-element `[name, args]` array of a TAG-27 FRAME?
 
@@ -1425,6 +1449,7 @@
                 ;; Decided on RAW offsets, before `base` is folded in: the
                 ;; Reader is positioned over this item's own buffer.
               (let [sorted (boolean (and srt (aget ^booleans srt 0)))
+                    walk (if (pos? n) (quot (aget walk-acc 0) n) 0)
                     ;; SLOTS ARE REBASED TOO, and the container offset alone was
                     ;; not enough. A node is (container-offset, count, entry
                     ;; offsets), and every one of those is a position in the
@@ -1449,8 +1474,8 @@
                                     out))]
                 ;; FLOOR DIVISION, matching `Writer.fillNode`. `walk-acc` is
                 ;; the sum of per-entry prefixes; `walk` is their mean.
-                (.add acc [(int (+ base p)) (int n) kept sorted
-                           (if (pos? n) (quot (aget walk-acc 0) n) 0)])))
+                (when (keep-node? map? sorted walk stride)
+                  (.add acc [(int (+ base p)) (int n) kept sorted walk]))))
             end))))))
 
 (defn- scan-into!

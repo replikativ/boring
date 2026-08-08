@@ -33,8 +33,19 @@
 
 (def specimen
   "A value with a map, a vector, strings and integers — enough that every
-  option under test has something to act on."
-  {:rows [{:e 1 :a "x" :v "alpha"} {:e 2 :a "y" :v "beta"}]
+  option under test has something to act on.
+
+  BIG ENOUGH TO EARN AN INDEX NODE, which two rows quietly depend on. The
+  writer now refuses a node for any container a scan crosses cheaply, and with
+  two rows this specimen earned none -- so `build-index` returned nil,
+  `seal-index!` short-circuited on nil before it validated anything, and nine
+  `seal-index!` rows recorded `:ok` for options that must be refused. The
+  matrix went green on calls that had stopped doing the work.
+
+  Sixty rows puts `:rows` well past the threshold. Nothing else about the
+  specimen matters to the options under test."
+  {:rows (vec (for [i (range 60)]
+                {:e i :a (str "a" i) :v (str "value-" i)}))
    :n 42 :s "hello"})
 
 (defn- encoded ^"[B" []

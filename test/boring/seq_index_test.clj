@@ -364,7 +364,18 @@
             idxed (boring/encode-indexed wide-map (assoc o :index 16 :index-min 8))
             cp (nav/root plain o)
             ci (nav/root idxed o)]
-        (is (< (alength ^bytes plain) (alength ^bytes idxed)) "index costs something")
+        ;; ONLY UNDER THE SORTING PROFILE. `wide-map` is 300 entries whose
+        ;; values are 2-entry maps: under `sorted-opts` the outer map is
+        ;; binary-searchable and earns a node, but UNSORTED at stride 16 it
+        ;; earns nothing -- `boring.nav` refuses an unsorted map's node above
+        ;; stride 1 (an anchor loop over an unordered map visits every entry,
+        ;; exactly as a scan does), so the writer stopped emitting one. The
+        ;; index is then genuinely free, and the answers below must still
+        ;; agree, which is the actual subject of this test.
+        (if (:profile o)
+          (is (< (alength ^bytes plain) (alength ^bytes idxed)) "index costs something")
+          (is (= (alength ^bytes plain) (alength ^bytes idxed))
+              "an unsorted map above stride 1 earns no node, so no cost"))
         (doseq [k (keys wide-map)]
           (is (= (nav/value (get-in cp [k "v"]))
                  (nav/value (get-in ci [k "v"]))
@@ -432,12 +443,17 @@
     (let [sizes (vec (for [mn [2 8 64]]
                        [mn (alength ^bytes (boring/encode-indexed
                                             wide-map (assoc sorted-opts :index 16 :index-min mn)))]))]
-      ;; Non-increasing, not strictly decreasing: 8 and 64 both exclude the
-      ;; 2-entry inner maps and index only the outer one, so they tie. The
-      ;; claim is that raising the threshold never GROWS the index.
+      ;; NON-INCREASING, and now FLAT. `:index-min` used to be what excluded
+      ;; the 2-entry inner maps, so 2 cost more than 64. `walk` excludes them
+      ;; first and at every setting -- a 2-entry map of scalars is crossed in
+      ;; two items, whatever the threshold says -- so all three tie.
+      ;;
+      ;; That is the knob being SUBSUMED, not broken: `:index-min` counts
+      ;; entries and the metric measures the scan, and where they disagree the
+      ;; metric is the one that describes the cost. What survives is the claim
+      ;; this test is named for -- raising the threshold never grows the index,
+      ;; and never changes an answer.
       (is (apply >= (map second sizes)) (str "size must not rise with threshold: " sizes))
-      (is (> (second (first sizes)) (second (last sizes)))
-          (str "and 2 must cost more than 64: " sizes))
       (doseq [mn [2 8 64]]
         (let [c (nav/root (boring/encode-indexed
                              wide-map (assoc sorted-opts :index 16 :index-min mn))
@@ -462,8 +478,11 @@
             "sealing nothing writes nothing")
         (is (= 0 (.size out)))))
     (testing "and a real index still seals"
+      ;; 200, not 40: 40 scalars are crossed in 19 items on average and no
+      ;; longer earn a node, so "a real index still seals" was sealing nil --
+      ;; the very case the first half of this test covers.
       (let [o {:stringref false}
-            v (vec (range 40))
+            v (vec (range 200))
             bs (boring/encode v o)
             w (boring/writer 4096 o)
             out (ByteArrayOutputStream.)]

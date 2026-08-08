@@ -395,6 +395,20 @@ public final class Writer {
      *  held to the same number. */
     private long[] idxWalk;
 
+    /**
+     * WHERE A BINARY SEARCH STARTS TO REPAY THE FRAME, in mean prefix items.
+     *
+     * Derived by measurement, not fitted: on `:archival` (sorted keys) the
+     * crossing sits around walk 60 -- walk 31 measured 0.95x, walk 63 1.21x,
+     * walk 255 3.51x. A round number off a flat curve. Being off by 2x costs
+     * ~10%; being off by the METRIC costs 2-3x, which is what choosing items
+     * over bytes and over subtree size was about.
+     */
+    private static final long WALK_THRESHOLD = 64;
+
+    /** Set when a node has been refused, cleared by {@link #compactNodes}. */
+    private boolean idxDirty;
+
     private static final long[] NO_LONGS = new long[0];
     private static final int[] NO_INTS = new int[0];
     private static final boolean[] NO_BOOLS = new boolean[0];
@@ -523,28 +537,34 @@ public final class Writer {
         if (idxSlots != null && idxN > 0)
             java.util.Arrays.fill(idxSlots, 0, idxN, null);
         idxN = 0;
+        idxDirty = false;
         idxSeqN = 0;
         idxItems = 0;
         idxItemCountdown = 1;
     }
-    public int idxCount() { return idxN; }
+    public int idxCount() { compactNodes(); return idxN; }
     // Null-safe because the backing arrays are lazy now: a writer that never
     // indexed has none, and `idxN` is 0, so an empty result is the right
     // answer rather than an NPE.
     public long[] idxContainers() {
+        compactNodes();
         return idxOffs == null ? NO_LONGS : java.util.Arrays.copyOf(idxOffs, idxN);
     }
     public int[] idxCounts() {
+        compactNodes();
         return idxCnts == null ? NO_INTS : java.util.Arrays.copyOf(idxCnts, idxN);
     }
     public Object[] idxSlots() {
+        compactNodes();
         return idxSlots == null ? NO_OBJS : java.util.Arrays.copyOf(idxSlots, idxN);
     }
     public boolean[] idxSorted() {
+        compactNodes();
         return idxSrt == null ? NO_BOOLS : java.util.Arrays.copyOf(idxSrt, idxN);
     }
     /** Each node's `walk`. Not written to the wire -- see {@link #idxWalk}. */
     public long[] idxWalks() {
+        compactNodes();
         return idxWalk == null ? NO_LONGS : java.util.Arrays.copyOf(idxWalk, idxN);
     }
 
@@ -651,15 +671,112 @@ public final class Writer {
     /** `off` is a FILE offset, captured by `absOffset()` when the container
      *  started -- not a buffer position to be resolved now. See absOffset(). */
     private void fillNode(int slot, long off, int n, long[] anchors, boolean sorted,
-                          long walkAcc) {
+                          long walkAcc, boolean isMap) {
+        // FLOOR DIVISION, and the byte walk must divide the same way. `walkAcc`
+        // is the SUM of per-entry prefixes; `walk` is their mean. An empty
+        // container has no entries to average over and no scan to shorten.
+        long walk = n > 0 ? walkAcc / n : 0;
+        if (!keepNode(n, sorted, walk, isMap)) { cancelNode(slot); return; }
         idxOffs[slot] = checkedOffset(off);
         idxCnts[slot] = n;
         idxSlots[slot] = anchors;
         idxSrt[slot] = sorted;
-        // FLOOR DIVISION, and the byte walk must divide the same way. `walkAcc`
-        // is the SUM of per-entry prefixes; `walk` is their mean. An empty
-        // container has no entries to average over and no scan to shorten.
-        idxWalk[slot] = n > 0 ? walkAcc / n : 0;
+        idxWalk[slot] = walk;
+    }
+
+    /**
+     * Whether this container is worth a node.
+     *
+     * TWO RULES, because they answer different questions.
+     *
+     * <p>An ARRAY or a SORTED MAP is reached by a binary search over the
+     * anchors, and that repays the frame from about {@link #WALK_THRESHOLD}
+     * mean prefix items -- so among the containers that reach here, `walk`
+     * decides and the entry count does not.
+     *
+     * <p>THE ENTRY COUNT STILL GATES WHAT REACHES HERE. `indexing(n)` refuses
+     * anything below `:index-min` before a slot is claimed, so a five-entry map
+     * beside a large sibling -- walk in the hundreds, entry count 5 -- is still
+     * excluded, and that is exactly the container whose scan is expensive. The
+     * floor is a capture guard (it avoids sizing an anchor array for a tiny
+     * container) that doubles as a policy it should not be making. Lowering it
+     * is a separate decision with its own measurements, because it also admits
+     * a flood of unsorted stride-1 nodes; it is not made here.
+     *
+     * <p>An UNSORTED MAP cannot be binary-searched, so at a stride above 1 the
+     * reader REFUSES the node outright -- `boring.nav` checks precisely this,
+     * because an anchor loop over an unordered map visits every entry exactly
+     * as a plain scan does. Writing one is pure cost: measured at 0.43x-0.81x,
+     * the frame's open cost buying nothing. So it is not written. At stride 1
+     * the node IS usable and today's behaviour is kept unchanged; gating that
+     * on `walk` too is a separate change, because it needs a per-node stride
+     * to be worth having and that costs a format version.
+     *
+     * <p>Not applied to the SEQUENCE node, which is synthesised outside this
+     * class: that one answers an explicit `:index N` request on `write-seq!`,
+     * and a metric must not silently switch off a feature asked for by name.
+     */
+    private boolean keepNode(int n, boolean sorted, long walk, boolean isMap) {
+        if (!isMap || sorted) return walk >= WALK_THRESHOLD;
+        return idxStride == 1;
+    }
+
+    /**
+     * Give up the slot this container claimed.
+     *
+     * It cannot simply be dropped: `reserveNode` claims BEFORE the entries are
+     * written, so a refused parent's slot sits in the middle of the arrays with
+     * its own children already filled in behind it. Marked dead here and
+     * squeezed out in one pass by {@link #compactNodes}, which preserves
+     * relative order -- and relative order IS ascending container offset, which
+     * `read-index` binary-searches.
+     *
+     * `-1` in `idxCnts` cannot collide with a real value: `fillNode` writes
+     * only counts >= 0. (The `-1` that appears in CONTAINER offsets is the
+     * sequence node's sentinel, added on the Clojure side, and never reaches
+     * these arrays.)
+     */
+    private void cancelNode(int slot) {
+        idxCnts[slot] = -1;
+        idxSlots[slot] = null;      // release it now rather than at compaction
+        idxDirty = true;
+    }
+
+    /**
+     * Squeeze out refused nodes, once, in place.
+     *
+     * O(N) with a write pointer rather than a sort: the array is already in
+     * ascending container order because slots are claimed at the container's
+     * head, and removing elements cannot disturb the order of what remains.
+     * (The byte walk sorts instead, because it appends on COMPLETION and is
+     * therefore post-order. Two orders, one invariant.)
+     *
+     * Idempotent, and called from every accessor rather than left to the caller
+     * -- there are five of them and forgetting one would report dead nodes as
+     * live, which `pack-slots` would then refuse for a reason that names the
+     * wrong thing.
+     */
+    private void compactNodes() {
+        if (!idxDirty) return;
+        int w = 0;
+        for (int i = 0; i < idxN; i++) {
+            if (idxCnts[i] < 0) continue;
+            if (w != i) {
+                idxOffs[w] = idxOffs[i];
+                idxCnts[w] = idxCnts[i];
+                idxSrt[w] = idxSrt[i];
+                idxSlots[w] = idxSlots[i];
+                idxWalk[w] = idxWalk[i];
+            }
+            w++;
+        }
+        // NULL THE TAIL. Each slot is its own long[], so leaving references
+        // above the new count pins one array per refused container for the life
+        // of the writer -- and a writer is meant to be long-lived and reused.
+        // Same reasoning, and the same fix, as `idxReset`.
+        java.util.Arrays.fill(idxSlots, w, idxN, null);
+        idxN = w;
+        idxDirty = false;
     }
 
     private static final clojure.lang.Keyword K_N =
@@ -1437,7 +1554,7 @@ public final class Writer {
             keysWalk += idxItemsWritten - keysAtStart;
             writeValue(keys[i]);
         }
-        if (ka != null) fillNode(keysSlot, keysStart, nk, ka, false, keysWalk);
+        if (ka != null) fillNode(keysSlot, keysStart, nk, ka, false, keysWalk, false);
 
         if (outer != null && --oc == 0) { outer[oa++] = idxOffset(pos); oc = idxStride; }
         outerWalk += idxItemsWritten - outerAtStart;
@@ -1462,11 +1579,11 @@ public final class Writer {
                 rowWalk += idxItemsWritten - rowAtStart;
                 writeValue(m.get(keys[i]));
             }
-            if (row != null) fillNode(rowSlot, rowStart, nk, row, false, rowWalk);
+            if (row != null) fillNode(rowSlot, rowStart, nk, row, false, rowWalk, false);
         }
-        if (ra != null) fillNode(rowsSlot, rowsStart, nr, ra, false, rowsWalk);
+        if (ra != null) fillNode(rowsSlot, rowsStart, nr, ra, false, rowsWalk, false);
 
-        if (outer != null) fillNode(outerSlot, outerStart, 2, outer, false, outerWalk);
+        if (outer != null) fillNode(outerSlot, outerStart, 2, outer, false, outerWalk, false);
     }
 
     /**
@@ -1555,7 +1672,7 @@ public final class Writer {
             writeValue(s.first());
         }
         if (seen != n) countMismatch(n, seen);
-        if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc);
+        if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc, false);
     }
 
     /** An array of `n` elements from any Iterable, indexed if it is big enough. */
@@ -1576,7 +1693,7 @@ public final class Writer {
             writeValue(o);
         }
         if (seen != n) countMismatch(n, seen);
-        if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc);
+        if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc, false);
     }
 
     @SuppressWarnings("rawtypes")
@@ -1625,7 +1742,7 @@ public final class Writer {
             writeValue(e.getValue());
         }
         if (seen != n) countMismatch(n, seen);
-        if (anchors != null) fillNode(slot, start, n, anchors, sorted, walkAcc);
+        if (anchors != null) fillNode(slot, start, n, anchors, sorted, walkAcc, true);
     }
 
     /**
@@ -1765,7 +1882,7 @@ public final class Writer {
             writeValue(e.getValue());
         }
         if (seen != n) countMismatch(n, seen);
-        fillNode(slot, start, n, anchors, sorted, walkAcc);
+        fillNode(slot, start, n, anchors, sorted, walkAcc, true);
     }
 
     // ---- time, uuid, rational ----------------------------------------------
@@ -2116,7 +2233,7 @@ public final class Writer {
             System.arraycopy(eb, 0, buf, pos, eb.length);
             pos += eb.length;
         }
-        if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc);
+        if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc, false);
     }
 
     /**
@@ -2265,7 +2382,7 @@ public final class Writer {
             pos += encodedKeys[k].length;
             writeValue(vals[k]);
         }
-        if (anchors != null) fillNode(slot, start, n, anchors, sorted, walkAcc);
+        if (anchors != null) fillNode(slot, start, n, anchors, sorted, walkAcc, true);
     }
 
     public void writeBoolean(boolean b) { u8(SIMPLE | (b ? 21 : 20)); }
@@ -2905,7 +3022,7 @@ public final class Writer {
                 }
                 if (seen != n) countMismatch(n, seen);
             }
-            if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc);
+            if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc, false);
             return;
         }
         if (x instanceof java.util.Collection) {

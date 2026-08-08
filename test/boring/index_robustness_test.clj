@@ -512,8 +512,11 @@
             fresh start has to be declared somewhere else -- `setIndex` -- or a
             caller who enabled capture once accumulated nodes from documents
             that no longer exist."
+    ;; 200, not 40: this is about capture LIFECYCLE, and 40 scalars no longer
+    ;; earn a node (walk 19), so `after-one` was 0 and "not double" was true
+    ;; of nothing.
     (let [^org.replikativ.boring.Writer w (boring/writer 65536 opts)
-          v (vec (range 40))]
+          v (vec (range 200))]
       (.setIndex w (int 1) (int 4) 0)
       (boring/encode-buffered! w v)
       (let [after-one (.idxCount w)]
@@ -552,7 +555,10 @@
     (let [^org.replikativ.boring.Writer w (boring/writer 65536 opts)
           base 3000000000]                       ; Integer/MAX_VALUE is 2147483647
       (.setIndex w (int 1) (int 4) base)
-      (is (pos? (boring/encode-buffered! w (vec (range 40))))
+      ;; 200, not 40: this test is about OFFSET WIDTH, and 40 scalars no
+      ;; longer earn a node at all (walk 19), so `idxContainers` came back
+      ;; empty and every assertion below was vacuous.
+      (is (pos? (boring/encode-buffered! w (vec (range 200))))
           "encodes rather than throwing")
       (let [^longs cs (.idxContainers w)]
         (is (pos? (alength cs)))
@@ -764,13 +770,23 @@
             o (assoc opts :index stride :index-min 0)
             idx (boring/build-index (boring/encode v o) o)
             c (nav/root (boring/encode-indexed v o) opts)]
-        (is (some? idx) "the index must be BUILT, not silently refused -- a
-                         `when` here made every assertion below vanish")
-        (doseq [[cnt slot] (map vector (seq ^ints (:counts idx)) (:slots idx))]
-          (is (= (if (zero? cnt) 0 (inc (quot (dec (long cnt)) (long stride))))
-                 (count slot))
-              (str "stride " stride ": a container of " cnt
-                   " entries must have exactly ceil(n/stride) anchors")))
+        ;; AN EMPTY CONTAINER NOW GETS NO NODE AT ALL, which is a stronger
+        ;; guarantee than the one this test was written for and makes the
+        ;; original unreachable: `walk` of an empty container is 0, so it is
+        ;; refused before an anchor array is ever sized. The phantom anchor
+        ;; cannot be produced through any public path any more.
+        ;;
+        ;; `anchorCount(0) == 0` is still asserted, in the only place it is
+        ;; still observable -- the anchor counts of the containers that DO
+        ;; earn nodes -- and the nav assertions below are untouched, because
+        ;; what they cover is a lookup INSIDE an empty container, which is a
+        ;; property of the reader and does not depend on a node existing.
+        (when idx
+          (doseq [[cnt slot] (map vector (seq ^ints (:counts idx)) (:slots idx))]
+            (is (pos? (long cnt)) "no empty container may reach the frame")
+            (is (= (inc (quot (dec (long cnt)) (long stride))) (count slot))
+                (str "stride " stride ": a container of " cnt
+                     " entries must have exactly ceil(n/stride) anchors"))))
         (is (= v (nav/value c)) (str "stride " stride ": and the value still reads back"))
         (is (= {} (nav/value (get c "empty-map"))))
         ;; LOOKING INSIDE is the case the first version missed: it only
@@ -1429,7 +1445,13 @@
             which costs only on genuine misses and makes this namespace's
             promise -- a stale index falls back to walking and returns the same
             answer -- true for a DAMAGED one too."
-    (let [m (into {} (for [i (range 40)] [(format "k%02d" i) i]))
+    ;; EIGHTY, not forty. Forty scalar pairs walk 39, below the threshold at
+    ;; which a node is written at all, so there was no frame left to damage and
+    ;; the byte hunt below indexed at -1. Eighty walks 79 and clears it while
+    ;; leaving every byte this test depends on unchanged: the keys are still
+    ;; three characters, the first entries still five bytes, so the needle and
+    ;; the expected anchors are the same.
+    (let [m (into {} (for [i (range 80)] [(format "k%02d" i) i]))
           o {:profile :canonical}
           bs (boring/encode-indexed m (assoc o :index 4 :index-min 4))
           ;; The node's anchors are 2, 22, 42, 62 ... so its deltas are
@@ -1464,7 +1486,7 @@
               "and anchor[2] really is one byte off")))
       (testing "yet every present key still reads back correctly"
         (let [src (nav/root damaged o)]
-          (doseq [i (range 40)]
+          (doseq [i (range 80)]
             (is (= i (some-> (get src (format "k%02d" i)) nav/value))
                 (format "k%02d" i)))))
       (testing "and an absent key is still absent"
@@ -1657,12 +1679,19 @@
     (let [doc (vec (for [i (range 40)]
                      (into {} (for [j (range 20)]
                                 [(format "k%02d" j) (+ (* 100 i) j)]))))
-          o (assoc opts :index 16 :index-min 4)
+          ;; STRIDE 1, not 16. The inner maps are UNSORTED, and an unsorted
+          ;; map cannot be binary-searched -- so above stride 1 `boring.nav`
+          ;; refuses its node and the writer no longer emits one. At stride 16
+          ;; this fixture collapsed to a single node, the outer vector, and
+          ;; "many nodes, which is the whole point of this fixture" was true of
+          ;; nothing. At stride 1 the nodes are usable and all 41 are written.
+          o (assoc opts :index 1 :index-min 4)
           ^bytes clean (boring/encode-indexed doc o)
           n (alength clean)
           frame-at (long (#'boring.frame/footer-start clean))
-          ;; across nodes AND across strides within a node: k00 is anchor 0,
-          ;; k07 is mid-stride, k19 is the last entry of the last stride
+          ;; Across nodes and across positions within a node. Every entry is an
+          ;; anchor at stride 1, so these no longer separate anchor from
+          ;; mid-stride; they still separate first, middle and last.
           paths (vec (for [i [0 1 17 39] j ["k00" "k07" "k19"]] [i j]))
           gen-damage (gen/vector (gen/tuple (gen/choose frame-at (dec n))
                                             (gen/choose 0 255))
@@ -1689,7 +1718,10 @@
     (let [doc (vec (for [i (range 40)]
                      (into {} (for [j (range 20)]
                                 [(format "k%02d" j) (+ (* 100 i) j)]))))
-          o (assoc opts :index 16 :index-min 4)
+          ;; Stride 1, matching the property above and for the same reason:
+          ;; these inner maps are unsorted, and an unsorted map earns no node
+          ;; above stride 1 because the reader would refuse it anyway.
+          o (assoc opts :index 1 :index-min 4)
           ^bytes clean (boring/encode-indexed doc o)
           ix (#'boring.nav/read-index (#'boring.nav/nav-of clean o))]
       (is (some? (:containers ix)) "the index is accepted")
@@ -1698,7 +1730,7 @@
       (is (< 1 (long (:containers ix)))
           "and has many nodes, which is the whole point of this fixture")
       (is (= 1907 (some-> (nav/walk (nav/root clean o) [19 "k07"]) nav/value))
-          "and a mid-stride key in a middle node reads correctly"))))
+          "and a key in a middle node reads correctly"))))
 
 (deftest a-sequence-node-claiming-no-items-must-be-backed-by-no-data
   (testing "A node with zero items has zero anchors, so the far-end check
@@ -1801,18 +1833,39 @@
                                  (boring/write-indexed! w v out (merge o opts))
                                  (.toByteArray out)))
           walk (fn [v opts] (boring/encode-indexed v (merge o opts)))
+          ;; NO FRAME IS A LEGITIMATE ANSWER, and became a common one when
+          ;; the writer started refusing nodes a scan does not need.
+          ;; `footer-start` returns -1 for a file without one, and reading
+          ;; there is `:boring/truncated-input` -- an error that says the
+          ;; document is broken when in fact it is fine and simply has no
+          ;; index.
           nodes (fn [^bytes bs]
                   (let [p (long (#'boring.frame/footer-start bs))]
-                    (count (vec (nth (boring.data/frame-payload
-                                      (.readFrom (Reader. bs) p)) 1)))))]
+                    (if (neg? p)
+                      0
+                      (count (vec (nth (boring.data/frame-payload
+                                        (.readFrom (Reader. bs) p)) 1))))))]
+      ;; THE NODE COUNTS ARE THE POINT OF THIS LIST, and they moved when the
+      ;; writer started refusing nodes a scan does not need. Refusing is not a
+      ;; free change to a test whose second assertion exists to stop it passing
+      ;; on two empty indexes -- so the fixtures are chosen to still EARN
+      ;; nodes, and the counts below are what the rule produces, checked one by
+      ;; one rather than pasted from the failure.
+      ;;
+      ;;   flat map    130 sorted scalar pairs, walk 129 -> the map is indexed
+      ;;   vec of maps the outer array walks 72 (five items an entry); the
+      ;;               two-entry inner maps walk 2 and are not worth a node
+      ;;   nested      the 20-entry L1 map walks 228; the 20-element vectors
+      ;;               under it walk 19 and are refused, as is the 1-entry root
+      ;;   map of vecs the root walks 209; its 20-element vectors walk 19
       (doseq [[label v expect-nodes]
-              [["flat map"    (into {} (for [i (range 40)] [(format "k%02d" i) i])) 1]
+              [["flat map"    (into {} (for [i (range 130)] [(format "k%03d" i) i])) 1]
                ["vec of maps" (vec (for [i (range 30)] {"a" i "b" (str i)}))        1]
                ["nested"      {"L1" (into {} (for [i (range 20)]
                                                [(format "m%02d" i)
-                                                {"L3" (vec (range 20))}]))}       21]
+                                                {"L3" (vec (range 20))}]))}        1]
                ["map of vecs" (into {} (for [i (range 20)]
-                                         [(format "v%02d" i) (vec (range 20))]))  21]]
+                                         [(format "v%02d" i) (vec (range 20))]))   1]]
               stride [4 16]]
         (let [c (capture v {:index stride :index-min 4})
               w (walk v {:index stride :index-min 4})]
@@ -1856,13 +1909,18 @@
           walk (fn [v opts] (boring/encode-indexed v opts))
           payload (fn [^bytes bs]
                     (let [p (long (#'boring.frame/footer-start bs))]
-                      (boring.data/frame-payload (.readFrom (Reader. bs) p))))
+                      (when-not (neg? p)
+                        (boring.data/frame-payload (.readFrom (Reader. bs) p)))))
+          ;; `::none` rather than nil or a throw -- see the `nodes` helper
+          ;; above. Two files that BOTH have no frame still have to compare
+          ;; equal, which is the case the sweep hits most often now.
           shape (fn [^bytes bs]
-                  (let [p (payload bs)]
+                  (if-some [p (payload bs)]
                     {:stride (nth p 0)
                      :containers (vec (nth p 1))
                      :counts (vec (nth p 2))
-                     :sorted (vec (nth p 4))}))]
+                     :sorted (vec (nth p 4))}
+                    ::none))]
       (doseq [[label v]
               [["vec of maps"  (vec (for [i (range 30)] {"a" i "b" (str i)}))]
                ["nested"       {"L1" (into {} (for [i (range 20)]

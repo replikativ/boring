@@ -191,7 +191,13 @@
   (testing "a writer that was never given setIndex records nothing, and encodes
             byte-identically to one that does -- the index must not change the
             document"
-    (let [v (into {} (for [i (range 40)] [(format "k%03d" i) i]))
+    ;; A 200-ELEMENT VECTOR, not a 40-entry map. This test needs the indexed
+    ;; writer to actually RECORD something, and the old fixture records
+    ;; nothing twice over: 40 scalar pairs are crossed in 39 items on average,
+    ;; below the threshold, and an UNSORTED map earns no node above stride 1
+    ;; at any walk, because the reader would refuse it. An array is gated on
+    ;; walk alone, and 200 elements walk 99.
+    (let [v (vec (range 200))
           ^Writer plain (boring/writer 65536 {:stringref false})
           ^Writer idxed (boring/writer 65536 {:stringref false})]
       (.setIndex idxed (int 16) (int 8) 0)

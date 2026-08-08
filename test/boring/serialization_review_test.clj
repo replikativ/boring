@@ -340,9 +340,16 @@
             bound, and catching StackOverflowError is only a backstop -- the
             handler needs stack to build the exception and can overflow again."
     (let [deep (fn [n] (byte-array (concat (repeat n (unchecked-byte 0x81)) [(byte 1)])))]
+      ;; NOT `some?`. `deep` is nested ONE-ELEMENT arrays -- a scan crosses
+      ;; each in a single item -- so the writer correctly declines to node any
+      ;; of them and `build-index` returns nil. What this test is about is the
+      ;; DEPTH BOUND: 200 levels must walk without throwing, and 201 must give
+      ;; a typed error rather than a StackOverflowError.
       (doseq [n [10 100 200]]
-        (is (some? (boring/build-index (deep n) {:index 4 :index-min 0}))
-            (str n " levels is ordinary nesting and must still index")))
+        (is (nil? (try (boring/build-index (deep n) {:index 4 :index-min 0})
+                       nil
+                       (catch clojure.lang.ExceptionInfo e e)))
+            (str n " levels is ordinary nesting and must still walk")))
       ;; The exact cutoff is a safety MARGIN, not a contract -- it is set where
       ;; the deterministic check reliably beats the stack, which depends on how
       ;; much stack the caller has already spent. So this asserts comfortably

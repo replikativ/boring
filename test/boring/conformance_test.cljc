@@ -2732,16 +2732,41 @@
 
             The discriminating byte is still one, and still the sorted flag."
     (let [opts {:index 1 :index-min 3 :shapes false :stringref false}
-          asc  (array-map "a" 1 "b" 2 "c" 3)
-          desc (array-map "c" 1 "b" 2 "a" 3)]
-      (is (= (str "81a3616101616202616303d81b826c626f72696e672f696e646578"
-                  "8601d84e4401000000d84e4403000000490200060009000103034101"
-                  "48000000000000000b")
+          ;; THE VALUES ARE LARGE BECAUSE THE MAP MUST EARN A NODE. Three
+          ;; entries of scalars are crossed in two items on average, and the
+          ;; writer no longer writes a node for a container that cheap -- so
+          ;; the earlier fixture, `{"a" 1 "b" 2 "c" 3}`, produced no frame at
+          ;; all and there was no `sorted` bit left to compare. A 70-element
+          ;; vector per entry puts the walk at 72.
+          ;;
+          ;; Nothing else about the fixture changed: the subject is still the
+          ;; KEY ORDER, "a" "b" "c" against "c" "b" "a", and the values are
+          ;; identical between the two so the only difference the bytes can
+          ;; show is the flag.
+          big  (vec (range 70))
+          asc  (array-map "a" big "b" big "c" big)
+          desc (array-map "c" big "b" big "a" big)
+          ;; The 70-element vector, once, rather than three times inside each
+          ;; of two 830-character literals.
+          v-hex (str "9846000102030405060708090a0b0c0d0e0f101112131415161718"
+                     "181819181a181b181c181d181e181f18201821182218231824182518"
+                     "26182718281829182a182b182c182d182e182f18301831183218331834"
+                     "18351836183718381839183a183b183c183d183e183f184018411842"
+                     "184318441845")
+          ;; The frame, whose ONLY difference between the two is the `sorted`
+          ;; bitset: `4101` (bit set) against `4100` (bit clear).
+          ;; `41` is the one-byte string head; the byte after it is the
+          ;; bitset. Split on the BYTE boundary -- splitting mid-byte silently
+          ;; shortens the literal by a nibble and the mismatch then reads as a
+          ;; frame layout change rather than a typo.
+          frame (fn [sorted-bit]
+                  (str "d81b826c626f72696e672f696e6465788601d84e4401000000"
+                       "d84e440300000049020006000900017878" "41" sorted-bit
+                       "48000000000000016a"))]
+      (is (= (str "81a3" "6161" v-hex "6162" v-hex "6163" v-hex (frame "01"))
              (c/bytes->hex (boring/encode-indexed [asc] opts)))
           "ascending keys -> sorted true (bit set)")
-      (is (= (str "81a3616301616202616103d81b826c626f72696e672f696e646578"
-                  "8601d84e4401000000d84e4403000000490200060009000103034100"
-                  "48000000000000000b")
+      (is (= (str "81a3" "6163" v-hex "6162" v-hex "6161" v-hex (frame "00"))
              (c/bytes->hex (boring/encode-indexed [desc] opts)))
           "descending keys -> sorted false (bit clear)")
       (testing "the flag is what separates them: same keys, same values, same
@@ -2813,9 +2838,17 @@
     (testing "the control: well-formed input of the SAME shapes still walks, so
               the assertions above are about the damage and not about the
               shapes being rejected wholesale"
+      ;; `:ok`, not `some?`. These are three- and two-element containers, and
+      ;; the writer no longer emits a node for a container a scan crosses in
+      ;; one or two items -- so `build-index` correctly returns nil and
+      ;; `some?` stopped meaning "the walk completed". What this control
+      ;; asserts is that the walk RUNS on well-formed bytes of these shapes,
+      ;; which is exactly "it did not throw".
       (doseq [hex ["83010203" "a201020304"]]
         (is (= 1 (count (boring/decode-seq (c/hex->bytes hex)))) hex)
-        (is (some? (boring/build-index (c/hex->bytes hex) {:index 1 :index-min 1})) hex)))))
+        (is (= :ok (first (err-type #(boring/build-index (c/hex->bytes hex)
+                                                         {:index 1 :index-min 1}))))
+            hex)))))
 
 (deftest a-declared-count-cannot-size-an-array-before-it-is-checked
   (testing "`build-index` sizes an anchor array from a count it reads off the
@@ -2834,8 +2867,12 @@
                                                       {:index 1 :index-min 1}))))))
     (testing "the control: a container whose count IS backed by bytes still
               indexes, so the guard rejects the lie and not the shape"
+      ;; See the control in `the-skip-walk-terminates-on-hostile-bytes`: nil
+      ;; is now the right answer for a container this cheap to cross, so the
+      ;; assertion is that the guard does not REJECT it.
       (doseq [hex ["83010203" "a201020304"]]
-        (is (some? (boring/build-index (c/hex->bytes hex) {:index 1 :index-min 1}))
+        (is (= :ok (first (err-type #(boring/build-index (c/hex->bytes hex)
+                                                         {:index 1 :index-min 1}))))
             hex)))))
 
 (deftest a-nil-input-is-a-typed-error-on-every-read-path

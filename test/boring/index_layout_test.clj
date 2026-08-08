@@ -16,7 +16,18 @@
 (def ^:private opts {:stringref false :shapes false})
 
 (def ^:private doc
-  (into (sorted-map) (for [i (range 40)] [(format "k%02d" i) i])))
+  "A SORTED MAP OF 130 ENTRIES, because the frame has to exist to be tested.
+
+  Forty entries earn no index node: a map of scalar pairs is crossed in
+  `n - 1` items on average, and the writer refuses a node below 64. So every
+  assertion here read a frame that was no longer written, and `footer-start`
+  returned -1 into `decode-at`.
+
+  130 walks 129, comfortably clear, and nothing else about the fixture matters
+  -- these tests are about the SHAPE of `slots` and `sorted`, not about how
+  many entries produced them. `k%03d` keeps the keys equal-length so they sort
+  the same way bytewise and numerically."
+  (into (sorted-map) (for [i (range 130)] [(format "k%03d" i) i])))
 
 (defn- wire-payload
   "The frame's six payload elements, as they sit ON THE WIRE.
@@ -101,8 +112,8 @@
 
 (defn- answers-everything? [^bytes bs]
   (let [src (nav/root bs opts)]
-    (every? (fn [i] (= i (some-> (get src (format "k%02d" i)) nav/value)))
-            (range 40))))
+    (every? (fn [i] (= i (some-> (get src (format "k%03d" i)) nav/value)))
+            (range 130))))
 
 ;; ---------------------------------------------------------------- old shape
 
