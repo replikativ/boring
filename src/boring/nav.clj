@@ -660,7 +660,22 @@
     ;; `(max 0 (min (dec m) hi))` still yields 0 and `aget` threw straight at
     ;; the caller of `get`. Cheaper to notice here than to special-case both
     ;; branches, and it also covers any future node that turns out empty.
-    (if (or (neg? ns) (zero? (alength ^longs (slot-at idx ns))))
+    ;; AN UNSORTED MAP AT STRIDE > 1 CANNOT BE ACCELERATED AT ALL, so do not
+    ;; pay to try. The unsorted branch below loops anchor to anchor calling
+    ;; `scan-map` for `span` entries each, which visits every entry of the
+    ;; container -- exactly what one `scan-map` from the head does, plus a jump
+    ;; and a call per anchor. Measured on a map of 2000 scalars: 16.81 us
+    ;; indexed against 11.29 scanning, 0.67x, i.e. the anchors cost 50% and
+    ;; bought nothing.
+    ;;
+    ;; At stride 1 it INVERTS and the index is the whole point: every entry has
+    ;; an anchor, so moving from one to the next JUMPS OVER the value instead of
+    ;; walking it. Measured 2.72x on a 20-key hash map of 1000-int vectors --
+    ;; and Clojure maps are unsorted by default, so that is the ordinary case
+    ;; rather than a corner. See `boring.core/pack-sorted` and commit 825657f.
+    (if (or (neg? ns)
+            (zero? (alength ^longs (slot-at idx ns)))
+            (and (> (long (:stride idx)) 1) (not (sorted-at? (:sorted idx) ns))))
       (scan-map r (.headEndAt r off) n probe)
       (let [^longs slot (slot-at idx ns)
             stride (long (:stride idx))
@@ -759,22 +774,39 @@
         n (head-count nav off)]
     (if (or (neg? idx) (>= idx n))
       -1
-      (let [ix (nav-idx nav)
-            ns (node-slot nav off)
-            ^longs slot (when-not (neg? ns) (slot-at ix ns))
-            stride (when slot (long (:stride ix)))
-            anchor (when slot (quot idx (long stride)))]
+      ;; ELEMENT 0 NEVER NEEDS THE INDEX, and does not even need it OPEN.
+      ;; `anchor` is `(quot idx stride)`, which is 0 for idx 0 whatever the
+      ;; stride is, and anchor 0 is the container's own first entry -- so the
+      ;; indexed route walks from exactly where this does, after paying a binary
+      ;; search, an anchor expansion, and possibly the whole index open.
+      ;;
+      ;; Measured on a 2000-element vector: `nth 0` cost 0.18x of scanning warm
+      ;; and 0.24x cold, and on a nested path `[0 "k7"]` was SLOWER than
+      ;; `[400 "k7"]` -- the index doing work that cannot pay.
+      (if (zero? idx)
+        (.headEndAt r off)
+        (let [ix (nav-idx nav)
+              ;; `nav-idx` is nil when the file carries no usable index at all.
+              stride0 (if ix (long (:stride ix)) 0)
+              ;; The same argument once the stride is known: any `idx` inside
+              ;; the first stride lands on anchor 0, so there is nothing to jump
+              ;; to. Checked before `node-slot`, which is a binary search over
+              ;; every node in the document.
+              ns (if (or (nil? ix) (< idx stride0)) -1 (node-slot nav off))
+              ^longs slot (when-not (neg? ns) (slot-at ix ns))
+              stride (when slot stride0)
+              anchor (when slot (quot idx (long stride)))]
         ;; THE ANCHOR MUST BE THERE, which `lookup-map` has always checked and
         ;; this never did -- `node-sound?` was rejecting such a node before it
         ;; got here, and with that gone `(aget slot anchor)` on a node whose
         ;; count says zero anchors is a raw AIOOBE out of `nth`. Empty
         ;; containers legitimately produce a zero-anchor node (`:index-min 0`
         ;; will index a `[]`), so this is reachable without any damage at all.
-        (if (or (nil? slot) (zero? (alength slot)) (>= (long anchor) (alength slot)))
-          (loop [i 0 p (.headEndAt r off)]
-            (if (= i idx) p (recur (inc i) (skip r p))))
-          (loop [i (* (long anchor) (long stride)) p (long (aget slot (long anchor)))]
-            (if (= i idx) p (recur (inc i) (skip r p)))))))))
+          (if (or (nil? slot) (zero? (alength slot)) (>= (long anchor) (alength slot)))
+            (loop [i 0 p (.headEndAt r off)]
+              (if (= i idx) p (recur (inc i) (skip r p))))
+            (loop [i (* (long anchor) (long stride)) p (long (aget slot (long anchor)))]
+              (if (= i idx) p (recur (inc i) (skip r p))))))))))
 
 ;; NOTE: this compares the declared count against `room` BEFORE doubling for a
 ;; map, while `Cursor.count` compares `2n`. Both are typed refusals, so the
