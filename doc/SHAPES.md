@@ -309,47 +309,49 @@ instead. Three checks guard against a file that merely happens to end in the
 right shape: the tail must look like an 8-byte byte string, the pointer must be
 in range, and the target must actually carry the `boring/index` name.
 
-**The index is never load-bearing for correctness.** It is rebuildable by a
-full scan, discardable at any time, and a missing or damaged one changes only
-the speed. That is deliberate, and it is what the test suite pins: a corrupt
-pointer, a truncated file, an appended-to file, a file that merely ends in the
-right 9-byte shape, and a frame that passes every detection check but holds an
-unusable payload all fall back to scanning rather than throwing.
+**The index is a trust boundary.** It is rebuildable by a full scan and
+discardable at any time, but a reader that uses it trusts what it says: nothing
+re-derives, at read time, whether its offsets are the right ones. Use it where
+you are willing to trust the bytes.
 
-**The limit of that claim, stated rather than implied.** It holds for an index
-that is **missing, stale, truncated, or damaged in a way that leaves it
-structurally inconsistent** — each is detected and costs only a scan. It does
-**not** hold for damage that leaves the payload structurally *consistent*, and
-that is not only a crafted-attack case: exhaustive single-byte mutation of a
-real index frame returns a **silently wrong answer 2.1% of the time**, and a
-**one-bit** flip of the `sorted` byte loses 15 of 20 keys with no error at all.
-Ordinary bit rot lands on the wrong side of this line.
+That is a narrowing, and it was deliberate. The reader used to verify each
+anchor against its predecessor on first use, which costs O(stride) *skips* per
+jump — and a skip is O(1) only for a scalar, so stepping over 16 twenty-entry
+maps is ~640 sub-skips, measured at four times the cost of the lookup it
+guarded. It also verified every node's parts against the data at open. Neither
+survives. Corruption beneath us is the storage layer's job.
 
-The reader checks that a node's parts agree — the container really is at that
-offset with the count it claims, its first anchor is that container's first
-entry, anchors ascend and stay inside the data section. All of that is O(1) per
-node. What it cannot check without doing the very work the index exists to
-avoid is that **every** anchor is a real entry boundary (O(n) per container), or
-that `sorted` is truthful (which means reading every key). An index built to lie
-about either will misdirect a lookup to a neighbouring value, silently and
-without error.
+**What is still promised**, and it is not negotiable:
 
-One check used to reach further and no longer does. For a **container** node the
-reader also walked to the container's end — `skip` over every item in it — to
-confirm that stepping from the last anchor landed exactly there. That pinned the
-final partial span, and it cost the walk the node exists to avoid: measured flat
-at ~190 µs on 769 maps of 20 wherever the key sat, against 2.2 µs unindexed for
-the first element, which made an untrusted index unable to beat an unindexed
-walk at any container size. It is gone; damage confined to the bytes past the
-last anchor is no longer detected. **Sequence** nodes keep the check, because
-their end is `data-end` — a constant already in the frame — so it costs O(stride)
-there and always did.
+- **No untyped exception, ever**, from any damage to any byte. A wrong answer is
+  inside the boundary; an `ArrayIndexOutOfBoundsException` out of `get` is not.
+- **No read outside the file.** Bounds are not a matter of trust, because
+  `Reader.skipFrom` does an unchecked array access — an offset nobody bounded
+  arrives as a raw AIOOBE at the caller. So the O(1) frame-structure checks
+  stay, and so do two explicit segment bounds: a node's delta run must lie
+  inside the packed `slots`, and its anchors must lie inside the data section.
+- **A reader that consults no index is never affected by frame damage.**
+- **Undamaged data always reads correctly**, which is less trivial than it
+  sounds — see `confirm` below.
 
-So the index frame is a **trust boundary**: integrity of the index is integrity
-of the document. That is the same exposure the data section already has — CBOR
-carries no checksum, and anyone able to rewrite the index can rewrite the data —
-but it is a real qualification of the sentence above, which was previously
-written without one.
+Two things survive that look like they should not, and the reasons differ.
+
+`confirm` re-derives every lookup *miss* by an honest scan. It looks like a
+damage check and is not: a `:sorted` node over a map ordered by something other
+than canonical CBOR bytes — a Clojure `sorted-map` is ordered by `compare` —
+leaves the binary search comparing with a function the array is not sorted by.
+It stays correct *only* because negatives are re-derived. Deleting it as a
+redundant optimisation breaks lookups on undamaged, correctly written data.
+
+The **sequence** node is still checked against the data section, alone, because
+it catches something trust says nothing about: a *file-level* mixup. Splice one
+sealed file's data section under another's footer of the same byte length and
+every other gate passes, while `nth 16` returns the string `"gaaaa"` and
+`decode-seq` over the same bytes is correct throughout — two code paths in one
+application disagreeing about the file. It is also cheap: its end is `data-end`,
+a constant already in the frame, so the walk is bounded by one stride. The
+expensive half was the **container** far end — `skip` over every item, ~190 µs
+on 769 maps of 20 — and that is gone.
 
 ### Slots are deltas, in the narrowest type that holds them
 

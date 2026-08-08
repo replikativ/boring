@@ -2,20 +2,38 @@
   "Every test here is a bug that shipped on this branch and was found by review
   rather than by the suite.
 
-  They share a theme, and it is the claim the whole index rests on: **the index
-  is an optimisation and is never load-bearing for correctness.** A missing,
-  stale, truncated or randomly corrupt index may cost speed; it may not change
-  an answer and it may not throw at the caller. Six findings all violated that,
-  and none of them needed hostile input -- four fire on ordinary data at the
-  shipped defaults.
+  They shared a theme, and the theme has since been narrowed deliberately.
 
-  That claim is QUALIFIED, and the qualification belongs beside it: it does not
-  extend to a CRAFTED index. Checking that every anchor is a real entry boundary
-  is O(n) per container, and checking that `sorted` is truthful means reading
-  every key -- both exactly the work the index exists to avoid. A deliberately
-  lying index can therefore still misdirect a lookup, so the index frame is a
-  trust boundary: integrity of the index is integrity of the document. This
-  namespace's docstring previously asserted the unqualified version.
+  It used to be: **the index is an optimisation and is never load-bearing for
+  correctness** -- a missing, stale, truncated or randomly corrupt index may
+  cost speed, but may not change an answer and may not throw at the caller.
+  Six findings violated that, and none needed hostile input; four fired on
+  ordinary data at the shipped defaults.
+
+  THAT CLAIM IS NO LONGER MADE, and the tests here say so. Holding it up meant
+  re-deriving at read time what the frame asserts: verifying an anchor against
+  its predecessor costs O(stride) SKIPS per jump, and a skip is O(1) only for a
+  scalar -- stepping over 16 twenty-entry maps is ~640 sub-skips, measured at
+  four times the cost of the lookup it guards. The index is now a TRUST
+  BOUNDARY outright: we use it only where we are willing to trust it, and
+  integrity of the index is integrity of the document. Corruption beneath us is
+  the storage layer's job, and both real consumers have one.
+
+  WHAT IS STILL PROMISED, and what these tests now pin, is narrower and not
+  negotiable:
+
+    * No untyped exception, ever, from any damage to any byte. A wrong answer
+      is within the boundary; an `ArrayIndexOutOfBoundsException` out of `get`
+      is not.
+    * No read outside the file. This is why the O(1) frame-structure and
+      segment bounds stay while the per-node verification goes -- bounds are
+      not a matter of trust, because `Reader.skipFrom` does an unchecked array
+      access.
+    * A reader that consults no index is never affected by frame damage.
+    * Undamaged data always reads correctly, which is less trivial than it
+      sounds: `confirm` looks like a damage check and is not, and deleting it
+      breaks `sorted-map` lookups on perfectly good bytes.
+
   See doc/SHAPES.md.
 
   The suite missed them for reasons worth recording, because they are reasons a
