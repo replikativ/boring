@@ -107,6 +107,53 @@ here.
 
 ### Changed
 
+- **BREAKING: the index frame is a trust boundary, and a corrupt one may now
+  change an answer.** boring previously promised that *a missing, stale,
+  truncated or randomly corrupt index may cost speed; it may not change an
+  answer and it may not throw at the caller*. That promise required re-deriving
+  at read time what the frame asserts — verifying each anchor against its
+  predecessor costs O(stride) *skips* per jump, and a skip is O(1) only for a
+  scalar, so stepping over 16 twenty-entry maps is ~640 sub-skips. Measured at
+  four times the cost of the lookup it guarded.
+
+  The promise is withdrawn rather than quietly falsified. Use the index where
+  you are willing to trust the bytes; corruption beneath boring is the storage
+  layer's job, and both known consumers have one.
+
+  **What is still promised, and is not negotiable**: no untyped exception ever,
+  from any damage to any byte — a wrong answer is inside the boundary, an
+  `ArrayIndexOutOfBoundsException` or `OutOfMemoryError` out of `get` is not;
+  no read outside the file; a reader that consults no index is never affected
+  by frame damage; and undamaged data always reads correctly. See
+  [doc/SHAPES.md](doc/SHAPES.md).
+
+- **`:trust-index :trusted` is accepted and does nothing.** There is one path
+  now, and it is faster than the old *trusted* one was — the checks it used to
+  skip are gone for everyone. The key is kept rather than removed because a
+  removed option key silently no-ops. `:trust-index :ignore` is unchanged and
+  still skips the index entirely.
+
+- **The index frame is recognised with six *through fifteen* payload
+  elements**, where it previously required exactly six. Nothing writes more
+  than six. This is forward compatibility, and the reason it matters is that
+  the failure mode of *not* recognising a frame is the worst one available: a
+  reader that does not recognise it never learns where the data section ends,
+  so the frame is republished as a trailing **data** item and a file of N
+  records reads back as N+1 — silently, and in both directions. Refusing to
+  *use* an index is safe; refusing to *see* one is not.
+
+  Readers from this version on therefore treat a widened frame as a frame. A
+  widened payload must insert its new elements **before** the trailing
+  back-pointer, which stays last: the trailer the whole scheme is located by is
+  the file's final 9 bytes.
+
+- **The index reader no longer materialises any of the frame.** `containers`,
+  `counts`, `slots` and `sorted` are read in place as byte offsets. Opening an
+  index on a 769-node document went from 17 840 to 1 664 bytes allocated, and
+  the open is now flat in both node count and anchor count — a 16 150-node
+  document opens in the same time as a 770-node one, and stride 1 costs no more
+  than stride 16. Neither the format nor any API changes.
+
 - **BREAKING, ClojureScript: a reserved tag-27 marker naming a type
   ClojureScript does not have now decodes to a frame-preserving carrier**
   instead of to its bare payload. `27(["java/period", "P1D"])` was `"P1D"` and
@@ -181,6 +228,25 @@ here.
   of the sequence rather than as an error. Pass `{:index 0}` for the old output.
 
 ### Fixed
+
+- **ClojureScript wrote index offsets past 2 GiB as negative numbers.**
+  `seal-index!` emitted a 32-bit typed array unconditionally, and
+  `Int32Array.from` wraps rather than refusing — so an offset at or above 2^31
+  went out negative, which is precisely the case 64-bit offsets exist for. The
+  JVM writer had always promoted to 64-bit; ClojureScript now does too.
+
+- **A damaged index could raise an untyped `OutOfMemoryError` out of `get`.**
+  The anchor array was allocated from an entry count read off the wire *before*
+  the bound check that refuses it, so one flipped bit reached 2^31−1 — and
+  `Error` walks through every catch between the frame parser and the caller.
+  Reachable from a single bit flip in a file boring itself wrote.
+
+- **A crafted index could raise an untyped `ArithmeticException` out of
+  `get`.** Anchors are a prefix sum, and a 64-bit delta near `Long/MAX_VALUE`
+  overflowed the sum before the range check that refuses it. Clojure's `+` on
+  primitive longs is checked; the sum is now unchecked, so the wrapped value
+  fails the range check that already existed.
+
 
 - Cross-platform: `encode-indexed` produced different bytes on ClojureScript
   than on the JVM, because the index's `sorted` flag was hardcoded rather than
