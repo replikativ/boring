@@ -71,7 +71,11 @@
 (defn- seal ^bytes [vs o]
   (let [w (boring/writer 65536 o)
         out (ByteArrayOutputStream.)]
-    (boring/write-seq! w vs out (merge o {:index 16}))
+    ;; `(merge {:index 16} o)`, not `(merge o {:index 16})`. The latter
+    ;; OVERRODE a stride the caller passed -- silently, so a test asking for
+    ;; `:index 1` got 16 and never knew. The default still applies when the
+    ;; caller says nothing, which is what every existing call does.
+    (boring/write-seq! w vs out (merge {:index 16} o))
     (.toByteArray out)))
 
 ;; ---------------------------------------------------------------- finding 1
@@ -374,6 +378,45 @@
           "trusted must still REFUSE this frame, not merely survive it")
       (is (= 3 (count (into [] (nav/items bs trusted))))
           "trusted must still fall back to scanning, not index into nothing"))))
+
+(deftest an-absurd-delta-is-refused-rather-than-overflowing
+  (testing "anchors are a prefix sum, and at width code 3 the stored delta is
+            an unconstrained signed 64-bit value straight off the wire. The
+            segment bound says WHERE the delta bytes are, not what they say --
+            so a container base plus a delta near `Long/MAX_VALUE` overflowed
+            the sum BEFORE the range check that refuses it, and Clojure's `+`
+            on primitive longs THROWS on overflow.
+
+            Measured: `ArithmeticException: long overflow` out of `get`, on a
+            frame that passed every acceptance gate, while `decode` of the same
+            bytes returned the true value. Untyped, so outside the one promise
+            that survives trusting the index.
+
+            Not reachable by bit rot -- the eight delta bytes have to land in a
+            narrow window at the top of the long range -- so no damage sweep
+            will ever produce it, which is why it is built by hand here."
+    (let [;; one node, width code 3, one anchor, stored delta = Long/MAX_VALUE
+          slots (byte-array (map unchecked-byte
+                                 [0x02          ; layout: v2, start-entry width 2
+                                  0x03          ; width codes: node 0 -> i64
+                                  0x06 0x00     ; deltas begin at 6
+                                  0x0E 0x00     ; total length 14
+                                  0xFF 0xFF 0xFF 0xFF 0xFF 0xFF 0xFF 0x7F]))
+          ;; node 0 is the REAL container at offset 4 -- the second `{"x" n}` --
+          ;; so the prefix sum starts at 4 rather than 0 and the add overflows
+          bs (crafted [1 (int-array [4]) (int-array [1]) slots (byte-array 1)])
+          item (nth (into [] (nav/items bs opts)) 1)]
+      (is (accepted? bs opts)
+          "the frame is ACCEPTED -- this is not a case the gates refuse")
+      (is (= {"x" 2} (nav/value item))
+          "and the data underneath it is intact")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boring"
+                            (get item "x"))
+          "so the absurd anchor must raise a TYPED error, not overflow")
+      (is (= :boring/bad-index
+             (try (get item "x") nil
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+          "specifically :boring/bad-index"))))
 
 (deftest containers-are-read-at-either-declared-width
   (testing "`containers` is emitted as tag 78 when every offset fits in int32
@@ -1283,11 +1326,19 @@
             `OutOfMemoryError` is an Error, so it walked through
             `index-payload`'s catch, `read-index`'s catch, and out of `get`.
             Reproduced on a blob boring itself wrote."
-    (let [o (assoc opts :index 1 :index-min 4)
-          doc (into {} (for [i (range 40)] [(format "k%02d" i) i]))
+    ;; MANY NODES, in both fixtures. The first version of this swept a 40-key
+    ;; map of ints and a `write-seq!` of 2-key records: n = 1 in BOTH, because
+    ;; a map of scalars is one container and `:index-min` excluded the records.
+    ;; So `width-code`, `slot-start` and `sorted-at?` were only ever evaluated
+    ;; at i = 0, where `(quot i 4)` and `(quot i 8)` are zero and the start
+    ;; table has exactly two entries -- the whole per-node table machinery sat
+    ;; outside the sweep it was supposed to be inside.
+    (let [o (assoc opts :index 1 :index-min 2)
+          doc (vec (for [i (range 60)]
+                     (into {} (for [j (range 3)] [(format "k%d" j) (+ (* 10 i) j)]))))
           ^bytes flat (boring/encode-indexed doc o)
           ^bytes seq-bs (seal (mapv #(hash-map :id % :name (str "r" %)) (range 60))
-                              (assoc opts :index 1))
+                              (assoc opts :index 1 :index-min 2))
           typed? (fn [t] (and (instance? clojure.lang.ExceptionInfo t)
                               (keyword? (:type (ex-data t)))
                               (= "boring" (namespace (:type (ex-data t))))))
@@ -1308,8 +1359,8 @@
                         :when bad]
                     (into [i bit] bad)))
           flat-bad (sweep flat (long (#'boring.frame/footer-start flat))
-                          [[:get (fn [c] (some-> (get (nav/source c opts) "k39") nav/value))]
-                           [:walk (fn [c] (some-> (nav/walk (nav/source c opts) ["k07"]) nav/value))]
+                          [[:nth-deep (fn [c] (some-> (nav/walk (nav/source c opts) [59 "k2"]) nav/value))]
+                           [:nth-mid (fn [c] (some-> (nav/walk (nav/source c opts) [37 "k1"]) nav/value))]
                            [:value (fn [c] (nav/value (nav/source c opts)))]])
           seq-bad (sweep seq-bs (long (body-len seq-bs))
                          [[:items-count (fn [c] (count (nav/items c opts)))]

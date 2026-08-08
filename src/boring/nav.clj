@@ -2048,7 +2048,18 @@
              p (+ sdata start)
              acc (max 0 (container-at r ix i))]
         (when (< k m)
-          (let [v (+ acc (delta-at r p w))]
+          ;; UNCHECKED, because Clojure's `+` on primitive longs THROWS on
+          ;; overflow and `delta-at` at width code 3 returns an unconstrained
+          ;; signed 64-bit value straight off the wire. A container base of 4
+          ;; plus a stored delta of Long/MAX_VALUE raised `ArithmeticException:
+          ;; long overflow` out of `get` -- untyped, on a frame that passed
+          ;; every acceptance gate. The segment bound above says where the
+          ;; bytes are, not what they say.
+          ;;
+          ;; Wrapping is exactly right here: the wrapped value is either
+          ;; negative or beyond `data-end`, so the range check on the next line
+          ;; -- which already existed -- turns it into `:boring/bad-index`.
+          (let [v (unchecked-add acc (delta-at r p w))]
             (when (or (neg? v) (>= v lim))
               (throw (ex-info "boring: index anchor outside the data section"
                               {:type :boring/bad-index :node i :anchor k
