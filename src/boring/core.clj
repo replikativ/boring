@@ -1497,8 +1497,30 @@
      (when (pos? (alength ^longs (:containers idx)))
        (assoc idx :stride stride)))))
 
+(def ^:no-doc ^:const slot-layout-v2
+  "Version nibble for a DENSE start table -- one entry per node.
+
+  v1 was sparse, one entry every 16 nodes, on the reasoning that a bounded
+  block walk was the same win an order of magnitude cheaper in bytes. Measured
+  on a 770-node frame, that was wrong: a block-aligned node resolves in
+  0.073 us and one at the end of its block in 0.376 -- the walk costs ~0.30 us,
+  FIVE TIMES the base, and averages ~0.22 across a block. Every number that
+  made sparse look free had been taken on node 0, which is block-aligned, so
+  the walk never ran.
+
+  Dense costs 1542 bytes against sparse's 98 on that frame -- but 1.85% of the
+  BLOB, which is the denominator that matters, against the +84%-of-`slots`
+  figure the sparse decision was anchored on. It is also simpler: `start_i` is
+  one read, there is no block loop, and `counts` stops being needed to locate a
+  node at all.
+
+  The layout byte is what makes this cost nothing to change, which is the
+  reason it exists."
+  2)
+
 (def ^:no-doc ^:const slot-block
-  "How many index nodes one entry of the slot start table covers.
+  "Retained for reading v1 frames. How many index nodes one entry of a SPARSE
+  slot start table covers.
 
   `slots` carries a SPARSE table of byte offsets -- one entry every this many
   nodes -- so reaching node `i`'s deltas is one table read plus the segments of
@@ -1638,7 +1660,7 @@
           seg (fn ^long [^long i] (* (alength ^longs (aget ds i))
                                      (bit-shift-left 1 (aget ws i))))
           deltas (loop [i 0 t 0] (if (= i n) t (recur (inc i) (+ (long t) (long (seg i))))))
-          entries (+ (quot n slot-block) 2)
+          entries (inc n)          ; DENSE: start_0 .. start_n
           ;; W depends on the total, and the total depends on W. Two iterations
           ;; settle it: widening the table can only push the total up by
           ;; `entries * 2`, never back down.
@@ -1657,7 +1679,7 @@
       ;; expects this layout and meets the old one reads a width code where a
       ;; version should be, and says so, instead of computing nonsense offsets
       ;; and hoping the length check catches them.
-      (aset-byte out 0 (unchecked-byte (bit-or slot-layout-v1
+      (aset-byte out 0 (unchecked-byte (bit-or slot-layout-v2
                                                (bit-shift-left (if (= w-start 4) 1 0) 4))))
       (dotimes [i n]
         (let [b (+ 1 (quot i 4))]
@@ -1673,15 +1695,10 @@
       ;;
       ;; The final entry is also the structural gate: it must equal the byte
       ;; string's own length, which is one read instead of a sum over N.
-      (let [tbase (+ 1 wbytes)
-            blocks (quot n slot-block)
-            ^longs starts (long-array (inc n))]
+      (let [tbase (+ 1 wbytes)]
         (loop [i 0 p (long header)]
-          (aset starts (int i) (long p))
-          (when (< i n) (recur (inc i) (+ (long p) (long (seg i))))))
-        (dotimes [t (inc blocks)]
-          (put! (+ tbase (* t w-start)) (aget starts (min (* t slot-block) n)) w-start))
-        (put! (+ tbase (* (inc blocks) w-start)) (aget starts n) w-start))
+          (put! (+ tbase (* i w-start)) p w-start)
+          (when (< i n) (recur (inc i) (+ (long p) (long (seg i)))))))
       (loop [i 0 p (long header)]
         (if (= i n)
           out

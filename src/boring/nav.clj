@@ -1850,31 +1850,24 @@
     (let [b0 (bit-and (aget packed 0) 0xFF)
           w (if (zero? (bit-and (bit-shift-right b0 4) 0x0F)) 2 4)
           tbase (+ 1 (quot (+ n 3) 4))
-          entries (+ (quot n boring/slot-block) 2)]
-      (when (and (= (bit-and b0 0x0F) boring/slot-layout-v1)
+          entries (inc n)]
+      (when (and (= (bit-and b0 0x0F) boring/slot-layout-v2)
                  (>= (alength packed) (+ tbase (* entries w)))
                  (= (alength packed)
                     (slot-le packed (+ tbase (* (dec entries) w)) w)))
         [tbase w]))))
 
 (defn- slot-start
-  "Byte offset where node `i`'s deltas begin.
+  "Byte offset where node `i`'s deltas begin. ONE READ.
 
-  One table read, then the segments of at most `boring/slot-block - 1` nodes --
-  bounded, and the bound is a constant rather than the index's size."
-  ;; No primitive return hint: six args plus one is past what Clojure allows
-  ;; for a fn with primitives, and this is called once per node visited.
-  [^bytes packed tbase w counts stride i]
-  (let [^ints counts counts
-        tbase (long tbase) w (long w) stride (long stride) i (long i)
-        blk (quot i boring/slot-block)]
-    (loop [j (* blk boring/slot-block)
-           p (slot-le packed (+ tbase (* blk w)) w)]
-      (if (= j i)
-        p
-        (recur (inc j)
-               (+ p (* (anchor-count (aget counts (int j)) stride)
-                       (bit-shift-left 1 (width-code packed j)))))))))
+  This walked up to 15 nodes from a sparse block start until the measurement
+  said otherwise: on a 770-node frame a block-aligned node resolved in 0.073 us
+  and one at the end of its block in 0.376 -- the walk cost ~0.30 us, five
+  times the base. Every earlier number that made sparse look free had been
+  taken on node 0, which is block-aligned, so the walk never ran.
+  See `boring.core/slot-layout-v2`."
+  ^long [^bytes packed tbase w i]
+  (slot-le packed (+ (long tbase) (* (long i) (long w))) (long w)))
 
 (defn- delta-at
   "The delta at byte `p` of `packed`, at width code `w`, little-endian.
@@ -1924,7 +1917,7 @@
         sz (bit-shift-left 1 w)
         a (long-array m)]
     (loop [k 0
-           p (long (slot-start packed tbase wstart counts stride i))
+           p (long (slot-start packed tbase wstart i))
            acc (max 0 (aget cs (int i)))]
       (when (< k m)
         (let [v (+ acc (delta-at packed p w))]

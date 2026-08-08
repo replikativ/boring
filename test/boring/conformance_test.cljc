@@ -2724,24 +2724,23 @@
             The flag used to be a CBOR boolean in an array (`81f5`/`81f4`) and
             is now a bit in a byte string (`4101`/`4100`). `slots` went from an
             array of typed arrays (`814301030381`) to one byte string, and now
-            carries a start table as well: `49 01 00 0600 0900 010303` is a
-            9-byte string holding the layout byte (version 1, 2-byte table
-            entries), the 2-bit width table (node 0 is width 0 = u8), two
-            little-endian start entries -- 6, where the deltas begin, and 9,
-            which must equal the string's own length and is the structural
-            gate -- and then the deltas 1, 3, 3.
+            carries a start table as well: `49 02 00 0600 0900 010303` is a
+            9-byte string holding the layout byte (version 2, 2-byte table
+            entries), the 2-bit width table (node 0 is width 0 = u8), one start entry per node plus a
+            final total -- 6, where node 0's deltas begin, and 9, which must
+            equal the string's own length and is the structural gate -- and then the deltas 1, 3, 3.
 
             The discriminating byte is still one, and still the sorted flag."
     (let [opts {:index 1 :index-min 3 :shapes false :stringref false}
           asc  (array-map "a" 1 "b" 2 "c" 3)
           desc (array-map "c" 1 "b" 2 "a" 3)]
       (is (= (str "81a3616101616202616303d81b826c626f72696e672f696e646578"
-                  "8601d84e4401000000d84e4403000000490100060009000103034101"
+                  "8601d84e4401000000d84e4403000000490200060009000103034101"
                   "48000000000000000b")
              (c/bytes->hex (boring/encode-indexed [asc] opts)))
           "ascending keys -> sorted true (bit set)")
       (is (= (str "81a3616301616202616103d81b826c626f72696e672f696e646578"
-                  "8601d84e4401000000d84e4403000000490100060009000103034100"
+                  "8601d84e4401000000d84e4403000000490200060009000103034100"
                   "48000000000000000b")
              (c/bytes->hex (boring/encode-indexed [desc] opts)))
           "descending keys -> sorted false (bit clear)")
