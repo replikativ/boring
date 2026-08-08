@@ -1507,7 +1507,9 @@
           ^bytes clean (boring/encode-indexed doc o)
           ix (#'boring.nav/read-index (#'boring.nav/nav-of clean o))]
       (is (some? (:containers ix)) "the index is accepted")
-      (is (< 1 (alength ^longs (:containers ix)))
+      ;; `:containers` is the NODE COUNT now, not the long[] -- the array is a
+      ;; byte offset into the frame and there is nothing to `alength`.
+      (is (< 1 (long (:containers ix)))
           "and has many nodes, which is the whole point of this fixture")
       (is (= 1907 (some-> (nav/walk (nav/source clean o) [19 "k07"]) nav/value))
           "and a mid-stride key in a middle node reads correctly"))))

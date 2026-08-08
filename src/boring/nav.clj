@@ -116,23 +116,7 @@
 
 ;; ---------------------------------------------------------------- the source
 
-(declare slot-at sorted-at?)
-
-;; RESOLVED ONCE, not per index open. `(Class/forName "[I")` is a classloader
-;; lookup, and `read-index` made four of them every time it opened a frame --
-;; on the path that decides whether an index is usable at all, so every
-;; navigable source paid for them whether or not it went on to use the index.
-;;
-;; Measured on a ONE-NODE frame, where nothing else about the open scales:
-;; 6.26 us to 3.94, so 2.3 us and 37% of a fixed cost that had nothing to do
-;; with the index's size. A cold indexed lookup on that frame went 10.12 to
-;; 7.86.
-;;
-;; `[J` and `[I` are how `containers` arrives -- sint64 or sint32, narrowest
-;; that fits -- and `[I` again is `counts`. There is no literal syntax for a
-;; primitive array class, so these cannot simply be inlined as constants.
-(def ^:private longs-array-class (Class/forName "[J"))
-(def ^:private ints-array-class (Class/forName "[I"))
+(declare slot-at sorted-at? container-at count-at)
 
 ;; A TYPE, not a fifteen-key map. `index-payload` used to return one, and on a
 ;; source that is read ONCE -- which is every read of a store handing out a
@@ -179,7 +163,15 @@
          ;; field was unused already; removing it is what keeps it that way once
          ;; the elements become byte offsets and reading them needs a Reader.
          [^long stride
-          ^longs containers
+          ;; CONTAINERS AS AN OFFSET TOO, at whichever width the frame
+          ;; declares. `seal-index!` emits tag 78 when every offset fits in
+          ;; int32 and tag 79 when one does not -- narrowest-that-fits, and the
+          ;; CBOR tag IS the declaration -- so `cw` is 4 or 8 and
+          ;; `container-at` sign-extends either. Normalising to a `long[]` used
+          ;; to cost 1.21 us per open on a 770-node frame, more than the decode
+          ;; it normalised, purely to change the type.
+          ^long containers-data
+          ^long cw
           ;; COUNTS AS AN OFFSET, not an int[]. `counts` is a tag-78 typed
           ;; array on the wire -- RFC 8746 little-endian -- so entry `i` is four
           ;; bytes at `counts-data + 4i` and reading one is a load rather than a
@@ -201,7 +193,12 @@
   (valAt [this k] (.valAt this k nil))
   (valAt [_ k nf]
     (case k
-      :stride stride :containers containers
+      :stride stride
+      ;; `:containers` was the long[]; it is the accepted/refused discriminator
+      ;; now, which is all any caller ever used it for -- `(some? (:containers
+      ;; ix))`. A refused-but-detected frame carries n = -1.
+      :containers (when-not (neg? n) n)
+      :containers-data containers-data :cw cw
       :counts-data counts-data :n n
       ;; `:counts` was the int[]; it is a node COUNT now. Nothing in the tree
       ;; reads it -- both test reach-ins named `:counts` are on
@@ -263,13 +260,17 @@
   ;; unusable now yields `{:data-end ptr}` alone -- the two questions are
   ;; answered separately, see `read-index*` -- so an index can be present and
   ;; carry no nodes at all.
-  (let [^Index ix (nav-idx nav)]
-    (if-let [^longs cs (when ix (.containers ix))]
-      (loop [lo 0 hi (dec (alength cs))]
+  (let [^Index ix (nav-idx nav)
+        ^Reader r (.rdr nav)]
+    ;; `n` is -1 for a detected-but-REFUSED frame, which still carries
+    ;; `data-end` -- the two questions are answered separately, see
+    ;; `read-index*` -- so an index can be present and carry no nodes at all.
+    (if (and ix (not (neg? (.n ix))))
+      (loop [lo 0 hi (dec (.n ix))]
         (if (> lo hi)
           -1
           (let [mid (quot (+ lo hi) 2)
-                c (aget cs mid)]
+                c (container-at r ix mid)]
             (cond
               ;; VALIDATED HERE, not at load. The node is checked against the
               ;; data the first time a lookup lands on it, and an unsound one
@@ -1895,6 +1896,23 @@
       (when (and (= 2 (.majorAt r bs)) (not= 31 (.infoAt r bs)))
         [(.headEndAt r bs) (.headArgAt r bs)]))))
 
+(defn- container-at
+  "Byte offset of node `i`'s container, sign-extended from whichever width the
+  frame declared.
+
+  Tag 78 is a signed int32 and one wide load; tag 79 needs two, because
+  `Reader` exposes no 64-bit accessor. The sign matters and is not incidental:
+  the SEQUENCE node is stored at the sentinel offset -1, so a zero-extending
+  read would turn it into 4294967295 and the node would never be found."
+  ^long [^Reader r ^Index ix ^long i]
+  (let [p (+ (.containers-data ix) (* (.cw ix) i))]
+    (if (= 4 (.cw ix))
+      (long (Integer/reverseBytes (unchecked-int (.u32At r p))))
+      (bit-or (bit-shift-left
+               (long (Integer/reverseBytes (unchecked-int (.u32At r (+ p 4))))) 32)
+              (bit-and (long (Integer/reverseBytes (unchecked-int (.u32At r p))))
+                       0xFFFFFFFF)))))
+
 (defn- count-at
   "Entry count of node `i`: one little-endian int32 load off the wire.
 
@@ -1938,7 +1956,6 @@
   (let [^bytes packed (.slots ix)
         tbase (.slots-tbase ix)
         wstart (.slots-wstart ix)
-        ^longs cs (.containers ix)
         stride (.stride ix)
         lim (.data-end ix)
         m (anchor-count (count-at r ix i) (long stride))
@@ -1965,7 +1982,7 @@
                        :anchors m :width sz :slots-length (alength packed)})))
     (loop [k 0
            p start
-           acc (max 0 (aget cs (int i)))]
+           acc (max 0 (container-at r ix i))]
       (when (< k m)
         (let [v (+ acc (delta-at packed p w))]
           (when (or (neg? v) (>= v lim))
@@ -2043,12 +2060,20 @@
           [off-stride off-containers off-counts off-slots off-sorted]
           (try (payload-offsets r ptr)
                (catch Exception _ [nil nil nil nil nil]))
-          [stride raw-containers packed sorted]
+          [stride packed sorted]
           (when off-stride
             [(.readFrom r (long off-stride))
-             (.readFrom r (long off-containers))
              (.readFrom r (long off-slots))
              (.readFrom r (long off-sorted))])
+          ;; CONTAINERS AT EITHER WIDTH, chosen by the tag rather than tested
+          ;; for. Tag 78 is int32, tag 79 sint64; both are RFC 8746
+          ;; little-endian, so entry `i` is `cw` bytes at `containers-data +
+          ;; cw*i`. The `long[]` normalisation this replaces cost 1.21 us per
+          ;; open on a 770-node frame -- more than the decode it normalised.
+          [containers-data containers-len cw]
+          (when off-containers
+            (or (when-let [[d l] (le-array-at r (long off-containers) 78)] [d l 4])
+                (when-let [[d l] (le-array-at r (long off-containers) 79)] [d l 8])))
           ;; COUNTS IS NOT DECODED. It is a tag-78 typed array, so its entries
           ;; are four little-endian bytes each and `count-at` loads one on
           ;; demand. Materialising it cost 1.07 us per open on a 770-node frame.
@@ -2067,20 +2092,6 @@
           ;; 770-entry `containers`, and be ACCEPTED where it is refused today.
           n (when (and counts-len (zero? (rem (long counts-len) 4)))
               (quot (long counts-len) 4))
-          ;; CONTAINERS ARRIVE AT EITHER WIDTH. `seal-index!` emits int32 when
-          ;; every offset fits and sint64 when one does not, and the CBOR tag is
-          ;; the declaration -- the same narrowest-that-fits rule the slot
-          ;; deltas have always used. Normalising to long here means one shape
-          ;; downstream and no width test in the binary search.
-          ^longs containers (cond
-                              (instance? longs-array-class raw-containers)
-                              raw-containers
-                              (instance? ints-array-class raw-containers)
-                              (let [^ints a raw-containers
-                                    out (long-array (alength a))]
-                                (dotimes [i (alength a)] (aset out i (long (aget a i))))
-                                out)
-                              :else nil)
           ;; THE FINAL TABLE ENTRY IS THE STRUCTURE CHECK, and it is now one
           ;; read rather than a prefix sum over every node. `slot-table` returns
           ;; nil unless the layout byte is one this reader writes AND the last
@@ -2091,7 +2102,7 @@
           table (when (and (bytes? packed) n)
                   (try (slot-table packed (long n))
                        (catch Exception _ nil)))]
-      (when (and (int? stride) (pos? (long stride)) containers n
+      (when (and (int? stride) (pos? (long stride)) containers-data n
                  ;; A BYTE STRING WHERE AN ARRAY USED TO BE. This is what makes
                  ;; the layout change safe in both directions: a frame written
                  ;; by an older writer arrives as a Clojure vector of typed
@@ -2107,77 +2118,68 @@
                  ;; are the one frame fault that costs O(1) to detect and would
                  ;; otherwise surface as a raw IndexOutOfBoundsException from
                  ;; inside `get` rather than as "no usable index, scan instead".
-                 (= (alength containers) (long n))
+                 ;; Same ragged-length trap as `counts`: `quot` truncates.
+                 (zero? (rem (long containers-len) (long cw)))
+                 (= (quot (long containers-len) (long cw)) (long n))
                  ;; `sorted` is a bit per node, so its byte length is exact --
                  ;; `(quot (+ n 7) 8)` -- and an equality rather than a bound.
                  (= (alength ^bytes sorted) (quot (+ (long n) 7) 8))
-                 ;; `node-slot` BINARY-SEARCHES containers, so they must
-                 ;; ascend. O(NODE COUNT), and the only per-node work left at
-                 ;; open -- kept because a search over an unordered array does
-                 ;; not merely miss, it can settle on a node belonging to a
-                 ;; different container and hand its anchors to this one. The
-                 ;; counts check that used to sit beside it is gone: a negative
-                 ;; count now cannot reach past `slot-at`, which bounds its
-                 ;; own segment and its own anchors.
-                 (loop [k 1]
-                   (cond (>= k (alength containers)) true
-                         (>= (aget containers (dec k)) (aget containers k)) false
-                         :else (recur (inc k)))))
-        ;; One uniform node list. The SEQUENCE is the node at the sentinel
-        ;; offset -1: it has no container header on the wire but behaves like
-        ;; one, and a sentinel avoids carrying two shapes for the same idea.
-        (let [seq-slot (loop [k 0]
-                         (cond (>= k (alength containers)) nil
-                               (= -1 (aget containers k)) k
-                               :else (recur (inc k))))
-              st (long stride)
-              ;; LAZY, memoized per node. `slot-at` is a prefix sum over a
-              ;; node's anchors and `node-valid?` reads the file, so doing both
-              ;; for every node at load made an index cost more than it saved on
-              ;; a source used for ONE lookup -- which is every read of a
-              ;; document store. Measured on a 1.37 MB nested map: 1140 us
-              ;; indexed against 129 us unindexed, the gap widening with size
-              ;; because both passes scale with container count.
-              ;;
-              ;; `expand-slot`'s docstring argues the eager pass is free because
-              ;; the index is materialised once per source. That is true when
-              ;; the source is REUSED and exactly inverted when it is not.
-              ;;
-              ;; AtomicReferenceArray rather than a plain object array: a forked
-              ;; THE SEQUENCE NODE STAYS EAGER, alone. `count` and `nth` consult
-              ;; it immediately, a wrong `:total` is the silent-corruption case
-              ;; documented in `node-valid?`, and it is a single node rather
-              ;; than one per container. A sequence is also the shape whose
-              ;; source is reused, so there is nothing to amortise away.
-              ;;
-              ;; A PROVISIONAL `Index`, so there is one expander rather than
-              ;; two. `slot-at` needs the frame's arrays and nothing else --
-              ;; not `total`, not `offsets` -- so it can run against an Index
-              ;; that carries only what has been decoded so far, and the final
-              ;; one is built from its result. A deftype cannot be completed in
-              ;; two steps the way a map could with `assoc`; building it twice
-              ;; is the same thing done honestly.
-              ;;
-              ;; Allocated only when there IS a sequence node, so an
-              ;; `encode-indexed` blob -- which never has one -- pays nothing.
-              ix0 (when seq-slot
-                    (Index. st containers (long counts-data) (long n) packed
-                            (long (nth table 0)) (long (nth table 1))
-                            sorted ptr nil nil))
-              seq-anchors (when seq-slot (slot-at r ix0 (long seq-slot)))
-              ;; The one validation left, and it is about which FILE this is,
-              ;; not about whether the bytes were corrupted -- see
-              ;; `seq-node-ok?`. O(stride), on one node.
-              seq-ok? (or (nil? seq-slot)
-                          (seq-node-ok? r ptr
-                                        (count-at r ix0 (long seq-slot))
-                                        st seq-anchors))]
-          (when seq-ok?
-            (Index. st containers (long counts-data) (long n) packed
-                    (long (nth table 0)) (long (nth table 1))
-                    sorted ptr
-                    (when seq-slot (count-at r ix0 (long seq-slot)))
-                    seq-anchors)))))
+                 )
+        ;; ONE PROVISIONAL INDEX, built as soon as every offset is known, and
+        ;; used for the three things that still need to read `containers`: the
+        ;; ascending check, the sentinel scan, and the sequence node's anchors.
+        ;; It IS the final Index whenever there is no sequence node, which is
+        ;; every `encode-indexed` blob, so that case allocates exactly one.
+        (let [st (long stride)
+              ix0 (Index. st (long containers-data) (long cw)
+                          (long counts-data) (long n) packed
+                          (long (nth table 0)) (long (nth table 1))
+                          sorted ptr nil nil)]
+          ;; `node-slot` BINARY-SEARCHES containers, so they must ascend.
+          ;; O(NODE COUNT), and the only per-node work left at open -- kept
+          ;; because a search over an unordered array does not merely miss, it
+          ;; can settle on a node belonging to a different container and hand
+          ;; its anchors to this one. The counts check that used to sit beside
+          ;; it is gone: a negative count cannot reach past `slot-at`, which
+          ;; bounds its own segment and its own anchors.
+          ;; ONE read per node, carrying the predecessor. Reading both ends of
+          ;; each comparison doubled it, and off the wire that is not free the
+          ;; way it was off a `long[]`: this is now the only O(NODE COUNT) work
+          ;; left at open, measured at ~0.8 us on 770 nodes against 0.13 when
+          ;; `containers` was materialised.
+          (when (loop [k 1 prev (container-at r ix0 0)]
+                  (if (>= k (long n))
+                    true
+                    (let [c (container-at r ix0 k)]
+                      (if (>= prev c) false (recur (inc k) c)))))
+            ;; One uniform node list. The SEQUENCE is the node at the sentinel
+            ;; offset -1: it has no container header on the wire but behaves
+            ;; like one, and a sentinel avoids carrying two shapes for the same
+            ;; idea. Containers ascend strictly and -1 is the minimum, so if it
+            ;; is present at all it is node 0 -- which the scan this replaces
+            ;; established by walking every node.
+            (let [seq-slot (when (and (pos? (long n)) (neg? (container-at r ix0 0))) 0)
+                  ;; THE SEQUENCE NODE STAYS EAGER, alone. `count` and `nth`
+                  ;; consult it immediately, a wrong `:total` is the
+                  ;; silent-corruption case, and it is a single node rather than
+                  ;; one per container. A sequence is also the shape whose
+                  ;; source is reused, so there is nothing to amortise away.
+                  seq-anchors (when seq-slot (slot-at r ix0 (long seq-slot)))
+                  ;; The one validation left, and it is about which FILE this
+                  ;; is, not about whether the bytes were corrupted -- see
+                  ;; `seq-node-ok?`. O(stride), on one node.
+                  seq-ok? (or (nil? seq-slot)
+                              (seq-node-ok? r ptr (count-at r ix0 (long seq-slot))
+                                            st seq-anchors))]
+              (when seq-ok?
+                (if seq-slot
+                  (Index. st (long containers-data) (long cw)
+                          (long counts-data) (long n) packed
+                          (long (nth table 0)) (long (nth table 1))
+                          sorted ptr
+                          (count-at r ix0 (long seq-slot))
+                          seq-anchors)
+                  ix0)))))))
     (catch Exception _ nil)))
 
 (defn- read-index
@@ -2282,10 +2284,15 @@
               ;; section and republishes the footer as a data item.
               (or (index-payload r ptr)
                   ;; DETECTED BUT REFUSED: an Index carrying only `data-end`.
-                  ;; `containers` nil is how every caller tells this apart --
-                  ;; `(if-let [cs (.containers ix)] ...)` -- which is the same
-                  ;; test they used when this was a map with one key.
-                  (Index. 0 nil 0 -1 nil 0 0 nil ptr nil nil)))))))))
+                  ;; `n` is -1, the "no nodes" sentinel, and every other
+                  ;; primitive is 0. THERE IS NO NIL IN THIS CALL AND THERE
+                  ;; CANNOT BE: the fields are primitive, so a nil here is an
+                  ;; NPE that the try in `read-index` swallows -- which loses
+                  ;; `:data-end` and makes `items` republish the footer as a
+                  ;; data item, N becoming N+1. That is exactly the defect this
+                  ;; branch exists to prevent, reintroduced by its own
+                  ;; constructor.
+                  (Index. 0 0 0 0 -1 nil 0 0 nil ptr nil nil)))))))))
 
 (deftype Items [^Nav nav ^Index idx]
   clojure.lang.Seqable
