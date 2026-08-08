@@ -339,3 +339,38 @@
       (is (< n-idx n-plain)
           (str "indexed walk took " n-idx " skips against " n-plain
                " unindexed; the index is not being consulted")))))
+
+(deftest a-re-pointed-source-answers-exactly-as-a-fresh-one
+  (testing "`re-point!` reuses the Reader, the Nav, the probe cache and the root
+            cursor so a scan allocates nothing per row. That is only worth
+            having if it answers identically to building a source per row, on
+            every document, in any order -- a reused source that lies is
+            worthless.
+
+            The length cases are the ones that bite: `Reader.reset` sets the
+            limit, and an earlier version of it skipped the rebind when handed
+            the SAME array, which left a narrowed limit in place and made a
+            256-byte buffer report as 4."
+    (let [o {:stringref false}
+          ctx (nav/context o)
+          docs (mapv (fn [i] {:id i :name (str "u" i) :city (str "c" i)}) (range 50))
+          blobs (mapv #(boring/encode % o) docs)
+          long-doc (boring/encode (vec (range 500)) o)
+          s (nav/source (first blobs) ctx)]
+      (is (= (mapv #(:city %) docs)
+             (mapv (fn [bs] (nav/value (get (nav/re-point! s bs) :city))) blobs))
+          "a reused source answers what each document says")
+      (is (= (mapv #(:city %) docs)
+             (mapv (fn [bs] (nav/value (get (nav/source bs ctx) :city))) blobs))
+          "and a fresh source per row agrees, which is the oracle")
+      (testing "a longer document after a short one, and back"
+        (is (= 500 (count (nav/value (nav/re-point! s long-doc)))))
+        (is (= "c7" (nav/value (get (nav/re-point! s (nth blobs 7)) :city)))))
+      (testing "an INDEXED document, so the index is re-parsed rather than stale"
+        (let [oi (assoc o :index 4 :index-min 4)
+              a (boring/encode-indexed (vec (for [i (range 40)] {:k i})) oi)
+              b (boring/encode-indexed (vec (for [i (range 40)] {:k (+ 100 i)})) oi)
+              c (nav/source a (nav/context oi))]
+          (is (= 39 (nav/value (get (nav/walk (nav/re-point! c a) [39]) :k))))
+          (is (= 139 (nav/value (get (nav/walk (nav/re-point! c b) [39]) :k)))
+              "the second document's index must be used, not the first's"))))))

@@ -246,6 +246,11 @@
 ;; where encoded bytes were expected.
 (deftype Nav [^Reader rdr opts probes idx src views])
 
+;; `src` is a VOLATILE, not the bytes: `re-point!` swaps what a reusable source
+;; reads, and `fork-nav` builds its fresh Reader from `src` -- so a fork taken
+;; after a re-point has to see the CURRENT bytes, not the ones the source was
+;; created with.
+
 (defn- nav-idx
   "The decoded index, parsed on first use.
 
@@ -462,10 +467,10 @@
     ;; not a `delay` any more -- 96 bytes per source, on every source.
     (Nav. r opts probes
           (when-not (= :ignore (:trust-index opts)) (volatile! ::unparsed))
-          src (volatile! nil))))
+          (volatile! src) (volatile! nil))))
 
 (defn- fork-nav ^Nav [^Nav n]
-  (let [src (.src n)
+  (let [src @(.src n)
         ^Reader r (cond (bytes? src) (Reader. ^bytes src)
                         :else (Reader. ^ByteSource src))]
     ;; Resolved once here rather than reading the options map, for the same
@@ -490,7 +495,7 @@
     ;; forking thread keeps the sharing -- 145 us for a 20 000-item index --
     ;; without the aliasing.
     (let [ix (nav-idx n)]
-      (Nav. r (.opts n) (atom {}) (volatile! ix) src (volatile! nil)))))
+      (Nav. r (.opts n) (atom {}) (volatile! ix) (volatile! src) (volatile! nil)))))
 
 (defn source
   "A navigable view over `src` -- a byte[], or a ByteSource such as
@@ -1757,6 +1762,53 @@
   realised arrives here as its value and leaves unchanged, so a walk gets the
   scalar back instead of an error. `cursor?` is how you tell the two apart."
   [^Cursor c] c)
+
+(defn re-point!
+  "Point an existing source at different bytes, and return a cursor at its root.
+
+  FOR SCANS, and the measurement is the reason it exists. A store hands out a
+  fresh blob per row, so a million-row projection builds a million sources --
+  and once the offset API made the lookup itself allocation-free, `source` was
+  100% of what a scan still allocated:
+
+      nav/source alone              249.6 B
+      source + field-offset         249.6      (the lookup adds nothing)
+      REUSED source + field-offset    0.0
+
+  This reuses the `Reader`, the `Nav`, the probe cache and the root cursor,
+  and re-points all four. Nothing is allocated.
+
+  THE CURSOR HANDED BACK IS THE ONE YOU PASSED IN, which is what makes it free
+  and also what makes it dangerous: every cursor previously derived from this
+  source now addresses the NEW bytes at its old offset, and will return
+  plausible wrong values rather than fail. So this is for a loop that finishes
+  with each document before starting the next -- which is exactly a scan, and
+  is not a projection you hold on to.
+
+  NOT SAFE ACROSS THREADS, more sharply than the rest of this namespace: `fork`
+  exists because a `Reader` carries a mutable position, and this adds mutable
+  BYTES. A forked source has its own Nav and is unaffected by a re-point of its
+  parent; a source being re-pointed must not be shared at all.
+
+  `boring.mmap` sources work too -- anything `source` accepts."
+  [c src]
+  (let [^Nav nav (.nav ^Cursor c)
+        ^Reader r (.rdr nav)]
+    (cond
+      (bytes? src) (.reset r ^bytes src)
+      (instance? ByteSource src) (.reset r ^ByteSource src)
+      :else (fail :boring/unsupported-source
+                  "boring.nav: expected a byte[] or a ByteSource"
+                  {:got (class src)}))
+    (when (.hasStringrefRoot r)
+      (fail :boring/stringref-not-navigable
+            (str "boring.nav: this document opens a stringref namespace, and a "
+                 "cursor holding only an offset cannot resolve one.")
+            {}))
+    (vreset! (.src nav) src)
+    (when-let [v (.idx nav)] (vreset! v ::unparsed))
+    (vreset! (.views nav) nil)
+    c))
 
 (defn- seq-node-ok?
   "Whether the SEQUENCE node's anchors describe this data section.
