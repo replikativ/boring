@@ -1901,6 +1901,67 @@
                  (nav/value (nav/root (boring/encode v o) o)))
               (str tag ": and the file must read back as the plain encoding")))))))
 
+(deftest the-two-index-builders-agree-on-shaped-arrays
+  (testing "`...-across-profiles-strides-and-frames` above sweeps profile x
+            stride x :index-min, and it CANNOT SET `:shapes`. Only the
+            `:clojure` profile permits it -- the other four pin it false and
+            refuse the override -- so a value that becomes a shaped array is
+            outside that sweep entirely, and the two builders disagreed there.
+
+            `writeShapedArray` emitted its arrays through bare `head()` and
+            captured no node, while the byte walk descended tag 39649 and noded
+            all four arrays inside it. Measured on this fixture at the
+            defaults: `write-indexed!` gave 157 bytes and NO FRAME,
+            `encode-indexed` gave 209 and one node of 30. Two builders, two
+            files, one value -- the format having two readings.
+
+            The walk was right. `boring.nav` descends a shaped array
+            structurally through `shaped-view`, so a node on the ROWS array is
+            reachable: 5000 rows, reading the last, 190.66 us unindexed against
+            35.80 indexed -- 5.3x for 365 bytes on a 48 KB document. (Contrast
+            `frame-payload-array?`, where the node IS dropped, because a tag-27
+            payload is realised opaquely and could never use one.)
+
+            Swept over buffer size as well, since the shaped path writes four
+            nested containers and a flush inside any of them would move an
+            offset the other builder computes differently."
+    (let [capture (fn [v opts buf]
+                    (let [w (boring/writer buf opts)
+                          out (ByteArrayOutputStream.)]
+                      (boring/write-indexed! w v out opts)
+                      (.toByteArray out)))]
+      (doseq [[label v]
+              [["shaped flat"   (vec (for [i (range 30)] {"a" i "b" (str i)}))]
+               ["shaped wide"   (vec (for [i (range 40)]
+                                       (into {} (for [k (range 20)]
+                                                  [(str "k" k) (+ i k)]))))]
+               ;; A shaped array nested under a map, and rows whose VALUES are
+               ;; containers -- so the walk has nodes above and below it.
+               ["shaped nested" {"rows" (vec (for [i (range 30)]
+                                               {"a" i "b" (vec (range 20))}))}]
+               ["shaped in vec" (vec (for [_ (range 3)]
+                                       (vec (for [i (range 20)] {"x" i "y" (str i)}))))]
+               ;; Heterogeneous keys, so `homogeneousShape` returns null and the
+               ;; ORDINARY path runs. The control: it must pass identically.
+               ["not shaped"    (vec (for [i (range 30)] {"a" i (str "b" i) i}))]
+               ["mixed"         {"s" (vec (for [i (range 25)] {"p" i "q" i}))
+                                 "plain" (vec (range 40))}]]
+              shapes [true false]
+              stride [1 4 16]
+              min-entries [2 4 16]
+              ;; 16 forces a flush inside every one of these values.
+              buf [65536 16]]
+        (let [o {:profile :clojure :stringref false :shapes shapes
+                 :index stride :index-min min-entries}
+              tag (str label " | shapes " shapes " | stride " stride
+                       " | :index-min " min-entries " | buffer " buf)
+              c (capture v o buf)
+              w (boring/encode-indexed v o)]
+          (is (= (seq c) (seq w))
+              (str tag ": the two builders must agree byte for byte"))
+          (is (= (nav/value (nav/root c o)) v)
+              (str tag ": and the file must read back as the value")))))))
+
 (deftest indexed-and-unindexed-agree-across-shapes
   (testing "the correctness spine: for every container shape, stride and
             profile, the indexed answer must equal the unindexed one for EVERY

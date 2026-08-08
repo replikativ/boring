@@ -150,14 +150,21 @@
                                                           (dec (alength ^bytes packed)))]
                ["one byte long" (java.util.Arrays/copyOf ^bytes packed
                                                          (inc (alength ^bytes packed)))]
-               ;; A flipped WIDTH CODE changes every following node's offset,
-               ;; so the sum lands somewhere else entirely. The old per-node
-               ;; arrays could not express this fault at all -- which is why
-               ;; this check is stronger than the one it replaced, not weaker.
-               ["a width code raised" (let [c (aclone ^bytes packed)]
-                                        (aset-byte c 0 (unchecked-byte
-                                                        (bit-or (aget c 0) 0x03)))
-                                        c)]]]
+               ;; BYTE 0 IS THE LAYOUT BYTE, not a width code. This case was
+               ;; labelled "a width code raised" and did `(bit-or (aget c 0)
+               ;; 0x03)`, which raises the VERSION NIBBLE from 2 to 3 -- so it
+               ;; asserted version refusal under a name that promised width
+               ;; coverage, and no width fault was ever tested. Renamed to what
+               ;; it does; the width fault has its own test below, because it
+               ;; behaves differently and the difference is the point.
+               ;;
+               ;; Version refusal is load-bearing beyond this test: the nibble
+               ;; is how a future layout stays refusable-not-misread, and #22
+               ;; Part B would spend it.
+               ["the version nibble raised"
+                (let [c (aclone ^bytes packed)]
+                  (aset-byte c 0 (unchecked-byte (bit-or (aget c 0) 0x03)))
+                  c)]]]
         (let [bs (seal-with body index mangled (packed-sorted good))]
           (is (not (usable-index? bs)) (str label ": must be refused"))
           (is (answers-everything? bs) (str label ": and still answer by scanning"))))))
@@ -178,6 +185,45 @@
         (let [bs (seal-with body index (packed-slots good) (byte-array n))]
           (is (not (usable-index? bs)) (str label ": must be refused"))
           (is (answers-everything? bs) (str label ": and still answer by scanning")))))))
+
+;; ------------------------------------- the width code is NOT structurally gated
+
+(deftest a-corrupt-width-code-costs-speed-not-correctness
+  (testing "The per-node width code is the one part of the layout the O(1)
+            structural gate does NOT cover, and that is deliberate.
+
+            The gate is `the last start-table entry equals the byte string's
+            length`. Node starts are STORED in the dense table, so a raised
+            width code does not move them and the gate still passes -- unlike
+            every fault above, which shifts the total. Catching it would mean a
+            per-node cross-check that `start[i+1] - start[i]` equals
+            `anchors * 2^width`: O(nodes) work to re-derive what the index is
+            TRUSTED to have got right. That trust is the boundary this codebase
+            settled on, so the check stays out.
+
+            What is promised instead holds exactly, and is what this asserts:
+            no untyped failure, no read outside the file, and NO WRONG ANSWER.
+            Node 0's 40 deltas read at i64 rather than u8 want 320 bytes of a
+            46-byte string, so the node is abandoned and the lookup falls back
+            to an honest scan -- `confirm` re-derives every candidate, so a
+            damaged offset can only cost time.
+
+            The frame is therefore USABLE and CORRECT at once, which reads as a
+            contradiction until you see that `usable-index?` means `opened`,
+            not `trustworthy`."
+    (let [body (boring/encode doc opts)
+          index (boring/build-index body (assoc opts :index 1 :index-min 4))
+          good (boring/encode-indexed doc (assoc opts :index 1 :index-min 4))
+          ;; Node 0's code is at bits 0-1 of byte 1 -- `(+ 1 (quot i 4))`, see
+          ;; `pack-slots`. Raised to 3 = i64, the widest tier.
+          raised (let [c (aclone ^bytes (packed-slots good))]
+                   (aset-byte c 1 (unchecked-byte (bit-or (aget c 1) 0x03)))
+                   c)
+          bs (seal-with body index raised (packed-sorted good))]
+      (is (usable-index? bs)
+          "the O(1) gate cannot see this, and is not asked to")
+      (is (answers-everything? bs)
+          "and every key must still read back correctly, by scanning"))))
 
 ;; ------------------------------------------------------------ width per node
 

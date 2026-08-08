@@ -1339,18 +1339,77 @@ public final class Writer {
         return keys;
     }
 
+    /**
+     * A shaped array, and THE FOUR ARRAYS INSIDE IT ARE INDEXED LIKE ANY OTHER.
+     *
+     * This method used to emit its arrays through bare `head()` and capture
+     * nothing, while the byte walk descended the tag and noded them -- so the
+     * two index builders produced different files for the same value. Measured
+     * on a 30-row shaped array at the defaults: `write-indexed!` gave 157 bytes
+     * and NO FRAME, `encode-indexed` gave 209 and one node. That is the format
+     * having two readings, which is the one thing the builders may not do.
+     *
+     * The walk was right and this side was wrong, which is worth saying because
+     * the opposite call was made for the tag-27 frame's own `[name, args]`
+     * array (see `frame-payload-array?`): there the node is DROPPED, because
+     * `boring.nav` realises a tag-27 payload opaquely and could never use it.
+     * A shaped array is different -- `nav` descends it structurally through
+     * `shaped-view`, presenting each row as a map -- so a node on the ROWS
+     * array is reachable and is exactly the one worth having. Measured on 5000
+     * rows, reading the last one: 190.66 us unindexed against 35.80 indexed,
+     * 5.3x, for 365 bytes of frame on a 48 KB document.
+     *
+     * The nodes are reserved in encounter order -- outer, keys, rows, then each
+     * row -- which is ascending by container offset, as `reserveNode` requires.
+     */
     @SuppressWarnings("rawtypes")
     private void writeShapedArray(List l, Object[] keys) {
+        int nk = keys.length, nr = l.size();
         head(TAG, TAG_SHAPED_ARRAY);
+
+        // The outer [keys, rows] pair. Two entries, so only reachable at
+        // `:index-min` <= 2 -- but the walk emits it there and this must too.
+        long outerStart = absOffset();
         head(ARRAY, 2);
-        head(ARRAY, keys.length);
-        for (int i = 0; i < keys.length; i++) writeValue(keys[i]);
-        head(ARRAY, l.size());
-        for (int r = 0; r < l.size(); r++) {
-            Map m = (Map) l.get(r);
-            head(ARRAY, keys.length);
-            for (int i = 0; i < keys.length; i++) writeValue(m.get(keys[i]));
+        long[] outer = indexing(2) ? new long[anchorCount(2)] : null;
+        int outerSlot = outer != null ? reserveNode() : -1;
+        int oa = 0, oc = 1;
+
+        if (outer != null && --oc == 0) { outer[oa++] = idxOffset(pos); oc = idxStride; }
+        long keysStart = absOffset();
+        head(ARRAY, nk);
+        long[] ka = indexing(nk) ? new long[anchorCount(nk)] : null;
+        int keysSlot = ka != null ? reserveNode() : -1;
+        int kai = 0, kc = 1;
+        for (int i = 0; i < nk; i++) {
+            if (ka != null && --kc == 0) { ka[kai++] = idxOffset(pos); kc = idxStride; }
+            writeValue(keys[i]);
         }
+        if (ka != null) fillNode(keysSlot, keysStart, nk, ka, false);
+
+        if (outer != null && --oc == 0) { outer[oa++] = idxOffset(pos); oc = idxStride; }
+        long rowsStart = absOffset();
+        head(ARRAY, nr);
+        long[] ra = indexing(nr) ? new long[anchorCount(nr)] : null;
+        int rowsSlot = ra != null ? reserveNode() : -1;
+        int rai = 0, rc = 1;
+        for (int r = 0; r < nr; r++) {
+            if (ra != null && --rc == 0) { ra[rai++] = idxOffset(pos); rc = idxStride; }
+            Map m = (Map) l.get(r);
+            long rowStart = absOffset();
+            head(ARRAY, nk);
+            long[] row = indexing(nk) ? new long[anchorCount(nk)] : null;
+            int rowSlot = row != null ? reserveNode() : -1;
+            int ri = 0, rcd = 1;
+            for (int i = 0; i < nk; i++) {
+                if (row != null && --rcd == 0) { row[ri++] = idxOffset(pos); rcd = idxStride; }
+                writeValue(m.get(keys[i]));
+            }
+            if (row != null) fillNode(rowSlot, rowStart, nk, row, false);
+        }
+        if (ra != null) fillNode(rowsSlot, rowsStart, nr, ra, false);
+
+        if (outer != null) fillNode(outerSlot, outerStart, 2, outer, false);
     }
 
     /**
