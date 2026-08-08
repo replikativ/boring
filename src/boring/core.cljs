@@ -869,6 +869,21 @@
         (recur (inc i) (js/Math.floor (/ x 256)))))
     b))
 
+(defn- wire-offsets
+  "`containers` as the narrowest typed array that holds them: tag 78 when every
+  offset fits in int32, tag 79 when one does not.
+
+  `js/Int32Array.from` applies ToInt32, which WRAPS rather than refusing, so
+  emitting it unconditionally turned an offset at or above 2^31 into a negative
+  one silently -- exactly the case 64-bit offsets were added for. A reader
+  normally rejects that at the ascending check, but `:trust-index :trusted`
+  skips it and the lookup jumps somewhere arbitrary. The JVM writer has always
+  promoted here; this is that rule, on this side."
+  [containers]
+  (if (some (fn [v] (or (< v -2147483648) (> v 2147483647))) containers)
+    (js/BigInt64Array.from (clj->js containers) js/BigInt)
+    (js/Int32Array.from (clj->js containers))))
+
 (defn seal-index!
   "Append the tag-27 index frame describing `index` over `data-len` bytes.
 
@@ -895,7 +910,7 @@
     ;; nav fell back to scanning: it proved the bytes were harmless, never that
     ;; the index was used. Same class as the vacuous budget tests.
     (encode (data/unknown-record index-name
-                                 [stride (js/Int32Array.from (clj->js containers))
+                                 [stride (wire-offsets containers)
                                   (js/Int32Array.from (clj->js counts))
                                   (pack-slots slots containers counts stride)
                                   (pack-sorted sorted)
