@@ -181,6 +181,10 @@
           ;; `n` is the node count, derived once as `byte-length / 4`, because
           ;; there is no `alength` to ask any more and three checks depend on it.
           ^long counts-data
+          ;; `nw` is the counts element width, 4 or 8, exactly as `cw` is for
+          ;; containers. Nothing writes 8; the reader accepts it so that a
+          ;; future writer change does not cost older readers their index.
+          ^long nw
           ^long n
           ;; SLOTS AND SORTED AS OFFSETS TOO, which is what stops the OPEN
           ;; scaling with total anchor count: the packed slots were bulk-copied
@@ -208,7 +212,7 @@
       ;; ix))`. A refused-but-detected frame carries n = -1.
       :containers (when-not (neg? n) n)
       :containers-data containers-data :cw cw
-      :counts-data counts-data :n n
+      :counts-data counts-data :nw nw :n n
       ;; `:counts` was the int[]; it is a node COUNT now. Nothing in the tree
       ;; reads it -- both test reach-ins named `:counts` are on
       ;; `boring.core/build-index`'s map, which is unaffected.
@@ -1947,32 +1951,49 @@
       (when (and (= 2 (.majorAt r bs)) (not= 31 (.infoAt r bs)))
         [(.headEndAt r bs) (.headArgAt r bs)]))))
 
-(defn- container-at
-  "Byte offset of node `i`'s container, sign-extended from whichever width the
-  frame declared.
+(defn- le-signed-at
+  "The signed little-endian value of width `w` (4 or 8) at absolute offset `p`.
 
-  Tag 78 is a signed int32 and one wide load; tag 79 needs two, because
-  `Reader` exposes no 64-bit accessor. The sign matters and is not incidental:
-  the SEQUENCE node is stored at the sentinel offset -1, so a zero-extending
-  read would turn it into 4294967295 and the node would never be found."
+  RFC 8746's sint32 (tag 78) and sint64 (tag 79) are the two widths any of this
+  frame's offset arrays can arrive at, and the CBOR tag IS the declaration, so
+  this is a branch on a value that is constant for a whole document -- free
+  after the first prediction.
+
+  `Integer/reverseBytes` of the big-endian word, NOT four `byteAt` calls: fewer
+  and wider accesses is the whole lever on this path, and on a memory-mapped
+  source every `byteAt` is also an interface call into the segment. The 64-bit
+  case needs two loads because `Reader` exposes no 64-bit accessor; masking the
+  LOW word is what makes the assembly correct for negatives."
+  ^long [^Reader r ^long p ^long w]
+  (if (= 4 w)
+    (long (Integer/reverseBytes (unchecked-int (.u32At r p))))
+    (bit-or (bit-shift-left
+             (long (Integer/reverseBytes (unchecked-int (.u32At r (+ p 4))))) 32)
+            (bit-and (long (Integer/reverseBytes (unchecked-int (.u32At r p))))
+                     0xFFFFFFFF))))
+
+(defn- container-at
+  "Byte offset of node `i`'s container, at whichever width the frame declared.
+
+  The sign matters and is not incidental: the SEQUENCE node is stored at the
+  sentinel offset -1, so a zero-extending read would turn it into 4294967295 at
+  width 4 and the node would never be found at all."
   ^long [^Reader r ^Index ix ^long i]
-  (let [p (+ (.containers-data ix) (* (.cw ix) i))]
-    (if (= 4 (.cw ix))
-      (long (Integer/reverseBytes (unchecked-int (.u32At r p))))
-      (bit-or (bit-shift-left
-               (long (Integer/reverseBytes (unchecked-int (.u32At r (+ p 4))))) 32)
-              (bit-and (long (Integer/reverseBytes (unchecked-int (.u32At r p))))
-                       0xFFFFFFFF)))))
+  (le-signed-at r (+ (.containers-data ix) (* (.cw ix) i)) (.cw ix)))
 
 (defn- count-at
-  "Entry count of node `i`: one little-endian int32 load off the wire.
+  "Entry count of node `i`, at whichever width the frame declared.
 
-  `Integer/reverseBytes` of the big-endian word, NOT four `byteAt` calls --
-  fewer, wider accesses is the whole lever on this path, and on a memory-mapped
-  source each `byteAt` is also an interface call into the segment."
+  ACCEPTS SINT64 THOUGH NOTHING WRITES IT. `seal-index!` emits tag 78, and an
+  entry count needs 64 bits only for a container of more than two billion
+  entries -- which for the sequence node means a log of that many records, far
+  off but not absurd. Teaching the reader the wider shape costs one predictable
+  branch now; NOT teaching it means that when a writer eventually emits tag 79,
+  every reader older than that change loses the index on those files. Refusing
+  an index is safe, so this is compatibility rather than correctness -- but it
+  is only free before the fact."
   ^long [^Reader r ^Index ix ^long i]
-  (long (Integer/reverseBytes
-         (unchecked-int (.u32At r (+ (.counts-data ix) (* 4 i)))))))
+  (le-signed-at r (+ (.counts-data ix) (* (.nw ix) i)) (.nw ix)))
 
 (defn- slot-at
   "Absolute anchors for node `i`, as arithmetic over the packed bytes.
@@ -2159,23 +2180,25 @@
           ;; are four little-endian bytes each and `count-at` loads one on
           ;; demand. Materialising it cost 1.07 us per open on a 770-node frame.
           ;;
-          ;; Deliberately NARROWER than `.readFrom` was: tag 78 only. The width
-          ;; is fixed at 4 and `n` is derived from the byte length, so accepting
-          ;; tag 79 here would silently halve the node count. `.readFrom` also
+          ;; Tag 78 OR 79, and `n` follows from whichever width was declared.
+          ;; Nothing writes 79 -- see `count-at` for why the reader knows it
+          ;; anyway. Still narrower than `.readFrom` was: that also
           ;; yielded int arrays for tags 66, 70, 71, 74 and 75, which are now
           ;; refused -- safe, since refused means scan, but a real change rather
           ;; than a tidy-up. Note 70 and 71 are LITTLE-endian uint32/uint64
           ;; (RFC 8746); only 66, 74 and 75 are big-endian. So tag 70 has the
           ;; IDENTICAL byte layout to 78 and differs only in signedness, which
           ;; makes it the cheapest widening available if one is ever wanted.
-          [counts-data counts-len] (when off-counts
-                                     (le-array-at r (long off-counts) 78))
+          [counts-data counts-len nw]
+          (when off-counts
+            (or (when-let [[d l] (le-array-at r (long off-counts) 78)] [d l 4])
+                (when-let [[d l] (le-array-at r (long off-counts) 79)] [d l 8])))
           ;; `readTypedArray` used to throw on a byte length that is not a
           ;; multiple of the element width; `quot` truncates instead. Without
           ;; this a 3081-byte counts string would yield n=770, agree with a
           ;; 770-entry `containers`, and be ACCEPTED where it is refused today.
-          n (when (and counts-len (zero? (rem (long counts-len) 4)))
-              (quot (long counts-len) 4))
+          n (when (and counts-len (zero? (rem (long counts-len) (long nw))))
+              (quot (long counts-len) (long nw)))
           ;; THE FINAL TABLE ENTRY IS THE STRUCTURE CHECK, and it is now one
           ;; read rather than a prefix sum over every node. `slot-table` returns
           ;; nil unless the layout byte is one this reader writes AND the last
@@ -2221,7 +2244,7 @@
         ;; every `encode-indexed` blob, so that case allocates exactly one.
         (let [st (long stride)
               ix0 (Index. st (long containers-data) (long cw)
-                          (long counts-data) (long n)
+                          (long counts-data) (long nw) (long n)
                           (long slots-data) (long slots-len)
                           (long (nth table 0)) (long (nth table 1))
                           (long sorted-data) ptr nil nil)]
@@ -2271,7 +2294,7 @@
               (when seq-ok?
                 (if seq-slot
                   (Index. st (long containers-data) (long cw)
-                          (long counts-data) (long n)
+                          (long counts-data) (long nw) (long n)
                           (long slots-data) (long slots-len)
                           (long (nth table 0)) (long (nth table 1))
                           (long sorted-data) ptr
@@ -2404,7 +2427,7 @@
                   ;; data item, N becoming N+1. That is exactly the defect this
                   ;; branch exists to prevent, reintroduced by its own
                   ;; constructor.
-                  (Index. 0 0 0 0 -1 0 0 0 0 0 ptr nil nil)))))))))
+                  (Index. 0 0 0 0 0 -1 0 0 0 0 0 ptr nil nil)))))))))
 
 (deftype Items [^Nav nav ^Index idx]
   clojure.lang.Seqable

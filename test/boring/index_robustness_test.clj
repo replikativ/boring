@@ -431,9 +431,15 @@
             Sign extension is the part that matters. The sequence node lives at
             the sentinel offset -1, so a zero-extending read turns it into
             4294967295 at width 4 and the node is never found at all."
-    (doseq [[label wire] [["tag 78, int32" (int-array [-1])]
-                          ["tag 79, sint64" (long-array [-1])]]]
-      (let [bs (crafted (assoc (parts) 1 wire))
+    (doseq [[label idx wire] [["containers tag 78, int32" 1 (int-array [-1])]
+                              ["containers tag 79, sint64" 1 (long-array [-1])]
+                              ;; counts too: nothing writes sint64 counts, but
+                              ;; the reader accepts them so a future writer
+                              ;; change costs no older reader its index. Only a
+                              ;; hand-built frame can exercise that.
+                              ["counts tag 78, int32" 2 (int-array [3])]
+                              ["counts tag 79, sint64" 2 (long-array [3])]]]
+      (let [bs (crafted (assoc (parts) idx wire))
             src (nav/source bs opts)]
         (is (accepted? bs opts) (str label ": the frame must be USED, not merely survived"))
         (is (= 3 (count (into [] (nav/items bs opts))))
