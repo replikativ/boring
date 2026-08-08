@@ -18,6 +18,24 @@
 (def ^:private doc
   (into (sorted-map) (for [i (range 40)] [(format "k%02d" i) i])))
 
+(defn- wire-payload
+  "The frame's six payload elements, as they sit ON THE WIRE.
+
+  These assertions used to reach them through `(:slots (index-of bs))`, back
+  when opening an index materialised every element into a Java array. It holds
+  a byte OFFSET now -- the reader reads `slots` and `sorted` in place instead of
+  copying them -- so the old route reports a Long and the assertion reads as a
+  layout failure when nothing about the layout changed.
+
+  Reading the frame directly is what these tests meant all along; the reader's
+  internals were a shortcut that happened to agree. `seq_index_test` made the
+  same move for the same reason."
+  [^bytes bs]
+  (data/frame-payload (boring/decode-at bs (#'boring.frame/footer-start bs) opts)))
+
+(defn- packed-slots ^bytes [^bytes bs] (nth (wire-payload bs) 3))
+(defn- packed-sorted ^bytes [^bytes bs] (nth (wire-payload bs) 4))
+
 (defn- ptr-bytes ^bytes [^long v]
   (let [b (byte-array 8)]
     (dotimes [i 8] (aset-byte b i (unchecked-byte (bit-shift-right v (* 8 (- 7 i))))))
@@ -104,8 +122,8 @@
             so the refusal above is about the shape and not about the fixture"
     (let [bs (boring/encode-indexed doc (assoc opts :index 1 :index-min 4))]
       (is (usable-index? bs))
-      (is (bytes? (:slots (index-of bs))) "slots arrive as one byte string")
-      (is (bytes? (:sorted (index-of bs))) "sorted arrives as a bitset")
+      (is (bytes? (packed-slots bs)) "slots arrive as one byte string")
+      (is (bytes? (packed-sorted bs)) "sorted arrives as a bitset")
       (is (answers-everything? bs)))))
 
 ;; -------------------------------------------------- the derived-length check
@@ -120,7 +138,7 @@
     (let [body (boring/encode doc opts)
           index (boring/build-index body (assoc opts :index 1 :index-min 4))
           good (boring/encode-indexed doc (assoc opts :index 1 :index-min 4))
-          packed (:slots (index-of good))]
+          packed (packed-slots good)]
       (is (some? packed))
       (doseq [[label mangled]
               [["one byte short" (java.util.Arrays/copyOf ^bytes packed
@@ -135,7 +153,7 @@
                                         (aset-byte c 0 (unchecked-byte
                                                         (bit-or (aget c 0) 0x03)))
                                         c)]]]
-        (let [bs (seal-with body index mangled (:sorted (index-of good)))]
+        (let [bs (seal-with body index mangled (packed-sorted good))]
           (is (not (usable-index? bs)) (str label ": must be refused"))
           (is (answers-everything? bs) (str label ": and still answer by scanning"))))))
 

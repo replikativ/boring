@@ -659,10 +659,24 @@ public final class Reader {
      */
     public int byteAt(long p) { return b(p); }
 
-    /** Big-endian unsigned 32-bit value at `p`. Unaligned. Same purpose as
-     *  {@link #byteAt}: a length a container format wrote itself. */
+    /**
+     * Big-endian unsigned 32-bit value at `p`. Unaligned. Same purpose as
+     * {@link #byteAt}: a length a container format wrote itself.
+     *
+     * <p><b>One word, not four bytes.</b> This spelled itself out as
+     * {@code b(p)<<24 | b(p+1)<<16 | ...}, which is four bounds checks, four
+     * {@code arr != null} branches, and -- on a segment -- four interface calls
+     * into four {@code seg.get(JAVA_BYTE, p)}. {@link #s32} has existed the
+     * whole time and does one: a {@code VarHandle} load on the heap path,
+     * {@code src.i32} on the segment path, one bounds check either way.
+     *
+     * <p>That the access COUNT matters here is not incidental. The JIT cannot
+     * see a segment's size when the segment is loaded from a field, so the
+     * per-access bounds check inside {@code MemorySegment.get} does not fold
+     * away -- fewer, wider accesses is the whole lever on this path.
+     */
     public long u32At(long p) {
-        return ((long) b(p) << 24) | (b(p + 1) << 16) | (b(p + 2) << 8) | b(p + 3);
+        return s32(p) & 0xFFFFFFFFL;
     }
 
     /**
