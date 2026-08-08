@@ -182,10 +182,19 @@
           ;; there is no `alength` to ask any more and three checks depend on it.
           ^long counts-data
           ^long n
-          ^bytes slots
+          ;; SLOTS AND SORTED AS OFFSETS TOO, which is what stops the OPEN
+          ;; scaling with total anchor count: the packed slots were bulk-copied
+          ;; on every open, so a finer stride made every open more expensive for
+          ;; every lookup in the document. That coupling is what made a
+          ;; per-container stride policy incoherent -- see the plan.
+          ;;
+          ;; `slots-tbase` is ABSOLUTE; the entries it holds are RELATIVE to
+          ;; `slots-data`. See `slot-table`.
+          ^long slots-data
+          ^long slots-len
           ^long slots-tbase
           ^long slots-wstart
-          ^bytes sorted
+          ^long sorted-data
           ^long data-end
           total
           ^longs offsets]
@@ -204,8 +213,13 @@
       ;; reads it -- both test reach-ins named `:counts` are on
       ;; `boring.core/build-index`'s map, which is unaffected.
       :counts n
-      :slots slots :slots-tbase slots-tbase :slots-wstart slots-wstart
-      :sorted sorted :data-end data-end
+      :slots-data slots-data :slots-len slots-len
+      :slots-tbase slots-tbase :slots-wstart slots-wstart
+      :sorted-data sorted-data :data-end data-end
+      ;; `:slots` and `:sorted` were the byte arrays. Tests used them only to
+      ;; ask "is this index usable", which `:containers` answers.
+      :slots (when-not (neg? n) slots-data)
+      :sorted (when-not (neg? n) sorted-data)
       :total total :offsets offsets
       nf)))
 
@@ -705,7 +719,7 @@
     ;; rather than a corner. See `boring.core/pack-sorted` and commit 825657f.
     (if (or (neg? ns)
             (zero? (alength ^longs (slot-at r idx ns)))
-            (and (> (.stride idx) 1) (not (sorted-at? (.sorted idx) ns))))
+            (and (> (.stride idx) 1) (not (sorted-at? r (.sorted-data idx) ns))))
       (scan-map r (.headEndAt r off) n probe)
       (let [^longs slot (slot-at r idx ns)
             stride (.stride idx)
@@ -746,7 +760,7 @@
                 ;; a redundant optimisation would break those lookups silently.
                 (confirm [^long hit]
                   (if (neg? hit) (scan-map r (.headEndAt r off) n probe) hit))]
-          (if (sorted-at? (.sorted idx) ns)
+          (if (sorted-at? r (.sorted-data idx) ns)
             ;; Sorted keys: binary search the anchors, then a bounded walk.
             ;;
             ;; The PROBE is bounds-checked as well as the walk. Validation
@@ -1793,53 +1807,62 @@
   (if (<= n 0) 0 (if (= stride 1) n (inc (quot (dec n) stride)))))
 
 (defn- slot-le
-  "The `w`-byte little-endian value at `p` of the packed slots."
-  ^long [^bytes packed ^long p ^long w]
+  "The `w`-byte little-endian value at ABSOLUTE offset `p`.
+
+  `byteAt` masks to 0-255 and bounds-checks against the Reader's limit, raising
+  a TYPED `:boring/truncated-input` -- so every read in this family is inside
+  the file or a typed error, never an unchecked access."
+  ^long [^Reader r ^long p ^long w]
   (if (= w 2)
-    (bit-or (bit-and (aget packed (int p)) 0xFF)
-            (bit-shift-left (bit-and (aget packed (int (+ p 1))) 0xFF) 8))
-    (bit-or (bit-and (aget packed (int p)) 0xFF)
-            (bit-shift-left (bit-and (aget packed (int (+ p 1))) 0xFF) 8)
-            (bit-shift-left (bit-and (aget packed (int (+ p 2))) 0xFF) 16)
-            (bit-shift-left (bit-and (aget packed (int (+ p 3))) 0xFF) 24))))
+    (bit-or (.byteAt r p)
+            (bit-shift-left (.byteAt r (+ p 1)) 8))
+    (bit-or (.byteAt r p)
+            (bit-shift-left (.byteAt r (+ p 1)) 8)
+            (bit-shift-left (.byteAt r (+ p 2)) 16)
+            (bit-shift-left (.byteAt r (+ p 3)) 24))))
 
 (defn- width-code
   "Node `i`'s 2-bit width code, out of the table after the LAYOUT BYTE."
-  ^long [^bytes packed ^long i]
-  (bit-and 3 (bit-shift-right (aget packed (int (+ 1 (quot i 4))))
-                              (int (* 2 (rem i 4))))))
+  ^long [^Reader r ^long slots-data ^long i]
+  (bit-and 3 (bit-shift-right (.byteAt r (+ slots-data 1 (quot i 4)))
+                              (* 2 (rem i 4)))))
 
 (defn- slot-table
-  "`[table-base entry-width]` for `packed`, or nil if it is not a layout this
-  reader knows or its final entry disagrees with its own length.
+  "`[table-base entry-width]` for the packed slots at `slots-data`, or nil if it
+  is not a layout this reader knows or its final entry disagrees with its own
+  length. TABLE-BASE IS ABSOLUTE; the entries it holds are RELATIVE to
+  `slots-data`, because that is what the writer put there.
 
-  TWO READS, WHERE THIS USED TO BE A PREFIX SUM OVER EVERY NODE. `slots` now
-  carries a sparse table of byte offsets -- one entry every
-  node, plus a final entry holding the total -- so a node is reachable without
-  walking to it, and the structural gate is that final entry against
-  `(alength packed)` rather than a sum that had to be run to be checked.
+  That mixture is the one place this file can go wrong by a whole byte string,
+  so it is stated rather than inferred: `slot-start` returns a RELATIVE offset,
+  the segment bound in `slot-at` compares it against `slots-len`, and only the
+  delta reads add `slots-data` back.
 
-  What that deletes is the point: the `long[N+1]` this returned, the O(N) pass
-  that filled it, and the reason every open had to touch all of `counts`.
+  TWO READS, WHERE THIS USED TO BE A PREFIX SUM OVER EVERY NODE. `slots`
+  carries a dense table of byte offsets -- one entry per node, plus a final
+  entry holding the total -- so a node is reachable without walking to it, and
+  the structural gate is that final entry against the byte string's own length
+  rather than a sum that had to be run to be checked.
 
   The LAYOUT BYTE makes the previous shape refusable exactly. Without it a
   reader meeting a frame with no table would read a width code where the
   version is, compute nonsense offsets, and depend on the length check to
   notice -- which it would, about 65535 times in 65536."
-  [^bytes packed ^long n]
-  (when (pos? (alength packed))
-    (let [b0 (bit-and (aget packed 0) 0xFF)
+  [^Reader r ^long slots-data ^long slots-len ^long n]
+  (when (pos? slots-len)
+    (let [b0 (.byteAt r slots-data)
           w (if (zero? (bit-and (bit-shift-right b0 4) 0x0F)) 2 4)
           tbase (+ 1 (quot (+ n 3) 4))
           entries (inc n)]
       (when (and (= (bit-and b0 0x0F) boring/slot-layout-v2)
-                 (>= (alength packed) (+ tbase (* entries w)))
-                 (= (alength packed)
-                    (slot-le packed (+ tbase (* (dec entries) w)) w)))
-        [tbase w]))))
+                 (>= slots-len (+ tbase (* entries w)))
+                 (= slots-len
+                    (slot-le r (+ slots-data tbase (* (dec entries) w)) w)))
+        [(+ slots-data tbase) w]))))
 
 (defn- slot-start
-  "Byte offset where node `i`'s deltas begin. ONE READ.
+  "Byte offset where node `i`'s deltas begin, RELATIVE to the packed slots.
+  ONE READ.
 
   This walked up to 15 nodes from a sparse block start until the measurement
   said otherwise: on a 770-node frame a block-aligned node resolved in 0.073 us
@@ -1847,38 +1870,55 @@
   times the base. Every earlier number that made sparse look free had been
   taken on node 0, which is block-aligned, so the walk never ran.
   See `boring.core/slot-layout-v2`."
-  ^long [^bytes packed tbase w i]
-  (slot-le packed (+ (long tbase) (* (long i) (long w))) (long w)))
+  ^long [^Reader r ^long tbase ^long w ^long i]
+  (slot-le r (+ tbase (* i w)) w))
 
 (defn- delta-at
-  "The delta at byte `p` of `packed`, at width code `w`, little-endian.
+  "The delta at ABSOLUTE offset `p`, at width code `w`, little-endian.
 
   u8 and u16 are UNSIGNED -- nothing here is a CBOR typed array, so the second
   tier is not forced signed the way tag 77 was, and 32 KiB..64 KiB deltas stay
   two bytes. i32 and i64 are signed, which is what makes a negative delta a
   representable absurdity rather than a silent wrap."
-  ^long [^bytes packed ^long p ^long w]
+  ^long [^Reader r ^long p ^long w]
   (case (int w)
-    0 (bit-and (aget packed (int p)) 0xFF)
-    1 (bit-or (bit-and (aget packed (int p)) 0xFF)
-              (bit-shift-left (bit-and (aget packed (int (+ p 1))) 0xFF) 8))
+    0 (.byteAt r p)
+    1 (bit-or (.byteAt r p)
+              (bit-shift-left (.byteAt r (+ p 1)) 8))
     2 (long (unchecked-int
-             (bit-or (bit-and (aget packed (int p)) 0xFF)
-                     (bit-shift-left (bit-and (aget packed (int (+ p 1))) 0xFF) 8)
-                     (bit-shift-left (bit-and (aget packed (int (+ p 2))) 0xFF) 16)
-                     (bit-shift-left (bit-and (aget packed (int (+ p 3))) 0xFF) 24))))
+             (bit-or (.byteAt r p)
+                     (bit-shift-left (.byteAt r (+ p 1)) 8)
+                     (bit-shift-left (.byteAt r (+ p 2)) 16)
+                     (bit-shift-left (.byteAt r (+ p 3)) 24))))
     (loop [j 0 acc 0]
       (if (= j 8)
         acc
         (recur (inc j)
-               (bit-or acc (bit-shift-left (bit-and (aget packed (int (+ p j))) 0xFF)
-                                           (* 8 j))))))))
+               (bit-or acc (bit-shift-left (.byteAt r (+ p j)) (* 8 j))))))))
 
 (defn- sorted-at?
-  "Whether node `i`'s keys ascend, out of the `sorted` bitset."
-  [^bytes sorted ^long i]
-  (not (zero? (bit-and (bit-and (aget sorted (int (quot i 8))) 0xFF)
-                       (bit-shift-left 1 (int (rem i 8)))))))
+  "Whether node `i`'s keys ascend, out of the `sorted` bitset.
+
+  THE LENGTH EQUALITY IN `index-payload` IS WHAT MAKES THIS SAFE, and it became
+  load-bearing when `sorted` stopped being a `byte[]`. An index one past the
+  end used to be an AIOOBE the caller turned into a refusal; it is now a byte
+  of the frame's own back-pointer, in the file, plausible, and wrong. A false
+  TRUE sends `lookup-map` down the binary-search branch on unsorted keys, and
+  `confirm` only re-derives negatives."
+  [^Reader r ^long sorted-data ^long i]
+  (not (zero? (bit-and (.byteAt r (+ sorted-data (quot i 8)))
+                       (bit-shift-left 1 (rem i 8))))))
+
+(defn- byte-string-at
+  "Data offset and length of the DEFINITE-length byte string at `off`, or nil.
+
+  The major check refuses the pre-v2 shape exactly: `slots` and `sorted` were a
+  CBOR array of typed arrays and a CBOR array of booleans, and an array head
+  answers `headArgAt`/`headEndAt` perfectly happily with an element count and a
+  first-element offset."
+  [^Reader r ^long off]
+  (when (and (= 2 (.majorAt r off)) (not= 31 (.infoAt r off)))
+    [(.headEndAt r off) (.headArgAt r off)]))
 
 (defn- le-array-at
   "Data offset and byte length of the RFC 8746 little-endian typed array at
@@ -1964,15 +2004,16 @@
   caller sees `:boring/bad-index`, which is what every other malformed-input
   path in this library raises."
   ^longs [^Reader r ^Index ix ^long i]
-  (let [^bytes packed (.slots ix)
-        tbase (.slots-tbase ix)
-        wstart (.slots-wstart ix)
+  (let [sdata (.slots-data ix)
+        slen (.slots-len ix)
         stride (.stride ix)
         lim (.data-end ix)
         m (anchor-count (count-at r ix i) (long stride))
-        w (width-code packed i)
+        w (width-code r sdata i)
         sz (bit-shift-left 1 w)
-        start (long (slot-start packed tbase wstart i))]
+        ;; RELATIVE to `slots-data`, so the bound below compares against
+        ;; `slots-len` and only the delta reads add the base back.
+        start (slot-start r (.slots-tbase ix) (.slots-wstart ix) i)]
     ;; AND THE DELTA RUN ITSELF IS BOUNDED, which nothing states elsewhere.
     ;; `slot-table` checks the start table's LAST entry against the byte
     ;; string's length; it never checks that the entries ascend, so one damaged
@@ -1998,16 +2039,16 @@
     ;;
     ;; After the check `m * sz <= alength packed`, and `sz >= 1`, so the array
     ;; is bounded by bytes that actually exist in the file.
-    (when (or (neg? start) (> (+ start (* m sz)) (alength packed)))
+    (when (or (neg? start) (> (+ start (* m sz)) slen))
       (throw (ex-info "boring: index slot segment outside the packed slots"
                       {:type :boring/bad-index :node i :start start
-                       :anchors m :width sz :slots-length (alength packed)})))
+                       :anchors m :width sz :slots-length slen})))
     (let [a (long-array m)]
       (loop [k 0
-             p start
+             p (+ sdata start)
              acc (max 0 (container-at r ix i))]
         (when (< k m)
-          (let [v (+ acc (delta-at packed p w))]
+          (let [v (+ acc (delta-at r p w))]
             (when (or (neg? v) (>= v lim))
               (throw (ex-info "boring: index anchor outside the data section"
                               {:type :boring/bad-index :node i :anchor k
@@ -2083,11 +2124,17 @@
           [off-stride off-containers off-counts off-slots off-sorted]
           (try (payload-offsets r ptr)
                (catch Exception _ [nil nil nil nil nil]))
-          [stride packed sorted]
-          (when off-stride
-            [(.readFrom r (long off-stride))
-             (.readFrom r (long off-slots))
-             (.readFrom r (long off-sorted))])
+          ;; STRIDE POSITIONALLY, which removes the last `.readFrom` from this
+          ;; function. A uint under 2^63; a negint is major 1, a bignum major 6,
+          ;; a float major 7, and a uint64 above 2^63 comes back negative -- so
+          ;; the `pos?` below refuses all of them, exactly as `(int? stride)`
+          ;; and `(pos? stride)` did together.
+          stride (when (and off-stride
+                            (zero? (.majorAt r (long off-stride)))
+                            (< (.infoAt r (long off-stride)) 28))
+                   (.headArgAt r (long off-stride)))
+          [slots-data slots-len] (when off-slots (byte-string-at r (long off-slots)))
+          [sorted-data sorted-len] (when off-sorted (byte-string-at r (long off-sorted)))
           ;; CONTAINERS AT EITHER WIDTH, chosen by the tag rather than tested
           ;; for. Tag 78 is int32, tag 79 sint64; both are RFC 8746
           ;; little-endian, so entry `i` is `cw` bytes at `containers-data +
@@ -2125,16 +2172,16 @@
           ;; decodes but whose parts disagree is refused here rather than at
           ;; whichever node a lookup happens to visit. Guarded on the types it
           ;; indexes with, because it runs BEFORE the checks below.
-          table (when (and (bytes? packed) n)
-                  (try (slot-table packed (long n))
+          table (when (and slots-data n)
+                  (try (slot-table r (long slots-data) (long slots-len) (long n))
                        (catch Exception _ nil)))]
-      (when (and (int? stride) (pos? (long stride)) containers-data n
+      (when (and stride (pos? (long stride)) containers-data n
                  ;; A BYTE STRING WHERE AN ARRAY USED TO BE. This is what makes
                  ;; the layout change safe in both directions: a frame written
                  ;; by an older writer arrives as a Clojure vector of typed
                  ;; arrays, fails here, and the caller scans. It cannot be read
                  ;; wrongly, only not read.
-                 (bytes? packed) (bytes? sorted) table
+                 slots-data sorted-data table
                  ;; STRUCTURE, not just decodability. Detection proves something
                  ;; MEANT to be an index; none of it proves the payload hangs
                  ;; together. A frame that decodes but whose parts disagree used
@@ -2149,7 +2196,12 @@
                  (= (quot (long containers-len) (long cw)) (long n))
                  ;; `sorted` is a bit per node, so its byte length is exact --
                  ;; `(quot (+ n 7) 8)` -- and an equality rather than a bound.
-                 (= (alength ^bytes sorted) (quot (+ (long n) 7) 8))
+                 ;; AND THIS ONE IS NOW LOAD-BEARING, not merely tidy. While
+                 ;; `sorted` was a `byte[]`, an index one past its end was an
+                 ;; AIOOBE the caller turned into "unusable". As an offset it is
+                 ;; a byte of the frame's own back-pointer: in the file,
+                 ;; plausible, and wrong. See `sorted-at?`.
+                 (= (long sorted-len) (quot (+ (long n) 7) 8))
                  )
         ;; ONE PROVISIONAL INDEX, built as soon as every offset is known, and
         ;; used for the three things that still need to read `containers`: the
@@ -2158,9 +2210,10 @@
         ;; every `encode-indexed` blob, so that case allocates exactly one.
         (let [st (long stride)
               ix0 (Index. st (long containers-data) (long cw)
-                          (long counts-data) (long n) packed
+                          (long counts-data) (long n)
+                          (long slots-data) (long slots-len)
                           (long (nth table 0)) (long (nth table 1))
-                          sorted ptr nil nil)]
+                          (long sorted-data) ptr nil nil)]
           ;; `node-slot` BINARY-SEARCHES containers, so they must ascend.
           ;; O(NODE COUNT), and the only per-node work left at open -- kept
           ;; because a search over an unordered array does not merely miss, it
@@ -2207,9 +2260,10 @@
               (when seq-ok?
                 (if seq-slot
                   (Index. st (long containers-data) (long cw)
-                          (long counts-data) (long n) packed
+                          (long counts-data) (long n)
+                          (long slots-data) (long slots-len)
                           (long (nth table 0)) (long (nth table 1))
-                          sorted ptr
+                          (long sorted-data) ptr
                           (count-at r ix0 (long seq-slot))
                           seq-anchors)
                   ix0)))))))
@@ -2332,7 +2386,7 @@
                   ;; data item, N becoming N+1. That is exactly the defect this
                   ;; branch exists to prevent, reintroduced by its own
                   ;; constructor.
-                  (Index. 0 0 0 0 -1 nil 0 0 nil ptr nil nil)))))))))
+                  (Index. 0 0 0 0 -1 0 0 0 0 0 ptr nil nil)))))))))
 
 (deftype Items [^Nav nav ^Index idx]
   clojure.lang.Seqable
