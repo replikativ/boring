@@ -114,15 +114,23 @@ everything in a small value, `decode` is the cheaper call.
 
 These are cheap to state now and impossible to retrofit, so they are stated.
 
-**The payload is six elements, and that count is inside the recognition
-constant.** `boring.frame/prefix-bytes` is 17 exact bytes ending in `0x86` —
-"array of 6" — and `footer-start` compares all of them before decoding anything.
-Widening the payload to seven elements does *not* merely make the index
-unusable: the frame stops being recognised at all, `data-end` is never learned,
-and the frame is republished as a trailing **data** item. A file of N records
-reads back as N+1, silently, in both directions. Changing an element's *type* is
-safe by contrast — the frame is still recognised, the index is refused, and the
-caller scans.
+**The payload is six elements, and readers accept six through fifteen.**
+`boring.frame/prefix-bytes` is 17 exact bytes ending in `0x86` — "array of 6" —
+and that is what this library writes. Readers compare the first 16 and then
+accept any array head from `0x86` to `0x8f`, so a future widening is
+*recognised* rather than mistaken for data.
+
+That distinction is the whole point, and it is worth stating why. A reader that
+does not recognise a frame never learns `data-end`, so the frame is republished
+as a trailing **data** item and a file of N records reads back as N+1 —
+silently, in both directions. Refusing to *use* an index is safe; refusing to
+*see* one is not.
+
+A widened payload must insert its new elements **before** the trailing
+back-pointer, which stays last: the trailer the whole scheme is located by is
+the file's final 9 bytes. Changing an element's *type* remains safe in the
+older way — the frame is still recognised, the index is refused, and the caller
+scans.
 
 **`data-end` is frozen in type as well as position.** `footer-start` requires
 the byte at `n-9` to be literally `0x48`, and the payload check requires a byte
@@ -269,12 +277,14 @@ offsets are stored as deltas in the narrowest type that holds them, so even a
 stride of 1 — no scan at all — costs 2.7% rather than the 10.9% absolute
 offsets would. `doc/SHAPES.md` has the format and the full stride table.
 
-The index is not load-bearing: a stale or missing one, or damage that leaves it
-structurally inconsistent, is detected and falls back to scanning. That stops at
-damage which leaves the payload *consistent* — including ordinary bit rot, which
-returns a wrong answer about 2% of the time. Verifying every anchor would cost
-the scan the index exists to avoid, so the index frame is a trust boundary and
-wants a checksum if the medium is not trusted. `doc/SHAPES.md` has the detail. It does **not** survive appending, though
+The index is not load-bearing: a stale or missing one, or damage the frame
+checks catch at open, falls back to scanning. Damage that gets past those is a
+different matter — the index frame is a **trust boundary**, so a damaged one may
+return a wrong answer, and damage inside a node's slot segment raises a typed
+`:boring/bad-index` at the lookup that touches it rather than at open. What is
+still guaranteed is that nothing fails *untyped* and nothing reads outside the
+file. Verifying every anchor would cost the scan the index exists to avoid, so
+put a checksum around it if the medium is not trusted. `doc/SHAPES.md` has the detail. It does **not** survive appending, though
 — re-seal rather than append to a sealed file.
 
 ## Compression

@@ -212,7 +212,7 @@
 
 (defn run-cursor []
   (let [^bytes bs (boring/encode customers opts)
-        c (nav/source bs opts)
+        c (nav/root bs opts)
         rdr (Reader. bs)
         path ["customer-137" "name"]]
 
@@ -258,7 +258,7 @@
     (let [payload (byte-array (* 1024 1024))
           blob-doc {"meta" {"id" 7} "data" payload}
           ^bytes bbs (boring/encode blob-doc opts)
-          bc (nav/source bbs opts)
+          bc (nav/root bbs opts)
           brdr (Reader. bbs)]
       (println (format "\nblob: one 1 MiB bytestring beside a small map\n"))
       (println (format "%-44s %10s %10s %8s" "" "nav" "decode" "ratio"))
@@ -355,8 +355,8 @@
           plain (boring/encode m idx-opts)
           bs (boring/encode-indexed m (assoc idx-opts :index 16 :index-min 16))
           ks (mapv #(format "k%06d" %) (range 0 n (max 1 (quot n 100))))
-          a (timed (lookup-sweep (nav/source plain idx-opts) ks) 5 8)
-          b (timed (lookup-sweep (nav/source bs idx-opts) ks) 20 8)]
+          a (timed (lookup-sweep (nav/root plain idx-opts) ks) 5 8)
+          b (timed (lookup-sweep (nav/root bs idx-opts) ks) 20 8)]
       (println (format "  %-8d %10.1f %11.1f %11.1f%% %12.2f %10.3f"
                        n (/ (alength ^bytes plain) 1024.0) (/ (alength ^bytes bs) 1024.0)
                        (* 100.0 (/ (- (alength ^bytes bs) (alength ^bytes plain))
@@ -371,7 +371,7 @@
           path (vec (concat (repeat d "zzz") ["v"]))
           plain (boring/encode m idx-opts)
           bs (boring/encode-indexed m (assoc idx-opts :index 16 :index-min 16))
-          cp (nav/source plain idx-opts) ci (nav/source bs idx-opts)
+          cp (nav/root plain idx-opts) ci (nav/root bs idx-opts)
           a (timed #(nav/value (get-in cp path)) 200 8)
           b (timed #(nav/value (get-in ci path)) 200 8)]
       (println (format "  %-8d %10.1f %11.1f%% %12.3f %12.3f"
@@ -391,7 +391,7 @@
         (println (format "  %-12d %-8d %10.1f%% %12.3f" mn st
                          (* 100.0 (/ (- (alength ^bytes bs) (alength ^bytes plain))
                                      (double (alength ^bytes plain))))
-                         (/ (timed (lookup-sweep (nav/source bs idx-opts) ks) 20 8)
+                         (/ (timed (lookup-sweep (nav/root bs idx-opts) ks) 20 8)
                             (count ks) 1000.0)))
         (flush))))
 

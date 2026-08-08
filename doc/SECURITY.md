@@ -51,15 +51,24 @@ Not yet built, and named here so the gap is visible rather than implied: a
 `:validate` setting that walks every anchor chain at load and refuses an index
 that does not hold together. It is measured at about one unindexed scan
 (12.2 ms on a 4.6 MB, 200 000-item file), after which lookups run at full
-speed — so it is never worse than having no index. Until it exists,
-`:trust-index` accepts only `:trusted` and `:ignore`.
+speed — so it is never worse than having no index.
 
-Two amplification paths on the `nav` side are also uncharged and unmeasured by
+Until it exists there is nothing to select. `:trust-index` accepts `:trusted`
+and `:ignore`; `:ignore` skips the index entirely and scans, and **`:trusted`
+is a documented no-op** — there is one read path, and the per-node validation
+the option used to disable no longer exists. The key is kept rather than
+removed because a removed option key silently no-ops rather than failing.
+
+One amplification path on the `nav` side is also uncharged and unmeasured by
 this page: cursor construction in `seq`/`reduce`/`items`/`count` is not charged
-to `:max-items` at all, and the index frame decodes with the budgets
-deliberately lifted. Both are bounded by the message size, so a transport cap
-bounds them — but the multiplier has not been measured and may exceed the
-decode figures below.
+to `:max-items` at all. It is bounded by the message size, so a transport cap
+bounds it — but the multiplier has not been measured and may exceed the decode
+figures below.
+
+The index frame used to be a second such path, decoding with the depth and item
+budgets lifted. It no longer lifts anything: each payload element is read at its
+own offset, so the frame's own nesting is never charged, and every element is a
+single item.
 
 ## Trust boundary
 

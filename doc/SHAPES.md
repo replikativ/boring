@@ -364,10 +364,10 @@ sentinel −1 is not a position.
 
 The CBOR element type *is* the width declaration, so there is no per-entry flag
 of the kind PostgreSQL needs for its `JEntry` array. Postgres reads offsets in
-place out of a TOAST'd datum and pays a prefix sum per probe; boring
-materialises the index once when it loads, expands there, and every lookup path
-then reads a plain `int[]` exactly as it did before. Delta encoding costs
-nothing at lookup time here.
+place out of a TOAST'd datum and pays a prefix sum per probe; boring now does
+the same — nothing is materialised at open, and a lookup expands one node's
+deltas, which at the default stride is two of them. The comparison used to run
+the other way, when the index was expanded into `int[]` at load.
 
 A reader must therefore treat an int32 slot as deltas too — absolutes and deltas
 are indistinguishable on the wire. That is why this landed before the format was

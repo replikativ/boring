@@ -648,12 +648,13 @@
 (defn- pack-slots
   "Every node's anchor deltas as ONE byte string:
 
-      [ 2-bit width code per node | node 0's deltas | node 1's deltas | ... ]
+      [ layout byte | 2-bit width code per node | dense start table |
+        node 0's deltas | node 1's deltas | ... ]
 
   Mirrors the JVM's `pack-slots` BYTE FOR BYTE -- see its docstring for why the
   shape is this and not one typed array per node, or one flat array at a single
   width. Little-endian, node `i`'s width at bit `(* 2 (rem i 4))` of byte
-  `(quot i 4)`, and no per-node length: that is `anchor-count` of the entry
+  `(+ 1 (quot i 4))` -- the layout byte is byte 0, and no per-node length: that is `anchor-count` of the entry
   count the frame already carries.
 
   `base` for each node is the container's own offset, or 0 for the sequence

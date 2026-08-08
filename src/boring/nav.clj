@@ -140,11 +140,14 @@
 ;; ix)] ...)`, exactly as they did when this was a map, so that contract is
 ;; unchanged.
 ;;
-;; `ILookup` so `(:containers ix)` keeps working. Tests reach in here on
-;; purpose -- `index_layout_test` and `index_robustness_test` assert on
-;; `:slots`, `:sorted`, `:offsets`, `:node-checked` -- and those assertions are
-;; the point of those files, not an accident to be rewritten around. The hot
-;; paths in this namespace use direct field access; `valAt` is for them.
+;; `ILookup` so `(:containers ix)` keeps working, which is how
+;; `index_robustness_test` asks whether a frame was ACCEPTED, and `:offsets`
+;; whether a sequence node is present. Those two are the live reach-ins; the
+;; list here used to name `:slots`, `:sorted` and `:node-checked` as well, and
+;; all three had moved on -- `:node-checked` is not served at all, and the
+;; other two are read off the WIRE by those tests now, not off this type.
+;;
+;; The hot paths use direct field access; `valAt` is for tests and debugging.
 (deftype Index
          ;; NO READER. The Index carries offsets and arrays and nothing that can
          ;; read them, deliberately: `fork-nav` builds a FRESH `Reader` per fork
@@ -272,7 +275,8 @@
 (defn- nav-idx
   "The decoded index, parsed on first use.
 
-  `idx` holds a DELAY, not the index. Parsing the frame is the expensive part
+  `idx` holds a VOLATILE, not the index -- see below. Parsing the frame is the
+  expensive part
   -- measured 8.5 us of the 11.0 us a per-call indexed lookup took, against
   2.5 us once the source is reused -- and a caller that only touches a
   top-level key never needs it. A store hands out a fresh blob per read and so
@@ -337,12 +341,12 @@
           (let [mid (quot (+ lo hi) 2)
                 c (container-at r ix mid)]
             (cond
-              ;; VALIDATED HERE, not at load. The node is checked against the
-              ;; data the first time a lookup lands on it, and an unsound one
-              ;; reports -1 -- which every caller already treats as "no index,
-              ;; walk it". So the fallback path is the one that always existed
-              ;; and the failure mode is unchanged; only the moment of
-              ;; discovery moved. See `index-payload`.
+              ;; MATCHED, NOT VALIDATED. The node is accepted only on an
+              ;; exact offset match, which is what keeps a mis-ordered
+              ;; `containers` from handing this container another one's
+              ;; anchors: a search that cannot find its node returns -1, and
+              ;; -1 means walk. Nothing here checks the node against the DATA
+              ;; -- per-node validation was removed, see doc/SHAPES.md.
               (= c off) mid
               (< c off) (recur (inc mid) hi)
               :else (recur lo (dec mid))))))
@@ -524,8 +528,8 @@
       (Nav. r (.opts n) (atom {}) (volatile! ix) (volatile! src) (volatile! nil)))))
 
 (defn source
-  "A navigable view over `src` -- a byte[], or a ByteSource such as
-  `boring.mmap/mmap-source` gives. Returns a cursor at the root.
+  "A SOURCE over `src` -- a byte[], or a ByteSource such as
+  `boring.mmap/mmap-source` gives. NOT a cursor: see `root`.
 
   `opts` are the decode options realisation will use (`:registry` and friends),
   and must describe how the document was WRITTEN. `:stringref false` is forced;
@@ -639,12 +643,11 @@
   "Linear walk of a map's entries from `start`, at most `limit` of them.
 
   BOUNDED BY THE SOURCE, not only by the entry count. An index anchor is where
-  this can start, and validation proves an anchor ascends, sits in range and --
-  for the first one -- is the container's real first entry. It cannot prove that
-  a MIDDLE anchor is an entry boundary without walking the container, which is
-  the work the index exists to avoid. A middle anchor pointing mid-item made
-  this read a garbage head and run off the end of the buffer, raising a raw
-  ArrayIndexOutOfBoundsException at the caller of `get`.
+  this can start, and `slot-at` proves only that an anchor lies inside the data
+  section -- nothing proves it is an ENTRY BOUNDARY, which would mean walking
+  the container, which is the work the index exists to avoid. An anchor
+  pointing mid-item made this read a garbage head and run off the end of the
+  buffer, raising a raw ArrayIndexOutOfBoundsException at the caller of `get`.
 
   So the walk stops at the source's end and reports a miss. A damaged index may
   still give a wrong ANSWER -- that is the trust boundary doc/SHAPES.md
@@ -789,10 +792,10 @@
                 ;; A MISS FROM THE INDEX IS NOT AN ANSWER, it is a hint that
                 ;; did not pay off.
                 ;;
-                ;; Validation proves the FIRST anchor is a real entry and that
-                ;; the anchors ascend and sit in range; it cannot prove a
-                ;; middle one is an entry boundary without walking the
-                ;; container, which is the work the index exists to avoid. A
+                ;; NOTHING PROVES AN ANCHOR IS AN ENTRY BOUNDARY. `slot-at`
+                ;; proves only that one lies inside the data section; proving
+                ;; more means walking the container, which is the work the
+                ;; index exists to avoid. An
                 ;; middle anchor off by one byte therefore made the bounded
                 ;; walk start mid-item and report a present key as absent:
                 ;; measured, eight of forty present keys came back `nil` from a
@@ -820,9 +823,9 @@
           (if (sorted-at? r (.sorted-data idx) ns)
             ;; Sorted keys: binary search the anchors, then a bounded walk.
             ;;
-            ;; The PROBE is bounds-checked as well as the walk. Validation
-            ;; proves the first anchor is a real entry; a middle one that points
-            ;; mid-item survives, and `compareItemToBytes` skips from wherever
+            ;; The PROBE is bounds-checked as well as the walk. An anchor
+            ;; that points mid-item is inside the data section and so survives
+            ;; `slot-at`, and `compareItemToBytes` skips from wherever
             ;; it is told -- reading a garbage head and running off the buffer,
             ;; which surfaced as a raw ArrayIndexOutOfBoundsException out of
             ;; `get`. Found by mutating every byte of a real indexed document
@@ -870,8 +873,8 @@
   stepping over 16 twenty-entry maps is ~640 sub-skips, measured at warm 1.14 ->
   4.90 us on 769 maps of 20. An index we have decided to trust does not earn
   that, and validating one jump while leaving the rest of the frame trusted was
-  never a coherent position anyway. See this namespace's docstring for what a
-  trusted index does and does not promise."
+  never a coherent position anyway. See doc/SHAPES.md for what a trusted
+  index does and does not promise."
   ^long [^Nav nav ^long off ^long idx]
   (let [^Reader r (.rdr nav)
         n (head-count nav off)]
@@ -2467,9 +2470,13 @@
 
   ANY exception here yields nil. Nothing in the index is load-bearing, so the
   honest response to a payload we cannot use is to ignore it and walk, never to
-  throw at the caller of `nav/source`. That matters more than it did: slots are
-  expanded eagerly below, so without this one malformed slot would take down a
-  cursor that never went near the container it belongs to.
+  throw at the caller of `nav/source`.
+
+  ITS REACH IS THE OPEN, NOT THE LOOKUP, and that distinction is worth keeping
+  straight. Slots are expanded per call by `slot-at`, not here -- only the
+  SEQUENCE node is expanded eagerly. So a malformed slot on a container node is
+  not caught by this `try` at all: `slot-at` raises a typed `:boring/bad-index`
+  at the lookup that touches it, which is deliberate and documented there.
 
   THERE IS ONE PATH. This took a `trusted?` flag -- `:trust-index :trusted` --
   that skipped the O(NODE COUNT) checks, because they were not marginal: paid
@@ -2606,8 +2613,8 @@
                  (= (long sorted-len) (quot (+ (long n) 7) 8))
                  )
         ;; ONE PROVISIONAL INDEX, built as soon as every offset is known, and
-        ;; used for the three things that still need to read `containers`: the
-        ;; ascending check, the sentinel scan, and the sequence node's anchors.
+        ;; used for the two things that still read `containers`: the sentinel
+        ;; check and the sequence node's anchors.
         ;; It IS the final Index whenever there is no sequence node, which is
         ;; every `encode-indexed` blob, so that case allocates exactly one.
         (let [st (long stride)
@@ -2616,14 +2623,9 @@
                           (long slots-data) (long slots-len)
                           (long (nth table 0)) (long (nth table 1))
                           (long sorted-data) ptr nil nil)]
-          ;; `node-slot` BINARY-SEARCHES containers, so they must ascend.
-          ;; O(NODE COUNT), and the only per-node work left at open -- kept
-          ;; because a search over an unordered array does not merely miss, it
-          ;; can settle on a node belonging to a different container and hand
-          ;; its anchors to this one. The counts check that used to sit beside
-          ;; it is gone: a negative count cannot reach past `slot-at`, which
-          ;; bounds its own segment and its own anchors.
-          ;; NO ASCENDING CHECK. It was the last O(NODE COUNT) work at open,
+          ;; NO ASCENDING CHECK, and no counts check either -- a negative
+          ;; count cannot reach past `slot-at`, which bounds its own segment
+          ;; and its own anchors. It was the last O(NODE COUNT) work at open,
           ;; and on a node-rich document it was not a residual -- it WAS the
           ;; open. Measured, same document and probe:
           ;;
@@ -2860,7 +2862,7 @@
             ;; 60-item file and `nth 32` returned -1768167461 where `decode-seq`
             ;; returned the record. That is still true; it is now the
             ;; documented consequence of trusting the frame rather than a
-            ;; defect. See this namespace's docstring.
+            ;; defect. See doc/SHAPES.md.
             (let [anchor (quot (long i) stride)]
               (loop [k (* anchor stride) p (long (aget offsets anchor))]
                 (if (= k (long i)) (cursor-at nav p) (recur (inc k) (skip r p)))))))

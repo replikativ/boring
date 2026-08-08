@@ -1558,10 +1558,11 @@
 (defn- pack-slots
   "Every node's anchor deltas, as ONE byte string.
 
-      [ 2-bit width code per node | node 0's deltas | node 1's deltas | ... ]
+      [ layout byte | 2-bit width code per node | dense start table |
+        node 0's deltas | node 1's deltas | ... ]
 
   The width codes come first, `(quot (+ n 3) 4)` bytes of them, node `i` at bit
-  `(* 2 (rem i 4))` of byte `(quot i 4)`: 0 = u8, 1 = u16, 2 = i32, 3 = i64,
+  `(* 2 (rem i 4))` of byte `(+ 1 (quot i 4))` -- the layout byte is byte 0: 0 = u8, 1 = u16, 2 = i32, 3 = i64,
   little-endian. Then each node's deltas back to back at its own width. A node's
   segment LENGTH is not stored -- it is `anchor-count` of that node's entry
   count, which the frame already carries.
