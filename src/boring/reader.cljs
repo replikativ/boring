@@ -368,7 +368,8 @@
   nesting is `(dec (.-length stack))`. `-3` is what makes `bf 01 ff` -- an
   indefinite map that breaks between a key and its value -- come out
   `:boring/unexpected-break` here as it does on the JVM, instead of `:ok`."
-  [^Reader r p]
+  ([^Reader r p] (skip-from r p nil))
+  ([^Reader r p items]
   (let [save (.-pos r)
         limit (skip-limit r)
         stack #js [1]
@@ -395,6 +396,12 @@
                 h (b-at r q)
                 mj (bit-shift-right h 5)
                 info (bit-and h 0x1F)]
+            ;; ONE ITEM PER HEAD, when the caller asked to count. Mirrors
+            ;; `Reader.skipCountingFrom` on the JVM, and must mirror it
+            ;; EXACTLY: `walk` decides which containers get an index node, so
+            ;; two platforms that count differently write different files for
+            ;; the same value.
+            (when items (aset items 0 (inc (aget items 0))))
             (set! (.-pos r) (inc q))
             ;; Settle the parent BEFORE dispatching -- except for a tag, which
             ;; owes its payload and is settled by whatever the payload turns
@@ -445,6 +452,10 @@
                                  (str "boring: tag chain longer than the skip bound ("
                                       limit ")")
                                  {:max-depth limit}))
+                          ;; EACH TAG IN THE CHAIN IS ITS OWN ITEM. The head
+                          ;; above counted the first; the rest are consumed
+                          ;; here without passing it.
+                          (when items (aset items 0 (inc (aget items 0))))
                           (set! (.-pos r) (inc (.-pos r)))
                           (arg! r (bit-and h2 0x1F))
                           (recur (inc chain))))))
@@ -458,7 +469,7 @@
                 (arg! r info)))))))
     (let [end (.-pos r)]
       (set! (.-pos r) save)
-      end)))
+      end))))
 
 (defn compare-items-at
   "Lexicographic comparison of the ENCODED items at `a` and `b`.

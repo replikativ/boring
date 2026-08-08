@@ -1218,7 +1218,21 @@
   tag's reader is an arbitrary function -- but the offsets describe the wire,
   and the wire is what they describe accurately either way."
   [^Reader r p stride min-entries base ^java.util.ArrayList acc]
-  (index-walk* r p stride min-entries base acc 0))
+  ;; THE RUNNING ITEM COUNT, in a one-slot array.
+  ;;
+  ;; `walk` needs, for each entry of a container, how many items precede it
+  ;; inside that container. Returning a per-entry count would mean every
+  ;; recursive call handing back two values, which in Clojure means allocating
+  ;; a tuple per ENTRY of the whole document -- on the walk whose entire design
+  ;; note is that it visits each byte once and allocates only for nodes it
+  ;; keeps.
+  ;;
+  ;; A monotone running total costs nothing and gives the same answer by
+  ;; subtraction: the items before entry j are (total now - total when the
+  ;; container started). It is exactly what `Writer.idxItemsWritten` does on
+  ;; the other side, which is also why the two agree by construction rather
+  ;; than by coincidence.
+  (index-walk* r p stride min-entries base acc 0 (long-array 1)))
 
 (defn- frame-payload-array?
   "Is the container at `p` the 2-element `[name, args]` array of a TAG-27 FRAME?
@@ -1244,7 +1258,7 @@
                        t))))))
 
 (defn- index-walk*
-  [^Reader r p stride min-entries base ^java.util.ArrayList acc depth]
+  [^Reader r p stride min-entries base ^java.util.ArrayList acc depth ^longs items]
   ;; CONTAINER nesting is bounded too, not only the tag chain. `build-index` is
   ;; public and documented for "a file somebody else wrote", and ~1.2 KB of
   ;; `81 81 81 ...` was a StackOverflowError where `decode` on the same bytes
@@ -1284,15 +1298,33 @@
         ;; Collapsing the chain is equivalent to recursing through it: a tag's
         ;; extent IS its payload's extent, so the payload's end is the value's.
         q0 (long p)
+        ;; EACH TAG IS ITS OWN ITEM, so the chain is counted as it collapses.
+        ;; The writer emits one `head(TAG, ..)` per tag; counting the chain as
+        ;; one would make the two builders disagree on any tagged value, which
+        ;; is most of what boring emits -- a set is tag 258, a record tag 27, a
+        ;; shaped array tag 39649.
+        ntags (long (loop [q p t 0]
+                      (if (= 6 (.majorAt r q))
+                        (recur (long (.headEndAt r q)) (inc t))
+                        t)))
         p (long (loop [q p]
                   (if (= 6 (.majorAt r q)) (recur (long (.headEndAt r q))) q)))
         mj (.majorAt r p)]
     (if-not (or (= mj 4) (= mj 5))
-      (.skipFrom r p)
+      ;; `skipCountingFrom`, not `skipFrom`: the items inside a scalar or a
+      ;; string are part of the enclosing container's walk, and a byte string
+      ;; of any size is ONE of them.
+      (let [e (.skipCountingFrom r p)]
+        (aset items 0 (+ (aget items 0) ntags (.skipItemCount r)))
+        e)
       (let [n (.headArgAt r p)
             map? (= mj 5)]
         (if (neg? n)
-          (.skipFrom r p)                       ; indefinite length: not indexable
+          ;; Indefinite length: not indexable, but still walked and still
+          ;; counted -- its items are part of its PARENT's walk.
+          (let [e (.skipCountingFrom r p)]
+            (aset items 0 (+ (aget items 0) ntags (.skipItemCount r)))
+            e)
             ;; Only containers we will KEEP get an array, and it holds one entry
             ;; per ANCHOR rather than one per entry. The old version allocated
             ;; `(int-array n)` for every container before testing `min-entries`,
@@ -1343,6 +1375,14 @@
                   ;; map has two anchors, so an unordered map was marked sorted
                   ;; about half the time and present keys came back nil.
                 srt (when (and keep? map?) (doto (boolean-array 1) (aset 0 true)))
+                ;; The tag chain and this container's OWN head, charged before
+                ;; any entry -- so `at-start` below is the count with the head
+                ;; already paid, and no entry's prefix includes it. The Java
+                ;; side captures `itemsAtStart` after `head(..)` for the same
+                ;; reason.
+                _ (aset items 0 (+ (aget items 0) ntags 1))
+                at-start (aget items 0)
+                walk-acc (long-array 1)
                 end (loop [i 0 q (long (.headEndAt r p)) prev -1]
                       (if (= i n)
                         q
@@ -1351,6 +1391,18 @@
                             (when (and srt (aget ^booleans srt 0) (>= (long prev) 0)
                                        (>= (.compareItemsAt r (long prev) q) 0))
                               (aset ^booleans srt 0 false))
+                            ;; BEFORE the entry is walked, not in the `recur`
+                            ;; form: `recur`'s arguments are evaluated left to
+                            ;; right and the position argument contains the
+                            ;; recursive calls, so a prefix computed there
+                            ;; would already include the entry it precedes.
+                            ;;
+                            ;; One prefix per ENTRY -- for a map that is the
+                            ;; key and value together, since a scan reaching
+                            ;; entry j crosses both halves of every earlier one.
+                            (when keep?
+                              (aset walk-acc 0 (+ (aget walk-acc 0)
+                                                  (- (aget items 0) at-start))))
                             ;; index-walk*, CARRYING THE DEPTH. Calling the
                             ;; 6-arg wrapper here reset it to 0 at every level,
                             ;; so the bound never fired and the only thing
@@ -1364,9 +1416,10 @@
                                           r
                                           (if map?
                                             (long (index-walk* r q stride min-entries base acc
-                                                               (inc (long depth))))
+                                                               (inc (long depth)) items))
                                             q)
-                                          stride min-entries base acc (inc (long depth))))
+                                          stride min-entries base acc (inc (long depth))
+                                          items))
                                    q))))]
             (when keep?
                 ;; Decided on RAW offsets, before `base` is folded in: the
@@ -1394,7 +1447,10 @@
                                     (dotimes [i (alength k)]
                                       (aset out i (+ base (aget k i))))
                                     out))]
-                (.add acc [(int (+ base p)) (int n) kept sorted])))
+                ;; FLOOR DIVISION, matching `Writer.fillNode`. `walk-acc` is
+                ;; the sum of per-entry prefixes; `walk` is their mean.
+                (.add acc [(int (+ base p)) (int n) kept sorted
+                           (if (pos? n) (quot (aget walk-acc 0) n) 0)])))
             end))))))
 
 (defn- scan-into!
@@ -1425,7 +1481,12 @@
     {:containers (long-array (map #(nth % 0) idx))
      :counts (int-array (map #(nth % 1) idx))
      :slots (mapv #(nth % 2) idx)
-     :sorted (mapv #(nth % 3) idx)}))
+     :sorted (mapv #(nth % 3) idx)
+     ;; `walk` NEVER REACHES THE WIRE. `seal-index-with!` writes the six frozen
+     ;; payload elements and this is not one of them; it is a decision input,
+     ;; carried here only so the writer's capture and this walk can be held to
+     ;; the same number before either is allowed to act on it.
+     :walk (mapv #(nth % 4) idx)}))
 
 (defn- scan-index
   "Index nodes for every container of at least `min-entries` entries in

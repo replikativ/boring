@@ -388,6 +388,12 @@ public final class Writer {
     private int[] idxCnts;
     private boolean[] idxSrt;
     private long[][] idxSlots;
+    /** Each node's `walk`: the mean number of CBOR items a scan crosses to
+     *  reach a random entry of that container. NEVER GOES ON THE WIRE -- it is
+     *  a writer-side decision input, read once to decide whether the node is
+     *  worth keeping and then discarded. Exposed only so the byte walk can be
+     *  held to the same number. */
+    private long[] idxWalk;
 
     private static final long[] NO_LONGS = new long[0];
     private static final int[] NO_INTS = new int[0];
@@ -537,6 +543,10 @@ public final class Writer {
     public boolean[] idxSorted() {
         return idxSrt == null ? NO_BOOLS : java.util.Arrays.copyOf(idxSrt, idxN);
     }
+    /** Each node's `walk`. Not written to the wire -- see {@link #idxWalk}. */
+    public long[] idxWalks() {
+        return idxWalk == null ? NO_LONGS : java.util.Arrays.copyOf(idxWalk, idxN);
+    }
 
     /** Anchors an indexed container of `n` entries needs at the current stride. */
     private int anchorCount(int n) {
@@ -572,12 +582,14 @@ public final class Writer {
             idxCnts = new int[32];
             idxSrt = new boolean[32];
             idxSlots = new long[32][];
+            idxWalk = new long[32];
         } else if (idxN == idxOffs.length) {
             int m = idxN * 2;
             idxOffs = java.util.Arrays.copyOf(idxOffs, m);
             idxCnts = java.util.Arrays.copyOf(idxCnts, m);
             idxSrt = java.util.Arrays.copyOf(idxSrt, m);
             idxSlots = java.util.Arrays.copyOf(idxSlots, m);
+            idxWalk = java.util.Arrays.copyOf(idxWalk, m);
         }
         return idxN++;
     }
@@ -638,11 +650,16 @@ public final class Writer {
 
     /** `off` is a FILE offset, captured by `absOffset()` when the container
      *  started -- not a buffer position to be resolved now. See absOffset(). */
-    private void fillNode(int slot, long off, int n, long[] anchors, boolean sorted) {
+    private void fillNode(int slot, long off, int n, long[] anchors, boolean sorted,
+                          long walkAcc) {
         idxOffs[slot] = checkedOffset(off);
         idxCnts[slot] = n;
         idxSlots[slot] = anchors;
         idxSrt[slot] = sorted;
+        // FLOOR DIVISION, and the byte walk must divide the same way. `walkAcc`
+        // is the SUM of per-entry prefixes; `walk` is their mean. An empty
+        // container has no entries to average over and no scan to shorten.
+        idxWalk[slot] = n > 0 ? walkAcc / n : 0;
     }
 
     private static final clojure.lang.Keyword K_N =
@@ -1405,42 +1422,51 @@ public final class Writer {
         long[] outer = indexing(2) ? new long[anchorCount(2)] : null;
         int outerSlot = outer != null ? reserveNode() : -1;
         int oa = 0, oc = 1;
+        long outerAtStart = idxItemsWritten, outerWalk = 0;
 
         if (outer != null && --oc == 0) { outer[oa++] = idxOffset(pos); oc = idxStride; }
+        outerWalk += idxItemsWritten - outerAtStart;
         long keysStart = absOffset();
         head(ARRAY, nk);
         long[] ka = indexing(nk) ? new long[anchorCount(nk)] : null;
         int keysSlot = ka != null ? reserveNode() : -1;
         int kai = 0, kc = 1;
+        long keysAtStart = idxItemsWritten, keysWalk = 0;
         for (int i = 0; i < nk; i++) {
             if (ka != null && --kc == 0) { ka[kai++] = idxOffset(pos); kc = idxStride; }
+            keysWalk += idxItemsWritten - keysAtStart;
             writeValue(keys[i]);
         }
-        if (ka != null) fillNode(keysSlot, keysStart, nk, ka, false);
+        if (ka != null) fillNode(keysSlot, keysStart, nk, ka, false, keysWalk);
 
         if (outer != null && --oc == 0) { outer[oa++] = idxOffset(pos); oc = idxStride; }
+        outerWalk += idxItemsWritten - outerAtStart;
         long rowsStart = absOffset();
         head(ARRAY, nr);
         long[] ra = indexing(nr) ? new long[anchorCount(nr)] : null;
         int rowsSlot = ra != null ? reserveNode() : -1;
         int rai = 0, rc = 1;
+        long rowsAtStart = idxItemsWritten, rowsWalk = 0;
         for (int r = 0; r < nr; r++) {
             if (ra != null && --rc == 0) { ra[rai++] = idxOffset(pos); rc = idxStride; }
+            rowsWalk += idxItemsWritten - rowsAtStart;
             Map m = (Map) l.get(r);
             long rowStart = absOffset();
             head(ARRAY, nk);
             long[] row = indexing(nk) ? new long[anchorCount(nk)] : null;
             int rowSlot = row != null ? reserveNode() : -1;
             int ri = 0, rcd = 1;
+            long rowAtStart = idxItemsWritten, rowWalk = 0;
             for (int i = 0; i < nk; i++) {
                 if (row != null && --rcd == 0) { row[ri++] = idxOffset(pos); rcd = idxStride; }
+                rowWalk += idxItemsWritten - rowAtStart;
                 writeValue(m.get(keys[i]));
             }
-            if (row != null) fillNode(rowSlot, rowStart, nk, row, false);
+            if (row != null) fillNode(rowSlot, rowStart, nk, row, false, rowWalk);
         }
-        if (ra != null) fillNode(rowsSlot, rowsStart, nr, ra, false);
+        if (ra != null) fillNode(rowsSlot, rowsStart, nr, ra, false, rowsWalk);
 
-        if (outer != null) fillNode(outerSlot, outerStart, 2, outer, false);
+        if (outer != null) fillNode(outerSlot, outerStart, 2, outer, false, outerWalk);
     }
 
     /**
@@ -1516,16 +1542,20 @@ public final class Writer {
         head(ARRAY, n);
         long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
+        // AFTER the head: `walk` is the scan INSIDE the container, so the
+        // container's own head is not part of any entry's prefix.
+        long itemsAtStart = idxItemsWritten, walkAcc = 0;
         int a = 0, countdown = 1, seen = 0;
         for (; s != null; s = s.next()) {
             if (++seen > n) countMismatch(n, seen);
             if (anchors != null && --countdown == 0) {
                 anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
+            walkAcc += idxItemsWritten - itemsAtStart;
             writeValue(s.first());
         }
         if (seen != n) countMismatch(n, seen);
-        if (anchors != null) fillNode(slot, start, n, anchors, false);
+        if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc);
     }
 
     /** An array of `n` elements from any Iterable, indexed if it is big enough. */
@@ -1535,16 +1565,18 @@ public final class Writer {
         head(ARRAY, n);
         long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
+        long itemsAtStart = idxItemsWritten, walkAcc = 0;
         int a = 0, countdown = 1, seen = 0;
         for (Object o : it) {
             if (++seen > n) countMismatch(n, seen);
             if (anchors != null && --countdown == 0) {
                 anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
+            walkAcc += idxItemsWritten - itemsAtStart;
             writeValue(o);
         }
         if (seen != n) countMismatch(n, seen);
-        if (anchors != null) fillNode(slot, start, n, anchors, false);
+        if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc);
     }
 
     @SuppressWarnings("rawtypes")
@@ -1562,6 +1594,10 @@ public final class Writer {
         int prevK0 = -1, prevK1 = -1;
         KeyOrder ko = null;
         int a = 0, countdown = 1;
+        // A MAP ENTRY IS KEY AND VALUE TOGETHER: a scan reaching entry j
+        // crosses both halves of every earlier entry, so the prefix is taken
+        // once per PAIR, before the key.
+        long itemsAtStart = idxItemsWritten, walkAcc = 0;
         // Every adjacent pair, for the reason spelled out in writeMapValue: an
         // anchor sample does not establish that the container is ordered.
         int seen = 0;
@@ -1571,6 +1607,7 @@ public final class Writer {
             if (anchors != null && --countdown == 0) {
                 anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
+            walkAcc += idxItemsWritten - itemsAtStart;
             int k0 = pos;
             long flushedAtKey = flushed;
             pinDepth++;
@@ -1588,7 +1625,7 @@ public final class Writer {
             writeValue(e.getValue());
         }
         if (seen != n) countMismatch(n, seen);
-        if (anchors != null) fillNode(slot, start, n, anchors, sorted);
+        if (anchors != null) fillNode(slot, start, n, anchors, sorted, walkAcc);
     }
 
     /**
@@ -1705,11 +1742,14 @@ public final class Writer {
         int prevK0 = -1, prevK1 = -1;
         KeyOrder ko = null;
         int a = 0, countdown = 1, seen = 0;
+        // See writeRecordFields: one prefix per key/value PAIR.
+        long itemsAtStart = idxItemsWritten, walkAcc = 0;
 
         for (Object o : m.entrySet()) {
             Map.Entry e = (Map.Entry) o;
             if (++seen > n) countMismatch(n, seen);
             if (--countdown == 0) { anchors[a++] = idxOffset(pos); countdown = idxStride; }
+            walkAcc += idxItemsWritten - itemsAtStart;
             int k0 = pos;
             long flushedAtKey = flushed;
             pinDepth++;
@@ -1725,7 +1765,7 @@ public final class Writer {
             writeValue(e.getValue());
         }
         if (seen != n) countMismatch(n, seen);
-        fillNode(slot, start, n, anchors, sorted);
+        fillNode(slot, start, n, anchors, sorted, walkAcc);
     }
 
     // ---- time, uuid, rational ----------------------------------------------
@@ -2051,6 +2091,7 @@ public final class Writer {
         head(ARRAY, n);
         long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
+        long itemsAtStart = idxItemsWritten, walkAcc = 0;
         int a = 0, countdown = 1;
         for (int j = 0; j < n; j++) {
             if (anchors != null && --countdown == 0) {
@@ -2063,6 +2104,7 @@ public final class Writer {
             // out DESCENDING. Canonical maps already copy their staged keys;
             // this is the same fix, and it also restores one handler call per
             // value.
+            walkAcc += idxItemsWritten - itemsAtStart;
             byte[] eb = encoded[order[j]];
             // THE STAGED BYTES CARRY NO EMIT SITE, so nothing has counted the
             // items inside them -- the scratch writer counted them into ITS
@@ -2074,7 +2116,7 @@ public final class Writer {
             System.arraycopy(eb, 0, buf, pos, eb.length);
             pos += eb.length;
         }
-        if (anchors != null) fillNode(slot, start, n, anchors, false);
+        if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc);
     }
 
     /**
@@ -2208,12 +2250,14 @@ public final class Writer {
         head(MAP, n);
         long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
+        long itemsAtStart = idxItemsWritten, walkAcc = 0;
         int a = 0, countdown = 1;
         for (int j = 0; j < n; j++) {
             int k = order[j];
             if (anchors != null && --countdown == 0) {
                 anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
+            walkAcc += idxItemsWritten - itemsAtStart;
             // See writeSetCanonical: staged bytes bypass every emit site.
             idxItemsWritten += encodedKeyItems[k];
             ensure(encodedKeys[k].length);
@@ -2221,7 +2265,7 @@ public final class Writer {
             pos += encodedKeys[k].length;
             writeValue(vals[k]);
         }
-        if (anchors != null) fillNode(slot, start, n, anchors, sorted);
+        if (anchors != null) fillNode(slot, start, n, anchors, sorted, walkAcc);
     }
 
     public void writeBoolean(boolean b) { u8(SIMPLE | (b ? 21 : 20)); }
@@ -2840,12 +2884,14 @@ public final class Writer {
             long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
             int slot = anchors != null ? reserveNode() : -1;
             int a = 0, countdown = 1, seen = 0;
+            long itemsAtStart = idxItemsWritten, walkAcc = 0;
             if (x instanceof java.util.RandomAccess) {
                 // Indexed by position, so it cannot yield more or fewer than n.
                 for (int i = 0; i < n; i++) {
                     if (anchors != null && --countdown == 0) {
                         anchors[a++] = idxOffset(pos); countdown = idxStride;
                     }
+                    walkAcc += idxItemsWritten - itemsAtStart;
                     writeValue(l.get(i));
                 }
             } else {
@@ -2854,11 +2900,12 @@ public final class Writer {
                     if (anchors != null && --countdown == 0) {
                         anchors[a++] = idxOffset(pos); countdown = idxStride;
                     }
+                    walkAcc += idxItemsWritten - itemsAtStart;
                     writeValue(o);
                 }
                 if (seen != n) countMismatch(n, seen);
             }
-            if (anchors != null) fillNode(slot, start, n, anchors, false);
+            if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc);
             return;
         }
         if (x instanceof java.util.Collection) {

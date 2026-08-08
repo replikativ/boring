@@ -158,3 +158,96 @@
       (is (= 1 (n-of [])))
       (is (= 1 (n-of {})))
       (is (= 4 (n-of [[] [] []])) "the outer head plus one per empty child"))))
+
+;; ---------------------------------------------------------------- walk itself
+
+(defn- capture-walks
+  "Each node's `walk` as the WRITER computed it while encoding, keyed by
+  container offset.
+
+  Driven through `setIndex` + `writeValue` rather than `write-indexed!`,
+  because `write-indexed!` turns capture off again once it has sealed
+  (`setIndex` with a stride of 0, which also resets) -- so reading the node
+  arrays after it returns reports an EMPTY capture and every comparison here
+  fails identically. `:stringref false` because indexing forces it off, which
+  the four public entry points each do for themselves."
+  [v o]
+  (let [ro (#'boring.core/resolve-opts (assoc o :stringref false))
+        ^Writer w (boring/writer 65536 (assoc o :stringref false))]
+    ;; `configure!` EXPLICITLY. `boring/writer` only STORES resolved options on
+    ;; the writer; the entry points apply them to the fields, and `.writeValue`
+    ;; is not an entry point. Without this the writer is not canonical under
+    ;; `:profile :canonical` -- same byte COUNT, different key order, so it
+    ;; looks like a walk disagreement and is a harness that never turned the
+    ;; profile on.
+    (#'boring.core/configure! w ro)
+    (.setIndex w (int (:index o 16)) (int (:index-min o 16)) 0)
+    (.writeValue w v)
+    (zipmap (seq (.idxContainers w)) (seq (.idxWalks w)))))
+
+(defn- walked-walks
+  "The same, as the BYTE WALK computed it afterwards."
+  [v o]
+  (let [o (assoc o :stringref false)
+        ix (boring/build-index (boring/encode v o) o)]
+    (if ix (zipmap (seq (:containers ix)) (:walk ix)) {})))
+
+(deftest the-two-builders-compute-the-same-walk
+  (testing "`walk` decides whether a container is worth an index node. The
+            writer accumulates it from items it emits; the byte walk
+            accumulates it from items it crosses. If they disagree they place
+            nodes differently, and two builders that place nodes differently
+            produce two different files for one value.
+
+            Asserted per NODE, keyed by container offset, so a failure names
+            the container rather than reporting that two files differ.
+
+            This is the property the whole of step 1 was groundwork for, and it
+            is checked BEFORE anything reads `walk` -- once the rule is live a
+            disagreement shows up as a byte-identity failure, which says that
+            something is wrong but not what."
+    (doseq [[label v]
+            [["flat map"     (into {} (for [i (range 40)] [(format "k%02d" i) i]))]
+             ["sorted map"   (into (sorted-map)
+                                   (for [i (range 40)] [(format "k%02d" i) i]))]
+             ["vec of maps"  (vec (for [i (range 30)] {"a" i "b" (str i)}))]
+             ;; Entries of WILDLY different sizes, so the mean is not the
+             ;; trivial (n-1)/2 * s and an off-by-one in either accumulator
+             ;; moves it.
+             ["ragged"       (into {} (for [i (range 20)]
+                                        [(format "k%02d" i)
+                                         (vec (range (* i i)))]))]
+             ["one big sibling" {"a" 1 "b" (vec (range 500)) "c" 3 "d" 4 "e" 5}]
+             ["nested"       {"L1" (into {} (for [i (range 20)]
+                                              [(format "m%02d" i)
+                                               {"L3" (vec (range 20))}]))}]
+             ["deep"         (reduce (fn [acc _] {"k" acc, "pad" (vec (range 20))})
+                                     {} (range 5))]
+             ["set"          (set (range 40))]
+             ["record"       (boring.data/unknown-record
+                              "R" (into {} (for [i (range 30)] [(str i) i])))]]
+            profile [:clojure :canonical :archival]
+            stride [1 4 16]
+            min-entries [2 16]]
+      (let [o (cond-> {:profile profile :index stride :index-min min-entries}
+                (= profile :clojure) (assoc :stringref false))
+            tag (str label " | " profile " | stride " stride " | min " min-entries)]
+        (is (= (capture-walks v o) (walked-walks v o))
+            (str tag ": the two builders must agree on every node's walk"))))))
+
+(deftest walk-is-the-mean-prefix-and-nothing-else
+  (testing "Pinned against hand-computed values, so the two builders agreeing
+            cannot mean they are agreeing on the wrong thing.
+
+            For n uniform entries of s items each, walk = s*(n-1)/2: entry j is
+            reached by crossing j entries, and the mean of 0..n-1 is (n-1)/2."
+    (let [o {:profile :clojure :stringref false :index 1 :index-min 2}
+          walk-of (fn [v] (first (vals (walked-walks v o))))]
+      ;; An array of scalars: one item per entry, so walk = (n-1)/2.
+      (is (= 4 (walk-of (vec (range 10)))) "10 scalars: (10-1)/2 = 4 (floor)")
+      (is (= 49 (walk-of (vec (range 100)))) "100 scalars: (100-1)/2 = 49")
+      ;; A byte string is ONE item however large -- the whole reason the metric
+      ;; is items. Ten 1 KB blobs must walk exactly like ten integers.
+      (is (= (walk-of (vec (range 10)))
+             (walk-of (vec (repeat 10 (byte-array 1024)))))
+          "a 1 KB blob and an integer cost a scan the same: one item"))))

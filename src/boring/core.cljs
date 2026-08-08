@@ -777,21 +777,34 @@
   a chain of them is not a stack hazard. Container nesting carries an explicit
   bound for the same reason the JVM does: this is public and runs on bytes
   somebody else wrote."
-  [r p stride min-entries base acc depth]
+  [r p stride min-entries base acc depth items]
   (when (> depth INDEX-WALK-MAX-DEPTH)
     (throw (ex-info (str "boring: nesting deeper than the index walk's bound ("
                          INDEX-WALK-MAX-DEPTH "). This document can be decoded "
                          "but not indexed.")
                     {:type :boring/max-depth-exceeded :max-depth INDEX-WALK-MAX-DEPTH})))
   (let [q0 p
+        ;; EACH TAG IS ITS OWN ITEM -- see the JVM `index-walk*`. The writer
+        ;; emits one head per tag, and most of what boring writes is tagged.
+        ntags (loop [q p t 0]
+                (if (== 6 (rd/major-at r q)) (recur (rd/head-end-at r q) (inc t)) t))
         p (loop [q p] (if (== 6 (rd/major-at r q)) (recur (rd/head-end-at r q)) q))
         mj (rd/major-at r p)]
     (if-not (or (== mj 4) (== mj 5))
-      (rd/skip-from r p)
+      ;; Counted into the enclosing container's walk. A byte string of any size
+      ;; is ONE item, which is the whole reason the metric is items.
+      (let [before (aget items 0)
+            e (rd/skip-from r p items)]
+        (aset items 0 (+ before ntags (- (aget items 0) before)))
+        e)
       (let [n (rd/head-arg-at r p)
             map? (== mj 5)]
         (if (neg? n)
-          (rd/skip-from r p)                    ; indefinite: not indexable
+          ;; Indefinite: not indexable, but still counted for its PARENT.
+          (let [before (aget items 0)
+                e (rd/skip-from r p items)]
+            (aset items 0 (+ before ntags (- (aget items 0) before)))
+            e)
           (let [keep? (and (>= n min-entries)
                            (not (frame-payload-array? r q0 p mj n)))
                 m (if keep?
@@ -805,6 +818,12 @@
                 ;; wrong answers. Arrays are never marked sorted: the flag is
                 ;; about map key order, and `boring.nav` only consults it there.
                 srt (when (and keep? map?) #js [true])
+                ;; The tag chain and this container's own head, charged before
+                ;; any entry -- so no entry's prefix includes them. The JVM
+                ;; captures `itemsAtStart` after `head(..)` for the same reason.
+                _ (aset items 0 (+ (aget items 0) ntags 1))
+                at-start (aget items 0)
+                walk-acc #js [0]
                 end (loop [i 0 q (rd/head-end-at r p) prev -1]
                       (if (== i n)
                         q
@@ -813,18 +832,25 @@
                             (when (and srt (aget srt 0) (>= prev 0)
                                        (>= (rd/compare-items-at r prev q) 0))
                               (aset srt 0 false))
+                            ;; BEFORE the entry is walked -- one prefix per
+                            ;; ENTRY, which for a map is key and value together.
+                            (when keep?
+                              (aset walk-acc 0 (+ (aget walk-acc 0)
+                                                  (- (aget items 0) at-start))))
                             (recur (inc i)
                                    (if map?
                                      ;; A map entry is a key AND a value, and
                                      ;; the anchor points at the key.
                                      (index-walk* r (index-walk* r q stride min-entries
-                                                                 base acc (inc depth))
-                                                  stride min-entries base acc (inc depth))
+                                                                 base acc (inc depth) items)
+                                                  stride min-entries base acc (inc depth) items)
                                      (index-walk* r q stride min-entries base acc
-                                                  (inc depth)))
+                                                  (inc depth) items))
                                    q))))]
             (when keep?
-              (.push acc [(+ p base) n (vec kept) (boolean (and srt (aget srt 0)))]))
+              ;; FLOOR DIVISION, matching `Writer.fillNode` and the JVM walk.
+              (.push acc [(+ p base) n (vec kept) (boolean (and srt (aget srt 0)))
+                          (if (pos? n) (quot (aget walk-acc 0) n) 0)]))
             end))))))
 
 (defn build-index
@@ -848,7 +874,8 @@
          r (rd/reader bs)
          acc (array)
          end (.-length bs)]
-     (loop [p 0] (when (< p end) (recur (index-walk* r p stride min-entries 0 acc 0))))
+     (loop [p 0] (when (< p end)
+                   (recur (index-walk* r p stride min-entries 0 acc 0 #js [0]))))
      (when (pos? (.-length acc))
        (let [idx (vec (sort-by first (vec acc)))]
          ;; `:stride` INCLUDED. The JVM's `build-index` returns it and
@@ -860,7 +887,11 @@
           :containers (mapv #(nth % 0) idx)
           :counts (mapv #(nth % 1) idx)
           :slots (mapv #(nth % 2) idx)
-          :sorted (mapv #(nth % 3) idx)})))))
+          :sorted (mapv #(nth % 3) idx)
+          ;; `walk` NEVER REACHES THE WIRE -- see the JVM `nodes->index`. It is
+          ;; a decision input, carried so the three builders can be held to the
+          ;; same number before any of them acts on it.
+          :walk (mapv #(nth % 4) idx)})))))
 
 (defn- long->8-bytes [v]
   (let [b (js/Uint8Array. 8)]
