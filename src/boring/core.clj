@@ -1518,36 +1518,6 @@
   reason it exists."
   2)
 
-(def ^:no-doc ^:const slot-block
-  "Retained for reading v1 frames. How many index nodes one entry of a SPARSE
-  slot start table covers.
-
-  `slots` carries a SPARSE table of byte offsets -- one entry every this many
-  nodes -- so reaching node `i`'s deltas is one table read plus the segments of
-  at most `slot-block - 1` nodes, instead of a prefix sum over every earlier
-  node. That bound is what lets a reader stop materialising the whole index to
-  serve one lookup.
-
-  16 is a size, not a law: the layout byte carries a version, so this can move
-  without another format break. Costs `(N/16 + 2)` entries -- 100 bytes on a
-  770-node frame, 0.13% of the blob -- against 9 KB of per-open allocation and
-  an O(N) pass. A dense table would be 2% of the blob for O(1); this is the
-  same win an order of magnitude cheaper, for a bounded walk nobody can measure.
-
-  `boring.nav` reads this var rather than repeating the number, because a
-  disagreement would not corrupt one node -- it would read every node's deltas
-  from the wrong offset."
-  16)
-
-(def ^:no-doc ^:const slot-layout-v1
-  "Version nibble of the `slots` layout byte.
-
-  Without it, a reader meeting the PREVIOUS shape -- no layout byte, no start
-  table -- would read a width code where the version is, compute nonsense
-  offsets, and rely on the final-entry length check to notice. That check would
-  catch it about 65535 times in 65536. A version makes it exact, for one byte."
-  1)
-
 (defn- slot-width-code
   "The narrowest of four widths that holds every delta in `d`: 0 = u8, 1 = u16,
   2 = i32, 3 = i64.
@@ -1686,12 +1656,10 @@
           (aset-byte out b (unchecked-byte
                             (bit-or (bit-and 0xFF (aget out b))
                                     (bit-shift-left (aget ws i) (* 2 (rem i 4))))))))
-      ;; THE SPARSE START TABLE, one entry every `slot-block` nodes, plus a
-      ;; final entry holding the total. Node i's deltas begin at entry
-      ;; `(quot i slot-block)` plus the segments of at most `slot-block - 1`
-      ;; nodes -- so reaching ANY node is a bounded walk rather than a prefix
-      ;; sum over every earlier one, which is what let the reader stop
-      ;; materialising `slot-starts` and `counts` at all.
+      ;; THE DENSE START TABLE, one entry per node plus a final entry holding
+      ;; the total. Node i's deltas begin at entry i -- ONE READ, where this
+      ;; was a prefix sum over every earlier node, which is what let the reader
+      ;; stop materialising `slot-starts` at all.
       ;;
       ;; The final entry is also the structural gate: it must equal the byte
       ;; string's own length, which is one read instead of a sum over N.

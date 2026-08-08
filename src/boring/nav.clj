@@ -1856,9 +1856,9 @@
 
   TWO READS, WHERE THIS USED TO BE A PREFIX SUM OVER EVERY NODE. `slots` now
   carries a sparse table of byte offsets -- one entry every
-  `boring/slot-block` nodes, plus a final entry holding the total -- so a node is
-  reachable without walking to it, and the structural gate is that final entry
-  against `(alength packed)` rather than a sum that had to be run to be checked.
+  node, plus a final entry holding the total -- so a node is reachable without
+  walking to it, and the structural gate is that final entry against
+  `(alength packed)` rather than a sum that had to be run to be checked.
 
   What that deletes is the point: the `long[N+1]` this returned, the O(N) pass
   that filled it, and the reason every open had to touch all of `counts`.
