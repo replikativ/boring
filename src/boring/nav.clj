@@ -2255,23 +2255,31 @@
           ;; its anchors to this one. The counts check that used to sit beside
           ;; it is gone: a negative count cannot reach past `slot-at`, which
           ;; bounds its own segment and its own anchors.
-          ;; ONE read per node, carrying the predecessor. Reading both ends of
-          ;; each comparison doubled it, and off the wire that is not free the
-          ;; way it was off a `long[]`: this is now the only O(NODE COUNT) work
-          ;; left at open, measured at ~0.8 us on 770 nodes against 0.13 when
-          ;; `containers` was materialised.
-          ;; `(pos? n)` guards the loop INIT, not just its body: a zero-node
-          ;; index is accepted, and `(container-at r ix0 0)` on one would read
-          ;; `cw` bytes at `containers-data` -- which for a zero-length
-          ;; containers array is the NEXT payload element, not containers. It
-          ;; cannot leave the file and cannot throw, but it is a read the array
-          ;; does not own.
-          (when (or (zero? (long n))
-                    (loop [k 1 prev (container-at r ix0 0)]
-                      (if (>= k (long n))
-                        true
-                        (let [c (container-at r ix0 k)]
-                          (if (>= prev c) false (recur (inc k) c))))))
+          ;; NO ASCENDING CHECK. It was the last O(NODE COUNT) work at open,
+          ;; and on a node-rich document it was not a residual -- it WAS the
+          ;; open. Measured, same document and probe:
+          ;;
+          ;;      nodes    with check    without
+          ;;        770      8.25 us      4.25 us
+          ;;      16150     71.07 us      4.08 us
+          ;;
+          ;; The open is now flat in node count. That matters beyond the
+          ;; number: it removes the last way one container's presence in the
+          ;; index taxes every other lookup in the document, which is what a
+          ;; per-container indexing policy needs in order to be decidable
+          ;; locally at all.
+          ;;
+          ;; AND IT WAS NEVER LOAD-BEARING THE WAY IT LOOKED. `node-slot`
+          ;; validates its own answer: the binary search accepts a node only on
+          ;; `(= c off)`, so it cannot return a node describing a DIFFERENT
+          ;; container. On a mis-ordered array the search may fail to find a
+          ;; node that exists -- which yields -1, and -1 means walk, which is
+          ;; correct. The residue is a crafted frame carrying DUPLICATE
+          ;; container offsets, where two nodes both claim `off` and the search
+          ;; picks one; `slot-at` still bounds its anchors, so that is a wrong
+          ;; answer inside the trust boundary, exactly like every other lie the
+          ;; frame is free to tell.
+          (when true
             ;; One uniform node list. The SEQUENCE is the node at the sentinel
             ;; offset -1: it has no container header on the wire but behaves
             ;; like one, and a sentinel avoids carrying two shapes for the same

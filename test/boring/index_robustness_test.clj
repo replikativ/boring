@@ -289,9 +289,6 @@
              ["count disagrees with the slot's length"
               (parts :counts [Integer/MAX_VALUE] :pack-counts [3]
                      :stride 1 :pack-stride 1)]
-             ["containers not ascending"
-              (parts :containers [5 -1] :counts [3 3]
-                     :slots [[5 9 13] [0 4 8]] :sorted [false false])]
              ["an anchor beyond the data section"
               (parts :slots [[0 100 200]])]
              ["a negative stride"
@@ -378,6 +375,32 @@
           "trusted must still REFUSE this frame, not merely survive it")
       (is (= 3 (count (into [] (nav/items bs trusted))))
           "trusted must still fall back to scanning, not index into nothing"))))
+
+(deftest containers-that-do-not-ascend-are-used-and-still-answer-correctly
+  (testing "this used to be refused, and the check that refused it is gone --
+            it was the last O(NODE COUNT) work at open and on a node-rich
+            document it WAS the open: 71.07 us against 4.08 on a 16150-node
+            frame, same probe.
+
+            What makes dropping it safe is that `node-slot` validates its own
+            answer. The binary search accepts a node only on `(= c off)`, so it
+            cannot return a node describing a DIFFERENT container. On a
+            mis-ordered array the search may fail to find a node that exists --
+            which yields -1, and -1 means walk, which is correct. So the cost
+            is a lookup that falls back to scanning, not a wrong answer.
+
+            Asserted here rather than deleted, because `accepted?` going from
+            false to true is exactly the kind of change that should be visible
+            in a test rather than only in a commit message."
+    (let [bs (crafted (parts :containers [5 -1] :counts [3 3]
+                             :slots [[5 9 13] [0 4 8]] :sorted [false false]))]
+      (is (accepted? bs opts)
+          "the frame is now ACCEPTED -- nothing re-derives that offsets ascend")
+      (is (= 3 (count (into [] (nav/items bs opts))))
+          "and it still sees three data items, not the frame as a fourth")
+      (is (= [1 2 3] (mapv #(get (nav/value %) "x") (into [] (nav/items bs opts))))
+          "and every record reads back correctly, because a search that cannot
+           find its node returns -1 and -1 means walk"))))
 
 (deftest an-absurd-delta-is-refused-rather-than-overflowing
   (testing "anchors are a prefix sum, and at width code 3 the stored delta is
