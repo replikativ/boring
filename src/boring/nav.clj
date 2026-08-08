@@ -102,7 +102,7 @@
 
 (set! *warn-on-reflection* true)
 
-(declare ->Cursor cursor-at read-index read-index* source-at tag-view
+(declare ->Cursor cursor-at nav-of-items read-index read-index* source-at tag-view
          nth-item realize lookup-map head-count child-offsets)
 
 ;; A shaped array is `39649([keys, [row, row, ...]])`, where each row is an
@@ -1269,6 +1269,65 @@
   (toString [_] (str "#boring.nav/cursor[" off (when shape " shaped") "]")))
 
 (defn- cursor-at [^Nav nav ^long off] (->Cursor nav off nil))
+
+;; ------------------------------------------------ the two layers, and the
+;;                                                   bridge between them
+;;
+;; A CURSOR IS A POSITION YOU CAN HOLD. AN OFFSET IS A POSITION YOU CAN ONLY
+;; USE. If you are exploring, holding, printing, `get`-ing, `seq`-ing or
+;; handing a subtree to someone else, you want cursors. If you are inside a
+;; loop whose trip count is the size of your data, you want offsets: they
+;; allocate nothing, and a scan is where that stops being a detail -- a
+;; million-row projection through cursors allocates 0.62 GB and through
+;; offsets 0.
+;;
+;; The two are bridged exactly, and `source` is what they share: the DOCUMENT
+;; -- the bytes, the reader over them, the index slot and the shape cache. A
+;; cursor is a position inside one. Naming it is what lets an offset function
+;; take `(source, offset)` rather than a cursor whose own offset it ignores.
+
+(defn source-of
+  "The source a cursor addresses into: the bytes, the reader, the index.
+
+  `(cursor (source-of c) (offset c))` is `c`, up to the `shape` field -- which
+  is the one thing an offset cannot carry, and which is exactly why a shaped
+  row cannot be addressed by offset alone. Stated here rather than discovered.
+
+  Accepts an `items` too -- it holds the same `nav`. That branch goes through
+  `nav-of-items`, declared above and defined beside `Items` itself, because
+  `Items` is a deftype further down the file and a hint here cannot name a
+  class the compiler has not seen yet.
+
+  IDEMPOTENT ON A SOURCE, and that is load-bearing rather than a convenience:
+  the identity in the docstring above is `(cursor (source-of c) (offset c))`,
+  and `cursor` takes `source-of` of its own first argument. Without this the
+  bridge would not compose with itself -- which is exactly what the test that
+  pins the identity found."
+  [c]
+  (cond (instance? Cursor c) (.nav ^Cursor c)
+        (instance? Nav c) c
+        :else (nav-of-items c)))
+
+(defn offset
+  "The byte offset `c` addresses. The inverse of `cursor`."
+  ^long [c] (.off ^Cursor c))
+
+(defn cursor
+  "A cursor at byte offset `off` of the source `c` addresses into.
+
+  Takes a cursor rather than a source only because `source` still returns a
+  root cursor; that is the one thing left to change here, and when it does this
+  keeps its meaning."
+  [c ^long off] (cursor-at (source-of c) off))
+
+(defn root
+  "A cursor at the root of the document `c` addresses into.
+
+      (nav/root (nav/source bs opts))     ; explicit
+      (nav/root c)                        ; back to the top from anywhere
+
+  `(root c)` is `(cursor c 0)`."
+  [c] (cursor-at (source-of c) 0))
 
 (defn walk
   "The cursor at `path` from `cursor`, or nil if any step is absent.
@@ -2632,6 +2691,12 @@
   ([src opts]
    (let [nav (nav-of src (or opts {}))]
      (Items. nav (nav-idx nav)))))
+
+(defn- nav-of-items
+  "The `Nav` behind an `items`. Exists only so `source-of` can reach it: that
+  function sits above `Items` in this file, and a `^Items` hint there would
+  name a class the compiler has not seen yet."
+  [^Items c] (.nav c))
 
 (defn fork
   "A view of the same source for ANOTHER THREAD.

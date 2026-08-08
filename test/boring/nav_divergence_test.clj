@@ -374,3 +374,35 @@
           (is (= 39 (nav/value (get (nav/walk (nav/re-point! c a) [39]) :k))))
           (is (= 139 (nav/value (get (nav/walk (nav/re-point! c b) [39]) :k)))
               "the second document's index must be used, not the first's"))))))
+
+(deftest the-cursor-offset-bridge-is-exact
+  (testing "`(cursor (source-of c) (offset c))` must be `c`. That is the whole
+            claim the two-layer split rests on: a caller can drop from cursors
+            to offsets in a hot loop and come back, and the position survives
+            the round trip.
+
+            The one exception is stated in `source-of`'s docstring rather than
+            left to be discovered -- a SHAPED row carries state on the cursor
+            that an offset cannot represent, so it does not round-trip. Pinned
+            here so the exception stays exactly one thing."
+    (let [o {:stringref false}
+          doc {:a {:b [10 20 {:c "deep"}]} :x 1}
+          bs (boring/encode doc o)
+          c (nav/source bs o)]
+      (doseq [[label cur] [["root" c]
+                           ["a map" (get c :a)]
+                           ["an array" (get-in c [:a :b])]
+                           ["an element" (nav/walk c [:a :b 2])]
+                           ["a scalar" (nav/walk c [:a :b 0])]]]
+        (let [round (nav/cursor (nav/source-of cur) (nav/offset cur))]
+          (is (= (nav/offset cur) (nav/offset round)) (str label ": offset survives"))
+          (is (= (nav/value cur) (nav/value round)) (str label ": and so does the value"))))
+      (testing "`root` gets back to the top from anywhere"
+        (is (= doc (nav/value (nav/root (nav/walk c [:a :b 2]))))))
+      (testing "`source-of` accepts an items as well as a cursor"
+        (let [out (java.io.ByteArrayOutputStream.)]
+          (boring/write-seq! (boring/writer 4096 o) [{:i 1} {:i 2}] out o)
+          (let [its (nav/items (.toByteArray out) o)]
+            (is (some? (nav/source-of its)))
+            (is (= 1 (nav/value (get (nav/cursor (nav/source-of its) (nav/offset (nth its 0))) :i)))
+                "and the two agree about where item 0 is")))))))
