@@ -1962,55 +1962,43 @@
     ;; `frame-payload`, not `record-fields`: an unregistered tag-27 frame
     ;; decodes to an UnknownRecord when its payload is a map and a
     ;; TaggedLiteral otherwise, and this payload is a vector.
-    (let [;; The index frame is decoded against ITS OWN depth budget, not the
-          ;; caller's. The frame is a fixed nested shape -- tag 27 around
-          ;; [name, [stride, containers, counts, slots, sorted, pointer]] -- so
-          ;; reading it costs four or five levels regardless of how shallow the
-          ;; DATA is. With `:max-depth 1`, an indexed `[1]` therefore failed to
-          ;; decode its own index, forgot it, and then walked into the frame as
-          ;; data and raised -- so a VALID index made reading fail where no
-          ;; index would have succeeded. That is the invariant inverted: the
-          ;; optimisation became load-bearing.
+    (let [;; NO BUDGET DANCE. This saved and overrode the Reader's `maxDepth`
+          ;; and `maxItems` around the reads below, and restored them in a
+          ;; `finally`, because the frame is a fixed nested shape whose cost is
+          ;; not a statement about the caller's data. Two real defects came from
+          ;; not doing it: with `:max-depth 1` an indexed `[1]` failed to decode
+          ;; its own index, forgot it, walked into the frame as data and raised;
+          ;; and a 500-record log overran an item budget generous for its data,
+          ;; lost `:data-end` with the payload, and reported 501 items for 500.
           ;;
-          ;; The caller's limit is a bound on THEIR data, and it is still
-          ;; enforced on every value they realise. It was never a statement
-          ;; about boring's own footer.
-          saved (.-maxDepth r)
-          _ (set! (.-maxDepth r) (int (max saved 32)))
-          ;; AND ITS OWN ITEM BUDGET, for exactly the same reason the depth
-          ;; budget above is isolated -- the argument was written out once and
-          ;; then applied to only one of the two limits.
+          ;; BOTH OVERRIDES ARE NOW DEAD, and structurally rather than by luck.
+          ;; `Reader.readFrom` saves and CLEARS `items` on entry, so each
+          ;; element below is read against a fresh budget; and since the v2
+          ;; layout every element is ONE item -- `sorted` used to be a CBOR
+          ;; array of one boolean per node, and 770 booleans inside a single
+          ;; `readFrom` is what overran the budget. Depth likewise: each element
+          ;; is read AT ITS OWN OFFSET, so the frame's own nesting is never
+          ;; charged, and the deepest element is a tag around a byte string.
           ;;
-          ;; The frame's item cost scales with the NODE COUNT, so a 500-record
-          ;; log written with default `write-seq!` options overran a budget that
-          ;; was generous for its data: `.readFrom` threw, the catch-all below
-          ;; returned nil, `:data-end` was lost, and `items` then walked past the
-          ;; data section into the frame and reported 501 items for 500 records.
-          ;; A silently wrong count out of a default-written file.
+          ;; Verified by disabling both overrides and running the whole suite,
+          ;; which stayed green including `a-valid-index-never-makes-reading-fail`
+          ;; at `:max-depth` 1. `a-valid-index-never-makes-counting-wrong` pins
+          ;; the item half independently of whether the override exists.
           ;;
-          ;; The counter is restored too, not just the limit: the frame must not
-          ;; spend the caller's budget on its way past.
-          savedMax (.-maxItems r)
-          savedN (.-items r)
-          _ (set! (.-maxItems r) 0)
-          ;; FIVE BULK READS. `slots` and `sorted` are byte strings now
-          ;; (`core/pack-slots`, `core/pack-sorted`), so every payload element
-          ;; is a single value and there is nothing to decode lazily: what used
-          ;; to be one typed array per node, located positionally and read on
-          ;; first use, is one `.readFrom` of a contiguous run of bytes.
+          ;; The `finally` was also attached to the wrong form: it wrapped only
+          ;; the `.readFrom` vector, so `payload-offsets` ran BEFORE the override
+          ;; and `slot-table` ran AFTER the restore. Invisible, and a trap to
+          ;; preserve blindly.
           [off-stride off-containers off-counts off-slots off-sorted]
           (try (payload-offsets r ptr)
                (catch Exception _ [nil nil nil nil nil]))
           [stride raw-containers ^ints counts packed sorted]
           (when off-stride
-            (try [(.readFrom r (long off-stride))
-                  (.readFrom r (long off-containers))
-                  (.readFrom r (long off-counts))
-                  (.readFrom r (long off-slots))
-                  (.readFrom r (long off-sorted))]
-                 (finally (set! (.-maxDepth r) (int saved))
-                          (set! (.-maxItems r) savedMax)
-                          (set! (.-items r) savedN))))
+            [(.readFrom r (long off-stride))
+             (.readFrom r (long off-containers))
+             (.readFrom r (long off-counts))
+             (.readFrom r (long off-slots))
+             (.readFrom r (long off-sorted))])
           ;; CONTAINERS ARRIVE AT EITHER WIDTH. `seal-index!` emits int32 when
           ;; every offset fits and sint64 when one does not, and the CBOR tag is
           ;; the declaration -- the same narrowest-that-fits rule the slot
