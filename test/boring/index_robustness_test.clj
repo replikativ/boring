@@ -1202,7 +1202,10 @@
                 the lookup path"
         (is (some? at) "the slot's delta bytes were found")
         (let [ix (#'boring.nav/read-index (#'boring.nav/nav-of damaged o))]
-          (is (some? (:slots ix)) "the damaged index is accepted")
+          ;; `:containers`, not `:slots`. Both are non-nil on an accepted index
+          ;; today, but only `:containers` MEANS accepted -- `:slots` means
+          ;; "slots is present", which stays true for shapes that are refused.
+          (is (some? (:containers ix)) "the damaged index is accepted")
           ;; Slots are expanded on demand now, so ask for node 0 rather than
           ;; reading a pre-expanded vector.
           (is (= [2 22 43 62 82 102]

@@ -22,10 +22,15 @@
   "The frame's six payload elements, as they sit ON THE WIRE.
 
   These assertions used to reach them through `(:slots (index-of bs))`, back
-  when opening an index materialised every element into a Java array. It holds
-  a byte OFFSET now -- the reader reads `slots` and `sorted` in place instead of
-  copying them -- so the old route reports a Long and the assertion reads as a
-  layout failure when nothing about the layout changed.
+  when opening an index materialised every element into a PER-NODE Java array.
+  `slots` and `sorted` are single packed byte strings now, so the old route
+  reports a different shape and the assertion reads as a layout failure when
+  nothing about the layout changed.
+
+  It is also where the reader is going: once `slots` and `sorted` are read in
+  place as byte OFFSETS rather than copied, `(:slots ix)` stops being a byte
+  array at all. Anything asserting on the reader's internals has to move before
+  then, and moving it early is free.
 
   Reading the frame directly is what these tests meant all along; the reader's
   internals were a shortcut that happened to agree. `seq_index_test` made the
@@ -162,10 +167,15 @@
             node count is a frame whose parts disagree."
     (let [body (boring/encode doc opts)
           index (boring/build-index body (assoc opts :index 1 :index-min 4))
-          good (boring/encode-indexed doc (assoc opts :index 1 :index-min 4))
-          ix (index-of good)]
+          good (boring/encode-indexed doc (assoc opts :index 1 :index-min 4))]
       (doseq [[label n] [["too short" 0] ["too long" 9]]]
-        (let [bs (seal-with body index (:slots ix) (byte-array n))]
+        ;; `(packed-slots good)`, not `(:slots (index-of good))`. Reaching into
+        ;; the reader for the GOOD half of a frame that is meant to be bad in
+        ;; exactly one way is how this stops testing what it says: the moment
+        ;; `slots` becomes a byte offset, `(:slots ix)` is a Long, `seal-with`
+        ;; encodes a uint where a byte string belongs, and the frame is refused
+        ;; for the WRONG reason -- with both assertions still passing.
+        (let [bs (seal-with body index (packed-slots good) (byte-array n))]
           (is (not (usable-index? bs)) (str label ": must be refused"))
           (is (answers-everything? bs) (str label ": and still answer by scanning")))))))
 
