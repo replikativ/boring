@@ -1889,7 +1889,18 @@
   element was a CBOR array -- gets a `headEndAt` and a `headArgAt` that both
   succeed, returning the element COUNT and the first element's offset, and the
   reader goes on to compute node offsets from them. The refusal has to be exact,
-  which is the whole compatibility argument for changing the layout."
+  which is the whole compatibility argument for changing the layout.
+
+  WHAT KEEPS THE RESULTING OFFSETS INSIDE THE FILE is not here, and is worth
+  naming because nothing near the accessors says it. Neither length returned
+  here is checked against the file. `count-at` and `container-at` are
+  nevertheless in-file for every `i < n` because of TWO things elsewhere:
+  `read-index*`'s `(= n (skip r ptr))` forces the whole frame to tile exactly
+  to EOF, and `Reader.checkCount` refuses any byte-string length exceeding
+  `remaining()`. That EOF check is documented where it lives purely as the
+  stale-index defence -- the concatenated-sealed-batches bug -- and is now also
+  the sole bound on two byte-offset accessors. Relaxing it would silently
+  un-bound both."
   [^Reader r ^long off ^long tag]
   (when (and (= 6 (.majorAt r off)) (= tag (.headArgAt r off)))
     (let [bs (.headEndAt r off)]
@@ -1961,8 +1972,7 @@
         m (anchor-count (count-at r ix i) (long stride))
         w (width-code packed i)
         sz (bit-shift-left 1 w)
-        start (long (slot-start packed tbase wstart i))
-        a (long-array m)]
+        start (long (slot-start packed tbase wstart i))]
     ;; AND THE DELTA RUN ITSELF IS BOUNDED, which nothing states elsewhere.
     ;; `slot-table` checks the start table's LAST entry against the byte
     ;; string's length; it never checks that the entries ascend, so one damaged
@@ -1976,22 +1986,35 @@
     ;; Stating it here makes the bound explicit and O(1) instead of implicit in
     ;; somebody else's catch, and it is the same check an offsets-based reader
     ;; will need when the JVM stops providing one for free.
+    ;; CHECKED BEFORE ALLOCATED, and the order is the whole point. `m` comes
+    ;; from `count-at`, which is a raw sint32 load off the wire that nothing
+    ;; cross-checks against the container -- at stride 1 `anchor-count` returns
+    ;; it verbatim, so one flipped bit in the counts array reaches 2^31-1 here.
+    ;; Allocating first meant `(long-array m)` raised OutOfMemoryError, which is
+    ;; an ERROR: it walks straight through `index-payload`'s and `read-index`'s
+    ;; catches and out of `get`, `nth`, `count` and `items`. Reproduced from a
+    ;; single bit flip in a blob boring itself wrote, and heap-independently
+    ;; with a crafted `Integer/MAX_VALUE` count.
+    ;;
+    ;; After the check `m * sz <= alength packed`, and `sz >= 1`, so the array
+    ;; is bounded by bytes that actually exist in the file.
     (when (or (neg? start) (> (+ start (* m sz)) (alength packed)))
       (throw (ex-info "boring: index slot segment outside the packed slots"
                       {:type :boring/bad-index :node i :start start
                        :anchors m :width sz :slots-length (alength packed)})))
-    (loop [k 0
-           p start
-           acc (max 0 (container-at r ix i))]
-      (when (< k m)
-        (let [v (+ acc (delta-at packed p w))]
-          (when (or (neg? v) (>= v lim))
-            (throw (ex-info "boring: index anchor outside the data section"
-                            {:type :boring/bad-index :node i :anchor k
-                             :offset v :data-end lim})))
-          (aset a k v)
-          (recur (inc k) (+ p sz) v))))
-    a))
+    (let [a (long-array m)]
+      (loop [k 0
+             p start
+             acc (max 0 (container-at r ix i))]
+        (when (< k m)
+          (let [v (+ acc (delta-at packed p w))]
+            (when (or (neg? v) (>= v lim))
+              (throw (ex-info "boring: index anchor outside the data section"
+                              {:type :boring/bad-index :node i :anchor k
+                               :offset v :data-end lim})))
+            (aset a k v)
+            (recur (inc k) (+ p sz) v))))
+      a)))
 
 (defn- index-payload
   "The usable index in the tag-27 frame at `ptr`, or nil meaning \"scan\".
@@ -2081,9 +2104,12 @@
           ;; Deliberately NARROWER than `.readFrom` was: tag 78 only. The width
           ;; is fixed at 4 and `n` is derived from the byte length, so accepting
           ;; tag 79 here would silently halve the node count. `.readFrom` also
-          ;; yielded int arrays for the BIG-ENDIAN tags (66, 70, 71, 74, 75),
-          ;; which are now refused -- safe, since refused means scan, but worth
-          ;; naming as a real change rather than a tidy-up.
+          ;; yielded int arrays for tags 66, 70, 71, 74 and 75, which are now
+          ;; refused -- safe, since refused means scan, but a real change rather
+          ;; than a tidy-up. Note 70 and 71 are LITTLE-endian uint32/uint64
+          ;; (RFC 8746); only 66, 74 and 75 are big-endian. So tag 70 has the
+          ;; IDENTICAL byte layout to 78 and differs only in signedness, which
+          ;; makes it the cheapest widening available if one is ever wanted.
           [counts-data counts-len] (when off-counts
                                      (le-array-at r (long off-counts) 78))
           ;; `readTypedArray` used to throw on a byte length that is not a
@@ -2147,11 +2173,18 @@
           ;; way it was off a `long[]`: this is now the only O(NODE COUNT) work
           ;; left at open, measured at ~0.8 us on 770 nodes against 0.13 when
           ;; `containers` was materialised.
-          (when (loop [k 1 prev (container-at r ix0 0)]
-                  (if (>= k (long n))
-                    true
-                    (let [c (container-at r ix0 k)]
-                      (if (>= prev c) false (recur (inc k) c)))))
+          ;; `(pos? n)` guards the loop INIT, not just its body: a zero-node
+          ;; index is accepted, and `(container-at r ix0 0)` on one would read
+          ;; `cw` bytes at `containers-data` -- which for a zero-length
+          ;; containers array is the NEXT payload element, not containers. It
+          ;; cannot leave the file and cannot throw, but it is a read the array
+          ;; does not own.
+          (when (or (zero? (long n))
+                    (loop [k 1 prev (container-at r ix0 0)]
+                      (if (>= k (long n))
+                        true
+                        (let [c (container-at r ix0 k)]
+                          (if (>= prev c) false (recur (inc k) c))))))
             ;; One uniform node list. The SEQUENCE is the node at the sentinel
             ;; offset -1: it has no container header on the wire but behaves
             ;; like one, and a sentinel avoids carrying two shapes for the same
@@ -2180,7 +2213,13 @@
                           (count-at r ix0 (long seq-slot))
                           seq-anchors)
                   ix0)))))))
-    (catch Exception _ nil)))
+    ;; THROWABLE, not Exception. This is the one place the reader promises
+    ;; "any failure parsing the frame means scan", and an `Error` walked
+    ;; straight through it: `slot-at` allocating from an unvalidated on-wire
+    ;; count raised OutOfMemoryError out of `get`. That specific case is fixed
+    ;; at its source, but the promise here should not depend on having found
+    ;; every way to raise an Error while parsing bytes somebody else wrote.
+    (catch Throwable _ nil)))
 
 (defn- read-index
   "The offset index sealed onto a CBOR sequence by `boring/write-seq!`, or nil.
@@ -2206,7 +2245,8 @@
   ;; has to cover the probing too.
   (try
     (read-index* nav)
-    (catch Exception _ nil)))
+    ;; Throwable for the same reason as `index-payload` -- see there.
+    (catch Throwable _ nil)))
 
 (defn- read-index* [^Nav nav]
   (let [^Reader r (.rdr nav)

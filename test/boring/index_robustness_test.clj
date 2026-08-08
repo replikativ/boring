@@ -274,8 +274,17 @@
               (assoc (parts) 3 (byte-array 0))]
              ["sorted shorter than containers"
               (parts :sorted [])]
+             ;; `Integer/MAX_VALUE` AT STRIDE 1, not 1000000 at stride 16.
+             ;; The old case allocated 8 MB and passed; `slot-at` allocated
+             ;; `long[m]` from this count BEFORE the bound check that refuses
+             ;; it, so the size of the lie decided whether the test found
+             ;; anything. At stride 1 `anchor-count` returns the count verbatim
+             ;; and the allocation exceeds the VM's array limit on ANY heap --
+             ;; an OutOfMemoryError, which is an Error and so walked through
+             ;; every catch between here and `get`.
              ["count disagrees with the slot's length"
-              (parts :counts [1000000] :pack-counts [3])]
+              (parts :counts [Integer/MAX_VALUE] :pack-counts [3]
+                     :stride 1 :pack-stride 1)]
              ["containers not ascending"
               (parts :containers [5 -1] :counts [3 3]
                      :slots [[5 9 13] [0 4 8]] :sorted [false false])]
@@ -365,6 +374,32 @@
           "trusted must still REFUSE this frame, not merely survive it")
       (is (= 3 (count (into [] (nav/items bs trusted))))
           "trusted must still fall back to scanning, not index into nothing"))))
+
+(deftest containers-are-read-at-either-declared-width
+  (testing "`containers` is emitted as tag 78 when every offset fits in int32
+            and tag 79 when one does not -- narrowest-that-fits, and the CBOR
+            tag IS the declaration. The reader sign-extends whichever it finds.
+
+            THE 64-BIT HALF IS UNREACHABLE FROM A REAL DOCUMENT: it needs an
+            offset past 2 GiB, so nothing in this suite has ever exercised it
+            and a regression there would be invisible. Hand-built here, at both
+            widths, over the same data.
+
+            Sign extension is the part that matters. The sequence node lives at
+            the sentinel offset -1, so a zero-extending read turns it into
+            4294967295 at width 4 and the node is never found at all."
+    (doseq [[label wire] [["tag 78, int32" (int-array [-1])]
+                          ["tag 79, sint64" (long-array [-1])]]]
+      (let [bs (crafted (assoc (parts) 1 wire))
+            src (nav/source bs opts)]
+        (is (accepted? bs opts) (str label ": the frame must be USED, not merely survived"))
+        (is (= 3 (count (into [] (nav/items bs opts))))
+            (str label ": three data items, the frame is not one of them"))
+        (is (= [1 2 3] (mapv #(get (nav/value %) "x") (into [] (nav/items bs opts))))
+            (str label ": and every record reads back through the index"))
+        (is (= {"x" 3} (nav/value (nth (nav/items bs opts) 2)))
+            (str label ": nth reaches the last record via the sentinel node"))
+        (is (some? src) (str label ": source opens"))))))
 
 (deftest a-consistent-crafted-payload-is-still-used
   (testing "the control: validation must reject inconsistency, not everything.
@@ -1229,6 +1264,63 @@
           (is (empty? disagreements)
               (str "frame bytes that make nav disagree with decode-seq: "
                    (vec (take 5 disagreements)))))))))
+
+(deftest no-bit-of-the-frame-can-produce-an-untyped-failure
+  (testing "the promise that survives trusting the index: a damaged frame may
+            give a WRONG ANSWER, but it may not throw something untyped. An
+            `ArrayIndexOutOfBoundsException` or an `OutOfMemoryError` out of
+            `get` is not inside the boundary; a wrong subtree is.
+
+            The sweep above cannot see this class. It flips ONE bit per byte
+            (`0x01`) and then `(catch Throwable _ :err)` and filters `:err`
+            out -- so a byte needing bits 2-6 is never reached, and anything
+            that does throw is discarded as uninteresting. This asserts on the
+            throwable instead of discarding it, and flips every bit.
+
+            What it found: `slot-at` allocated `long[m]` from `count-at` -- a
+            raw sint32 load off the wire -- BEFORE the bound check that refuses
+            it. One flipped bit in the counts array reached 2^31-1, and
+            `OutOfMemoryError` is an Error, so it walked through
+            `index-payload`'s catch, `read-index`'s catch, and out of `get`.
+            Reproduced on a blob boring itself wrote."
+    (let [o (assoc opts :index 1 :index-min 4)
+          doc (into {} (for [i (range 40)] [(format "k%02d" i) i]))
+          ^bytes flat (boring/encode-indexed doc o)
+          ^bytes seq-bs (seal (mapv #(hash-map :id % :name (str "r" %)) (range 60))
+                              (assoc opts :index 1))
+          typed? (fn [t] (and (instance? clojure.lang.ExceptionInfo t)
+                              (keyword? (:type (ex-data t)))
+                              (= "boring" (namespace (:type (ex-data t))))))
+          probe (fn [label ^bytes c f]
+                  (try (f c) nil
+                       (catch Throwable t
+                         (when-not (typed? t)
+                           [label (.getSimpleName (class t)) (.getMessage t)]))))
+          sweep (fn [^bytes clean from ops]
+                  (for [i (range from (alength clean))
+                        bit (range 8)
+                        :let [c (aclone clean)
+                              _ (aset-byte c i (unchecked-byte
+                                                (bit-xor (aget clean i)
+                                                         (bit-shift-left 1 bit))))]
+                        [label f] ops
+                        :let [bad (probe label c f)]
+                        :when bad]
+                    (into [i bit] bad)))
+          flat-bad (sweep flat (long (#'boring.frame/footer-start flat))
+                          [[:get (fn [c] (some-> (get (nav/source c opts) "k39") nav/value))]
+                           [:walk (fn [c] (some-> (nav/walk (nav/source c opts) ["k07"]) nav/value))]
+                           [:value (fn [c] (nav/value (nav/source c opts)))]])
+          seq-bad (sweep seq-bs (long (body-len seq-bs))
+                         [[:items-count (fn [c] (count (nav/items c opts)))]
+                          [:items-reduce (fn [c] (reduce (fn [n _] (inc n)) 0 (nav/items c opts)))]
+                          [:nth (fn [c] (nav/value (nth (nav/items c opts) 30 nil)))]])]
+      (is (empty? flat-bad)
+          (str "untyped failures from an encode-indexed frame: "
+               (vec (take 4 flat-bad))))
+      (is (empty? seq-bad)
+          (str "untyped failures from a write-seq! frame: "
+               (vec (take 4 seq-bad)))))))
 
 (deftest a-lookup-miss-is-re-derived-by-walking
   (testing "Validation proves the FIRST anchor is a real entry and that the
