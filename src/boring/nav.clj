@@ -258,9 +258,33 @@
   shallow `:meta` lookup went from 0.95 us unindexed to 7.5 us indexed.
 
   Deferring it makes an index free for the lookups that do not consult it, and
-  unchanged for the ones that do."
+  unchanged for the ones that do.
+
+  A VOLATILE HOLDING A SENTINEL, not a `delay`. A `Delay`, plus the `volatile`
+  holder its closure needed in order to reach the Nav, cost 112 bytes of the
+  360 a source allocates -- 27% of it -- and were paid on EVERY source,
+  including every document with no index frame at all, which is the common case
+  for a store handing out small blobs. This is 16.
+
+  The holder is gone because it was never necessary: `nav-idx` is handed the
+  Nav, so nothing has to close over a reference to it.
+
+  THREAD SAFETY IS UNCHANGED IN THE WAY THAT MATTERS, and the difference is
+  worth naming. `Delay` is synchronized, so two threads racing here both got
+  one parse; now both may parse and one wins. That is wasteful, not wrong --
+  the parse is deterministic over immutable bytes and yields an immutable
+  Index. And a Nav shared across threads without `fork` is ALREADY the
+  documented hazard: `Reader` carries a mutable `pos`, which is a far worse
+  race than a duplicated parse. `fork-nav` forces this before sharing, so
+  forks are unaffected."
   [^Nav n]
-  (when-let [d (.idx n)] @d))
+  (when-let [v (.idx n)]
+    (let [x @v]
+      (if (identical? ::unparsed x)
+        (let [parsed (read-index n)]
+          (vreset! v parsed)
+          parsed)
+        x))))
 
 (defn- node-slot
   "Position of the index node covering the container at `off`, or -1.
@@ -432,15 +456,13 @@
     ;; `:trust-index :ignore` skips the index entirely and scans. The scan is
     ;; the reference implementation the indexed paths are checked against, so
     ;; this is the one setting whose correctness needs no separate argument.
-    (let [holder (volatile! nil)
-          ;; A DELAY. Detection is deferred with the parse: a document with no
-          ;; frame costs nothing to find that out, and one with a frame pays
-          ;; only if something consults it.
-          idx (when-not (= :ignore (:trust-index opts))
-                (delay (read-index @holder)))
-          nav (Nav. r opts probes idx src (volatile! nil))]
-      (vreset! holder nav)
-      nav)))
+    ;; A VOLATILE HOLDING A SENTINEL. Detection is deferred with the parse: a
+    ;; document with no frame costs nothing to find that out, and one with a
+    ;; frame pays only if something consults it. See `nav-idx` for why this is
+    ;; not a `delay` any more -- 96 bytes per source, on every source.
+    (Nav. r opts probes
+          (when-not (= :ignore (:trust-index opts)) (volatile! ::unparsed))
+          src (volatile! nil))))
 
 (defn- fork-nav ^Nav [^Nav n]
   (let [src (.src n)
@@ -468,7 +490,7 @@
     ;; forking thread keeps the sharing -- 145 us for a 20 000-item index --
     ;; without the aliasing.
     (let [ix (nav-idx n)]
-      (Nav. r (.opts n) (atom {}) (when ix (delay ix)) src (volatile! nil)))))
+      (Nav. r (.opts n) (atom {}) (volatile! ix) src (volatile! nil)))))
 
 (defn source
   "A navigable view over `src` -- a byte[], or a ByteSource such as
