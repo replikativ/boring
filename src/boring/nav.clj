@@ -2347,7 +2347,14 @@
                        ;; while `decode-seq`, `footer-start` and `index-frame?`
                        ;; all refused it: one file, two logical contents, and
                        ;; the disagreement decided by which API you called.
-                       (.bytesEqualAt r ptr frame/prefix-array)
+                       (.bytesEqualAt r ptr frame/prefix-head-array)
+                       ;; The payload's array head separately, because six
+                       ;; through fifteen elements all count as a frame -- see
+                       ;; `frame/payload-count-bytes`. Only the first six are
+                       ;; read; the rest are skipped by `payload-offsets`,
+                       ;; which never visits them.
+                       (contains? frame/payload-count-bytes
+                                  (.byteAt r (+ ptr frame/prefix-head-length)))
                        ;; The frame must END EXACTLY AT THE FILE'S END.
                        ;;
                        ;; Without this, concatenating two sealed sequences lost

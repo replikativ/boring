@@ -1734,8 +1734,11 @@
   use. Deltas and absolutes are indistinguishable on the wire, which is why this
   had to land before the format was published rather than after.
 
-  THE PAYLOAD IS STILL SIX ELEMENTS, so `boring.frame/prefix-bytes` -- whose
-  trailing `0x86` is that count -- is unchanged. A reader too old for this shape
+  THE PAYLOAD IS SIX ELEMENTS, which is what `boring.frame/prefix-bytes`
+  emits. Readers accept six THROUGH FIFTEEN -- see
+  `boring.frame/payload-count-bytes` -- so that a future widening is
+  RECOGNISED rather than republished as a trailing data item; nothing here
+  writes more than six. A reader too old for this shape
   finds a byte string where it expects an array, fails its own structure check
   and scans, which is the documented answer for an index it cannot use. A reader
   new enough finds an array where it expects a byte string and does the same.

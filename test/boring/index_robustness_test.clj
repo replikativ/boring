@@ -1200,7 +1200,18 @@
             an index and reported 1. Which answer you got depended on which API
             you called.
 
-            All four now compare the same seventeen-byte constant."
+            All four now agree on the same gate: sixteen fixed bytes plus an
+            array head of six THROUGH FIFTEEN elements.
+
+            THE ANSWER HAS CHANGED, deliberately. A widened payload used to be
+            refused by every gate, which sounds safe and is not: a reader that
+            does not RECOGNISE a frame never learns `data-end`, so it
+            republishes the frame as a trailing DATA item and a file of N
+            records reads back as N+1. Refusing to USE an index is safe;
+            refusing to SEE one is not. So readers from this version on treat a
+            seven-element frame as a frame -- bounded, index used or refused on
+            its own merits -- and the property asserted here is unchanged: nav
+            and decode-seq must give the SAME answer."
     (let [v (vec (for [i (range 40)] {:e i :a :n/x :v (str "v" i)}))
           good (boring/encode-indexed v {:index 4 :index-min 4})
           ;; Widen the payload header from 0x86 to 0x87 and splice one more
@@ -1222,13 +1233,16 @@
         (is (not= -1 p) "the genuine file has a locatable footer")
         (is (= 1 (count (boring/decode-seq good))))
         (is (= 1 (count (nav/items good)))))
-      (testing "and the crafted one is refused by both"
-        (is (= -1 (#'boring.frame/footer-start bad))
-            "the byte-level gate refuses it")
+      (testing "and the widened one is RECOGNISED by both, identically"
+        (is (not= -1 (#'boring.frame/footer-start bad))
+            "the byte-level gate accepts six-through-fifteen elements")
         (is (= (count (boring/decode-seq bad)) (count (nav/items bad)))
             "nav and decode-seq report the same number of items")
-        (is (= 2 (count (nav/items bad)))
-            "namely two -- the data and the thing that is not a frame")))))
+        (is (= 1 (count (nav/items bad)))
+            "namely ONE -- the data. The frame is metadata, not a phantom
+             trailing item, which is the whole reason to recognise it")
+        (is (= (first (boring/decode-seq good)) (first (boring/decode-seq bad)))
+            "and the data itself is untouched by the widening")))))
 
 ;; ---------------------------------------------------------------- audit 9
 ;;
