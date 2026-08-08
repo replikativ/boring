@@ -279,7 +279,7 @@ a cursor implements `ILookup`, `clojure.core/get-in` works on it directly for
 ;; :stringref false at WRITE time — see below; it is not optional
 (def bs (boring/encode customers {:stringref false}))
 
-(def c (nav/source bs))
+(def c (nav/root bs))
 (nav/value (get-in c ["customer-137" "name"]))   ; => "name-137"
                                                  ; the other 199 are never built
 ```
@@ -294,7 +294,7 @@ missing, truncated or stale index falls back to scanning.
 (def ibs (boring/encode-indexed customers))
 
 (boring/decode ibs)                              ; => the map, unchanged
-(nav/value (get-in (nav/source ibs) ["customer-137" "name"]))   ; => "name-137"
+(nav/value (get-in (nav/root ibs) ["customer-137" "name"]))   ; => "name-137"
 ```
 
 The result is a two-item CBOR sequence — the value, then the index — so

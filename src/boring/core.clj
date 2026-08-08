@@ -699,10 +699,10 @@
 (defn decode-at
   "Decode the CBOR item starting at byte offset `off` in `src`.
 
-  `decode` is this with `off` 0. The companion of `boring.nav/source-at`, for
+  `decode` is this with `off` 0. The companion of `boring.nav/cursor`, for
   the same reason: a format that puts a header, a length or another item in
   front of the one you want should not have to nest it in a container purely so
-  it can be found. See `source-at` for the case that motivated both.
+  it can be found. See `boring.nav/cursor` for the case that motivated both.
 
   `off` is TRUSTED. A wrong offset lands mid-item and decodes whatever the
   bytes there happen to encode -- bounded by the source, so it cannot read past
@@ -773,7 +773,7 @@
   false by default. The default profile writes stringref, and `boring.nav`
   categorically refuses a stringref document -- a stringref is an index into a
   table built from every preceding string, which a cursor holding only an offset
-  cannot resolve. So `(nav/source (encode-indexed v))` threw
+  cannot resolve. So `(nav/root (encode-indexed v))` threw
   `:boring/stringref-not-navigable` on the very shape this function's docstring
   recommends. Every test passed `{:stringref false}` or a sorting profile, so the
   advertised default was the one path never exercised.
@@ -1385,7 +1385,7 @@
                     ;; 0. It is no longer always 0: an item embedded at an
                     ;; offset -- konserve-lmdb's split blob puts its value after
                     ;; a five-byte header -- needs its index expressed in the
-                    ;; enclosing buffer's coordinates, or `nav/source-at` finds
+                    ;; enclosing buffer's coordinates, or `nav/cursor` finds
                     ;; a frame whose every offset is wrong by the prefix.
                     ^longs kept (if (zero? base)
                                   kept

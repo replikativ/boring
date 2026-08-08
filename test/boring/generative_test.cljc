@@ -409,7 +409,7 @@
                                gen-value {:max-elements 6})]
                    (let [opts {:stringref false}
                          bs (boring/encode v opts)
-                         c (boring.nav/source bs opts)
+                         c (boring.nav/root bs opts)
                          decoded (boring/decode bs opts)]
                      (every? (fn [path]
                                (let [cur (get-in c path)]
@@ -424,7 +424,7 @@
      (prop/for-all [v (gen/map gen/string-ascii gen-value {:max-elements 5})]
                    (let [opts {:stringref false}
                          bs (boring/encode v opts)
-                         c (boring.nav/source bs opts)]
+                         c (boring.nav/root bs opts)]
                      (every? (fn [k]
                                (let [cur (get c k)]
                                  (c/equiv? (boring/decode (boring.nav/raw-bytes cur) opts)
@@ -437,7 +437,7 @@
    (defspec cursor-count-agrees 300
      (prop/for-all [v (gen/map gen/string-ascii gen-value {:max-elements 6})]
                    (let [opts {:stringref false}
-                         c (boring.nav/source (boring/encode v opts) opts)]
+                         c (boring.nav/root (boring/encode v opts) opts)]
                      (and (= (count c) (count v))
               ;; Only where the WIRE says container -- see nav-paths.
                           (every? (fn [k]
@@ -454,7 +454,7 @@
    (defspec cursor-reduce-agrees-and-short-circuits 200
      (prop/for-all [v (gen/map gen/string-ascii gen/large-integer {:max-elements 6})]
                    (let [opts {:stringref false}
-                         c (boring.nav/source (boring/encode v opts) opts)
+                         c (boring.nav/root (boring/encode v opts) opts)
                          via-nav (reduce (fn [acc e] (assoc acc (key e) (boring.nav/value (val e))))
                                          {} c)
                          first-key (reduce (fn [_ e] (reduced (key e))) nil c)]

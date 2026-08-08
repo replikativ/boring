@@ -196,7 +196,7 @@
           w (boring/writer 64 o)]
       (boring/write-indexed! w v out {:index 16})
       (let [bs (.toByteArray out)
-            c (nav/source bs o)]
+            c (nav/root bs o)]
         (is (= {:v 499} (nav/value (get c "key-499"))))
         (is (= v (nav/value c)))
         (is (= v (boring/decode bs o)) "and `decode` still returns the value")

@@ -107,6 +107,41 @@ here.
 
 ### Changed
 
+- **BREAKING: `boring.nav/source` returns a *source*, not a root cursor.**
+  `(nav/root bs opts)` is what it used to be, and is what you want for `get`,
+  `seq`, `walk` and friends.
+
+  The split names a concept the namespace did not have. A **source** is the
+  document — the bytes, the reader over them, the index, the shape cache. A
+  **cursor** is a position inside one. Without that distinction an
+  allocation-free field lookup has to take a cursor and *ignore* its offset,
+  which is both meaningless and a trap.
+
+  The rule: **a cursor is a position you can hold; an offset is a position you
+  can only use.** Exploring, holding, printing, `get`-ing, `seq`-ing — cursors.
+  Inside a loop whose trip count is the size of your data — the source and its
+  offsets, where a million-row projection allocates 0.62 GB through cursors and
+  none at all through offsets.
+
+  A source implements no collection interface, and `get` on one *throws* rather
+  than answering nil — because `clojure.core/get` returns nil for anything that
+  is not `ILookup`, and a silently empty projection is exactly what this change
+  must not cause.
+
+  `source-at` is deprecated in favour of `cursor`, which is the same function
+  under a name that says what it returns. New: `root`, `cursor`, `offset`,
+  `source-of`. The bridge is exact — `(cursor (source-of c) (offset c))` is
+  `c`, for everything except a shaped row, whose `shape` is cursor state an
+  offset cannot carry.
+
+- **`boring.nav/re-point!`** — point an existing source at different bytes and
+  get its root cursor back, reusing the reader, the nav, the probe cache and
+  the cursor. A scan over many blobs then allocates nothing per row. It is
+  sharp on purpose: cursors previously taken from that source now address the
+  new bytes, so it is for a loop that finishes with each document before
+  starting the next, and it must not be shared across threads even by the
+  standards of the rest of the namespace.
+
 - **BREAKING: the index frame is a trust boundary, and a corrupt one may now
   change an answer.** boring previously promised that *a missing, stale,
   truncated or randomly corrupt index may cost speed; it may not change an

@@ -70,8 +70,8 @@
    ["decode-with"     #(boring/decode-with (boring/reader (byte-array 0) opts) bs)]
    ["decode-seq"      #(doall (boring/decode-seq bs opts))]
    ["decode-seq-from" #(doall (boring/decode-seq-from (stream-of bs) opts))]
-   ["nav/value"       #(nav/value (nav/source bs))]
-   ["nav/children"    #(doall (map nav/value (nav/children (nav/source bs))))]])
+   ["nav/value"       #(nav/value (nav/root bs))]
+   ["nav/children"    #(doall (map nav/value (nav/children (nav/root bs))))]])
 
 (deftest shallow-input-decodes-on-every-path
   (testing "the control. Without it, a suite asserting 'this throws typed' can
@@ -113,7 +113,7 @@
   (testing "the StackOverflowError branch used to drop the throwable it caught,
             which left a caller unable to tell a document that nests too deep
             from their own recursion overflowing inside a nav traversal"
-    (let [r (on-small-stack #(nav/value (nav/source (tag-chain 1000))))
+    (let [r (on-small-stack #(nav/value (nav/root (tag-chain 1000))))
           t (:threw r)]
       (when (instance? clojure.lang.ExceptionInfo t)
         (is (= :boring/max-depth-exceeded (:type (ex-data t))))

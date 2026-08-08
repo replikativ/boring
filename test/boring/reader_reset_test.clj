@@ -144,15 +144,15 @@
           blob (byte-array (+ 5 (alength ^bytes a) (alength ^bytes c)))]
       (System/arraycopy a 0 blob 5 (alength ^bytes a))
       (System/arraycopy c 0 blob (+ 5 (alength ^bytes a)) (alength ^bytes c))
-      (is (= 1 (nav/value (get (nav/source-at blob 5 opts) :aaa))))
-      (is (= "x" (nav/value (get (nav/source-at blob 5 opts) :bbb))))
+      (is (= 1 (nav/value (get (nav/cursor blob 5 opts) :aaa))))
+      (is (= "x" (nav/value (get (nav/cursor blob 5 opts) :bbb))))
       (let [second-off (+ 5 (alength ^bytes a))]
-        (is (= [1 2 3] (nav/value (get (nav/source-at blob second-off opts) :ccc))))
-        (is (= :e (nav/value (get (nav/source-at blob second-off opts) :ddd)))))
+        (is (= [1 2 3] (nav/value (get (nav/cursor blob second-off opts) :ccc))))
+        (is (= :e (nav/value (get (nav/cursor blob second-off opts) :ddd)))))
       (testing "and realising the whole item at an offset equals decoding it alone"
-        (is (= {:aaa 1 :bbb "x"} (nav/value (nav/source-at blob 5 opts))))))))
+        (is (= {:aaa 1 :bbb "x"} (nav/value (nav/cursor blob 5 opts))))))))
 
 (deftest source-at-zero-is-source
   (let [bs (b/encode {:a 1 :b [2 3]} opts)]
-    (is (= (nav/value (nav/source bs opts))
-           (nav/value (nav/source-at bs 0 opts))))))
+    (is (= (nav/value (nav/root bs opts))
+           (nav/value (nav/cursor bs 0 opts))))))

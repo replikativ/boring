@@ -95,7 +95,7 @@
             m (reduce (fn [^java.util.LinkedHashMap a k]
                         (doto a (.put k (subs k 1))))
                       (java.util.LinkedHashMap.) ks)
-            c (nav/source (boring/encode-indexed m (assoc opts :index 16 :index-min 16))
+            c (nav/root (boring/encode-indexed m (assoc opts :index 16 :index-min 16))
                           opts)]
         (doseq [k ks]
           (is (= (subs k 1) (some-> (get c k) nav/value))
@@ -206,7 +206,7 @@
                                                 0xFF))))
           (is (= 21 (count (into [] (nav/items broken opts))))
               "scans: 20 data items plus the unrecognised index frame")
-          (is (some? (nav/source broken opts))
+          (is (some? (nav/root broken opts))
               "and `source` returns rather than throwing"))))))
 
 ;; ---------------------------------------------------------------- finding 6
@@ -246,7 +246,7 @@
   data -- which is why an item count alone cannot tell them apart, and why every
   case here asserts this too."
   [^bytes bs o]
-  (let [c (nav/source bs o)
+  (let [c (nav/root bs o)
         ix (#'nav/nav-idx (.nav ^boring.nav.Cursor c))]
     (some? (:containers ix))))
 
@@ -331,15 +331,15 @@
                                              [i {:k (str i)} [i i]]))  [89 1 :k]]
                ["empty array"         [[] [] []]                   [1]]]]
         (let [bs (boring/encode-indexed v (assoc opts :index 16 :index-min 4))
-              reach (fn [o] (nav/value (reduce #(get %1 %2) (nav/source bs o) path)))]
+              reach (fn [o] (nav/value (reduce #(get %1 %2) (nav/root bs o) path)))]
           (is (= (get-in v path) (reach opts)) (str label ": validated path"))
           (is (= (get-in v path) (reach trusted)) (str label ": trusted path"))
           ;; whole-document realisation too, not just the one path -- a skipped
           ;; check that corrupted `:total` or `:data-end` shows up here first
-          (is (= v (nav/value (nav/source bs trusted)))
+          (is (= v (nav/value (nav/root bs trusted)))
               (str label ": trusted realises the whole document unchanged"))
-          (is (= (nav/value (nav/source bs opts))
-                 (nav/value (nav/source bs trusted)))
+          (is (= (nav/value (nav/root bs opts))
+                 (nav/value (nav/root bs trusted)))
               (str label ": the two settings must not disagree")))))))
 
 (deftest a-tagged-container-is-realised-not-navigated
@@ -359,7 +359,7 @@
           "a sorted-map must encode as a tag")
       (doseq [[label bs] [["bare" bare] ["tagged" tagged]]
               trust [:trusted :ignore]]
-        (let [s (nav/source bs (assoc opts :trust-index trust))]
+        (let [s (nav/root bs (assoc opts :trust-index trust))]
           (is (= 0 (nav/value (get s "f000"))) (str label " " trust " first key"))
           (is (= 59 (nav/value (get s "f059"))) (str label " " trust " last key"))
           (is (nil? (get s "nope")) (str label " " trust " absent key")))))))
@@ -463,7 +463,7 @@
                               ["counts tag 78, int32" 2 (int-array [3])]
                               ["counts tag 79, sint64" 2 (long-array [3])]]]
       (let [bs (crafted (assoc (parts) idx wire))
-            src (nav/source bs opts)]
+            src (nav/root bs opts)]
         (is (accepted? bs opts) (str label ": the frame must be USED, not merely survived"))
         (is (= 3 (count (into [] (nav/items bs opts))))
             (str label ": three data items, the frame is not one of them"))
@@ -589,15 +589,15 @@
     (let [reg (-> (boring/tag-registry) (boring/register-record-class Widget))
           o {:stringref false :registry reg}
           bs (boring/encode {"w" (->Widget 1 2)} o)]
-      (is (= (boring/decode bs o) (nav/value (nav/source bs o)))
+      (is (= (boring/decode bs o) (nav/value (nav/root bs o)))
           "nav must realise exactly what decode returns")
-      (is (instance? Widget (nav/value (get (nav/source bs o) "w")))
+      (is (instance? Widget (nav/value (get (nav/root bs o) "w")))
           "and a registered record must come back as the record type"))
     (testing "and :max-depth is enforced rather than ignored"
       (let [deep (reduce (fn [acc _] [acc]) [] (range 40))
             bs (boring/encode deep {:stringref false})]
         (is (thrown? clojure.lang.ExceptionInfo
-                     (nav/value (nav/source bs {:stringref false :max-depth 4}))))))))
+                     (nav/value (nav/root bs {:stringref false :max-depth 4}))))))))
 
 (deftest a-failed-read-does-not-poison-the-readers-depth
   (testing "`enter()` incremented before throwing, and only array/map unwind it
@@ -763,7 +763,7 @@
                                                                [(format "k%02d" i) i]))}
             o (assoc opts :index stride :index-min 0)
             idx (boring/build-index (boring/encode v o) o)
-            c (nav/source (boring/encode-indexed v o) opts)]
+            c (nav/root (boring/encode-indexed v o) opts)]
         (is (some? idx) "the index must be BUILT, not silently refused -- a
                          `when` here made every assertion below vanish")
         (doseq [[cnt slot] (map vector (seq ^ints (:counts idx)) (:slots idx))]
@@ -1018,7 +1018,7 @@
             o (assoc prof :max-depth md)
             decoded? (try (boring/decode bs o) true (catch Exception _ false))]
         (when decoded?
-          (is (some? (try (nav/byte-span (nav/source bs o))
+          (is (some? (try (nav/byte-span (nav/root bs o))
                           (catch Exception _ nil)))
               (str (pr-str v) " shapes=" shapes? " max-depth=" md
                    ": decodes, so it must navigate")))))))
@@ -1166,7 +1166,7 @@
           (let [c (java.util.Arrays/copyOf ^bytes bs (alength ^bytes bs))]
             (aset-byte c i (unchecked-byte v))
             (doseq [k ["k00" "k07" "k19" "nope"]]
-              (is (try (some-> (get (nav/source c opts) k) nav/value) true
+              (is (try (some-> (get (nav/root c opts) k) nav/value) true
                        (catch clojure.lang.ExceptionInfo _ true)
                        (catch Throwable t
                          (println "  untyped" (.getSimpleName (class t))
@@ -1212,7 +1212,7 @@
               v [0x9F 0xBF 0xFB 0xD9 0x5F]]
         (let [c (java.util.Arrays/copyOf bs (alength bs))]
           (aset-byte c i (unchecked-byte v))
-          (is (try (nav/value (nav/source c opts)) true
+          (is (try (nav/value (nav/root c opts)) true
                    (catch clojure.lang.ExceptionInfo _ true)
                    (catch Throwable _ false))
               (str "byte " i " -> " v " must be typed or fine, never untyped")))))))
@@ -1402,9 +1402,9 @@
                         :when bad]
                     (into [i bit] bad)))
           flat-bad (sweep flat (long (#'boring.frame/footer-start flat))
-                          [[:nth-deep (fn [c] (some-> (nav/walk (nav/source c opts) [59 "k2"]) nav/value))]
-                           [:nth-mid (fn [c] (some-> (nav/walk (nav/source c opts) [37 "k1"]) nav/value))]
-                           [:value (fn [c] (nav/value (nav/source c opts)))]])
+                          [[:nth-deep (fn [c] (some-> (nav/walk (nav/root c opts) [59 "k2"]) nav/value))]
+                           [:nth-mid (fn [c] (some-> (nav/walk (nav/root c opts) [37 "k1"]) nav/value))]
+                           [:value (fn [c] (nav/value (nav/root c opts)))]])
           seq-bad (sweep seq-bs (long (body-len seq-bs))
                          [[:items-count (fn [c] (count (nav/items c opts)))]
                           [:items-reduce (fn [c] (reduce (fn [n _] (inc n)) 0 (nav/items c opts)))]
@@ -1463,12 +1463,12 @@
                  (vec (take 6 (#'boring.nav/slot-at (.rdr nv) ix 0))))
               "and anchor[2] really is one byte off")))
       (testing "yet every present key still reads back correctly"
-        (let [src (nav/source damaged o)]
+        (let [src (nav/root damaged o)]
           (doseq [i (range 40)]
             (is (= i (some-> (get src (format "k%02d" i)) nav/value))
                 (format "k%02d" i)))))
       (testing "and an absent key is still absent"
-        (is (nil? (get (nav/source damaged o) "nope")))))))
+        (is (nil? (get (nav/root damaged o) "nope")))))))
 
 ;; ------------------------------------------ the property, not another case
 ;;
@@ -1623,7 +1623,7 @@
   that -- which is how a many-node index can be badly wrong and still look
   fine."
   [^bytes bs paths o]
-  (try (let [src (nav/source bs o)]
+  (try (let [src (nav/root bs o)]
          {:ok (mapv (fn [p] (some-> (nav/walk src p) nav/value)) paths)})
        (catch clojure.lang.ExceptionInfo e {:typed (:type (ex-data e))})
        (catch Throwable t {:untyped (class t)})))
@@ -1697,7 +1697,7 @@
       ;; byte offset into the frame and there is nothing to `alength`.
       (is (< 1 (long (:containers ix)))
           "and has many nodes, which is the whole point of this fixture")
-      (is (= 1907 (some-> (nav/walk (nav/source clean o) [19 "k07"]) nav/value))
+      (is (= 1907 (some-> (nav/walk (nav/root clean o) [19 "k07"]) nav/value))
           "and a mid-stride key in a middle node reads correctly"))))
 
 (deftest a-sequence-node-claiming-no-items-must-be-backed-by-no-data
@@ -1752,8 +1752,8 @@
   (testing "`lookup-map`'s indexed branch, which nothing depended on"
     (let [o {:profile :canonical}
           m (into {} (for [i (range 200)] [(format "k%03d" i) i]))
-          indexed (nav/source (boring/encode-indexed m (assoc o :index 8 :index-min 8)) o)
-          plain (nav/source (boring/encode m o) o)]
+          indexed (nav/root (boring/encode-indexed m (assoc o :index 8 :index-min 8)) o)
+          plain (nav/root (boring/encode m o) o)]
       (testing "both find the key -- the index changes the work, not the answer"
         (is (= 150 (nav/value (get indexed "k150"))))
         (is (= 150 (nav/value (get plain "k150")))))
@@ -1770,8 +1770,8 @@
   (testing "`nth-item`'s indexed branch, which nothing depended on either"
     (let [o {:profile :canonical}
           v (vec (range 200))
-          indexed (nav/source (boring/encode-indexed v (assoc o :index 8 :index-min 8)) o)
-          plain (nav/source (boring/encode v o) o)]
+          indexed (nav/root (boring/encode-indexed v (assoc o :index 8 :index-min 8)) o)
+          plain (nav/root (boring/encode v o) o)]
       (testing "both reach the element"
         (is (= 150 (nav/value (nth indexed 150))))
         (is (= 150 (nav/value (nth plain 150)))))
@@ -1820,7 +1820,7 @@
               (str label " at stride " stride ": the two builders must agree byte for byte"))
           (is (= expect-nodes (nodes w))
               (str label ": and the index must be non-trivial -- " expect-nodes " nodes"))
-          (is (= (nav/value (nav/source c o)) (nav/value (nav/source (boring/encode v o) o)))
+          (is (= (nav/value (nav/root c o)) (nav/value (nav/root (boring/encode v o) o)))
               (str label ": and both must read back as the plain encoding")))))))
 
 (deftest the-two-index-builders-agree-across-profiles-strides-and-frames
@@ -1897,8 +1897,8 @@
               (str tag ": and therefore the same file, byte for byte"))
           ;; Both must still READ as the plain value, so a builder cannot be
           ;; made to agree by making both of them wrong.
-          (is (= (nav/value (nav/source c o))
-                 (nav/value (nav/source (boring/encode v o) o)))
+          (is (= (nav/value (nav/root c o))
+                 (nav/value (nav/root (boring/encode v o) o)))
               (str tag ": and the file must read back as the plain encoding")))))))
 
 (deftest indexed-and-unindexed-agree-across-shapes
@@ -1912,8 +1912,8 @@
             profile [:canonical :clojure]]
       (let [o (cond-> {:profile profile} (= profile :clojure) (assoc :stringref false))
             m (into {} (for [i (range n)] [(format "k%04d" i) i]))
-            ix (nav/source (boring/encode-indexed m (assoc o :index stride :index-min 1)) o)
-            pl (nav/source (boring/encode m o) o)]
+            ix (nav/root (boring/encode-indexed m (assoc o :index stride :index-min 1)) o)
+            pl (nav/root (boring/encode m o) o)]
         (doseq [k (keys m)]
           (is (= (some-> (get ix k) nav/value) (some-> (get pl k) nav/value))
               (str "map n=" n " stride=" stride " " profile " key " k)))
@@ -1921,8 +1921,8 @@
             (str "map n=" n " stride=" stride " " profile ": and an absent key stays absent")))
       (let [o (cond-> {:profile profile} (= profile :clojure) (assoc :stringref false))
             v (vec (range n))
-            ix (nav/source (boring/encode-indexed v (assoc o :index stride :index-min 1)) o)
-            pl (nav/source (boring/encode v o) o)]
+            ix (nav/root (boring/encode-indexed v (assoc o :index stride :index-min 1)) o)
+            pl (nav/root (boring/encode v o) o)]
         (dotimes [i n]
           (is (= (nav/value (nth ix i)) (nav/value (nth pl i)))
               (str "vec n=" n " stride=" stride " " profile " idx " i)))))))
@@ -1943,7 +1943,7 @@
     (let [o {:profile :canonical}
           m (into {} (for [i (range 200)] [(format "k%03d" i) i]))
           bs (boring/encode-indexed m (assoc o :index 8 :index-min 8))
-          walked (fn [opts k] (let [c (nav/source bs opts)]
+          walked (fn [opts k] (let [c (nav/root bs opts)]
                                 (nav/skips c 0)
                                 [(nav/value (get c k)) (nav/skips c)]))
           [tv trusted-skips] (walked o "k150")
@@ -1955,7 +1955,7 @@
         (is (< (* 4 trusted-skips) scan-skips)
             (str "trusted " trusted-skips " skips, ignored " scan-skips)))
       (testing "and every key still reads back under `:ignore`"
-        (let [c (nav/source bs (assoc o :trust-index :ignore))]
+        (let [c (nav/root bs (assoc o :trust-index :ignore))]
           (doseq [i (range 0 200 17)]
             (is (= i (nav/value (get c (format "k%03d" i))))))))
       (testing "an unimplemented or misspelt value is refused rather than
@@ -1964,7 +1964,7 @@
                 be worse than not offering it"
         (doseq [bad [:validate :nope "trusted" nil]]
           (is (= :boring/bad-option
-                 (try (do (nav/source bs (assoc o :trust-index bad)) nil)
+                 (try (do (nav/root bs (assoc o :trust-index bad)) nil)
                       (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
               (pr-str bad)))))))
 
@@ -1977,13 +1977,13 @@
           o {:stringref false}
           bs (boring/encode-indexed m (assoc o :index 16))]
       (doseq [k (map #(format "k%03d" %) (range 200))]
-        (is (= (some-> (get (nav/source bs o) k) nav/value)
-               (some-> (get (nav/source bs (assoc o :trust-index :trusted)) k)
+        (is (= (some-> (get (nav/root bs o) k) nav/value)
+               (some-> (get (nav/root bs (assoc o :trust-index :trusted)) k)
                        nav/value))
             (str "trusted and validated must agree on " k)))
       (testing "and an absent key is absent under both"
-        (is (nil? (get (nav/source bs o) "nope")))
-        (is (nil? (get (nav/source bs (assoc o :trust-index :trusted)) "nope")))))))
+        (is (nil? (get (nav/root bs o) "nope")))
+        (is (nil? (get (nav/root bs (assoc o :trust-index :trusted)) "nope")))))))
 
 (deftest validation-is-per-node-not-per-index
   (testing "an unsound node must not disable the index for containers that are
@@ -1993,7 +1993,7 @@
              "b" (into {} (for [i (range 40)] [(format "b%02d" i) i]))}
           o {:stringref false}
           bs (boring/encode-indexed m (assoc o :index 4 :index-min 4))
-          src (nav/source bs o)]
+          src (nav/root bs o)]
       ;; Both containers read correctly, and the index carries a node for each.
       ;;
       ;; This used to assert `(some? (:node-checked ix))` -- that the index
@@ -2023,7 +2023,7 @@
                          ["shapes" {:stringref false :shapes true}]
                          ["indexed" {:stringref false :index 4 :index-min 4}]]]
         (let [bs (if (:index o) (boring/encode-indexed v o) (boring/encode v o))
-              rows (get (nav/source bs o) :rows)]
+              rows (get (nav/root bs o) :rows)]
           (doseq [i (range 40)]
             (is (= {:e i :v (str "val-" i)} (nav/value (get rows i)))
                 (str label ": get " i))
@@ -2040,7 +2040,7 @@
   (testing "the shape a consumer actually writes"
     (let [v {:a {:b [{:c 1} {:c 2} {:c 3}]}}
           o {:stringref false}
-          src (nav/source (boring/encode v o) o)]
+          src (nav/root (boring/encode v o) o)]
       (is (= 2 (nav/value (-> src (get :a) (get :b) (get 1) (get :c))))))))
 
 (defn- counting-source
@@ -2110,7 +2110,7 @@
           ropts {:stringref false :trust-index :trusted}
           reads (fn [x k]
                   (let [c (atom 0)
-                        v (nav/value (get (nav/source (counting-source x c) ropts) k))]
+                        v (nav/value (get (nav/root (counting-source x c) ropts) k))]
                     [v @c]))]
       (testing "every answer is what the unindexed document gives"
         (doseq [k [:a :b :c :d :absent]]

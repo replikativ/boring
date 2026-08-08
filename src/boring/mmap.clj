@@ -145,7 +145,7 @@
    (let [arena (Arena/ofShared)]
      (try
        (let [seg (sub-segment (mmap-segment file arena) opts)]
-         [(nav/source (segment-source seg) opts) arena])
+         [(nav/root (segment-source seg) opts) arena])
        (catch Throwable t
          (.close ^java.lang.AutoCloseable arena)
          (throw t))))))

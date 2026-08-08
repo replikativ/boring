@@ -244,7 +244,7 @@
           ;; positionally to find each node's slot, and those are `skipFrom`
           ;; calls too. What is being compared here is lookup work.
           probe (fn [^bytes bs ^long off]
-                  (let [c (nav/source-at bs off o)
+                  (let [c (nav/cursor bs off o)
                         nv (.nav ^boring.nav.Cursor c)
                         ^Reader r (.rdr ^boring.nav.Nav nv)
                         _ (#'nav/nav-idx nv)

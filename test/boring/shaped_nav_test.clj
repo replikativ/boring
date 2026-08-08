@@ -47,7 +47,7 @@
 
 (deftest a-shaped-array-navigates-as-the-vector-of-maps-it-realises-to
   (let [bs (shaped records)
-        c (nav/source bs trusted)]
+        c (nav/root bs trusted)]
     (is (tagged? bs) "the writer must have shaped this, or the test proves nothing")
     (testing "the array itself"
       (is (= (count records) (count c)))
@@ -77,8 +77,8 @@
             keys and indexes that are absent."
     (doseq [n [0 1 2 7 200]]
       (let [v (subvec records 0 n)
-            cs (nav/source (shaped v) trusted)
-            cp (nav/source (plain v) trusted)]
+            cs (nav/root (shaped v) trusted)
+            cp (nav/root (plain v) trusted)]
         (is (= (nav/value cp) (nav/value cs)) (str n ": whole value"))
         (is (= (count cp) (count cs)) (str n ": count"))
         (dotimes [i n]
@@ -107,7 +107,7 @@
             they had none. Sets keep `get`-as-membership semantics that no
             structural descent reproduces, so they are the honest case."
     (let [bs (boring/encode-indexed #{1 2 3} opts)
-          c (nav/source bs trusted)]
+          c (nav/root bs trusted)]
       (is (= #{1 2 3} (nav/value c)))
       (is (= 1 (nav/value (get c 1))) "membership still answers through realising")
       (is (nil? (get c 99)) "and a non-member is absent")
@@ -125,7 +125,7 @@
         0 25)]
    (let [v (vec ms)
          bs (shaped v)
-         c (nav/source bs trusted)]
+         c (nav/root bs trusted)]
      (and (= v (nav/value c))
           (= (count v) (count c))
           (= v (mapv nav/value (seq c)))

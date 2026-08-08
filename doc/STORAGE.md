@@ -38,7 +38,7 @@ from being built — so `nav/value` at the end:
                           [(str "customer-" i) {"name" (str "name-" i)}])))
 
 (def bs (boring/encode customers {:stringref false}))   ; at WRITE time
-(def c (nav/source bs))
+(def c (nav/root bs))
 (nav/value (get-in c ["customer-137" "name"]))          ; => "name-137"
 ```
 

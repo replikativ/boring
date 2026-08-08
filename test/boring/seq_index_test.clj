@@ -337,7 +337,7 @@
           m (into {} (for [i (range 40)]
                        [(format "k%03d" i)
                         (if (= i 20) (apply str (repeat 50000 \z)) i)]))
-          c (nav/source (boring/encode-indexed m (assoc o :index 4 :index-min 8)) o)]
+          c (nav/root (boring/encode-indexed m (assoc o :index 4 :index-min 8)) o)]
       (doseq [k (keys m)]
         (is (= (get m k) (nav/value (get c k))) (str "key " k))))))
 
@@ -362,8 +362,8 @@
     (doseq [o [sorted-opts opts]]
       (let [plain (boring/encode wide-map o)
             idxed (boring/encode-indexed wide-map (assoc o :index 16 :index-min 8))
-            cp (nav/source plain o)
-            ci (nav/source idxed o)]
+            cp (nav/root plain o)
+            ci (nav/root idxed o)]
         (is (< (alength ^bytes plain) (alength ^bytes idxed)) "index costs something")
         (doseq [k (keys wide-map)]
           (is (= (nav/value (get-in cp [k "v"]))
@@ -379,8 +379,8 @@
             it is only maps that need canonical order for binary search"
     (let [plain (boring/encode wide-vec opts)
           idxed (boring/encode-indexed wide-vec (assoc opts :index 16 :index-min 8))
-          cp (nav/source plain opts)
-          ci (nav/source idxed opts)]
+          cp (nav/root plain opts)
+          ci (nav/root idxed opts)]
       (doseq [i [0 1 15 16 17 150 298 299]]
         (is (= (nav/value (nth cp i)) (nav/value (nth ci i)) (wide-vec i))
             (str "index " i)))
@@ -404,7 +404,7 @@
             falls back to walking -- slower, identical answers"
     (let [bs (boring/encode-indexed wide-map (assoc sorted-opts :index 16 :index-min 8))
           broken (corrupt-at bs (- (alength bs) 6) 0x7F)
-          c (nav/source broken sorted-opts)]
+          c (nav/root broken sorted-opts)]
       (doseq [k (take 50 (keys wide-map))]
         (is (= (get-in wide-map [k "v"]) (nav/value (get-in c [k "v"])))
             (str "key " k))))))
@@ -439,7 +439,7 @@
       (is (> (second (first sizes)) (second (last sizes)))
           (str "and 2 must cost more than 64: " sizes))
       (doseq [mn [2 8 64]]
-        (let [c (nav/source (boring/encode-indexed
+        (let [c (nav/root (boring/encode-indexed
                              wide-map (assoc sorted-opts :index 16 :index-min mn))
                             sorted-opts)]
           (is (= 42 (nav/value (get-in c ["k0042" "v"]))) (str "min " mn)))))))
@@ -498,4 +498,4 @@
       (let [v (vec (range 40))
             opts {:index 4 :index-min 2}]
         (is (pos? (alength ^bytes (boring/encode-indexed v opts))))
-        (is (= v (nav/value (nav/source (boring/encode-indexed v opts)))))))))
+        (is (= v (nav/value (nav/root (boring/encode-indexed v opts)))))))))

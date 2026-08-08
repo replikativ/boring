@@ -72,7 +72,7 @@
           opts {:stringref false :registry reg :max-depth 64}
           bs (boring/encode {:a {:b [1 2 3]}} opts)
           ctx ((requiring-resolve 'boring.nav/context) opts)
-          src ((requiring-resolve 'boring.nav/source) bs ctx)]
+          src ((requiring-resolve 'boring.nav/root) bs ctx)]
       (is (= (boring/decode bs opts)
              ((requiring-resolve 'boring.nav/value) src)))
       (is (= [1 2 3]

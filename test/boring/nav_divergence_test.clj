@@ -135,7 +135,7 @@
 (defn- nav-ops
   "Every nav operation worth probing on a root cursor, as [label thunk]."
   [bs opts]
-  (let [src #(nav/source bs opts)]
+  (let [src #(nav/root bs opts)]
     [[:value  #(nav/value (src))]
      [:count  #(count (src))]
      [:seq    #(doall (map nav/value (seq (src))))]
@@ -189,7 +189,7 @@
       (let [o (assoc opts :stringref false)
             bs (boring/encode v o)
             [dk dv] (outcome #(boring/decode bs o))
-            [nk nv] (outcome #(nav/value (nav/source bs o)))]
+            [nk nv] (outcome #(nav/value (nav/root bs o)))]
         (when-not (known? axis dl :value)
           (is (= dk nk) (str "value: decode " dk " but nav " nk
                              " | doc " dl " | opts " axis))
@@ -212,13 +212,13 @@
                      (or (map? dv) (sequential? dv) (set? dv)
                          (and (some? dv) (.isArray (class dv)))))
             (let [want (count (if (.isArray (class dv)) (seq dv) dv))
-                  [k got] (outcome #(count (nav/source bs o)))]
+                  [k got] (outcome #(count (nav/root bs o)))]
               (when (= :ok k)
                 (is (= want got) (str "count | doc " dl " | opts " axis)))))
           ;; a keyword lookup, where the realised value supports one
           (when (map? dv)
             (let [want (get dv :a ::nf)
-                  [k got] (outcome #(nav/value (get (nav/source bs o) :a ::nf)))]
+                  [k got] (outcome #(nav/value (get (nav/root bs o) :a ::nf)))]
               (when (= :ok k)
                 (is (same-value? want got)
                     (str "get :a | doc " dl " | opts " axis))))))))))
@@ -232,7 +232,7 @@
     (doseq [[label hex] hostile/cases]
       (let [bs (c/hex->bytes hex)
             o {:stringref false}
-            [k n] (outcome #(count (nav/source bs o)))]
+            [k n] (outcome #(count (nav/root bs o)))]
         (when (= :ok k)
           (is (<= (long n) (alength bs))
               (str "count " n " exceeds the " (alength bs)
@@ -266,11 +266,11 @@
                   (str "[" axis " " dl "] no longer raises untyped -- delete the row"))
               :value
               (is (not= (first (outcome #(boring/decode bs o)))
-                        (first (outcome #(nav/value (nav/source bs o)))))
+                        (first (outcome #(nav/value (nav/root bs o)))))
                   (str "[" axis " " dl "] value now agrees -- delete the row"))
               :count
               (let [[dk dv] (outcome #(boring/decode bs o))
-                    [nk nv] (outcome #(count (nav/source bs o)))]
+                    [nk nv] (outcome #(count (nav/root bs o)))]
                 (is (not (and (= :ok dk) (= :ok nk) (= (count dv) nv)))
                     (str "[" axis " " dl "] count now agrees -- delete the row"))))))))))
 
@@ -292,7 +292,7 @@
                :deep {:a {:b {:c "found"}}}
                :mixed [{:x 1} {:x 2}]}
           bs (boring/encode doc o)
-          c (nav/source bs o)]
+          c (nav/root bs o)]
       (doseq [path [[:m 0] [:m 1] [:m :k]
                     [:v 0] [:v 2] [:v 3]
                     [:deep :a :b :c] [:deep :a :nope]
@@ -320,7 +320,7 @@
           ;; not distinguish "found the slots" from "walked the data". The claim
           ;; under test is that a LOOKUP consults the index, so open is excluded.
           skips (fn [bs]
-                  (let [c (nav/source bs o)
+                  (let [c (nav/root bs o)
                         nv (.nav ^boring.nav.Cursor c)
                         ^Reader r (.rdr ^boring.nav.Nav nv)
                         _ (#'nav/nav-idx nv)
@@ -356,12 +356,12 @@
           docs (mapv (fn [i] {:id i :name (str "u" i) :city (str "c" i)}) (range 50))
           blobs (mapv #(boring/encode % o) docs)
           long-doc (boring/encode (vec (range 500)) o)
-          s (nav/source (first blobs) ctx)]
+          s (nav/root (first blobs) ctx)]
       (is (= (mapv #(:city %) docs)
              (mapv (fn [bs] (nav/value (get (nav/re-point! s bs) :city))) blobs))
           "a reused source answers what each document says")
       (is (= (mapv #(:city %) docs)
-             (mapv (fn [bs] (nav/value (get (nav/source bs ctx) :city))) blobs))
+             (mapv (fn [bs] (nav/value (get (nav/root bs ctx) :city))) blobs))
           "and a fresh source per row agrees, which is the oracle")
       (testing "a longer document after a short one, and back"
         (is (= 500 (count (nav/value (nav/re-point! s long-doc)))))
@@ -370,7 +370,7 @@
         (let [oi (assoc o :index 4 :index-min 4)
               a (boring/encode-indexed (vec (for [i (range 40)] {:k i})) oi)
               b (boring/encode-indexed (vec (for [i (range 40)] {:k (+ 100 i)})) oi)
-              c (nav/source a (nav/context oi))]
+              c (nav/root a (nav/context oi))]
           (is (= 39 (nav/value (get (nav/walk (nav/re-point! c a) [39]) :k))))
           (is (= 139 (nav/value (get (nav/walk (nav/re-point! c b) [39]) :k)))
               "the second document's index must be used, not the first's"))))))
@@ -388,7 +388,7 @@
     (let [o {:stringref false}
           doc {:a {:b [10 20 {:c "deep"}]} :x 1}
           bs (boring/encode doc o)
-          c (nav/source bs o)]
+          c (nav/root bs o)]
       (doseq [[label cur] [["root" c]
                            ["a map" (get c :a)]
                            ["an array" (get-in c [:a :b])]
@@ -406,3 +406,87 @@
             (is (some? (nav/source-of its)))
             (is (= 1 (nav/value (get (nav/cursor (nav/source-of its) (nav/offset (nth its 0))) :i)))
                 "and the two agree about where item 0 is")))))))
+
+(deftest a-source-is-not-a-cursor-and-says-so
+  (testing "`source` returns a SOURCE now, where it used to return a root
+            cursor. That break has to be LOUD: a source deliberately implements
+            no collection interface, so the calls a caller would have written
+            against the old return value throw rather than quietly answering
+            nil -- which is the difference between a compile-time-ish failure
+            and a silently wrong scan.
+
+            `root` is what `source` was."
+    (let [o {:stringref false}
+          bs (boring/encode {:a 1 :b [1 2 3]} o)
+          s (nav/source bs o)]
+      (is (not (nav/cursor? s)) "a source is not a cursor")
+      (is (thrown? Exception (get s :a)) "get on a source must not answer nil")
+      (is (thrown? Exception (count s)) "nor count")
+      (is (thrown? Exception (seq s)) "nor seq")
+      (testing "and `root` gives back exactly what `source` used to"
+        (is (= {:a 1 :b [1 2 3]} (nav/value (nav/root bs o))))
+        (is (= 1 (nav/value (get (nav/root s) :a))))
+        (is (= (nav/offset (nav/root bs o)) (nav/offset (nav/root s)))))
+      (testing "`root` and `cursor` take raw bytes as well as a source"
+        (is (= {:a 1 :b [1 2 3]} (nav/value (nav/root bs))))
+        (is (= (nav/value (nav/cursor bs 0 o)) (nav/value (nav/cursor s 0))))))))
+
+(deftest the-offset-layer-answers-what-the-cursor-layer-answers
+  (testing "the offset layer exists so a caller does not write their own walker
+            -- konserve-lmdb wrote two and both disagreed with this namespace.
+            So it has to agree with `get`/`nth`/`walk` on every shape, not
+            approximately and not on the shapes it was developed against."
+    (let [o {:stringref false}
+          doc {:id 7 :name "u7" :tags ["a" "b" "c"]
+               :profile {:address {:city "Rome"} :n -12}
+               :empty {} :ev [] :neg -1 :big 100000}
+          bs (boring/encode doc o)
+          s (nav/source bs o)
+          c (nav/root s)]
+      (testing "field-offset agrees with get, by key and by probe"
+        (doseq [k [:id :name :tags :profile :neg :big :missing]]
+          (let [off (nav/field-offset s 0 k)
+                pb (nav/field-offset s 0 (nav/probe s k))]
+            (is (= off pb) (str k ": key and probe find the same offset"))
+            (if (contains? doc k)
+              (is (= (get doc k) (nav/value-at s off)) (str k ": and the right value"))
+              (is (= -1 off) (str k ": absent is -1"))))))
+      (testing "nth-offset agrees with nth"
+        (let [to (nav/field-offset s 0 :tags)]
+          (dotimes [i 3]
+            (is (= (nth ["a" "b" "c"] i) (nav/value-at s (nav/nth-offset s to i)))))
+          (is (= -1 (nav/nth-offset s to 3)) "past the end is -1")))
+      (testing "long-at agrees with value-at on integers, both signs"
+        (doseq [k [:id :neg :big]]
+          (let [off (nav/field-offset s 0 k)]
+            (is (= (get doc k) (nav/long-at s off)) (str k))
+            (is (= (nav/value-at s off) (nav/long-at s off))))))
+      (testing "and refuses what is not an integer, rather than coercing"
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (nav/long-at s (nav/field-offset s 0 :name)))))
+      (testing "value-at refuses -1 rather than reading the document's head"
+        (is (thrown? clojure.lang.ExceptionInfo (nav/value-at s -1))))
+      (testing "container-count agrees with count, including empties"
+        (is (= 8 (nav/container-count s 0)))
+        (is (= 3 (nav/container-count s (nav/field-offset s 0 :tags))))
+        (is (= 0 (nav/container-count s (nav/field-offset s 0 :empty))))
+        (is (= 0 (nav/container-count s (nav/field-offset s 0 :ev)))))
+      (testing "reduce-at sees every element, and reduced stops it"
+        (let [to (nav/field-offset s 0 :tags)]
+          (is (= ["a" "b" "c"]
+                 (nav/reduce-at s to (fn [acc ^long p] (conj acc (nav/value-at s p))) [])))
+          (is (= ["a"] (nav/reduce-at s to (fn [acc ^long p]
+                                             (reduced (conj acc (nav/value-at s p)))) [])))
+          (is (= [] (nav/reduce-at s (nav/field-offset s 0 :ev)
+                                   (fn [acc ^long p] (conj acc p)) [])))))
+      (testing "reduce-kv-at sees every pair, keys and values"
+        (is (= doc (nav/reduce-kv-at s 0
+                                     (fn [acc ^long kp ^long vp]
+                                       (assoc acc (nav/value-at s kp) (nav/value-at s vp)))
+                                     {}))))
+      (testing "and each refuses the other's shape rather than misreading it"
+        (is (thrown? clojure.lang.ExceptionInfo (nav/reduce-at s 0 (fn [a _] a) nil))
+            "reduce-at on a map")
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (nav/reduce-kv-at s (nav/field-offset s 0 :tags) (fn [a _ _] a) nil))
+            "reduce-kv-at on an array")))))

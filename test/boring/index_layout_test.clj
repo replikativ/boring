@@ -100,7 +100,7 @@
   (some? (:containers (index-of bs))))
 
 (defn- answers-everything? [^bytes bs]
-  (let [src (nav/source bs opts)]
+  (let [src (nav/root bs opts)]
     (every? (fn [i] (= i (some-> (get src (format "k%02d" i)) nav/value)))
             (range 40))))
 

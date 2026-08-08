@@ -102,7 +102,7 @@
 
 (set! *warn-on-reflection* true)
 
-(declare ->Cursor cursor-at nav-of-items read-index read-index* source-at tag-view
+(declare ->Cursor cursor cursor-at nav-of-items read-index read-index* source-at tag-view
          nth-item realize lookup-map head-count child-offsets)
 
 ;; A shaped array is `39649([keys, [row, row, ...]])`, where each row is an
@@ -244,7 +244,25 @@
 ;; Separate from `probes` rather than sharing it: `probes` is keyed by USER key
 ;; values, so a caller whose key happened to equal a cache key would get a view
 ;; where encoded bytes were expected.
-(deftype Nav [^Reader rdr opts probes idx src views])
+(deftype Nav [^Reader rdr opts probes idx src views]
+  ;; ILookup ONLY IN ORDER TO REFUSE. A source is not a value and implements no
+  ;; collection interface -- but `clojure.core/get` answers nil for anything
+  ;; that is not ILookup, so `(get (source bs) :k)` would have been SILENTLY
+  ;; nil rather than an error. That is precisely the failure the split exists
+  ;; to prevent: `source` used to return a root cursor, so that call is what
+  ;; every existing caller has written.
+  ;;
+  ;; Throwing here makes the break loud at the first lookup instead of turning
+  ;; a working projection into one that finds nothing. Found by the test that
+  ;; asserts the break is loud, which failed on exactly this line.
+  clojure.lang.ILookup
+  (valAt [this k] (.valAt this k nil))
+  (valAt [_ k _]
+    (fail :boring/not-a-cursor
+          (str "boring.nav: a source is not a cursor -- `get` needs a position "
+               "inside the document, not the document. Use (nav/root s), which "
+               "is what (nav/source ...) returned before the two were split.")
+          {:key k})))
 
 ;; `src` is a VOLATILE, not the bytes: `re-point!` swaps what a reusable source
 ;; reads, and `fork-nav` builds its fresh Reader from `src` -- so a fork taken
@@ -338,11 +356,19 @@
 (defn- probe-for
   "The encoded bytes of `k`, cached. Key matching compares bytes rather than
   decoding keys, which is sound because encoding is deterministic for a given
-  profile -- so byte equality is value equality."
+  profile -- so byte equality is value equality.
+
+  ALREADY-ENCODED BYTES PASS THROUGH, which is what lets `field-offset` take a
+  probe made once by `probe` and reused across a whole scan. The cache lookup
+  below is cheap but not free, and on the offset path cheap is the entire
+  budget: measured, `field-offset` with a keyword allocates 32 bytes a call and
+  with a probe allocates none."
   ^bytes [^Nav nav k]
-  (let [p (.probes nav)
-        m @p]
-    (or (get m k)
+  (if (bytes? k)
+    k
+    (let [p (.probes nav)
+          m @p]
+      (or (get m k)
         (let [bs (boring/encode k (.opts nav))]
           ;; BOUNDED. A context is documented as reusable for as long as its
           ;; options hold, and its cache is shared by every source opened
@@ -355,7 +381,7 @@
           ;; document. A working set that large is not a path, it is a leak.
           (when (< (count m) max-cached-probes)
             (swap! p assoc k bs))
-          bs))))
+          bs)))))
 
 ;; A reusable navigation context: resolved options plus the PROBE CACHE, shared
 ;; across every source opened through it.
@@ -390,7 +416,7 @@
 
     (let [ctx (nav/context {:stringref false})]
       (doseq [blob blobs]
-        (nav/value (get-in (nav/source blob ctx) path))))
+        (nav/value (get-in (nav/root blob ctx) path))))
 
   A context holds no document state and is safe to reuse for as long as the
   options hold. It is NOT a cache of documents: per-document state, including
@@ -510,33 +536,33 @@
   a loop produces -- and a cursor from here would navigate only the first of
   them and silently ignore the rest. Use `items` for that. This is not an error
   case, because a caller may legitimately navigate a value sitting in an
-  oversized scratch buffer."
+  oversized scratch buffer.
+
+  BREAKING: THIS RETURNS A SOURCE, NOT A ROOT CURSOR. `(nav/root bs opts)` is
+  what this used to be, and is what you want for `get`/`seq`/`walk`. A source
+  is the DOCUMENT -- the bytes, the reader over them, the index slot and the
+  shape cache -- and it deliberately implements nothing: no `ILookup`, no
+  `Seqable`, no `Counted`. It is a handle, not a value, and giving it
+  collection interfaces is exactly how it would turn back into a cursor.
+
+  So the break is LOUD: `(get (source bs) :k)` throws rather than quietly
+  answering nil.
+
+  The reason to have the name at all is the offset layer. Every offset
+  function takes `(source, offset)`, so there is exactly one place a position
+  can come from and it is the argument you passed. Before the split those
+  functions took a cursor and IGNORED its offset -- `(field-offset
+  cursor-at-500 0 probe)` was well-typed and meaningless, because the cursor
+  was standing in for a document that had no name."
   ([src] (source src nil))
-  ([src opts] (source-at src 0 opts)))
+  ([src opts] (nav-of src (or opts {}))))
 
-(defn source-at
-  "A navigable view over the item at byte offset `off` in `src`.
-
-  `source` is this with `off` 0.
-
-  THE OFFSET IS FOR FORMATS THAT PREFIX AN ITEM WITH SOMETHING OF THEIR OWN --
-  a length, a header, another item. The alternative is to nest the item inside
-  a container purely so that it can be found, and then every read pays to skip
-  whatever shares that container. konserve-lmdb's store blobs are
-  `<header><meta item><value item>` for exactly this reason: both items are
-  reachable in constant time, where a two-entry map forces one of them to walk
-  past the other on every read. Measured there, one field out of 20k rows:
-  0.163 us/row through the map against 0.091 through the offset.
-
-  `off` is TRUSTED, like every other positional entry point in this namespace.
-  A wrong offset lands mid-item and reports whatever the bytes there happen to
-  encode -- the reader is bounded, so it cannot read past the source, but it
-  can very much return a plausible wrong value. Callers derive offsets from the
-  format, not from user input.
-
-  Addresses ONE item, the one starting at `off`. See `source` on sequences."
-  ([src off] (source-at src off nil))
-  ([src off opts] (cursor-at (nav-of src (or opts {})) (long off))))
+(defn ^:deprecated source-at
+  "DEPRECATED: use `cursor`, which is this under a name that says what it
+  returns. Kept as a one-line forward because removing an entry point outright
+  is how a caller finds out at runtime instead of at compile time."
+  ([src off] (cursor src off nil))
+  ([src off opts] (cursor src off opts)))
 
 ;; ------------------------------------------------------------- wire queries
 
@@ -1313,21 +1339,230 @@
   ^long [c] (.off ^Cursor c))
 
 (defn cursor
-  "A cursor at byte offset `off` of the source `c` addresses into.
+  "A cursor at byte offset `off`.
 
-  Takes a cursor rather than a source only because `source` still returns a
-  root cursor; that is the one thing left to change here, and when it does this
-  keeps its meaning."
-  [c ^long off] (cursor-at (source-of c) off))
+      (nav/cursor s off)                  ; of a source, or of any cursor's
+      (nav/cursor bs off opts)            ; the same, in one step
+
+  THE OFFSET IS FOR FORMATS THAT PREFIX AN ITEM WITH SOMETHING OF THEIR OWN --
+  a length, a header, another item. The alternative is to nest the item inside
+  a container purely so that it can be found, and then every read pays to skip
+  whatever shares that container. konserve-lmdb's store blobs are
+  `<header><meta item><value item>` for exactly this reason: both items are
+  reachable in constant time, where a two-entry map forces one of them to walk
+  past the other on every read. Measured there, one field out of 20k rows:
+  0.163 us/row through the map against 0.091 through the offset.
+
+  `off` is TRUSTED, like every other positional entry point in this namespace.
+  A wrong offset lands mid-item and reports whatever the bytes there happen to
+  encode -- the reader is bounded, so it cannot read past the source, but it
+  can very much return a plausible wrong value. Callers derive offsets from the
+  format, not from user input.
+
+  The three-argument form is what `source-at` was, and the two-argument form
+  takes raw bytes as well as a source, for the same reason `root` does."
+  ([s ^long off] (if (or (bytes? s) (instance? ByteSource s))
+                   (cursor-at (source s nil) off)
+                   (cursor-at (source-of s) off)))
+  ([src ^long off opts] (cursor-at (source src opts) off)))
 
 (defn root
-  "A cursor at the root of the document `c` addresses into.
+  "A cursor at the root of a document.
 
-      (nav/root (nav/source bs opts))     ; explicit
+      (nav/root bs opts)                  ; what `source` used to be
+      (nav/root (nav/root bs opts))     ; the same, in two steps
       (nav/root c)                        ; back to the top from anywhere
 
-  `(root c)` is `(cursor c 0)`."
-  [c] (cursor-at (source-of c) 0))
+  THE ORDINARY ENTRY POINT. If you are exploring, holding, printing, `get`-ing
+  or `seq`-ing, you want this. If you are inside a loop whose trip count is the
+  size of your data, you want `source` and the offset layer.
+
+  The one-argument form takes RAW BYTES as well as a source or a cursor,
+  because `(root bs)` is what a caller writes first and making them spell
+  `(root (source bs))` buys nothing."
+  ([s] (if (or (bytes? s) (instance? ByteSource s))
+         (cursor-at (source s nil) 0)
+         (cursor-at (source-of s) 0)))
+  ([src opts] (cursor-at (source src opts) 0)))
+
+;; ------------------------------------------------------- the offset layer
+;;
+;; Everything below takes `(source, offset)` and returns a `long` or a scalar.
+;; Nothing allocates. The internals have always worked in offsets -- `lookup-map`
+;; and `nth-item` return one, `realize` takes one -- so this is a skin over what
+;; was already there, and the reason to have it is that the alternative is every
+;; caller writing its own walker. konserve-lmdb wrote two, and both disagreed
+;; with this namespace.
+;;
+;; -1 MEANS ABSENT, everywhere, and that is the only sentinel. A caller that
+;; passes it on to `value-at` gets a typed error rather than a wrong answer.
+
+(defn probe
+  "`k` encoded once, to hand to `field-offset` in a loop.
+
+  A key is matched by comparing BYTES, not by decoding the stored key, so a
+  lookup needs the key's encoding. `field-offset` will make one per call from
+  a cache on the source; making it yourself is worth 32 bytes a call, which on
+  a scan over a million rows is 32 MB of garbage for a value that never
+  changes.
+
+  Tied to the OPTIONS, not to the document: the encoding depends on the
+  profile, so a probe made under one set of options is meaningless under
+  another. Make it from the same source or context you will use it with."
+  ^bytes [s k] (probe-for (source-of s) k))
+
+(defn field-offset
+  "Byte offset of the value for key `k` in the map at `off`, or -1.
+
+  `k` may be a key or an already-encoded `probe`. The probe is the hot-loop
+  form: measured, a keyword costs 32 bytes a call and a probe costs nothing.
+
+  CONSULTS THE INDEX exactly as `get` does -- same `lookup-map`, so an indexed
+  container is a binary search and an unindexed one is the linear walk a
+  hand-rolled reader would do. That is the whole point of this existing: a
+  caller who writes their own walker over `Reader` CANNOT reach the index,
+  because the index lives on the source and `Reader.skipFrom` knows nothing
+  about it."
+  ^long [s ^long off k] (lookup-map (source-of s) off k))
+
+(defn nth-offset
+  "Byte offset of element `i` of the array at `off`, or -1."
+  ^long [s ^long off ^long i] (nth-item (source-of s) off i))
+
+(defn container-count
+  "Element count of the array, or pair count of the map, at `off`.
+
+  O(1) -- it is read from the container's head, not counted.
+
+  NOT `count-at`, which is taken by the index reader's per-node accessor
+  further down this file. Two definitions of the same name in one namespace do
+  not collide loudly -- the later one simply wins, and the earlier calls go to
+  it -- which is exactly how a public function can end up silently rebound to
+  a private one that answers a different question."
+  ^long [s ^long off] (head-count (source-of s) off))
+
+(defn end-at
+  "Byte offset one past the item at `off`. `byte-span` without a cursor."
+  ^long [s ^long off]
+  (let [^Nav nav (source-of s)] (skip ^Reader (.rdr nav) off)))
+
+(defn value-at
+  "The value at `off`, realised.
+
+  The general reader, and the one that allocates: use `long-at` for an integer
+  in a hot loop. Refuses -1 rather than reading whatever sits at the front of
+  the document, because -1 is what every function above returns for ABSENT and
+  passing it on unchecked is how a miss becomes a wrong answer."
+  [s ^long off]
+  (if (neg? off)
+    (fail :boring/absent
+          "boring.nav: no value at offset -1 -- that is what `field-offset` and
+           `nth-offset` return for a key or index that is not there."
+          {:offset off})
+    (realize (source-of s) off)))
+
+(defn long-at
+  "The integer at `off`, as a primitive long. Allocates nothing.
+
+  `value-at` boxes: summing one integer field over 2000 children allocates a
+  `Long` per child, and `Long.valueOf`'s cache only covers -128..127. This
+  needs no decode at all -- for major 0 the value IS the head argument, and for
+  major 1 it is `-1 - arg`, which is CBOR's negative encoding by definition.
+
+  Refuses anything that is not an integer, rather than coercing: a caller
+  reaching for this in a loop wants to know that the field it named is a float
+  or a string, not to get a plausible number out of one."
+  ^long [s ^long off]
+  (let [^Nav nav (source-of s)
+        ^Reader r (.rdr nav)
+        mj (major nav off)]
+    (case (int mj)
+      0 (.headArgAt r off)
+      1 (- -1 (.headArgAt r off))
+      (fail :boring/not-an-int
+            "boring.nav: long-at needs a CBOR integer (major 0 or 1)"
+            {:offset off :major mj}))))
+
+(defn reduce-at
+  "Reduce over the OFFSETS of the array at `off`. Allocates nothing.
+
+      (nav/reduce-at s off (fn [acc o] (+ acc (nav/long-at s o))) 0)
+
+  `f` is `(fn [acc offset] acc)` and may return `reduced`. Compare
+  `(reduce f init (children c))`, which allocates a cursor per child --
+  measured at 24 bytes each, and 134 when the body reaches a field inside one.
+  That is the difference between a within-document aggregate a scan can afford
+  and one it cannot.
+
+  HINT `f`'S SECOND ARGUMENT and the offset is never boxed:
+  `(fn [acc ^long o] ...)` compiles to `IFn$OLO`, and the `instanceof` below
+  picks that path. Unhinted it costs one `Long` per child -- slow, never wrong,
+  which is the right way round.
+
+  THE TEST IS OUTSIDE THE LOOP, which is the only reason it is worth doing: one
+  `instanceof` per reduction, not per child. Writing it without the test and
+  hoping the JIT sees through `(f acc p)` does not work, because `f` is an
+  untyped local -- measured, the offset boxed on every child and the whole
+  point of the layer was lost."
+  [s ^long off f init]
+  (let [^Nav nav (source-of s)
+        ^Reader r (.rdr nav)
+        n (head-count nav off)]
+    (when-not (= MAJOR-ARRAY (major nav off))
+      (fail :boring/not-an-array
+            "boring.nav: reduce-at is for arrays; use reduce-kv-at for a map"
+            {:offset off :major (major nav off)}))
+    (if (instance? clojure.lang.IFn$OLO f)
+      (let [^clojure.lang.IFn$OLO g f]
+        (loop [i 0 p (.headEndAt r off) acc init]
+          (if (or (= i n) (reduced? acc))
+            (unreduced acc)
+            (recur (inc i) (skip r p) (.invokePrim g acc p)))))
+      (loop [i 0 p (.headEndAt r off) acc init]
+        (if (or (= i n) (reduced? acc))
+          (unreduced acc)
+          (recur (inc i) (skip r p) (f acc p)))))))
+
+(defn reduce-kv-at
+  "Reduce over the KEY and VALUE offsets of the map at `off`. Allocates nothing.
+
+      (nav/reduce-kv-at s off (fn [acc ko vo] ...) init)
+
+  `f` is `(fn [acc key-offset value-offset] acc)` and may return `reduced`.
+
+  A SEPARATE NAME rather than an arity of `reduce-at`, mirroring
+  `reduce`/`reduce-kv`. One name taking either would dispatch on the container
+  and so would work on array-shaped data and throw `ArityException` on
+  map-shaped data -- the exact `works on my documents` failure this layer
+  exists to close, and one that only shows up on the row where the shape
+  changes.
+
+  The KEY arrives as an offset, not a value, so a caller that only needs to
+  compare it can use `value-at` on the ones it cares about and never realise
+  the rest.
+
+  BOTH OFFSETS STAY PRIMITIVE when `f` is hinted `(fn [acc ^long k ^long v] ...)`,
+  which compiles to `IFn$OLLO`. Same one-test-outside-the-loop as `reduce-at`."
+  [s ^long off f init]
+  (let [^Nav nav (source-of s)
+        ^Reader r (.rdr nav)
+        n (head-count nav off)]
+    (when-not (= MAJOR-MAP (major nav off))
+      (fail :boring/not-a-map
+            "boring.nav: reduce-kv-at is for maps; use reduce-at for an array"
+            {:offset off :major (major nav off)}))
+    (if (instance? clojure.lang.IFn$OLLO f)
+      (let [^clojure.lang.IFn$OLLO g f]
+        (loop [i 0 p (.headEndAt r off) acc init]
+          (if (or (= i n) (reduced? acc))
+            (unreduced acc)
+            (let [vp (skip r p)]
+              (recur (inc i) (skip r vp) (.invokePrim g acc p vp))))))
+      (loop [i 0 p (.headEndAt r off) acc init]
+        (if (or (= i n) (reduced? acc))
+          (unreduced acc)
+          (let [vp (skip r p)]
+            (recur (inc i) (skip r vp) (f acc p vp))))))))
 
 (defn walk
   "The cursor at `path` from `cursor`, or nil if any step is absent.

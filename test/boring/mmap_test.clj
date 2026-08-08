@@ -77,7 +77,7 @@
            (prop/for-all [v gen-doc]
                          (let [^bytes bs (boring/encode v opts)
                                f (spit-bytes bs)
-                               heap (nav/source bs opts)
+                               heap (nav/root bs opts)
                                decoded (boring/decode bs opts)
                                [mm arena] (mmap-source* f)]
                            (try
@@ -216,7 +216,7 @@
             (is (<= (alength ^bytes (boring/buffer w)) 4096)
                 "and the heap buffer stayed bounded while doing it")
             (testing "the bytes are readable in place, never staged through the heap"
-              (let [c (nav/source (seg-source (.written snk)) opts)]
+              (let [c (nav/root (seg-source (.written snk)) opts)]
                 (is (= value (nav/value c)))))
             (testing "overflow is loud, not a silent truncation -- the index frame
                       is at the END, so a quietly short write would look like a

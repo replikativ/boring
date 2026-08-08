@@ -260,11 +260,11 @@
                   (.toByteArray out))]
       (testing "reduce WITHOUT an init -- IReduce, not only IReduceInit"
         (is (= 3 (count (reduce (fn [a x] (conj (if (vector? a) a [a]) x))
-                                (nav/source v o)))))
+                                (nav/root v o)))))
         (is (= 3 (count (reduce (fn [a x] (conj (if (vector? a) a [a]) x))
                                 (nav/items seqbs o))))))
       (testing "contains? and find -- Associative, not only ILookup"
-        (let [c (nav/source m o)]
+        (let [c (nav/root m o)]
           (is (true? (contains? c "a")))
           (is (false? (contains? c "zz")))
           (is (= 1 (nav/value (val (find c "a")))))
@@ -272,15 +272,15 @@
           (is (thrown? clojure.lang.ExceptionInfo (assoc c "c" 3))
               "and assoc is refused, because a cursor is a view over bytes")))
       (testing "nth's two arities differ, as Indexed specifies"
-        (let [c (nav/source v o)]
+        (let [c (nav/root v o)]
           (is (= 2 (nav/value (nth c 1))))
           (is (thrown? IndexOutOfBoundsException (nth c 99))
               "the 2-arity throws out of range, like every other Indexed")
           (is (= :nf (nth c 99 :nf)) "the 3-arity answers with not-found")))
       (testing "and a not-found argument is honoured even through a tag, where
                 clojure.core/nth throws for a realised keyword or set"
-        (is (= :nf (nth (nav/source (boring/encode :foo/bar o) o) 0 :nf)))
-        (is (= :nf (nth (nav/source (boring/encode #{1 2 3} o) o) 0 :nf)))))))
+        (is (= :nf (nth (nav/root (boring/encode :foo/bar o) o) 0 :nf)))
+        (is (= :nf (nth (nav/root (boring/encode #{1 2 3} o) o) 0 :nf)))))))
 
 (deftest nav-reports-an-impossible-count-rather-than-believing-it
   (testing "`count` was the one entry point that never checked the head against
@@ -297,10 +297,10 @@
                ["map 2^62 head"   (ba 0xbb 0x40 0 0 0 0 0 0 0 0x01 0x02) #(doall (seq %))]
                ["map 2^62 zipper" (ba 0xbb 0x40 0 0 0 0 0 0 0 0x01 0x02)
                 #(clojure.zip/next (nav/zipper %))]]]
-        (is (thrown? clojure.lang.ExceptionInfo (op (nav/source bs o)))
+        (is (thrown? clojure.lang.ExceptionInfo (op (nav/root bs o)))
             (str label " must be typed, not untyped or impossible"))))
     (testing "and a real count still answers"
-      (is (= 3 (count (nav/source (boring/encode [1 2 3] o) o)))))))
+      (is (= 3 (count (nav/root (boring/encode [1 2 3] o) o)))))))
 
 (deftest sorted-collections-refuse-incomparable-content
   (testing "a corrupt `clojure/sorted-map` frame fed the default comparator keys
@@ -370,7 +370,7 @@
                     (doall (pmap (fn [_] (mapv nav/value (nav/fork its))) (range 60))))
             "and 60 parallel forked passes all agree")
         (testing "a forked CURSOR works too, and keeps its position"
-          (let [c (nav/source (boring/encode {"a" {"b" 7}} o) o)]
+          (let [c (nav/root (boring/encode {"a" {"b" 7}} o) o)]
             (is (= 7 (nav/value (get-in (nav/fork c) ["a" "b"]))))))))))
 
 (deftest forked-parallel-lookups-agree-on-container-nodes
@@ -393,7 +393,7 @@
           doc (vec (for [i (range 120)]
                      (into {} (for [j (range 20)] [(format "k%02d" j) (+ (* 100 i) j)]))))
           ^bytes bs (boring/encode-indexed doc oi)
-          src (nav/source bs oi)
+          src (nav/root bs oi)
           paths (vec (for [i [0 1 37 119] j ["k00" "k07" "k19"]] [i j]))
           want (mapv (fn [p] (some-> (nav/walk src p) nav/value)) paths)]
       (is (= (mapv #(get-in doc %) paths) want)
@@ -413,7 +413,7 @@
             what you asked for: a sorted-map is a tag, a plain map is not, and
             the caller cannot tell from the outside. Found by writing that
             expression in a probe and having it fail on the sorted case only."
-    (let [c (nav/source (boring/encode {"plain"  {"y" 2}
+    (let [c (nav/root (boring/encode {"plain"  {"y" 2}
                                         "sorted" (into (sorted-map) {"x" 1 "y" 2})
                                         "set"    #{1 2}
                                         "vec"    [1 2]} o) o)]
@@ -440,7 +440,7 @@
                          (vec (for [i (range 50)] {"n" i "v" [i i]})) out
                          (assoc o :index 4 :index-min 2))
       (let [seqbs (.toByteArray out)
-            c (nav/source bs o)
+            c (nav/root bs o)
             it (nav/items seqbs o)]
         (are [x] (some? x)
           (nav/value (get-in c ["a" "b"]))
@@ -822,7 +822,7 @@
           "the document-level guard cannot fire on this buffer")
       (is (= {:aaaa "alexander" :zzzz 2} (:inner doc)) "truth")
       (doseq [k [:aaaa :zzzz]]
-        (let [got (try (nav/value (get (nav/source-at blob inner {:stringref false}) k))
+        (let [got (try (nav/value (get (nav/cursor blob inner {:stringref false}) k))
                        (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))]
           (is (= :boring/stringref-not-navigable got)
               (str "key " k " must be refused, not reported absent")))))))
