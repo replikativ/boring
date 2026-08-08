@@ -736,28 +736,71 @@
                  (let [hit (scan-map r (aget slot a) (span a) probe)]
                    (if (>= hit 0) hit (recur (inc a)))))))))))))
 
+(defn- container-anchor-ok?
+  "Whether CONTAINER anchor `k` is where it claims to be, checked against its
+  PREDECESSOR: stepping `stride` items from anchor k-1 must land exactly on
+  anchor k, and anchor 0 must be the container's first entry.
+
+  The same local rule `anchor-sound?` applies to a sequence, and the same
+  O(stride) cost -- the order `nth-item` already pays walking from the anchor it
+  lands on. Uncached deliberately: the per-node verdict arrays were what made
+  caching expensive (three arrays sized by the whole document, to serve a lookup
+  touching one node), not the check.
+
+  It is a DETECTOR, not a proof. Validating the chain from anchor 0 is O(n),
+  which is the work the index exists to avoid; checking backward means damage
+  has to fake each anchor separately, and the zeroth is pinned to the
+  container's head. That is the same bargain the sequence node has always made."
+  ;; No primitive hints: five args with three of them primitive is one past what
+  ;; Clojure allows, and the boxing here is once per lookup, not per item --
+  ;; the same trade `anchor-sound?` makes for the same reason.
+  [^Reader r ^longs slot stride k head]
+  (if (zero? (long k))
+    (= (aget slot 0) (long head))
+    (try (= (aget slot (int k))
+            (let [span (long stride)]
+              (loop [j 0 p (aget slot (int (dec (long k))))]
+                (if (= j span) p (recur (inc j) (skip r p))))))
+         (catch clojure.lang.ExceptionInfo _ false))))
+
 (defn- nth-item
   "Offset of element `idx` of the array at `off`, or -1.
 
   Arrays need no sorting: element i is simply the i-th recorded offset, so an
   indexed array is O(1) to the anchor and then at most `stride`-1 skips. That
   is why the index helps arrays under any profile, while maps need canonical
-  key order before binary search is legal."
+  key order before binary search is legal.
+
+  THE ANCHOR IS VERIFIED BEFORE IT IS TRUSTED, because nothing downstream can
+  catch it here. `lookup-map` turns a damaged anchor into a MISS and re-derives
+  every miss by an honest scan (`confirm`); `nth` has no miss to re-derive -- it
+  jumps and returns whatever offset it lands on, so a damaged anchor is a wrong
+  answer with nothing between it and the caller.
+
+  That gap was real and measured: with container nodes no longer walked to their
+  far end, a single changed byte inside `slots` left `nth 17` and `nth 39`
+  pointing into the middle of an item, and a key that exists came back nil. The
+  property that found it is `many-node-damage-never-makes-a-lookup-wrong`; the
+  one-node fixture the older damage sweep uses cannot express it."
   ^long [^Nav nav ^long off ^long idx]
   (let [^Reader r (.rdr nav)
         n (head-count nav off)]
     (if (or (neg? idx) (>= idx n))
       -1
       (let [ix (nav-idx nav)
-            ns (node-slot nav off)]
+            ns (node-slot nav off)
+            head (.headEndAt r off)
+            walk (fn ^long [] (loop [i 0 p head]
+                                (if (= i idx) p (recur (inc i) (skip r p)))))]
         (if (neg? ns)
-          (loop [i 0 p (.headEndAt r off)]
-            (if (= i idx) p (recur (inc i) (skip r p))))
+          (walk)
           (let [^longs slot (slot-at ix ns)
                 stride (long (:stride ix))
                 anchor (quot idx stride)]
-            (loop [i (* anchor stride) p (long (aget slot anchor))]
-              (if (= i idx) p (recur (inc i) (skip r p))))))))))
+            (if (container-anchor-ok? r slot stride anchor head)
+              (loop [i (* anchor stride) p (long (aget slot anchor))]
+                (if (= i idx) p (recur (inc i) (skip r p))))
+              (walk))))))))
 
 ;; NOTE: this compares the declared count against `room` BEFORE doubling for a
 ;; map, while `Cursor.count` compares `2n`. Both are typed refusals, so the

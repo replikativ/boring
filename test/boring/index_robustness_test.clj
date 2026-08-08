@@ -1410,6 +1410,81 @@
           "and a bare Reader sees one MORE item -- the frame -- which is what
            makes `decode-seq` a real second opinion rather than the same code"))))
 
+(defn- probe-or-error
+  "Look up a KEY inside each indexed map, which is the path that goes through
+  `node-slot`, `slot-at`, the per-node width codes and the delta run. Realising
+  the whole document instead walks it start to finish and consults none of
+  that -- which is how a many-node index can be badly wrong and still look
+  fine."
+  [^bytes bs paths o]
+  (try (let [src (nav/source bs o)]
+         {:ok (mapv (fn [p] (some-> (nav/walk src p) nav/value)) paths)})
+       (catch clojure.lang.ExceptionInfo e {:typed (:type (ex-data e))})
+       (catch Throwable t {:untyped (class t)})))
+
+(deftest many-node-damage-never-makes-a-lookup-wrong
+  (testing "the same property as `damage-never-makes-the-two-readers-disagree`,
+            on a frame with MANY nodes instead of one.
+
+            That test seals with `write-seq!` over records too small to index,
+            so its frame has exactly one node -- the sequence. A one-node frame
+            cannot express a bad node index, a mis-ordered start table, or a
+            width code belonging to a different node, and those are precisely
+            the failures the dense per-node layout makes possible and the ones
+            an offsets-based reader will no longer get a free JVM bounds check
+            against.
+
+            41 nodes here: 40 maps of 20 entries, plus the vector holding them.
+            Damage is confined to the frame, so the index is either refused --
+            and the lookup falls back to scanning, which is correct -- or
+            accepted, in which case the validation that accepted it is claiming
+            the answers are still right. Either way a key that exists must read
+            back the value the plain decoder sees, and nothing may fail
+            untyped."
+    (let [doc (vec (for [i (range 40)]
+                     (into {} (for [j (range 20)]
+                                [(format "k%02d" j) (+ (* 100 i) j)]))))
+          o (assoc opts :index 16 :index-min 4)
+          ^bytes clean (boring/encode-indexed doc o)
+          n (alength clean)
+          frame-at (long (#'boring.frame/footer-start clean))
+          ;; across nodes AND across strides within a node: k00 is anchor 0,
+          ;; k07 is mid-stride, k19 is the last entry of the last stride
+          paths (vec (for [i [0 1 17 39] j ["k00" "k07" "k19"]] [i j]))
+          expect (mapv #(get-in doc %) paths)
+          gen-damage (gen/vector (gen/tuple (gen/choose frame-at (dec n))
+                                            (gen/choose 0 255))
+                                 1 4)
+          result
+          (tc/quick-check
+           2000
+           (prop/for-all
+            [damage gen-damage]
+            (let [c (java.util.Arrays/copyOf clean n)]
+              (doseq [[i v] damage] (aset-byte c (int i) (unchecked-byte (int v))))
+              (let [a (probe-or-error c paths o)]
+                (and (nil? (:untyped a))
+                     (or (not (contains? a :ok)) (= expect (:ok a)))))))
+           :seed 1785873600000)]
+      (is (:pass? result)
+          (str "a damaged frame that changed a lookup's answer: "
+               (pr-str (:shrunk result))))))
+
+  (testing "the control: undamaged, the index really is in use and really is
+            many-node -- without this the property could pass on a frame that
+            never had more than one node to get wrong"
+    (let [doc (vec (for [i (range 40)]
+                     (into {} (for [j (range 20)]
+                                [(format "k%02d" j) (+ (* 100 i) j)]))))
+          o (assoc opts :index 16 :index-min 4)
+          ^bytes clean (boring/encode-indexed doc o)
+          ix (#'boring.nav/read-index (#'boring.nav/nav-of clean o))]
+      (is (some? (:containers ix)) "the index is accepted")
+      (is (< 1 (alength ^longs (:containers ix)))
+          "and has many nodes, which is the whole point of this fixture")
+      (is (= 1907 (some-> (nav/walk (nav/source clean o) [19 "k07"]) nav/value))
+          "and a mid-stride key in a middle node reads correctly"))))
+
 (deftest a-sequence-node-claiming-no-items-must-be-backed-by-no-data
   (testing "A node with zero items has zero anchors, so the far-end check
             short-circuits before it looks at the data at all -- and `count`
