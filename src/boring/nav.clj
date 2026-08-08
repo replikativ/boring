@@ -234,8 +234,8 @@
   ;; unusable now yields `{:data-end ptr}` alone -- the two questions are
   ;; answered separately, see `read-index*` -- so an index can be present and
   ;; carry no nodes at all.
-  (let [ix (nav-idx nav)]
-    (if-let [^longs cs (:containers ix)]
+  (let [^Index ix (nav-idx nav)]
+    (if-let [^longs cs (when ix (.containers ix))]
       (loop [lo 0 hi (dec (alength cs))]
         (if (> lo hi)
           -1
@@ -652,7 +652,7 @@
   (let [^Reader r (.rdr nav)
         n (head-count nav off)
         ^bytes probe (probe-for nav k)
-        idx (nav-idx nav)
+        ^Index idx (nav-idx nav)
         ns (node-slot nav off)]
     ;; A node with NO anchors means nothing to jump to -- walk instead. Empty
     ;; containers legitimately produce one (`:index-min 0` will index a `{}`),
@@ -675,10 +675,10 @@
     ;; rather than a corner. See `boring.core/pack-sorted` and commit 825657f.
     (if (or (neg? ns)
             (zero? (alength ^longs (slot-at idx ns)))
-            (and (> (long (:stride idx)) 1) (not (sorted-at? (:sorted idx) ns))))
+            (and (> (.stride idx) 1) (not (sorted-at? (.sorted idx) ns))))
       (scan-map r (.headEndAt r off) n probe)
       (let [^longs slot (slot-at idx ns)
-            stride (long (:stride idx))
+            stride (.stride idx)
             m (alength slot)]
         ;; Entries after anchor a, which is NOT always `stride`: the last
         ;; anchor covers the remainder. Walking a full stride from it ran off
@@ -716,7 +716,7 @@
                 ;; a redundant optimisation would break those lookups silently.
                 (confirm [^long hit]
                   (if (neg? hit) (scan-map r (.headEndAt r off) n probe) hit))]
-          (if (sorted-at? (:sorted idx) ns)
+          (if (sorted-at? (.sorted idx) ns)
             ;; Sorted keys: binary search the anchors, then a bounded walk.
             ;;
             ;; The PROBE is bounds-checked as well as the walk. Validation
@@ -726,7 +726,9 @@
             ;; which surfaced as a raw ArrayIndexOutOfBoundsException out of
             ;; `get`. Found by mutating every byte of a real indexed document
             ;; and requiring that no lookup ever throws an untyped exception.
-            (let [lim (long (or (:data-end idx) (.size r)))]
+            ;; `.data-end` is a primitive field and so never nil; the `or`
+            ;; against `(.size r)` dated from the fifteen-key map.
+            (let [lim (.data-end idx)]
               (confirm
                (loop [lo 0 hi (dec m)]
                  (if (> lo hi)
@@ -787,7 +789,7 @@
         (.headEndAt r off)
         (let [ix (nav-idx nav)
               ;; `nav-idx` is nil when the file carries no usable index at all.
-              stride0 (if ix (long (:stride ix)) 0)
+              stride0 (if ix (.stride ^Index ix) 0)
               ;; The same argument once the stride is known: any `idx` inside
               ;; the first stride lands on anchor 0, so there is nothing to jump
               ;; to. Checked before `node-slot`, which is a binary search over
@@ -2211,7 +2213,7 @@
                   ;; test they used when this was a map with one key.
                   (Index. r 0 nil nil nil 0 0 nil ptr nil nil)))))))))
 
-(deftype Items [^Nav nav idx]
+(deftype Items [^Nav nav ^Index idx]
   clojure.lang.Seqable
   (seq [this] (seq (into [] this)))
 
@@ -2227,7 +2229,7 @@
   ;; sequence has no head at all.
   clojure.lang.Counted
   (count [this]
-    (if-let [t (:total idx)]
+    (if-let [t (when idx (.total idx))]
       (long t)
       (reduce (fn [^long n _] (inc n)) 0 this)))
 
@@ -2244,7 +2246,9 @@
         v)))
   (nth [_ i nf]
     (let [^Reader r (.rdr nav)
-          end (long (or (:data-end idx) (.size r)))]
+          ;; `idx` is nil for a sequence with no usable index at all, which is
+          ;; why this is a guard and not a field read.
+          end (if idx (.data-end idx) (.size r))]
       ;; `:offsets`, not `idx`. An index can exist and carry NO sequence node:
       ;; only `write-seq!` emits the sentinel -1 node, so `encode-indexed`, and
       ;; `build-index` + `seal-index!` over a file somebody else wrote, both
@@ -2252,10 +2256,10 @@
       ;; destructured `total` as nil and compared it, so `nth` threw an NPE --
       ;; on the 3-arity not-found form too, leaving no safe way to call it,
       ;; while `seq` and `reduce` on the same object worked.
-      (if-let [^longs offsets (:offsets idx)]
+      (if-let [^longs offsets (when idx (.offsets idx))]
         ;; O(1) to the anchor, then at most stride-1 skips.
-        (let [stride (long (:stride idx))
-              total (long (:total idx))]
+        (let [stride (.stride idx)
+              total (long (.total idx))]
           (if (or (neg? i) (>= i total))
             nf
             ;; THE ANCHOR IS TRUSTED, as everywhere else in this namespace. It
@@ -2289,7 +2293,7 @@
     (let [^Reader r (.rdr nav)
           ;; Stop at the data section's end, NOT the file's. Without this the
           ;; index item itself would be yielded as if it were data.
-          end (long (or (:data-end idx) (.size r)))]
+          end (if idx (.data-end idx) (.size r))]
       (loop [p 0 acc init]
         (if (or (>= p end) (reduced? acc))
           (unreduced acc)
