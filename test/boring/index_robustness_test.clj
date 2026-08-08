@@ -913,6 +913,52 @@
           (is (= [1 2 3] (mapv nav/value (nav/items bs (assoc opts :max-depth md))))
               (str "max-depth " md)))))))
 
+(deftest a-valid-index-never-makes-counting-wrong
+  (testing "the ITEM budget, which is the same argument as `:max-depth` above
+            and was written out once then applied to only one of the two
+            limits. The frame's item cost scales with the NODE count, so a
+            500-record log written with default options overran a budget that
+            was generous for its data: `.readFrom` threw, the payload came back
+            nil, `:data-end` was lost with it, and `items` walked past the data
+            section into the frame and reported 501 records for 500.
+
+            A silently wrong COUNT out of a default-written file, and it had no
+            test. This asserts the count itself rather than that the index
+            survived: losing `:data-end` IS the failure, and an index-shaped
+            assertion would not see it.
+
+            What it does NOT pin, stated because the difference is easy to
+            assume away: the item override no longer does anything. Disabling
+            it leaves the whole suite green, and the reason is structural
+            rather than lucky -- `Reader.readFrom` sets `items = 0` on entry,
+            so each payload element is read against a fresh budget, and since
+            the v2 layout every element is ONE item. `sorted` used to be a CBOR
+            array of one boolean per node, and 770 booleans inside a single
+            `readFrom` is what overran a 500-record file's budget. Byte strings
+            removed the scaling, not the override.
+
+            So this guards the INVARIANT -- a caller's budget bounds their
+            data, never boring's own footer -- against whatever is done to the
+            frame next, which is the reason to have it either way."
+    (let [out (ByteArrayOutputStream.)
+          vs (vec (repeat 500 (vec (range 32))))]
+      (boring/write-seq! (boring/writer 65536 opts) vs out (assoc opts :index 16))
+      (let [bs (.toByteArray out)]
+        (doseq [mi [1 10 100 1000 0]]
+          (is (= 500 (count (into [] (nav/items bs (assoc opts :max-items mi)))))
+              (str "max-items " mi ": the caller's budget bounds THEIR data, "
+                   "never boring's own footer")))
+        ;; and it MUST still bound their data. A 32-element record does not fit
+        ;; in a budget of 1, and asking for one there is meant to raise -- the
+        ;; override isolates the frame, it does not lift the limit. Realising is
+        ;; therefore asserted only where the records themselves fit.
+        (doseq [mi [1000 0]]
+          (is (= vs (mapv nav/value (nav/items bs (assoc opts :max-items mi))))
+              (str "max-items " mi ": and the records read back unchanged")))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (mapv nav/value (nav/items bs (assoc opts :max-items 10))))
+            "a record too big for the budget still raises")))))
+
 (deftest build-index-survives-a-long-tag-chain
   (testing "`index-walk` recursed once per tag, so `c0 c0 ... 00` -- legal CBOR,
             and reachable through the public `build-index` on bytes somebody
