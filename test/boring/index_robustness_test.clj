@@ -189,6 +189,45 @@
 
 ;; ---------------------------------------------------------------- finding 6
 
+(defn- parts
+  "The six payload elements, CONSISTENT by default, through the writer's own
+  packers.
+
+  The cases below used to build `slots` as a vector of byte arrays and `sorted`
+  as a vector of booleans -- the shapes both had before the v2 layout. Every one
+  of them was therefore refused at `(bytes? packed)`, a check that runs BEFORE
+  every length check the cases name, so all seven assertions passed against a
+  frame refused for a reason none of them was testing. The control asserted
+  `index accepted` over an index whose `:containers` was nil.
+
+  Packing through `pack-slots`/`pack-sorted` is what stops that recurring: a
+  case can only be inconsistent in the way it says it is. It also means the
+  writer's own node invariant runs here, which is why lying about `counts` or
+  `stride` needs `:pack-counts`/`:pack-stride` -- `pack-slots` refuses to build
+  an inconsistent node, so the lie has to go in the DECLARED value only.
+
+  Defaults describe the three 4-byte `{\"x\" n}` items `crafted` writes: one
+  sequence node at the sentinel offset -1, three entries, anchors at 0, 4, 8."
+  [& {:keys [stride containers counts slots sorted pack-counts pack-stride]
+      :or {stride 1 containers [-1] counts [3] slots [[0 4 8]] sorted [false]}}]
+  [stride
+   (int-array containers)
+   (int-array counts)
+   (#'boring/pack-slots (mapv long-array slots) (long-array containers)
+                        (int-array (or pack-counts counts))
+                        (long (or pack-stride stride)))
+   (#'boring/pack-sorted sorted)])
+
+(defn- accepted?
+  "Did the reader actually USE the index, as opposed to detecting the frame and
+  refusing it? Both keep `data-end`, so both stop `items` yielding the frame as
+  data -- which is why an item count alone cannot tell them apart, and why every
+  case here asserts this too."
+  [^bytes bs o]
+  (let [c (nav/source bs o)
+        ix (#'nav/nav-idx (.nav ^boring.nav.Cursor c))]
+    (some? (:containers ix))))
+
 (defn- crafted
   "A sealed sequence whose index frame is hand-built from `payload`."
   ^bytes [payload]
@@ -213,25 +252,22 @@
             `get`, or a wrong subtree. All must now fall back to scanning, which
             sees 4 items -- the 3 data items and the index frame as data."
     (doseq [[label payload]
-            [["slots shorter than containers"
-              [1 (int-array [-1]) (int-array [3]) [] [false]]]
+            [["slots empty where a node is declared"
+              (assoc (parts) 3 (byte-array 0))]
              ["sorted shorter than containers"
-              [1 (int-array [-1]) (int-array [3])
-               [(byte-array (map unchecked-byte [0 4 4]))] []]]
+              (parts :sorted [])]
              ["count disagrees with the slot's length"
-              [1 (int-array [-1]) (int-array [1000000])
-               [(byte-array (map unchecked-byte [0 4 4]))] [false]]]
+              (parts :counts [1000000] :pack-counts [3])]
              ["containers not ascending"
-              [1 (int-array [5 -1]) (int-array [3 3])
-               [(byte-array (map unchecked-byte [0 4 4]))
-                (byte-array (map unchecked-byte [0 4 4]))] [false false]]]
+              (parts :containers [5 -1] :counts [3 3]
+                     :slots [[5 9 13] [0 4 8]] :sorted [false false])]
              ["an anchor beyond the data section"
-              [1 (int-array [-1]) (int-array [3])
-               [(byte-array (map unchecked-byte [0 100 100]))] [false]]]
+              (parts :slots [[0 100 200]])]
              ["a negative stride"
-              [-1 (int-array [-1]) (int-array [3])
-               [(byte-array (map unchecked-byte [0 4 4]))] [false]]]]]
+              (parts :stride -1 :pack-stride 1)]]]
       (let [bs (crafted payload)]
+        (is (not (accepted? bs opts))
+            (str label ": the index must be REFUSED, not merely survived"))
         ;; THREE, not four. The frame stays metadata even when its payload is
         ;; unusable: detection and usability are separate questions, and
         ;; detection has already succeeded here -- prefix, pointer, ends at
@@ -305,15 +341,20 @@
             cost O(1) to detect and would otherwise surface as a raw
             IndexOutOfBoundsException from inside `get` rather than as
             \"no usable index, scan instead\"."
-    (let [bs (crafted [1 (int-array [-1]) (int-array [3]) [] [false]])]
-      (is (= 3 (count (into [] (nav/items bs (assoc opts :trust-index :trusted)))))
+    (let [bs (crafted (assoc (parts) 3 (byte-array 0)))
+          trusted (assoc opts :trust-index :trusted)]
+      (is (not (accepted? bs trusted))
+          "trusted must still REFUSE this frame, not merely survive it")
+      (is (= 3 (count (into [] (nav/items bs trusted))))
           "trusted must still fall back to scanning, not index into nothing"))))
 
 (deftest a-consistent-crafted-payload-is-still-used
   (testing "the control: validation must reject inconsistency, not everything.
             Three 4-byte items at stride 1 means three anchors at 0, 4 and 8."
-    (let [bs (crafted [1 (int-array [-1]) (int-array [3])
-                       [(byte-array (map unchecked-byte [0 4 4]))] [false]])]
+    (let [bs (crafted (parts))]
+      (is (accepted? bs opts)
+          "the control's index must actually be USED -- this is the assertion
+           whose absence made all six cases above vacuous")
       (is (= 3 (count (into [] (nav/items bs opts))))
           "index accepted, so the frame is not yielded as data")
       (is (= 3 (get (nav/value (nth (nav/items bs opts) 2)) "x"))))))
