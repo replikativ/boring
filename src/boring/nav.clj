@@ -116,7 +116,7 @@
 
 ;; ---------------------------------------------------------------- the source
 
-(declare slot-at node-sound? sorted-at?)
+(declare slot-at sorted-at?)
 
 ;; RESOLVED ONCE, not per index open. `(Class/forName "[I")` is a classloader
 ;; lookup, and `read-index` made four of them every time it opened a frame --
@@ -248,7 +248,7 @@
               ;; walk it". So the fallback path is the one that always existed
               ;; and the failure mode is unchanged; only the moment of
               ;; discovery moved. See `index-payload`.
-              (= c off) (if (node-sound? nav ix mid) mid -1)
+              (= c off) mid
               (< c off) (recur (inc mid) hi)
               :else (recur lo (dec mid))))))
       -1)))
@@ -760,15 +760,21 @@
     (if (or (neg? idx) (>= idx n))
       -1
       (let [ix (nav-idx nav)
-            ns (node-slot nav off)]
-        (if (neg? ns)
+            ns (node-slot nav off)
+            ^longs slot (when-not (neg? ns) (slot-at ix ns))
+            stride (when slot (long (:stride ix)))
+            anchor (when slot (quot idx (long stride)))]
+        ;; THE ANCHOR MUST BE THERE, which `lookup-map` has always checked and
+        ;; this never did -- `node-sound?` was rejecting such a node before it
+        ;; got here, and with that gone `(aget slot anchor)` on a node whose
+        ;; count says zero anchors is a raw AIOOBE out of `nth`. Empty
+        ;; containers legitimately produce a zero-anchor node (`:index-min 0`
+        ;; will index a `[]`), so this is reachable without any damage at all.
+        (if (or (nil? slot) (zero? (alength slot)) (>= (long anchor) (alength slot)))
           (loop [i 0 p (.headEndAt r off)]
             (if (= i idx) p (recur (inc i) (skip r p))))
-          (let [^longs slot (slot-at ix ns)
-                stride (long (:stride ix))
-                anchor (quot idx stride)]
-            (loop [i (* anchor stride) p (long (aget slot anchor))]
-              (if (= i idx) p (recur (inc i) (skip r p))))))))))
+          (loop [i (* (long anchor) (long stride)) p (long (aget slot (long anchor)))]
+            (if (= i idx) p (recur (inc i) (skip r p)))))))))
 
 ;; NOTE: this compares the declared count against `room` BEFORE doubling for a
 ;; map, while `Cursor.count` compares `2n`. Both are typed refusals, so the
@@ -1648,169 +1654,47 @@
   scalar back instead of an error. `cursor?` is how you tell the two apart."
   [^Cursor c] c)
 
-(defn- node-valid?
-  "Does index node `i` describe the data it claims to?
+(defn- seq-node-ok?
+  "Whether the SEQUENCE node's anchors describe this data section.
 
-  Split out of `index-payload` so it can be run PER NODE, on demand, instead of
-  over every node at load. That is the whole cost of an index on a short-lived
-  source: the checks below read the file, so validating a 12 000-container
-  frame cost ~1 ms before a single lookup ran, and a caller that touches one
-  key paid all of it. Deferring makes the price proportional to what is
-  actually navigated.
+  All that survives of `node-valid?`, and the reason it survives is that it is
+  not the same kind of check as the rest. The per-node and per-anchor
+  validation policed byte-level corruption of an index we have now decided to
+  trust; this catches a FILE-level mixup, which trusting the index says nothing
+  about:
 
-  IT DOES NOT MAKE IT SMALL. Pinning the far end needs the container's end, and
-  a CBOR container carries no byte length, so finding it walks every item --
-  the work the node exists to avoid. Untrusted, an index therefore cannot beat
-  an unindexed walk on a source read ONCE, at any container size, by
-  construction rather than by a constant: measured flat at ~190 us on 769 maps
-  of 20 wherever the key sat, against 2.2 us unindexed for the first element.
-  `:trust-index :trusted` skips it and runs 20-23 us. See the far-end check
-  below.
+    Splice one sealed file's data section under another's footer of the same
+    byte length but different item boundaries -- an interrupted append and a
+    retry, a restore taking the body from one snapshot and the tail from
+    another. Every other gate passes. `nth items 16` returned the string
+    \"gaaaa\", `nth 32` returned the record written at 32-9, and `decode-seq`
+    over the same bytes was correct throughout, so two code paths in one
+    application disagreed about the file.
 
-  The checks themselves are unchanged, and each was reachable: a slot shorter
-  than its count made `nth` walk off the end, a zero-length slot made the binary
-  search index -1, and an anchor outside the data section reached
-  `Reader.skipFrom`, which does an unchecked array access and throws a raw
-  AIOOBE at the caller."
-  [^Reader r ptr c cnt st ^longs a]
-  (let [ptr (long ptr) c (long c) cnt (long cnt) st (long st)
-        want (if (zero? cnt) 0 (inc (quot (dec cnt) st)))]
-    (and (= (alength a) want)
-                 ;; The node must describe a container that IS THERE
-                 ;; and has the entry count it claims, and its first
-                 ;; anchor must be that container's first entry.
-                 ;; All O(1) -- read from the head -- and together
-                 ;; they reject an index whose offsets are internally
-                 ;; tidy but point at the wrong places, which passed
-                 ;; every earlier check and silently returned a
-                 ;; neighbouring value.
-         (if (neg? c)
-                   ;; the sequence node: its first item is byte 0
-           (or (zero? want) (zero? (aget a 0)))
-           (and (< c ptr)
-                (#{4 5} (.majorAt r c))
-                (= cnt (.headArgAt r c))
-                (or (zero? want)
-                    (= (long (aget a 0)) (.headEndAt r c)))))
-                 ;; anchors ascend, sit inside the data section, and
-                 ;; for a real container start after its own header
-         (loop [k 0 prev -1]
-           (if (>= k (alength a))
+  And it is CHEAP, which the container version never was. `want-end` is
+  `data-end`, a constant already in the frame, and the walk from the last
+  anchor is bounded by one stride because `m = 1 + (cnt-1)/stride` forces
+  `remaining` into [1, stride]. For a container it was `(skip r c)` -- a walk
+  of every item, the work the node exists to avoid, ~190 us on 769 maps of 20.
+  That is the half that was expensive and the half that is gone.
+
+  Zero anchors is honest only when the data section is empty: a node claiming
+  no items short-circuits every other check, and `count` then returned 0 and
+  `nth` nil over a file holding all 60 of its records."
+  [^Reader r ptr cnt st ^longs a]
+  (let [ptr (long ptr) cnt (long cnt) st (long st) m (alength a)]
+    (and (or (zero? m) (zero? (aget a 0)))       ; a sequence starts at byte 0
+         (loop [k 0 prev -1]                     ; anchors ascend, inside the data
+           (if (>= k m)
              true
              (let [v (long (aget a k))]
-               (if (and (> v prev) (<= 0 v) (< v ptr)
-                        (or (neg? c) (> v c)))
-                 (recur (inc k) v)
-                 false))))
-                 ;; AND THE FAR END, which nothing pinned.
-                 ;;
-                 ;; Every check above is about the START of the node
-                 ;; and about the anchors being tidy among
-                 ;; themselves. None of them says the node describes
-                 ;; THIS data. Two measured consequences:
-                 ;;
-                 ;;   Splice one sealed file's data section under
-                 ;;   another's footer of the same byte length but
-                 ;;   different item boundaries -- an interrupted
-                 ;;   append and a retry, a restore taking the body
-                 ;;   from one snapshot and the tail from another.
-                 ;;   Every gate passed. `nth items 16` returned the
-                 ;;   string "gaaaa", `nth 32` returned the record
-                 ;;   written at 32-9, and `decode-seq` over the same
-                 ;;   bytes was correct throughout, so two code paths
-                 ;;   in one application disagreed about the file.
-                 ;;
-                 ;;   The item total was never compared with the
-                 ;;   data at all -- the slot-length rule
-                 ;;   `want = 1 + (cnt-1)/stride` cannot see a change
-                 ;;   anywhere inside a whole stride. One flipped bit
-                 ;;   made `count` report 501 for a 500-item file;
-                 ;;   deflating it left ten written records present
-                 ;;   in the file, returned by `decode-seq`, and
-                 ;;   unreachable through `count`/`nth`.
-                 ;;
-                 ;; THE STEP FROM THE LAST ANCHOR is bounded by one
-                 ;; stride -- the slot-length rule above forces
-                 ;; `remaining` into [1, stride]. `want-end` is NOT.
-                 ;;
-                 ;; This comment used to claim the check "never
-                 ;; walks the container", and `(skip r c)` below is
-                 ;; precisely a walk of the container: CBOR arrays
-                 ;; and maps carry no byte length, so finding where
-                 ;; one ends means stepping over every item in it.
-                 ;; That is the work the node exists to avoid, paid
-                 ;; to prove the node honest.
-                 ;;
-                 ;; Measured, 769 maps of 20 at stride 1, one cold
-                 ;; lookup: untrusted is FLAT at ~190 us wherever
-                 ;; the key sits, because it walks the outer array
-                 ;; either way, while an unindexed walk runs 2.2 us
-                 ;; to reach element 0 and 240 to reach element 768.
-                 ;; So an untrusted index is 91x SLOWER than none at
-                 ;; the front and only breaks even at the very back.
-                 ;; Trusted is 20-23 us throughout.
-                 ;;
-                 ;; It is memoized per node, so a REUSED source pays
-                 ;; it once and profits after; a source read once --
-                 ;; which is every read of a store handing out a
-                 ;; fresh blob -- pays it and gains nothing. Making
-                 ;; this O(stride) needs the frame to carry each
-                 ;; node's end, which is a format change and not one
-                 ;; to make silently.
-                 ;;
-                 ;; From the last anchor, stepping over the items it
-                 ;; covers must land EXACTLY on the node's end --
-                 ;; the data section's end for the sequence, the
-                 ;; container's own end otherwise.
-         (let [m (alength a)]
-           (or (if (neg? c)
-                         ;; A SEQUENCE NODE CLAIMING ZERO ITEMS has
-                         ;; no anchors, so the far-end check below
-                         ;; short-circuits and never looks at the
-                         ;; data -- and `count` then returned 0 and
-                         ;; `nth` nil over a file holding all 60 of
-                         ;; its records. Zero items is only honest
-                         ;; if the data section is empty, which is
-                         ;; one comparison.
-                 (and (zero? m) (zero? ptr))
-                 (zero? m))
-               (let [covered (* st (dec m))
-                     remaining (- cnt covered)
-                     per (if (and (not (neg? c)) (= MAJOR-MAP (.majorAt r c)))
-                           2 1)
-                     n (* per remaining)
-                     want-end (if (neg? c) ptr -1)]
-                 ;; SEQUENCE NODES ONLY. `want-end` is `data-end` for a
-                 ;; sequence -- a constant already in the frame -- and the walk
-                 ;; from the last anchor is bounded by one stride, so this costs
-                 ;; O(stride) there and always did.
-                 ;;
-                 ;; For a CONTAINER it was `(skip r c)`: a walk of every item in
-                 ;; the container, to learn where it ends. That is the work the
-                 ;; node exists to avoid, and it made an untrusted index unable
-                 ;; to beat an unindexed walk at any size -- measured FLAT at
-                 ;; ~190 us on 769 maps of 20 wherever the key sat, against
-                 ;; 2.2 us unindexed for the first element.
-                 ;;
-                 ;; What a container node still gets, all O(1): the offset is
-                 ;; inside the data section, the byte there is major 4 or 5, the
-                 ;; declared entry count matches `counts[i]`, anchor 0 is that
-                 ;; container's first entry, and the anchors ascend within
-                 ;; range. What it LOSES is the last anchor's far end -- damage
-                 ;; confined to the final partial span, past the last anchor, is
-                 ;; no longer detected.
-                 ;;
-                 ;; No test pinned this: disabling it left 392 tests / 18986
-                 ;; assertions green. That is a coverage gap and not a licence,
-                 ;; which is why the O(1) checks above stay unconditional --
-                 ;; `nth-item` jumps to an anchor with no `confirm` to catch a
-                 ;; wrong answer, unlike `lookup-map`, whose misses are
-                 ;; re-derived by an honest scan.
-                 (or (neg? want-end)
-                     (and (pos? remaining)
-                          (= want-end
-                             (loop [k 0 p (long (aget a (dec m)))]
-                               (if (= k n) p (recur (inc k) (skip r p)))))))))))))
+               (if (and (> v prev) (<= 0 v) (< v ptr)) (recur (inc k) v) false))))
+         (if (zero? m)
+           (zero? ptr)
+           (let [remaining (- cnt (* st (dec m)))]
+             (and (pos? remaining)
+                  (= ptr (loop [k 0 p (long (aget a (dec m)))]
+                           (if (= k remaining) p (recur (inc k) (skip r p)))))))))))
 
 (defn- payload-offsets
   "Byte offset of each of the frame payload's first five elements, decoding none
@@ -1939,21 +1823,56 @@
   anchors while it is still assembling the `Index` that `slot-at` would read
   them from -- the old map could be built in two steps with `assoc`, a type
   cannot. Taking the pieces rather than the whole also says what this actually
-  depends on, which is five arrays and a stride."
+  depends on, which is five arrays and a stride.
+
+  THE ANCHORS ARE BOUNDED HERE, and this is the only place left that checks
+  anything about them. The index is trusted for whether its anchors are the
+  RIGHT offsets; it is not trusted to keep them inside the file, because
+  `Reader.skipFrom` does an unchecked array access and an anchor past the end
+  reaches it as a raw AIOOBE at the caller of `get`. One comparison per anchor,
+  and `m` is 2 at the default stride.
+
+  A typed throw rather than a nil, because there is no longer a validation
+  layer above this to turn a bad node into `node-slot` -1 and a scan. The
+  caller sees `:boring/bad-index`, which is what every other malformed-input
+  path in this library raises."
   ;; No primitive hints on `stride`/`i`: six args with two of them primitive is
   ;; one past what Clojure allows, and the boxing here is once per node rather
-  ;; than per anchor. `node-valid?` carries the same note for the same reason.
-  ^longs [^bytes packed tbase wstart ^ints counts ^longs cs stride i]
+  ;; than per anchor.
+  ^longs [^bytes packed tbase wstart ^ints counts ^longs cs stride i limit]
   (let [i (long i)
+        lim (long limit)
         m (anchor-count (aget counts (int i)) (long stride))
         w (width-code packed i)
         sz (bit-shift-left 1 w)
+        start (long (slot-start packed tbase wstart i))
         a (long-array m)]
+    ;; AND THE DELTA RUN ITSELF IS BOUNDED, which nothing states elsewhere.
+    ;; `slot-table` checks the start table's LAST entry against the byte
+    ;; string's length; it never checks that the entries ascend, so one damaged
+    ;; start entry sends `delta-at` anywhere. That was survivable only by
+    ;; accident: `node-sound?` wrapped the expansion in `(catch Exception _
+    ;; false)`, so the AIOOBE became "unusable, scan". With the per-node
+    ;; validation gone the exception escapes -- measured, a raw
+    ;; ArrayIndexOutOfBoundsException reading index 65286 of an 11-byte array,
+    ;; straight out of `get`.
+    ;;
+    ;; Stating it here makes the bound explicit and O(1) instead of implicit in
+    ;; somebody else's catch, and it is the same check an offsets-based reader
+    ;; will need when the JVM stops providing one for free.
+    (when (or (neg? start) (> (+ start (* m sz)) (alength packed)))
+      (throw (ex-info "boring: index slot segment outside the packed slots"
+                      {:type :boring/bad-index :node i :start start
+                       :anchors m :width sz :slots-length (alength packed)})))
     (loop [k 0
-           p (long (slot-start packed tbase wstart i))
+           p start
            acc (max 0 (aget cs (int i)))]
       (when (< k m)
         (let [v (+ acc (delta-at packed p w))]
+          (when (or (neg? v) (>= v lim))
+            (throw (ex-info "boring: index anchor outside the data section"
+                            {:type :boring/bad-index :node i :anchor k
+                             :offset v :data-end lim})))
           (aset a k v)
           (recur (inc k) (+ p sz) v))))
     a))
@@ -1972,47 +1891,7 @@
   immediately and a sequence is the shape whose source IS reused."
   ^longs [^Index ix ^long i]
   (expand-anchors (.slots ix) (.slots-tbase ix) (.slots-wstart ix)
-                  (.counts ix) (.containers ix) (.stride ix) i))
-
-(defn- node-sound?
-  "Is index node `i` usable?
-
-  An unsound node is not an error: `node-slot` reports -1 and the caller walks
-  the container, which is the path taken whenever a container is simply not
-  indexed. So a malformed node costs speed, never correctness -- the same
-  contract `read-index` keeps for a corrupt back-pointer.
-
-  NOT REMEMBERED, and it no longer needs to be. This cached a verdict per node
-  in two `boolean[]` allocated per open, because the check used to walk the
-  container to its end -- ~190 us on a 769-node frame, worth caching at any
-  price. What is left is O(1): the offset is inside the data section, the byte
-  there is major 4 or 5, the declared count matches, anchor 0 is the container's
-  first entry, and the anchors ascend in range. Three reads. Allocating two
-  arrays sized by the whole document to avoid repeating three reads is a worse
-  trade than repeating them, on a source read once -- and it makes the per-node
-  claim in the name structural rather than cached, since there is now no shared
-  state to disagree with itself.
-
-  `:trust-index :trusted` skips it entirely; `:ignore` skips the index
-  altogether. Two ends of one dial -- and with the walk gone the two ends are
-  9.01 us and 7.44 us on a 769-node frame, against 165.95 unindexed, which is
-  most of the reason to reach for `:trusted` gone."
-  [^Nav nav ^Index ix ^long i]
-  (if (= :trusted (:trust-index (.opts nav)))
-    true
-    (let [^Reader r (.rdr nav)
-          ^longs cs (.containers ix)
-          ^ints cnts (.counts ix)]
-      (boolean
-       (try
-         (node-valid? r (.data-end ix)
-                      (long (aget cs (int i)))
-                      (long (aget cnts (int i)))
-                      (.stride ix)
-                      (slot-at ix i))
-         ;; Any failure reading a malformed node means "unusable", not "throw
-         ;; at the caller of `get`".
-         (catch Exception _ false))))))
+                  (.counts ix) (.containers ix) (.stride ix) i (.data-end ix)))
 
 (defn- index-payload
   "The usable index in the tag-27 frame at `ptr`, or nil meaning \"scan\".
@@ -2028,17 +1907,25 @@
   expanded eagerly below, so without this one malformed slot would take down a
   cursor that never went near the container it belongs to.
 
-  `trusted?` is `:trust-index :trusted`, and it skips the two checks below that
-  are O(NODE COUNT). It had been honoured only per node, by `node-sound?`; the
-  FRAME-level structure was re-verified on every `nav/source` regardless, which
-  is the same defect one level up -- an option accepted and then ignored.
+  THERE IS ONE PATH. This took a `trusted?` flag -- `:trust-index :trusted` --
+  that skipped the O(NODE COUNT) checks, because they were not marginal: paid
+  per SOURCE, and a document store opens one source per blob to do one lookup.
+  Measured on 4096 scalars, the indexed lookup itself was 0.22 us against 24.97
+  scanning, while opening the source and doing that one lookup came to 8.67 --
+  nearly all of what the index saved, spent proving the index was well-formed.
 
-  That cost is not marginal, because it is paid per SOURCE and a document store
-  opens one source per blob and does one lookup. Measured on 4096 scalars: the
-  indexed lookup itself is 0.22 us against 24.97 us scanning, but opening the
-  source and doing that one lookup came to 8.67 us -- so nearly all of what the
-  index saved was spent proving the index was well-formed."
-  [^Reader r ^long ptr trusted?]
+  The dial is gone because the answer is the same at both ends now. The index
+  is a TRUST BOUNDARY: we use it where we are willing to trust it, so nothing
+  here re-derives whether its offsets are RIGHT. What is left is only what
+  keeps reads inside the file, which is not a matter of trust --
+  `Reader.skipFrom` does an unchecked array access, so an offset we never
+  bounded arrives as a raw AIOOBE at the caller of `get`.
+
+  `:trust-index :ignore` still means what it always did: do not use the index
+  at all. `:trusted` is accepted and does nothing, which is deliberate -- a
+  REMOVED option key silently no-ops (`boring.options/near-miss` passes unknown
+  keys), and konserve-lmdb sets it."
+  [^Reader r ^long ptr]
   (try
     ;; `frame-payload`, not `record-fields`: an unregistered tag-27 frame
     ;; decodes to an UnknownRecord when its payload is a map and a
@@ -2138,21 +2025,18 @@
                  ;; `sorted` is a bit per node, so its byte length is exact --
                  ;; `(quot (+ n 7) 8)` -- and an equality rather than a bound.
                  (= (alength ^bytes sorted) (quot (+ (alength counts) 7) 8))
-                 (or
-                  trusted?
-                  (and
-                   ;; `node-slot` BINARY-SEARCHES containers, so they must ascend.
-                   (loop [k 1]
-                     (cond (>= k (alength containers)) true
-                           (>= (aget containers (dec k)) (aget containers k)) false
-                           :else (recur (inc k))))
-                   ;; `(every? nat-int? (seq counts))` walked an int[] as a
-                   ;; boxed seq -- one Integer per node, on the path taken for
-                   ;; every source opened. Same predicate, no allocation.
-                   (loop [k 0]
-                     (cond (>= k (alength counts)) true
-                           (neg? (aget counts k)) false
-                           :else (recur (inc k)))))))
+                 ;; `node-slot` BINARY-SEARCHES containers, so they must
+                 ;; ascend. O(NODE COUNT), and the only per-node work left at
+                 ;; open -- kept because a search over an unordered array does
+                 ;; not merely miss, it can settle on a node belonging to a
+                 ;; different container and hand its anchors to this one. The
+                 ;; counts check that used to sit beside it is gone: a negative
+                 ;; count now cannot reach past `expand-anchors`, which bounds
+                 ;; its own segment and its own anchors.
+                 (loop [k 1]
+                   (cond (>= k (alength containers)) true
+                         (>= (aget containers (dec k)) (aget containers k)) false
+                         :else (recur (inc k)))))
         ;; One uniform node list. The SEQUENCE is the node at the sentinel
         ;; offset -1: it has no container header on the wire but behaves like
         ;; one, and a sentinel avoids carrying two shapes for the same idea.
@@ -2184,16 +2068,15 @@
               ;; `Index` does not exist yet -- see that function.
               seq-anchors (when seq-slot
                             (expand-anchors packed (nth table 0) (nth table 1)
-                                            counts containers st (long seq-slot)))
-              ;; Trusted skips this for the same reason `node-sound?` does: it
-              ;; walks the file to prove the sequence node honest, and a caller
-              ;; who wrote the bytes has already answered that question.
-              seq-ok? (or trusted?
-                          (nil? seq-slot)
-                          (node-valid? r ptr
-                                       (long (aget containers (int seq-slot)))
-                                       (long (aget counts (int seq-slot)))
-                                       st seq-anchors))]
+                                            counts containers st (long seq-slot)
+                                            ptr))
+              ;; The one validation left, and it is about which FILE this is,
+              ;; not about whether the bytes were corrupted -- see
+              ;; `seq-node-ok?`. O(stride), on one node.
+              seq-ok? (or (nil? seq-slot)
+                          (seq-node-ok? r ptr
+                                        (long (aget counts (int seq-slot)))
+                                        st seq-anchors))]
           (when seq-ok?
             (Index. r st containers counts packed (long (nth table 0)) (long (nth table 1))
                     sorted ptr
@@ -2301,8 +2184,7 @@
               ;; does: detection has succeeded by here, so an UNUSABLE payload
               ;; must still yield `:data-end` or `items` walks past the data
               ;; section and republishes the footer as a data item.
-              (or (index-payload r ptr
-                                 (= :trusted (:trust-index (.opts nav))))
+              (or (index-payload r ptr)
                   ;; DETECTED BUT REFUSED: an Index carrying only `data-end`.
                   ;; `containers` nil is how every caller tells this apart --
                   ;; `(if-let [cs (.containers ix)] ...)` -- which is the same
