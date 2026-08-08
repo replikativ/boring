@@ -181,9 +181,9 @@
     slots))
 
 (defn- width-code
-  "Node `i`'s 2-bit width code out of the table at the head of `packed`."
+  "Node `i`'s 2-bit width code, out of the table that follows the LAYOUT BYTE."
   [^bytes packed i]
-  (bit-and 3 (bit-shift-right (aget packed (quot i 4)) (* 2 (rem i 4)))))
+  (bit-and 3 (bit-shift-right (aget packed (+ 1 (quot i 4))) (* 2 (rem i 4)))))
 
 (deftest slots-narrow-to-the-width-the-data-needs
   (testing "small, uniform deltas take the u8 tier"
@@ -191,9 +191,11 @@
       (is (bytes? packed) "slots are ONE byte string, not an array per node")
       (is (= 0 (width-code packed 0))
           "expected the u8 tier for ~60-byte deltas")
-      ;; One node -- the sequence -- so one width byte and 500 one-byte deltas.
-      (is (= (+ 1 500) (alength packed))
-          "the byte string is exactly the width table plus the deltas")))
+      ;; One node -- the sequence -- so: a layout byte, one width byte, a
+      ;; start table of two 2-byte entries (the block start and the total,
+      ;; which is the structural gate), then 500 one-byte deltas.
+      (is (= (+ 1 1 4 500) (alength packed))
+          "the byte string is exactly the header plus the deltas")))
   (testing "wider deltas step up to u16, and wider still to i32"
     (let [w (boring/writer 262144 opts)
           mk (fn [len]

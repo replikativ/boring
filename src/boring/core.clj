@@ -1497,6 +1497,35 @@
      (when (pos? (alength ^longs (:containers idx)))
        (assoc idx :stride stride)))))
 
+(def ^:no-doc ^:const slot-block
+  "How many index nodes one entry of the slot start table covers.
+
+  `slots` carries a SPARSE table of byte offsets -- one entry every this many
+  nodes -- so reaching node `i`'s deltas is one table read plus the segments of
+  at most `slot-block - 1` nodes, instead of a prefix sum over every earlier
+  node. That bound is what lets a reader stop materialising the whole index to
+  serve one lookup.
+
+  16 is a size, not a law: the layout byte carries a version, so this can move
+  without another format break. Costs `(N/16 + 2)` entries -- 100 bytes on a
+  770-node frame, 0.13% of the blob -- against 9 KB of per-open allocation and
+  an O(N) pass. A dense table would be 2% of the blob for O(1); this is the
+  same win an order of magnitude cheaper, for a bounded walk nobody can measure.
+
+  `boring.nav` reads this var rather than repeating the number, because a
+  disagreement would not corrupt one node -- it would read every node's deltas
+  from the wrong offset."
+  16)
+
+(def ^:no-doc ^:const slot-layout-v1
+  "Version nibble of the `slots` layout byte.
+
+  Without it, a reader meeting the PREVIOUS shape -- no layout byte, no start
+  table -- would read a width code where the version is, compute nonsense
+  offsets, and rely on the final-entry length check to notice. That check would
+  catch it about 65535 times in 65536. A version makes it exact, for one byte."
+  1)
+
 (defn- slot-width-code
   "The narrowest of four widths that holds every delta in `d`: 0 = u8, 1 = u16,
   2 = i32, 3 = i64.
@@ -1606,30 +1635,60 @@
         ;; That makes it an assumption about the walk, not about the file.
         (aset-byte ws i (byte (slot-width-code d)))))
     (let [wbytes (quot (+ n 3) 4)
-          total (loop [i 0 t (long wbytes)]
-                  (if (= i n)
-                    t
-                    (recur (inc i)
-                           (+ t (* (alength ^longs (aget ds i))
-                                   (bit-shift-left 1 (aget ws i)))))))
-          out (byte-array total)]
+          seg (fn ^long [^long i] (* (alength ^longs (aget ds i))
+                                     (bit-shift-left 1 (aget ws i))))
+          deltas (loop [i 0 t 0] (if (= i n) t (recur (inc i) (+ (long t) (long (seg i))))))
+          entries (+ (quot n slot-block) 2)
+          ;; W depends on the total, and the total depends on W. Two iterations
+          ;; settle it: widening the table can only push the total up by
+          ;; `entries * 2`, never back down.
+          w-start (loop [sw 2]
+                    (let [tot (+ 1 wbytes (* entries sw) deltas)]
+                      (if (or (= sw 4) (< tot 0x10000)) sw (recur 4))))
+          header (+ 1 wbytes (* entries w-start))
+          total (+ header deltas)
+          out (byte-array total)
+          put! (fn [^long o ^long v ^long sz]
+                 (dotimes [j sz]
+                   (aset-byte out (+ o j) (unchecked-byte (bit-shift-right v (* 8 j))))))]
+      ;; The layout byte: version in the low nibble, the start table's entry
+      ;; width in the high nibble. It is what makes a frame in the PREVIOUS
+      ;; shape refusable exactly rather than probabilistically -- a reader that
+      ;; expects this layout and meets the old one reads a width code where a
+      ;; version should be, and says so, instead of computing nonsense offsets
+      ;; and hoping the length check catches them.
+      (aset-byte out 0 (unchecked-byte (bit-or slot-layout-v1
+                                               (bit-shift-left (if (= w-start 4) 1 0) 4))))
       (dotimes [i n]
-        (let [b (quot i 4)]
+        (let [b (+ 1 (quot i 4))]
           (aset-byte out b (unchecked-byte
                             (bit-or (bit-and 0xFF (aget out b))
                                     (bit-shift-left (aget ws i) (* 2 (rem i 4))))))))
-      (loop [i 0 p (long wbytes)]
+      ;; THE SPARSE START TABLE, one entry every `slot-block` nodes, plus a
+      ;; final entry holding the total. Node i's deltas begin at entry
+      ;; `(quot i slot-block)` plus the segments of at most `slot-block - 1`
+      ;; nodes -- so reaching ANY node is a bounded walk rather than a prefix
+      ;; sum over every earlier one, which is what let the reader stop
+      ;; materialising `slot-starts` and `counts` at all.
+      ;;
+      ;; The final entry is also the structural gate: it must equal the byte
+      ;; string's own length, which is one read instead of a sum over N.
+      (let [tbase (+ 1 wbytes)
+            blocks (quot n slot-block)
+            ^longs starts (long-array (inc n))]
+        (loop [i 0 p (long header)]
+          (aset starts (int i) (long p))
+          (when (< i n) (recur (inc i) (+ (long p) (long (seg i))))))
+        (dotimes [t (inc blocks)]
+          (put! (+ tbase (* t w-start)) (aget starts (min (* t slot-block) n)) w-start))
+        (put! (+ tbase (* (inc blocks) w-start)) (aget starts n) w-start))
+      (loop [i 0 p (long header)]
         (if (= i n)
           out
           (let [^longs d (aget ds i)
                 sz (bit-shift-left 1 (aget ws i))
                 m (alength d)]
-            (dotimes [k m]
-              (let [v (aget d k)
-                    o (+ p (* k sz))]
-                (dotimes [j sz]
-                  (aset-byte out (+ o j)
-                             (unchecked-byte (bit-shift-right v (* 8 j)))))))
+            (dotimes [k m] (put! (+ p (* k sz)) (aget d k) sz))
             (recur (inc i) (+ p (* m sz)))))))))
 
 (defn- pack-sorted

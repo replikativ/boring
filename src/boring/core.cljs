@@ -624,6 +624,16 @@
   [n stride]
   (if (<= n 0) 0 (if (== stride 1) n (inc (js/Math.floor (/ (dec n) stride))))))
 
+(def ^:private ^:const slot-block
+  "How many index nodes one entry of the slot start table covers. MUST equal
+  the JVM's `boring.core/slot-block` -- a disagreement would not corrupt one
+  node, it would read every node's deltas from the wrong offset."
+  16)
+
+(def ^:private ^:const slot-layout-v1
+  "Version nibble of the `slots` layout byte. Mirrors the JVM's."
+  1)
+
 (defn- slot-width-code
   "The narrowest of four widths that holds every delta: 0 = u8, 1 = u16,
   2 = i32, 3 = i64. Mirrors the JVM's `slot-width-code`."
@@ -680,17 +690,44 @@
         (aset ds i d)
         (aset ws i (slot-width-code d))))
     (let [wbytes (js/Math.ceil (/ n 4))
-          total (loop [i 0 t wbytes]
-                  (if (== i n)
-                    t
-                    (recur (inc i) (+ t (* (alength (aget ds i))
-                                           (bit-shift-left 1 (aget ws i)))))))
-          out (js/Uint8Array. total)]
+          seg (fn [i] (* (alength (aget ds i)) (bit-shift-left 1 (aget ws i))))
+          deltas (loop [i 0 t 0] (if (== i n) t (recur (inc i) (+ t (seg i)))))
+          entries (+ (js/Math.floor (/ n slot-block)) 2)
+          ;; W depends on the total and the total depends on W; widening can
+          ;; only push the total up, so two iterations settle it.
+          w-start (loop [sw 2]
+                    (let [tot (+ 1 wbytes (* entries sw) deltas)]
+                      (if (or (== sw 4) (< tot 0x10000)) sw (recur 4))))
+          header (+ 1 wbytes (* entries w-start))
+          total (+ header deltas)
+          out (js/Uint8Array. total)
+          put! (fn [o v sz]
+                 ;; NOT `bit-shift-right`: 32-bit on ClojureScript. See below.
+                 (loop [j 0 rem-v v]
+                   (when (< j sz)
+                     (aset out (+ o j) (bit-and (js/Math.floor rem-v) 0xFF))
+                     (recur (inc j) (/ rem-v 256)))))]
+      ;; The layout byte -- version low, start-entry width high. Mirrors the
+      ;; JVM's `pack-slots` byte for byte; see its docstring for why it exists.
+      (aset out 0 (bit-or slot-layout-v1
+                          (bit-shift-left (if (== w-start 4) 1 0) 4)))
       (dotimes [i n]
-        (let [b (js/Math.floor (/ i 4))]
+        (let [b (+ 1 (js/Math.floor (/ i 4)))]
           (aset out b (bit-or (aget out b)
                               (bit-shift-left (aget ws i) (* 2 (mod i 4)))))))
-      (loop [i 0 p wbytes]
+      ;; The sparse start table: one entry every `slot-block` nodes, plus a
+      ;; final entry holding the total, which is also the structural gate.
+      (let [tbase (+ 1 wbytes)
+            blocks (js/Math.floor (/ n slot-block))
+            starts (js/Array. (inc n))]
+        (loop [i 0 p header]
+          (aset starts i p)
+          (when (< i n) (recur (inc i) (+ p (seg i)))))
+        (dotimes [t (inc blocks)]
+          (put! (+ tbase (* t w-start))
+                (aget starts (min (* t slot-block) n)) w-start))
+        (put! (+ tbase (* (inc blocks) w-start)) (aget starts n) w-start))
+      (loop [i 0 p header]
         (if (== i n)
           out
           (let [d (aget ds i)

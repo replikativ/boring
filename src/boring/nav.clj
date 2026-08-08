@@ -168,7 +168,8 @@
           ^longs containers
           ^ints counts
           ^bytes slots
-          ^longs slot-starts
+          ^long slots-tbase
+          ^long slots-wstart
           ^bytes sorted
           ^long data-end
           ^java.util.concurrent.atomic.AtomicReferenceArray slot-cache
@@ -183,7 +184,8 @@
   (valAt [_ k nf]
     (case k
       :rdr rdr :stride stride :containers containers :counts counts
-      :slots slots :slot-starts slot-starts :sorted sorted :data-end data-end
+      :slots slots :slots-tbase slots-tbase :slots-wstart slots-wstart
+      :sorted sorted :data-end data-end
       :slot-cache slot-cache :node-checked node-checked :node-ok node-ok
       :total total :offsets offsets
       :anchor-checked anchor-checked :anchor-ok anchor-ok
@@ -1809,39 +1811,70 @@
   ^long [^long n ^long stride]
   (if (<= n 0) 0 (if (= stride 1) n (inc (quot (dec n) stride)))))
 
+(defn- slot-le
+  "The `w`-byte little-endian value at `p` of the packed slots."
+  ^long [^bytes packed ^long p ^long w]
+  (if (= w 2)
+    (bit-or (bit-and (aget packed (int p)) 0xFF)
+            (bit-shift-left (bit-and (aget packed (int (+ p 1))) 0xFF) 8))
+    (bit-or (bit-and (aget packed (int p)) 0xFF)
+            (bit-shift-left (bit-and (aget packed (int (+ p 1))) 0xFF) 8)
+            (bit-shift-left (bit-and (aget packed (int (+ p 2))) 0xFF) 16)
+            (bit-shift-left (bit-and (aget packed (int (+ p 3))) 0xFF) 24))))
+
 (defn- width-code
-  "Node `i`'s 2-bit width code, out of the table at the head of `packed`."
+  "Node `i`'s 2-bit width code, out of the table after the LAYOUT BYTE."
   ^long [^bytes packed ^long i]
-  (bit-and 3 (bit-shift-right (aget packed (int (quot i 4)))
+  (bit-and 3 (bit-shift-right (aget packed (int (+ 1 (quot i 4))))
                               (int (* 2 (rem i 4))))))
 
-(defn- slot-starts
-  "Byte offset in `packed` where each node's deltas begin, or nil if the widths
-  and the entry counts do not describe `packed` exactly.
+(defn- slot-table
+  "`[table-base entry-width]` for `packed`, or nil if it is not a layout this
+  reader knows or its final entry disagrees with its own length.
 
-  ONE PREFIX SUM, at open, over integers only -- no decoding, and no per-node
-  array to locate. That it must land EXACTLY on `(alength packed)` is the
-  structural check this layout gets for free, and it is stronger than the
-  per-slot type check it replaced: a frame whose widths, counts and byte length
-  disagree anywhere is refused whole, rather than at the node that happens to be
-  visited. Six of 222 single-byte footer mutants escaped the old check untyped."
-  ^longs [^bytes packed ^long n ^ints counts ^long stride]
-  (let [wbytes (quot (+ n 3) 4)]
-    (when (>= (alength packed) wbytes)
-      (let [starts (long-array (inc n))]
-        ;; This is 5.3 ns per node, against 0.9 for a bare add loop over the
-        ;; same array. The gap is the dependent chain -- each offset needs the
-        ;; previous one plus two array loads -- NOT the two var calls: writing
-        ;; both bodies out inline measured 5.6, i.e. no change. Left as calls,
-        ;; because the inline copy of `anchor-count` is exactly the kind that
-        ;; drifts from the writer's and silently shifts every node's anchors.
-        (loop [i 0 p (long wbytes)]
-          (aset starts i p)
-          (if (= i n)
-            (when (= p (alength packed)) starts)
-            (recur (inc i)
-                   (+ p (* (anchor-count (aget counts (int i)) stride)
-                           (bit-shift-left 1 (width-code packed i)))))))))))
+  TWO READS, WHERE THIS USED TO BE A PREFIX SUM OVER EVERY NODE. `slots` now
+  carries a sparse table of byte offsets -- one entry every
+  `boring/slot-block` nodes, plus a final entry holding the total -- so a node is
+  reachable without walking to it, and the structural gate is that final entry
+  against `(alength packed)` rather than a sum that had to be run to be checked.
+
+  What that deletes is the point: the `long[N+1]` this returned, the O(N) pass
+  that filled it, and the reason every open had to touch all of `counts`.
+
+  The LAYOUT BYTE makes the previous shape refusable exactly. Without it a
+  reader meeting a frame with no table would read a width code where the
+  version is, compute nonsense offsets, and depend on the length check to
+  notice -- which it would, about 65535 times in 65536."
+  [^bytes packed ^long n]
+  (when (pos? (alength packed))
+    (let [b0 (bit-and (aget packed 0) 0xFF)
+          w (if (zero? (bit-and (bit-shift-right b0 4) 0x0F)) 2 4)
+          tbase (+ 1 (quot (+ n 3) 4))
+          entries (+ (quot n boring/slot-block) 2)]
+      (when (and (= (bit-and b0 0x0F) boring/slot-layout-v1)
+                 (>= (alength packed) (+ tbase (* entries w)))
+                 (= (alength packed)
+                    (slot-le packed (+ tbase (* (dec entries) w)) w)))
+        [tbase w]))))
+
+(defn- slot-start
+  "Byte offset where node `i`'s deltas begin.
+
+  One table read, then the segments of at most `boring/slot-block - 1` nodes --
+  bounded, and the bound is a constant rather than the index's size."
+  ;; No primitive return hint: six args plus one is past what Clojure allows
+  ;; for a fn with primitives, and this is called once per node visited.
+  [^bytes packed tbase w counts stride i]
+  (let [^ints counts counts
+        tbase (long tbase) w (long w) stride (long stride) i (long i)
+        blk (quot i boring/slot-block)]
+    (loop [j (* blk boring/slot-block)
+           p (slot-le packed (+ tbase (* blk w)) w)]
+      (if (= j i)
+        p
+        (recur (inc j)
+               (+ p (* (anchor-count (aget counts (int j)) stride)
+                       (bit-shift-left 1 (width-code packed j)))))))))
 
 (defn- delta-at
   "The delta at byte `p` of `packed`, at width code `w`, little-endian.
@@ -1884,13 +1917,15 @@
   ;; No primitive hints on `stride`/`i`: six args with two of them primitive is
   ;; one past what Clojure allows, and the boxing here is once per node rather
   ;; than per anchor. `node-valid?` carries the same note for the same reason.
-  ^longs [^bytes packed ^longs starts ^ints counts ^longs cs stride i]
+  ^longs [^bytes packed tbase wstart ^ints counts ^longs cs stride i]
   (let [i (long i)
         m (anchor-count (aget counts (int i)) (long stride))
         w (width-code packed i)
         sz (bit-shift-left 1 w)
         a (long-array m)]
-    (loop [k 0 p (aget starts (int i)) acc (max 0 (aget cs (int i)))]
+    (loop [k 0
+           p (long (slot-start packed tbase wstart counts stride i))
+           acc (max 0 (aget cs (int i)))]
       (when (< k m)
         (let [v (+ acc (delta-at packed p w))]
           (aset a k v)
@@ -1914,8 +1949,8 @@
   (let [^AtomicReferenceArray cache (.slot-cache ix)
         hit (.get cache (int i))]
     (or hit
-        (let [a (expand-anchors (.slots ix) (.slot-starts ix) (.counts ix)
-                                (.containers ix) (.stride ix) i)]
+        (let [a (expand-anchors (.slots ix) (.slots-tbase ix) (.slots-wstart ix)
+                                (.counts ix) (.containers ix) (.stride ix) i)]
           ;; CAS so every thread observes the same array; a loser discards its
           ;; own copy rather than publishing a second one.
           (.compareAndSet cache (int i) nil a)
@@ -2062,18 +2097,17 @@
                                 (dotimes [i (alength a)] (aset out i (long (aget a i))))
                                 out)
                               :else nil)
-          ;; THE PREFIX SUM IS ALSO THE STRUCTURE CHECK. `slot-starts` returns
-          ;; nil unless the width codes and the derived anchor counts describe
-          ;; `packed` to the byte, so a frame that decodes but whose parts
-          ;; disagree is refused here rather than at whichever node a lookup
-          ;; happens to visit. Guarded on the types it indexes with, because it
-          ;; runs BEFORE the checks below.
-          ^longs starts (when (and (bytes? packed)
-                                   (instance? ints-array-class counts)
-                                   (int? stride) (pos? (long stride)))
-                          (try (slot-starts packed (alength ^ints counts)
-                                            counts (long stride))
-                               (catch Exception _ nil)))]
+          ;; THE FINAL TABLE ENTRY IS THE STRUCTURE CHECK, and it is now one
+          ;; read rather than a prefix sum over every node. `slot-table` returns
+          ;; nil unless the layout byte is one this reader writes AND the last
+          ;; entry equals the byte string's own length -- so a frame that
+          ;; decodes but whose parts disagree is refused here rather than at
+          ;; whichever node a lookup happens to visit. Guarded on the types it
+          ;; indexes with, because it runs BEFORE the checks below.
+          table (when (and (bytes? packed)
+                           (instance? ints-array-class counts))
+                  (try (slot-table packed (alength ^ints counts))
+                       (catch Exception _ nil)))]
       (when (and (int? stride) (pos? (long stride)) containers
                  (instance? ints-array-class counts)
                  ;; A BYTE STRING WHERE AN ARRAY USED TO BE. This is what makes
@@ -2081,7 +2115,7 @@
                  ;; by an older writer arrives as a Clojure vector of typed
                  ;; arrays, fails here, and the caller scans. It cannot be read
                  ;; wrongly, only not read.
-                 (bytes? packed) (bytes? sorted) starts
+                 (bytes? packed) (bytes? sorted) table
                  ;; STRUCTURE, not just decodability. Detection proves something
                  ;; MEANT to be an index; none of it proves the payload hangs
                  ;; together. A frame that decodes but whose parts disagree used
@@ -2147,8 +2181,8 @@
               ;; Through `expand-anchors` rather than `slot-at`, because the
               ;; `Index` does not exist yet -- see that function.
               seq-anchors (when seq-slot
-                            (expand-anchors packed starts counts containers st
-                                            (long seq-slot)))
+                            (expand-anchors packed (nth table 0) (nth table 1)
+                                            counts containers st (long seq-slot)))
               ;; Trusted skips this for the same reason `node-sound?` does: it
               ;; walks the file to prove the sequence node honest, and a caller
               ;; who wrote the bytes has already answered that question.
@@ -2159,7 +2193,8 @@
                                        (long (aget counts (int seq-slot)))
                                        st seq-anchors))]
           (when seq-ok?
-            (Index. r st containers counts packed starts sorted ptr cache
+            (Index. r st containers counts packed (long (nth table 0)) (long (nth table 1))
+                    sorted ptr cache
                     (boolean-array n) (boolean-array n)
                     (when seq-slot (long (aget counts (int seq-slot))))
                     seq-anchors
@@ -2274,7 +2309,7 @@
                   ;; `containers` nil is how every caller tells this apart --
                   ;; `(if-let [cs (.containers ix)] ...)` -- which is the same
                   ;; test they used when this was a map with one key.
-                  (Index. r 0 nil nil nil nil nil ptr nil nil nil nil nil nil nil)))))))))
+                  (Index. r 0 nil nil nil 0 0 nil ptr nil nil nil nil nil nil nil)))))))))
 
 (defn- anchor-sound?
   "Whether sequence anchor `k` is where it claims to be. Cached per anchor.
