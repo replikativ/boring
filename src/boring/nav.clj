@@ -172,9 +172,7 @@
           ^bytes sorted
           ^long data-end
           total
-          ^longs offsets
-          ^booleans anchor-checked
-          ^booleans anchor-ok]
+          ^longs offsets]
   clojure.lang.ILookup
   (valAt [this k] (.valAt this k nil))
   (valAt [_ k nf]
@@ -183,7 +181,6 @@
       :slots slots :slots-tbase slots-tbase :slots-wstart slots-wstart
       :sorted sorted :data-end data-end
       :total total :offsets offsets
-      :anchor-checked anchor-checked :anchor-ok anchor-ok
       nf)))
 
 ;; `views` is a ONE-SLOT cache of the last tag view built, as `[offset view]`.
@@ -736,33 +733,6 @@
                  (let [hit (scan-map r (aget slot a) (span a) probe)]
                    (if (>= hit 0) hit (recur (inc a)))))))))))))
 
-(defn- container-anchor-ok?
-  "Whether CONTAINER anchor `k` is where it claims to be, checked against its
-  PREDECESSOR: stepping `stride` items from anchor k-1 must land exactly on
-  anchor k, and anchor 0 must be the container's first entry.
-
-  The same local rule `anchor-sound?` applies to a sequence, and the same
-  O(stride) cost -- the order `nth-item` already pays walking from the anchor it
-  lands on. Uncached deliberately: the per-node verdict arrays were what made
-  caching expensive (three arrays sized by the whole document, to serve a lookup
-  touching one node), not the check.
-
-  It is a DETECTOR, not a proof. Validating the chain from anchor 0 is O(n),
-  which is the work the index exists to avoid; checking backward means damage
-  has to fake each anchor separately, and the zeroth is pinned to the
-  container's head. That is the same bargain the sequence node has always made."
-  ;; No primitive hints: five args with three of them primitive is one past what
-  ;; Clojure allows, and the boxing here is once per lookup, not per item --
-  ;; the same trade `anchor-sound?` makes for the same reason.
-  [^Reader r ^longs slot stride k head]
-  (if (zero? (long k))
-    (= (aget slot 0) (long head))
-    (try (= (aget slot (int k))
-            (let [span (long stride)]
-              (loop [j 0 p (aget slot (int (dec (long k))))]
-                (if (= j span) p (recur (inc j) (skip r p))))))
-         (catch clojure.lang.ExceptionInfo _ false))))
-
 (defn- nth-item
   "Offset of element `idx` of the array at `off`, or -1.
 
@@ -771,36 +741,34 @@
   is why the index helps arrays under any profile, while maps need canonical
   key order before binary search is legal.
 
-  THE ANCHOR IS VERIFIED BEFORE IT IS TRUSTED, because nothing downstream can
-  catch it here. `lookup-map` turns a damaged anchor into a MISS and re-derives
-  every miss by an honest scan (`confirm`); `nth` has no miss to re-derive -- it
-  jumps and returns whatever offset it lands on, so a damaged anchor is a wrong
-  answer with nothing between it and the caller.
+  THE ANCHOR IS TRUSTED. It was briefly verified against its predecessor here --
+  stepping `stride` items from anchor k-1 and requiring it to land on anchor k,
+  the same local rule sequences used -- because a damaged anchor reaches the
+  caller through `nth` with nothing in between, unlike `lookup-map`, whose
+  misses `confirm` re-derives.
 
-  That gap was real and measured: with container nodes no longer walked to their
-  far end, a single changed byte inside `slots` left `nth 17` and `nth 39`
-  pointing into the middle of an item, and a key that exists came back nil. The
-  property that found it is `many-node-damage-never-makes-a-lookup-wrong`; the
-  one-node fixture the older damage sweep uses cannot express it."
+  That check cost more than it was worth once the index became a trust boundary
+  outright. It is O(stride) SKIPS, and a skip is O(1) only for a scalar:
+  stepping over 16 twenty-entry maps is ~640 sub-skips, measured at warm 1.14 ->
+  4.90 us on 769 maps of 20. An index we have decided to trust does not earn
+  that, and validating one jump while leaving the rest of the frame trusted was
+  never a coherent position anyway. See this namespace's docstring for what a
+  trusted index does and does not promise."
   ^long [^Nav nav ^long off ^long idx]
   (let [^Reader r (.rdr nav)
         n (head-count nav off)]
     (if (or (neg? idx) (>= idx n))
       -1
       (let [ix (nav-idx nav)
-            ns (node-slot nav off)
-            head (.headEndAt r off)
-            walk (fn ^long [] (loop [i 0 p head]
-                                (if (= i idx) p (recur (inc i) (skip r p)))))]
+            ns (node-slot nav off)]
         (if (neg? ns)
-          (walk)
+          (loop [i 0 p (.headEndAt r off)]
+            (if (= i idx) p (recur (inc i) (skip r p))))
           (let [^longs slot (slot-at ix ns)
                 stride (long (:stride ix))
                 anchor (quot idx stride)]
-            (if (container-anchor-ok? r slot stride anchor head)
-              (loop [i (* anchor stride) p (long (aget slot anchor))]
-                (if (= i idx) p (recur (inc i) (skip r p))))
-              (walk))))))))
+            (loop [i (* anchor stride) p (long (aget slot anchor))]
+              (if (= i idx) p (recur (inc i) (skip r p))))))))))
 
 ;; NOTE: this compares the declared count against `room` BEFORE doubling for a
 ;; map, while `Cursor.count` compares `2n`. Both are typed refusals, so the
@@ -2230,10 +2198,7 @@
             (Index. r st containers counts packed (long (nth table 0)) (long (nth table 1))
                     sorted ptr
                     (when seq-slot (long (aget counts (int seq-slot))))
-                    seq-anchors
-                    ;; The per-anchor verdict cache -- see `anchor-sound?`.
-                    (when seq-slot (boolean-array (alength ^longs seq-anchors)))
-                    (when seq-slot (boolean-array (alength ^longs seq-anchors))))))))
+                    seq-anchors)))))
     (catch Exception _ nil)))
 
 (defn- read-index
@@ -2342,60 +2307,7 @@
                   ;; `containers` nil is how every caller tells this apart --
                   ;; `(if-let [cs (.containers ix)] ...)` -- which is the same
                   ;; test they used when this was a map with one key.
-                  (Index. r 0 nil nil nil 0 0 nil ptr nil nil nil nil)))))))))
-
-(defn- anchor-sound?
-  "Whether sequence anchor `k` is where it claims to be. Cached per anchor.
-
-  VALIDATED LOCALLY, against the PREVIOUS anchor rather than against the start
-  of the file: stepping `stride` items from anchor k-1 must land exactly on
-  anchor k. That is O(stride) --
-  the same order as the walk `nth` already does from the anchor it lands on --
-  and it needs no earlier anchor to be trusted, so it costs no more for anchor
-  5000 than for anchor 1.
-
-  Cached because the alternative is paying it per lookup: a full scan through
-  `nth` then verifies each anchor once rather than once per item, which is one
-  extra pass over the data across the whole scan. The cache is a plain
-  boolean pair per anchor; two threads racing to compute the same verdict
-  write the same value.
-
-  This is the last of the three levels. `footer-start` pins the frame,
-  `anchor[0] = 0` and the end-of-node check pin the two ends, and this pins the
-  middle -- but only for the anchors actually used, which is what keeps it
-  affordable."
-  ;; No primitive hints: five args with three of them primitive is one past
-  ;; what Clojure allows, and the boxing here is once per anchor, not per item.
-  [^Nav nav ^longs offsets stride k]
-  (let [ix (nav-idx nav)
-        ^booleans done (:anchor-checked ix)
-        ^booleans okv (:anchor-ok ix)]
-    (if (or (nil? done) (>= (long k) (alength done)))
-      true                                    ; no cache: nothing to verify against
-      (if (aget done (int k))
-        (aget okv (int k))
-        (let [^Reader r (.rdr nav)
-              ;; Against the PREDECESSOR, not the successor. Checking forward
-              ;; leaves the LAST anchor with only the data section's end to
-              ;; compare against -- which is what the end-of-node check already
-              ;; does, and shares its blind spot: a uniform shift moves the last
-              ;; anchor and the walk from its new position can still land
-              ;; exactly on the end. Measured, that left `nth 48` wrong and
-              ;; every other item right. Checking backward gives every anchor
-              ;; but the zeroth a reference that damage has to fake separately,
-              ;; and the zeroth is pinned to offset 0 at load.
-              ok (if (zero? (long k))
-                   (zero? (aget offsets 0))
-                   (let [prev (aget offsets (int (dec (long k))))
-                         span (long stride)]
-                     (try
-                       (= (aget offsets (int k))
-                          (loop [j 0 p prev]
-                            (if (= j span) p (recur (inc j) (skip r p)))))
-                       (catch clojure.lang.ExceptionInfo _ false))))]
-          (aset done (int k) true)
-          (aset okv (int k) (boolean ok))
-          ok)))))
+                  (Index. r 0 nil nil nil 0 0 nil ptr nil nil)))))))))
 
 (deftype Items [^Nav nav idx]
   clojure.lang.Seqable
@@ -2444,25 +2356,16 @@
               total (long (:total idx))]
           (if (or (neg? i) (>= i total))
             nf
+            ;; THE ANCHOR IS TRUSTED, as everywhere else in this namespace. It
+            ;; was verified here against its neighbour, cached per anchor,
+            ;; because one changed delta byte moved anchors 2 and 3 of a
+            ;; 60-item file and `nth 32` returned -1768167461 where `decode-seq`
+            ;; returned the record. That is still true; it is now the
+            ;; documented consequence of trusting the frame rather than a
+            ;; defect. See this namespace's docstring.
             (let [anchor (quot (long i) stride)]
-              (if-not (anchor-sound? nav offsets stride anchor)
-                ;; A middle anchor cannot be validated at load without walking
-                ;; to it, which is the work the index exists to avoid -- so it
-                ;; is validated HERE, against its neighbour, the first time
-                ;; anybody jumps to it, and the verdict is cached.
-                ;;
-                ;; Without it, one changed delta byte inside the frame moved
-                ;; anchors 2 and 3 of a 60-item file and `nth 32` returned
-                ;; -1768167461 where `decode-seq` returned the record. The
-                ;; end-of-node check does not see it: the last anchor moved
-                ;; too, and the walk from its new position still landed
-                ;; exactly on the data section's end.
-                (loop [k 0 p 0]                     ; fall back to the walk
-                  (cond (>= p end) nf
-                        (= k (long i)) (cursor-at nav p)
-                        :else (recur (inc k) (skip r p))))
-                (loop [k (* anchor stride) p (long (aget offsets anchor))]
-                  (if (= k (long i)) (cursor-at nav p) (recur (inc k) (skip r p))))))))
+              (loop [k (* anchor stride) p (long (aget offsets anchor))]
+                (if (= k (long i)) (cursor-at nav p) (recur (inc k) (skip r p)))))))
         ;; No sequence index: skip i times, or run out.
         (loop [k 0 p 0]
           (cond (>= p end) nf

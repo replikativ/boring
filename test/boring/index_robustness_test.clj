@@ -1320,32 +1320,28 @@
        (catch clojure.lang.ExceptionInfo e {:typed (:type (ex-data e))})
        (catch Throwable t {:untyped (class t)})))
 
-(deftest damage-never-makes-the-two-readers-disagree
-  (testing "mutate arbitrary bytes of a sealed file and require that `nav` --
-            which consults the index -- and `decode-seq` -- which does not --
-            never both succeed with different answers. That is exactly the
-            shape of every index defect found so far, and none of them would
-            have survived this."
+(deftest damage-inside-the-frame-never-fails-untyped
+  (testing "mutate arbitrary bytes of a sealed file's FRAME and require that
+            neither reader ever fails untyped, and that the reader which
+            consults no index is unaffected.
+
+            This asserted more once: that `nav` and `decode-seq` never both
+            succeed with different answers. That property is gone deliberately.
+            The index is now a TRUST BOUNDARY outright -- we use it only where
+            we are willing to trust it -- so a damaged frame may hand back a
+            wrong answer, and the per-node and per-anchor validation that made
+            it not do so has been removed. It cost O(stride) skips per jump
+            plus two `boolean[]` per open, to defend against corruption that
+            the storage layer beneath us is already responsible for.
+
+            What remains is the half that is not negotiable, because it is not
+            about answers but about staying inside the file: no untyped
+            exception, ever, and no read past the buffer. That is bought by the
+            O(1) frame-structure checks, which is exactly why THOSE stay while
+            the per-node walks go."
     (let [vs (vec (for [i (range 60)] {:id i :name (str "rec-" i) :tags [i (inc i)]}))
           ^bytes clean (seal vs opts)
           n (alength clean)
-          ;; DAMAGE INSIDE THE FRAME, and the boundary is the point.
-          ;;
-          ;; The index is a claim ABOUT the data section. Validating that claim
-          ;; against the data it describes is cheap and complete only at the
-          ;; ends: `footer-start` pins the frame, `anchor[0] = 0` pins the
-          ;; start, and the end check pins the last stride. Proving a MIDDLE
-          ;; anchor is an item boundary means walking to it, which is the work
-          ;; the index exists to avoid -- so damage to the DATA that shifts item
-          ;; boundaries can leave every anchor after it stale, and measurably
-          ;; does: zeroing byte 0 of this fixture makes `nth` disagree with
-          ;; `decode-seq` on 44 of 60 items, from anchor 1 onward.
-          ;;
-          ;; That is the trust boundary doc/SHAPES.md already states, and
-          ;; closing it costs a validating walk on every lookup. What must
-          ;; hold, and what this asserts, is the half that is affordable: when
-          ;; the INDEX is what is damaged, the reader that consults it and the
-          ;; reader that ignores it never disagree.
           frame-at (long (#'boring.frame/footer-start clean))
           gen-site (gen/choose frame-at (dec n))
           gen-damage (gen/vector (gen/tuple gen-site (gen/choose 0 255)) 1 4)
@@ -1370,10 +1366,20 @@
               (let [a (nav-items-or-error c)
                     b (seq-items-or-error c)]
                 (and
-                 ;; Neither reader may fail untyped, whatever the bytes say.
+                 ;; NEITHER READER MAY FAIL UNTYPED, whatever the bytes say.
+                 ;; This is the half that survives trusting the index, and it
+                 ;; is not free -- it is what the O(1) frame-structure checks
+                 ;; buy. A lying length with no check sends `byteAt` into the
+                 ;; back-pointer or past the buffer, which is how a raw
+                 ;; ArrayIndexOutOfBoundsException came out of `get`.
                  (nil? (:untyped a)) (nil? (:untyped b))
-                 ;; And where both produce values, the values must match, item
-                 ;; for item, for as far as both got.
+                 ;; AND THE INDEX-FREE READER IS UNAFFECTED. Damage is confined
+                 ;; to the frame, so `decode-seq` -- which consults no index --
+                 ;; must still produce the true records. It may produce one
+                 ;; MORE than there are records, because damage that makes the
+                 ;; frame undetectable republishes it as a trailing data item;
+                 ;; what it may never do is change a record.
+                 ;;
                  ;; COMPARED BY RE-ENCODING, which is the only oracle strong
                  ;; enough here. Three earlier versions of this property
                  ;; reported disagreements that were not: `=` treats the Java
@@ -1383,18 +1389,13 @@
                  ;; `contains?`, which cannot match a `byte[]` KEY -- which
                  ;; damaged bytes readily produce. Each failure was in the
                  ;; comparison, not the library.
-                 ;;
-                 ;; The wire is the ground truth this is about anyway: two
-                 ;; values that re-encode to the same bytes are the same value
-                 ;; for every purpose boring has.
-                 (or (not (and (contains? a :ok) (contains? b :ok)))
-                     (let [xs (:ok a) ys (:ok b)]
-                       (and (= (count xs) (count ys))
-                            (= (mapv re-encode xs) (mapv re-encode ys)))))))))
+                 (or (not (contains? b :ok))
+                     (= (mapv re-encode vs)
+                        (mapv re-encode (take (count vs) (:ok b)))))))))
            ;; Pinned so CI is deterministic -- see the note on the case count.
            :seed 1785873600000)]
       (is (:pass? result)
-          (str "a damaged file where the two readers disagree: "
+          (str "a damaged frame that failed untyped or changed a record: "
                (pr-str (:shrunk result))))))
 
   (testing "the control: undamaged, both readers agree AND the index is really
@@ -1435,12 +1436,19 @@
             against.
 
             41 nodes here: 40 maps of 20 entries, plus the vector holding them.
-            Damage is confined to the frame, so the index is either refused --
-            and the lookup falls back to scanning, which is correct -- or
-            accepted, in which case the validation that accepted it is claiming
-            the answers are still right. Either way a key that exists must read
-            back the value the plain decoder sees, and nothing may fail
-            untyped."
+
+            WHAT IT ASSERTS is no untyped failure and no read outside the file,
+            NOT that the answers stay right. A trusted index that has been
+            damaged may hand back a wrong value or report a present key absent;
+            that is what trusting it means. The one-slot property that remains
+            is the one the O(1) frame-structure checks buy, and it is the reason
+            those checks stay when the per-node walks go -- a lying length with
+            nothing checking it sends `byteAt` into the back-pointer or past the
+            buffer, which is how a raw ArrayIndexOutOfBoundsException came out
+            of `get`.
+
+            The index-free reader is the control: `decode` consults no index, so
+            frame damage may never change what IT sees."
     (let [doc (vec (for [i (range 40)]
                      (into {} (for [j (range 20)]
                                 [(format "k%02d" j) (+ (* 100 i) j)]))))
@@ -1451,7 +1459,6 @@
           ;; across nodes AND across strides within a node: k00 is anchor 0,
           ;; k07 is mid-stride, k19 is the last entry of the last stride
           paths (vec (for [i [0 1 17 39] j ["k00" "k07" "k19"]] [i j]))
-          expect (mapv #(get-in doc %) paths)
           gen-damage (gen/vector (gen/tuple (gen/choose frame-at (dec n))
                                             (gen/choose 0 255))
                                  1 4)
@@ -1464,10 +1471,11 @@
               (doseq [[i v] damage] (aset-byte c (int i) (unchecked-byte (int v))))
               (let [a (probe-or-error c paths o)]
                 (and (nil? (:untyped a))
-                     (or (not (contains? a :ok)) (= expect (:ok a)))))))
+                     ;; the index-free reader must be untouched by frame damage
+                     (= doc (try (boring/decode c o) (catch Throwable _ ::threw)))))))
            :seed 1785873600000)]
       (is (:pass? result)
-          (str "a damaged frame that changed a lookup's answer: "
+          (str "a damaged frame that failed untyped, or reached the decoder: "
                (pr-str (:shrunk result))))))
 
   (testing "the control: undamaged, the index really is in use and really is
