@@ -110,6 +110,50 @@ everything in a small value, `decode` is the cheaper call.
   A consequence: positional records (a tag 27 wrapping a vector, as datahike's
   `Datom` uses) can be reached but not descended into.
 
+### The index frame's format, and what is frozen about it
+
+These are cheap to state now and impossible to retrofit, so they are stated.
+
+**The payload is six elements, and that count is inside the recognition
+constant.** `boring.frame/prefix-bytes` is 17 exact bytes ending in `0x86` —
+"array of 6" — and `footer-start` compares all of them before decoding anything.
+Widening the payload to seven elements does *not* merely make the index
+unusable: the frame stops being recognised at all, `data-end` is never learned,
+and the frame is republished as a trailing **data** item. A file of N records
+reads back as N+1, silently, in both directions. Changing an element's *type* is
+safe by contrast — the frame is still recognised, the index is refused, and the
+caller scans.
+
+**`data-end` is frozen in type as well as position.** `footer-start` requires
+the byte at `n-9` to be literally `0x48`, and the payload check requires a byte
+string of length 8. Five of the six elements have a free type; that one has
+none.
+
+**The `slots` layout byte has no spare bits.** Its low nibble is the version and
+its high nibble is the start-table entry width — and the reader consults the
+*whole* high nibble, so setting any of bits 5–7 makes a current reader compute a
+4-byte width, fail the final-entry gate, and refuse the index. The extension
+point is the **version nibble**, which has 14 unused values. That layout byte
+versions the whole frame: any semantic change to any of the six elements bumps
+it.
+
+**Sealed files are terminal.** `footer-start` requires the frame to end exactly
+at EOF — the check that stops a concatenated pair of sealed batches from having
+the second file's back-pointer land inside the first. So two sealed files can
+never simply be concatenated and keep an index, and `write-seq!`'s back-pointers
+are chunk-relative. The supported way to re-seal is `build-index`'s `base`
+arity, which roots an index at an offset.
+
+**There is deliberately no integrity check.** The frame is a trust boundary (see
+[SHAPES.md](SHAPES.md)), and adding a checksum would not change that, because
+whoever can rewrite the index can rewrite the checksum and the data. If one is
+ever wanted for *accident* detection it belongs in a `slots` v3 section, not in
+a seventh payload element.
+
+**`sorted` must never grow.** Its length is checked as an *equality* —
+`(quot (+ n 7) 8)` — not a bound, so it cannot carry a second bit per node.
+Future per-node flags go in `slots`, which is versioned and can.
+
 ## Memory-mapped files
 
 `boring.mmap` needs **JDK 22+** for `java.lang.foreign`. Everything else,
