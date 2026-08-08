@@ -1850,32 +1850,43 @@
   (not (zero? (bit-and (bit-and (aget sorted (int (quot i 8))) 0xFF)
                        (bit-shift-left 1 (int (rem i 8)))))))
 
-(defn- expand-anchors
-  "Node `i`'s absolute anchors, as arithmetic over the packed bytes.
+(defn- slot-at
+  "Absolute anchors for node `i`, as arithmetic over the packed bytes.
 
-  Split out of `slot-at` because `index-payload` needs the SEQUENCE node's
-  anchors while it is still assembling the `Index` that `slot-at` would read
-  them from -- the old map could be built in two steps with `assoc`, a type
-  cannot. Taking the pieces rather than the whole also says what this actually
-  depends on, which is five arrays and a stride.
+  ONE EXPANDER. This delegated to an `expand-anchors` taking the eight pieces
+  separately, because `index-payload` needed the SEQUENCE node's anchors while
+  it was still assembling the `Index` that `slot-at` reads them from -- an old
+  map could be built in two steps with `assoc`, a type cannot. It builds a
+  PROVISIONAL `Index` instead now, so there is one entry point and the two
+  cannot drift. They could: the offsets prototype written against this layout
+  implemented a second expander that read the wrong node's segment for every
+  node past 15, and agreed with this one on the fixture only because every
+  node's delta bytes happened to be identical.
 
-  THE ANCHORS ARE BOUNDED HERE, and this is the only place left that checks
-  anything about them. The index is trusted for whether its anchors are the
-  RIGHT offsets; it is not trusted to keep them inside the file, because
-  `Reader.skipFrom` does an unchecked array access and an anchor past the end
-  reaches it as a raw AIOOBE at the caller of `get`. One comparison per anchor,
-  and `m` is 2 at the default stride.
+  NO CACHE. This memoized into an `AtomicReferenceArray` allocated per open,
+  one slot per node in the document, to serve a lookup that touches one or two
+  -- and the source it was protecting is read ONCE, which is every read of a
+  store handing out a fresh blob. Expanding is a prefix sum over `m` deltas
+  read in place; at the default stride `m` is 2.
+
+  THE ANCHORS AND THEIR SEGMENT ARE BOUNDED HERE, and this is the only place
+  left that checks anything about them. The index is trusted for whether its
+  anchors are the RIGHT offsets; it is not trusted to keep them inside the
+  file, because `Reader.skipFrom` does an unchecked array access and an anchor
+  past the end reaches it as a raw AIOOBE at the caller of `get`.
 
   A typed throw rather than a nil, because there is no longer a validation
   layer above this to turn a bad node into `node-slot` -1 and a scan. The
   caller sees `:boring/bad-index`, which is what every other malformed-input
   path in this library raises."
-  ;; No primitive hints on `stride`/`i`: six args with two of them primitive is
-  ;; one past what Clojure allows, and the boxing here is once per node rather
-  ;; than per anchor.
-  ^longs [^bytes packed tbase wstart ^ints counts ^longs cs stride i limit]
-  (let [i (long i)
-        lim (long limit)
+  ^longs [^Index ix ^long i]
+  (let [^bytes packed (.slots ix)
+        tbase (.slots-tbase ix)
+        wstart (.slots-wstart ix)
+        ^ints counts (.counts ix)
+        ^longs cs (.containers ix)
+        stride (.stride ix)
+        lim (.data-end ix)
         m (anchor-count (aget counts (int i)) (long stride))
         w (width-code packed i)
         sz (bit-shift-left 1 w)
@@ -1910,22 +1921,6 @@
           (aset a k v)
           (recur (inc k) (+ p sz) v))))
     a))
-
-(defn- slot-at
-  "Absolute anchors for node `i`.
-
-  NO CACHE. This memoized into an `AtomicReferenceArray` allocated per open,
-  one slot per node in the document, to serve a lookup that touches one or two
-  -- and the source it was protecting is read ONCE, which is every read of a
-  store handing out a fresh blob. Expanding is a prefix sum over `m` deltas
-  read in place; at the default stride `m` is 2.
-
-  The sequence node does not come through here at all: its anchors are expanded
-  once at open into `offsets`, because `count` and `nth` consult them
-  immediately and a sequence is the shape whose source IS reused."
-  ^longs [^Index ix ^long i]
-  (expand-anchors (.slots ix) (.slots-tbase ix) (.slots-wstart ix)
-                  (.counts ix) (.containers ix) (.stride ix) i (.data-end ix)))
 
 (defn- index-payload
   "The usable index in the tag-27 frame at `ptr`, or nil meaning \"scan\".
@@ -2053,8 +2048,8 @@
                  ;; not merely miss, it can settle on a node belonging to a
                  ;; different container and hand its anchors to this one. The
                  ;; counts check that used to sit beside it is gone: a negative
-                 ;; count now cannot reach past `expand-anchors`, which bounds
-                 ;; its own segment and its own anchors.
+                 ;; count now cannot reach past `slot-at`, which bounds its
+                 ;; own segment and its own anchors.
                  (loop [k 1]
                    (cond (>= k (alength containers)) true
                          (>= (aget containers (dec k)) (aget containers k)) false
@@ -2086,12 +2081,21 @@
               ;; than one per container. A sequence is also the shape whose
               ;; source is reused, so there is nothing to amortise away.
               ;;
-              ;; Through `expand-anchors` rather than `slot-at`, because the
-              ;; `Index` does not exist yet -- see that function.
-              seq-anchors (when seq-slot
-                            (expand-anchors packed (nth table 0) (nth table 1)
-                                            counts containers st (long seq-slot)
-                                            ptr))
+              ;; A PROVISIONAL `Index`, so there is one expander rather than
+              ;; two. `slot-at` needs the frame's arrays and nothing else --
+              ;; not `total`, not `offsets` -- so it can run against an Index
+              ;; that carries only what has been decoded so far, and the final
+              ;; one is built from its result. A deftype cannot be completed in
+              ;; two steps the way a map could with `assoc`; building it twice
+              ;; is the same thing done honestly.
+              ;;
+              ;; Allocated only when there IS a sequence node, so an
+              ;; `encode-indexed` blob -- which never has one -- pays nothing.
+              ix0 (when seq-slot
+                    (Index. r st containers counts packed
+                            (long (nth table 0)) (long (nth table 1))
+                            sorted ptr nil nil))
+              seq-anchors (when seq-slot (slot-at ix0 (long seq-slot)))
               ;; The one validation left, and it is about which FILE this is,
               ;; not about whether the bytes were corrupted -- see
               ;; `seq-node-ok?`. O(stride), on one node.
