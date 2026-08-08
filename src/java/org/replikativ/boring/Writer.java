@@ -436,6 +436,25 @@ public final class Writer {
     // in this picture and is not thread-safe anyway, so there is nothing for a
     // barrier to protect.
 
+    /**
+     * CBOR items emitted so far, ONE PER HEAD. The input to the `walk` metric.
+     *
+     * NOT `idxItems` below, which counts top-level SEQUENCE items and is
+     * refused at Integer.MAX_VALUE because the frame stores it as an int32.
+     * This one counts every head at every depth, is never written to the wire,
+     * and is only ever read as a DIFFERENCE between two points in one
+     * container -- so it may wrap without consequence and is not bounded.
+     *
+     * Counted at the emit sites (`head`, `headU64`, `u8`, the three float
+     * writers, and the two-byte simple form) rather than once per `writeValue`,
+     * because the number has to match what a STRUCTURAL WALK over the same
+     * bytes counts -- `Reader.skipCountingFrom` -- and a walker sees heads, not
+     * calls. A shaped array is the case that separates the two: its reader
+     * consumes the outer, keys, rows and row heads inline, so counting
+     * `writeValue` calls would miss four containers per row.
+     */
+    private long idxItemsWritten;
+
     /** Null until the first anchored item -- see the node arrays above. 8 KB
      *  on every Writer was the largest single piece of that regression. */
     private long[] idxSeq;
@@ -478,6 +497,11 @@ public final class Writer {
     /** How many top-level items `idxItem` has seen. Never above
      *  {@code Integer.MAX_VALUE}: {@link #idxItem} refuses to go past it. */
     public long idxItemTotal() { return idxItems; }
+
+    /** CBOR items emitted so far, one per head. See {@link #idxItemsWritten}.
+     *  Exposed for the property test that holds this count and
+     *  {@code Reader.skipCountingFrom} in agreement. */
+    public long itemsWritten() { return idxItemsWritten; }
 
     /** Offsets of every `stride`th top-level item. */
     public long[] idxItemOffsets() {
@@ -954,12 +978,14 @@ public final class Writer {
     // ---- primitive emission -------------------------------------------------
 
     private void u8(int b) {
+        idxItemsWritten++;
         ensure(1);
         buf[pos++] = (byte) b;
     }
 
     /** Header byte for `major` carrying unsigned `val`, shortest form. */
     private void head(int major, long val) {
+        idxItemsWritten++;
         // EVERY byte string on the wire consumes a stringref index, wherever it
         // appears -- a bignum magnitude, a UUID's 16 bytes and a typed-array
         // payload all count, which was verified against cbor2. Accounted here
@@ -1004,6 +1030,7 @@ public final class Writer {
     /** 8-byte argument form, treating `bits` as UNSIGNED. Needed for the top of
      *  the uint64 range, which does not fit a signed long. */
     private void headU64(int major, long bits) {
+        idxItemsWritten++;
         ensure(9);
         buf[pos] = (byte) (major | 27);
         LONG_BE.set(buf, pos + 1, bits);
@@ -1103,6 +1130,7 @@ public final class Writer {
     }
 
     private void writeF64(double d) {
+        idxItemsWritten++;
         ensure(9);
         buf[pos] = (byte) (SIMPLE | 27);
         LONG_BE.set(buf, pos + 1, Double.doubleToRawLongBits(d));
@@ -1115,6 +1143,7 @@ public final class Writer {
     }
 
     private void writeF32(float f) {
+        idxItemsWritten++;
         ensure(5);
         buf[pos] = (byte) (SIMPLE | 26);
         INT_BE.set(buf, pos + 1, Float.floatToRawIntBits(f));
@@ -1122,6 +1151,7 @@ public final class Writer {
     }
 
     private void writeF16(short bits) {
+        idxItemsWritten++;
         ensure(3);
         buf[pos] = (byte) (SIMPLE | 25);
         SHORT_BE.set(buf, pos + 1, bits);
@@ -1229,6 +1259,7 @@ public final class Writer {
             + " (0xf8 followed by a byte < 0x20), and makes such sequences not "
             + "well-formed, so boring will not read the result back; set "
             + ":permit-reserved-simple-values to emit it anyway", "value", (long) n);
+        idxItemsWritten++;
         ensure(2);
         buf[pos] = (byte) (SIMPLE | 24);
         buf[pos + 1] = (byte) n;
@@ -1978,13 +2009,19 @@ public final class Writer {
         int n = s.size();
         final byte[][] encoded = new byte[n][];
         Object[] items = new Object[n];
+        // What the scratch writer counted for each staged element. `reset()`
+        // does not clear the tally -- it is a running counter, not per-value --
+        // so the count for one element is the DIFFERENCE across its encode.
+        final long[] encodedItems = new long[n];
 
         Writer scratch = canonicalSubWriter();
         int i = 0;
         for (Object o : s) {
             if (i >= n) countMismatch(n, i + 1);    // staging arrays are size()d
             scratch.reset();
+            long before = scratch.idxItemsWritten;
             scratch.writeValue(o);
+            encodedItems[i] = scratch.idxItemsWritten - before;
             encoded[i] = scratch.toByteArray();
             items[i] = o;
             i++;
@@ -2027,6 +2064,12 @@ public final class Writer {
             // this is the same fix, and it also restores one handler call per
             // value.
             byte[] eb = encoded[order[j]];
+            // THE STAGED BYTES CARRY NO EMIT SITE, so nothing has counted the
+            // items inside them -- the scratch writer counted them into ITS
+            // own tally and this one never saw them. Carried over explicitly;
+            // a per-emit counter alone reads zero items for a whole canonical
+            // set, which is unbounded error rather than an off-by-one.
+            idxItemsWritten += encodedItems[order[j]];
             ensure(eb.length);
             System.arraycopy(eb, 0, buf, pos, eb.length);
             pos += eb.length;
@@ -2095,6 +2138,8 @@ public final class Writer {
     private void writeMapCanonical(Map m) {
         int n = m.size();
         final byte[][] encodedKeys = new byte[n][];
+        // See writeSetCanonical: the scratch writer's tally, per staged key.
+        final long[] encodedKeyItems = new long[n];
         Object[] keys = new Object[n];
         Object[] vals = new Object[n];
 
@@ -2109,7 +2154,9 @@ public final class Writer {
             // error the other container paths give.
             if (i >= n) countMismatch(n, i + 1);
             scratch.reset();
+            long before = scratch.idxItemsWritten;
             scratch.writeValue(e.getKey());
+            encodedKeyItems[i] = scratch.idxItemsWritten - before;
             encodedKeys[i] = scratch.toByteArray();
             keys[i] = e.getKey();
             vals[i] = e.getValue();
@@ -2167,6 +2214,8 @@ public final class Writer {
             if (anchors != null && --countdown == 0) {
                 anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
+            // See writeSetCanonical: staged bytes bypass every emit site.
+            idxItemsWritten += encodedKeyItems[k];
             ensure(encodedKeys[k].length);
             System.arraycopy(encodedKeys[k], 0, buf, pos, encodedKeys[k].length);
             pos += encodedKeys[k].length;

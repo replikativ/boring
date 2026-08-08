@@ -195,6 +195,18 @@ public final class Reader {
      *  must not spend the caller's budget. */
     public long items;
 
+    /** Items crossed by the current structural skip. NOT the same quantity as
+     *  `items` above and not interchangeable with it: `items` is the DECODE
+     *  budget, charged by `read` against `maxItems` to bound amplification,
+     *  while this counts heads crossed by `skipStructural` and is charged
+     *  against nothing. They deliberately disagree -- see skipCountingFrom. */
+    private long skipItems;
+
+    /** Whether the current skip is counting. False for every ordinary skip --
+     *  see skipStructural for why this is a flag and not an unconditional
+     *  increment. */
+    private boolean skipCounting;
+
     /** Whether `v` parses as an ordinary RFC 3339 instant. Used to validate the
      *  non-leap part of a leap-second timestamp before preserving it. */
     private static boolean parsesAsInstant(String v) {
@@ -532,6 +544,22 @@ public final class Reader {
     }
 
     private void skipStructural() {
+        // ONE ITEM PER HEAD. See skipCountingFrom for what this is for and why
+        // the count is defined structurally rather than as "what `read` would
+        // charge".
+        //
+        // GUARDED, not unconditional, on the PRINCIPLE that the skip path every
+        // navigation runs should not maintain a counter only the two index
+        // builders ever read. Not on a measurement: on a 42 KB document of
+        // 18 000 items, minima over four runs each were 142.0 us unguarded
+        // against 145.9 with an unconditional increment and 146.9 with this
+        // branch -- a ~3% band that run-to-run spread (~6%) does not resolve.
+        // The guard is not demonstrably faster than the store; it is simply
+        // the version whose cost is confined to the callers that want it.
+        //
+        // Said plainly because a single tighter-looking pair of runs here read
+        // as 7.6% and did not survive being repeated.
+        if (skipCounting) skipItems++;
         int h = u8();
         int major = h >>> 5;
         int info = h & 0x1F;
@@ -623,6 +651,13 @@ public final class Reader {
                             + skipLimit() + ")", "max-depth", (long) skipLimit());
                     arg(h2 & 0x1F);
                 }
+                // EACH TAG IN THE CHAIN IS ITS OWN ITEM. The loop above
+                // collapses the chain rather than recursing, so the `++` at the
+                // top charged the whole chain once. The writer emits one
+                // `head(TAG, ..)` per tag, so leaving it at one would make the
+                // two index builders disagree on any doubly-tagged value --
+                // exactly the divergence skipCountingFrom exists to rule out.
+                if (skipCounting) skipItems += chain - 1;
                 skipStructural();
                 return;
             }
@@ -762,6 +797,59 @@ public final class Reader {
         try { pos = p; skipDepth = 0; skipValue(); return pos; }
         finally { pos = save; depth = d; skipDepth = sd; busy = false; }
     }
+
+    /**
+     * Skip the value at `p` like {@link #skipFrom}, and also COUNT the CBOR
+     * items crossed. Returns the end offset; {@link #skipItemCount} then gives
+     * the count.
+     *
+     * <p>This is the `walk` metric's input. `walk` is the mean number of items
+     * a scan crosses to reach a random entry of a container, and it is what
+     * decides whether that container is worth an index node at all -- so the
+     * WRITER, which counts items as it emits them, and the BYTE WALK, which
+     * counts them here, must arrive at the same number for the same bytes.
+     * They produce the same file only if they do.
+     *
+     * <p>ONE ITEM PER HEAD, and that is the whole definition. Deliberately NOT
+     * "what `read` would charge to the item budget": `skipStructural` above
+     * records three attempts at making a generic walker agree with `read`, each
+     * of which broke a different value, and concludes that mirroring it is not
+     * a reachable goal -- a tag reader that parses its payload inline charges
+     * nothing for the containers under it, and the gap is unbounded. None of
+     * that matters here, because both sides of THIS agreement are structural:
+     * bytes emitted against the same bytes walked.
+     *
+     * <p>Items, not bytes, because CBOR containers are element-counted and
+     * stepping over a subtree means walking it item by item. A 70 KB byte
+     * string is ONE item and skips in O(1); 70 KB of small integers is 35 000.
+     * Measuring the span in bytes gets that backwards, which is the error two
+     * earlier versions of the index policy made.
+     *
+     * <p>Refuses while a stringref namespace is open, where `skipValue` falls
+     * back to a full `read` and would count nothing. Not a live restriction:
+     * `:stringref` and `:index` cannot be combined, and the index builders are
+     * the only callers.
+     */
+    public long skipCountingFrom(long p) {
+        if (busy) throw concurrentUse();
+        if (srActive) throw Err.of("unsupported-option",
+            "boring: items cannot be counted inside an open stringref namespace"
+            + " -- :stringref and :index are mutually exclusive");
+        skips++;
+        busy = true;
+        long save = pos; int d = depth, sd = skipDepth;
+        try {
+            pos = p; skipDepth = 0; skipItems = 0; skipCounting = true;
+            skipStructural();
+            return pos;
+        } finally {
+            pos = save; depth = d; skipDepth = sd; skipCounting = false;
+            busy = false;
+        }
+    }
+
+    /** Items crossed by the most recent {@link #skipCountingFrom}. */
+    public long skipItemCount() { return skipItems; }
 
     /** Decode the value at `p`. Does not disturb the caller's position or depth. */
     public Object readFrom(long p) {
