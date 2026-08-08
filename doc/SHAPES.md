@@ -327,11 +327,23 @@ Ordinary bit rot lands on the wrong side of this line.
 
 The reader checks that a node's parts agree — the container really is at that
 offset with the count it claims, its first anchor is that container's first
-entry, anchors ascend and stay inside the data section. What it cannot check
-without doing the very work the index exists to avoid is that **every** anchor
-is a real entry boundary (O(n) per container), or that `sorted` is truthful
-(which means reading every key). An index built to lie about either will
-misdirect a lookup to a neighbouring value, silently and without error.
+entry, anchors ascend and stay inside the data section. All of that is O(1) per
+node. What it cannot check without doing the very work the index exists to
+avoid is that **every** anchor is a real entry boundary (O(n) per container), or
+that `sorted` is truthful (which means reading every key). An index built to lie
+about either will misdirect a lookup to a neighbouring value, silently and
+without error.
+
+One check used to reach further and no longer does. For a **container** node the
+reader also walked to the container's end — `skip` over every item in it — to
+confirm that stepping from the last anchor landed exactly there. That pinned the
+final partial span, and it cost the walk the node exists to avoid: measured flat
+at ~190 µs on 769 maps of 20 wherever the key sat, against 2.2 µs unindexed for
+the first element, which made an untrusted index unable to beat an unindexed
+walk at any container size. It is gone; damage confined to the bytes past the
+last anchor is no longer detected. **Sequence** nodes keep the check, because
+their end is `data-end` — a constant already in the frame — so it costs O(stride)
+there and always did.
 
 So the index frame is a **trust boundary**: integrity of the index is integrity
 of the document. That is the same exposure the data section already has — CBOR

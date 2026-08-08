@@ -1615,9 +1615,17 @@
           bs (boring/encode-indexed m (assoc o :index 4 :index-min 4))
           src (nav/source bs o)]
       ;; Both containers read correctly, and the index carries a node for each.
-      (let [ix (#'boring.nav/read-index (#'boring.nav/nav-of bs o))]
-        (is (>= (alength ^longs (:containers ix)) 2) "both containers indexed")
-        (is (some? (:node-checked ix)) "and each carries its own verdict slot"))
+      ;;
+      ;; This used to assert `(some? (:node-checked ix))` -- that the index
+      ;; carried a per-node verdict slot. That was checking the MECHANISM, and
+      ;; the mechanism is gone: the verdict was cached in two `boolean[]` sized
+      ;; by the document because the check walked the container to its end, and
+      ;; what is left is three O(1) reads, cheaper to repeat than to remember.
+      ;;
+      ;; The property the name claims is now STRUCTURAL rather than observed.
+      ;; There is no shared verdict store, so there is nothing an unsound node
+      ;; could poison for a sound one -- `node-sound?` is a pure function of the
+      ;; node it is asked about.
       (doseq [i (range 40)]
         (is (= i (some-> (get (get src "a") (format "a%02d" i)) nav/value)))
         (is (= i (some-> (get (get src "b") (format "b%02d" i)) nav/value)))))))
