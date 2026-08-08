@@ -162,8 +162,23 @@
 ;; the point of those files, not an accident to be rewritten around. The hot
 ;; paths in this namespace use direct field access; `valAt` is for them.
 (deftype Index
-         [^Reader rdr
-          ^long stride
+         ;; NO READER. The Index carries offsets and arrays and nothing that can
+         ;; read them, deliberately: `fork-nav` builds a FRESH `Reader` per fork
+         ;; and SHARES the decoded index, justified in its own comment by "it is
+         ;; immutable once built". That is true of arrays. It would be false the
+         ;; moment this held a Reader, because `byteAt`/`u32At`/`headArgAt`/
+         ;; `headEndAt` do not set the `busy` flag -- only `skipFrom` and
+         ;; `readFrom` do -- and the last two MUTATE `pos` and restore it in a
+         ;; `finally`. Two forked threads interleaving there race on `pos`: A
+         ;; sets `pos = p+1`, B sets `pos = q+1`, A's `arg()` reads B's bytes.
+         ;; Wrong offset, wrong anchor, wrong subtree, NO exception -- which is
+         ;; exactly what `fork` exists to prevent and exactly what the `busy`
+         ;; detector was added for.
+         ;;
+         ;; So every accessor takes its `^Reader` from the calling `Nav`. The
+         ;; field was unused already; removing it is what keeps it that way once
+         ;; the elements become byte offsets and reading them needs a Reader.
+         [^long stride
           ^longs containers
           ^ints counts
           ^bytes slots
@@ -177,7 +192,7 @@
   (valAt [this k] (.valAt this k nil))
   (valAt [_ k nf]
     (case k
-      :rdr rdr :stride stride :containers containers :counts counts
+      :stride stride :containers containers :counts counts
       :slots slots :slots-tbase slots-tbase :slots-wstart slots-wstart
       :sorted sorted :data-end data-end
       :total total :offsets offsets
@@ -2092,7 +2107,7 @@
               ;; Allocated only when there IS a sequence node, so an
               ;; `encode-indexed` blob -- which never has one -- pays nothing.
               ix0 (when seq-slot
-                    (Index. r st containers counts packed
+                    (Index. st containers counts packed
                             (long (nth table 0)) (long (nth table 1))
                             sorted ptr nil nil))
               seq-anchors (when seq-slot (slot-at ix0 (long seq-slot)))
@@ -2104,7 +2119,7 @@
                                         (long (aget counts (int seq-slot)))
                                         st seq-anchors))]
           (when seq-ok?
-            (Index. r st containers counts packed (long (nth table 0)) (long (nth table 1))
+            (Index. st containers counts packed (long (nth table 0)) (long (nth table 1))
                     sorted ptr
                     (when seq-slot (long (aget counts (int seq-slot))))
                     seq-anchors)))))
@@ -2215,7 +2230,7 @@
                   ;; `containers` nil is how every caller tells this apart --
                   ;; `(if-let [cs (.containers ix)] ...)` -- which is the same
                   ;; test they used when this was a map with one key.
-                  (Index. r 0 nil nil nil 0 0 nil ptr nil nil)))))))))
+                  (Index. 0 nil nil nil 0 0 nil ptr nil nil)))))))))
 
 (deftype Items [^Nav nav ^Index idx]
   clojure.lang.Seqable

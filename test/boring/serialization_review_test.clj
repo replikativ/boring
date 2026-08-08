@@ -373,6 +373,38 @@
           (let [c (nav/source (boring/encode {"a" {"b" 7}} o) o)]
             (is (= 7 (nav/value (get-in (nav/fork c) ["a" "b"]))))))))))
 
+(deftest forked-parallel-lookups-agree-on-container-nodes
+  (testing "the test above forks over a SEQUENCE -- `Items` walking the sentinel
+            node's pre-expanded `offsets`. It never touches the path that
+            container nodes serve: `node-slot` binary-searching `containers`,
+            then `slot-at` expanding that node's deltas on demand. Those are the
+            reads that a fork shares, and the ones that stop being safe the
+            moment the `Index` holds anything mutable.
+
+            `fork` shares the decoded index on the argument that it is immutable
+            once built. That is true while the elements are Java arrays and
+            would be FALSE if the Index carried a `Reader`: `byteAt`, `u32At`,
+            `headArgAt` and `headEndAt` do not set the `busy` flag, and the last
+            two mutate `pos` and restore it in a `finally`, so two forked
+            threads interleaving there read each other's bytes with no
+            exception. This pins the property before the elements become byte
+            offsets and reading one needs a Reader at all."
+    (let [oi (assoc o :shapes false :index 4 :index-min 4)
+          doc (vec (for [i (range 120)]
+                     (into {} (for [j (range 20)] [(format "k%02d" j) (+ (* 100 i) j)]))))
+          ^bytes bs (boring/encode-indexed doc oi)
+          src (nav/source bs oi)
+          paths (vec (for [i [0 1 37 119] j ["k00" "k07" "k19"]] [i j]))
+          want (mapv (fn [p] (some-> (nav/walk src p) nav/value)) paths)]
+      (is (= (mapv #(get-in doc %) paths) want)
+          "the sequential answers are right to begin with")
+      (is (every? #(= want %)
+                  (doall (pmap (fn [_]
+                                 (let [f (nav/fork src)]
+                                   (mapv (fn [p] (some-> (nav/walk f p) nav/value)) paths)))
+                               (range 60))))
+          "and 60 parallel forked passes of the same indexed lookups all agree"))))
+
 (deftest value-is-total-so-lookups-behave-the-same-through-tags
   (testing "`get` returns a CURSOR when it descends a map or array and the
             REALISED VALUE when it descends a tag -- documented, because a tag's
