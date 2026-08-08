@@ -98,8 +98,7 @@
             [boring.frame :as frame]
             [boring.options :as opt]
             [clojure.zip :as zip])
-  (:import (org.replikativ.boring Reader ByteSource)
-           (java.util.concurrent.atomic AtomicReferenceArray)))
+  (:import (org.replikativ.boring Reader ByteSource)))
 
 (set! *warn-on-reflection* true)
 
@@ -2150,7 +2149,6 @@
                          (cond (>= k (alength containers)) nil
                                (= -1 (aget containers k)) k
                                :else (recur (inc k))))
-              n (alength containers)
               st (long stride)
               ;; LAZY, memoized per node. `slot-at` is a prefix sum over a
               ;; node's anchors and `node-valid?` reads the file, so doing both
