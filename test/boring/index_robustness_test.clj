@@ -1265,7 +1265,8 @@
                 by the index being rejected, which would prove nothing about
                 the lookup path"
         (is (some? at) "the slot's delta bytes were found")
-        (let [ix (#'boring.nav/read-index (#'boring.nav/nav-of damaged o))]
+        (let [nv (#'boring.nav/nav-of damaged o)
+              ix (#'boring.nav/read-index nv)]
           ;; `:containers`, not `:slots`. Both are non-nil on an accepted index
           ;; today, but only `:containers` MEANS accepted -- `:slots` means
           ;; "slots is present", which stays true for shapes that are refused.
@@ -1273,7 +1274,7 @@
           ;; Slots are expanded on demand now, so ask for node 0 rather than
           ;; reading a pre-expanded vector.
           (is (= [2 22 43 62 82 102]
-                 (vec (take 6 (#'boring.nav/slot-at ix 0))))
+                 (vec (take 6 (#'boring.nav/slot-at (.rdr nv) ix 0))))
               "and anchor[2] really is one byte off")))
       (testing "yet every present key still reads back correctly"
         (let [src (nav/source damaged o)]

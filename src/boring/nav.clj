@@ -180,7 +180,16 @@
          ;; the elements become byte offsets and reading them needs a Reader.
          [^long stride
           ^longs containers
-          ^ints counts
+          ;; COUNTS AS AN OFFSET, not an int[]. `counts` is a tag-78 typed
+          ;; array on the wire -- RFC 8746 little-endian -- so entry `i` is four
+          ;; bytes at `counts-data + 4i` and reading one is a load rather than a
+          ;; decode. Materialising it cost 1.07 us per open on a 770-node frame,
+          ;; to serve a lookup that touches one or two nodes.
+          ;;
+          ;; `n` is the node count, derived once as `byte-length / 4`, because
+          ;; there is no `alength` to ask any more and three checks depend on it.
+          ^long counts-data
+          ^long n
           ^bytes slots
           ^long slots-tbase
           ^long slots-wstart
@@ -192,7 +201,12 @@
   (valAt [this k] (.valAt this k nil))
   (valAt [_ k nf]
     (case k
-      :stride stride :containers containers :counts counts
+      :stride stride :containers containers
+      :counts-data counts-data :n n
+      ;; `:counts` was the int[]; it is a node COUNT now. Nothing in the tree
+      ;; reads it -- both test reach-ins named `:counts` are on
+      ;; `boring.core/build-index`'s map, which is unaffected.
+      :counts n
       :slots slots :slots-tbase slots-tbase :slots-wstart slots-wstart
       :sorted sorted :data-end data-end
       :total total :offsets offsets
@@ -689,10 +703,10 @@
     ;; and Clojure maps are unsorted by default, so that is the ordinary case
     ;; rather than a corner. See `boring.core/pack-sorted` and commit 825657f.
     (if (or (neg? ns)
-            (zero? (alength ^longs (slot-at idx ns)))
+            (zero? (alength ^longs (slot-at r idx ns)))
             (and (> (.stride idx) 1) (not (sorted-at? (.sorted idx) ns))))
       (scan-map r (.headEndAt r off) n probe)
-      (let [^longs slot (slot-at idx ns)
+      (let [^longs slot (slot-at r idx ns)
             stride (.stride idx)
             m (alength slot)]
         ;; Entries after anchor a, which is NOT always `stride`: the last
@@ -810,7 +824,7 @@
               ;; to. Checked before `node-slot`, which is a binary search over
               ;; every node in the document.
               ns (if (or (nil? ix) (< idx stride0)) -1 (node-slot nav off))
-              ^longs slot (when-not (neg? ns) (slot-at ix ns))
+              ^longs slot (when-not (neg? ns) (slot-at r ix ns))
               stride (when slot stride0)
               anchor (when slot (quot idx (long stride)))]
         ;; THE ANCHOR MUST BE THERE, which `lookup-map` has always checked and
@@ -1865,6 +1879,32 @@
   (not (zero? (bit-and (bit-and (aget sorted (int (quot i 8))) 0xFF)
                        (bit-shift-left 1 (int (rem i 8)))))))
 
+(defn- le-array-at
+  "Data offset and byte length of the RFC 8746 little-endian typed array at
+  `off`, or nil.
+
+  Requires the tag AND that its payload is a DEFINITE-length byte string. The
+  major check is not optional: without it the previous frame shape -- where this
+  element was a CBOR array -- gets a `headEndAt` and a `headArgAt` that both
+  succeed, returning the element COUNT and the first element's offset, and the
+  reader goes on to compute node offsets from them. The refusal has to be exact,
+  which is the whole compatibility argument for changing the layout."
+  [^Reader r ^long off ^long tag]
+  (when (and (= 6 (.majorAt r off)) (= tag (.headArgAt r off)))
+    (let [bs (.headEndAt r off)]
+      (when (and (= 2 (.majorAt r bs)) (not= 31 (.infoAt r bs)))
+        [(.headEndAt r bs) (.headArgAt r bs)]))))
+
+(defn- count-at
+  "Entry count of node `i`: one little-endian int32 load off the wire.
+
+  `Integer/reverseBytes` of the big-endian word, NOT four `byteAt` calls --
+  fewer, wider accesses is the whole lever on this path, and on a memory-mapped
+  source each `byteAt` is also an interface call into the segment."
+  ^long [^Reader r ^Index ix ^long i]
+  (long (Integer/reverseBytes
+         (unchecked-int (.u32At r (+ (.counts-data ix) (* 4 i)))))))
+
 (defn- slot-at
   "Absolute anchors for node `i`, as arithmetic over the packed bytes.
 
@@ -1894,15 +1934,14 @@
   layer above this to turn a bad node into `node-slot` -1 and a scan. The
   caller sees `:boring/bad-index`, which is what every other malformed-input
   path in this library raises."
-  ^longs [^Index ix ^long i]
+  ^longs [^Reader r ^Index ix ^long i]
   (let [^bytes packed (.slots ix)
         tbase (.slots-tbase ix)
         wstart (.slots-wstart ix)
-        ^ints counts (.counts ix)
         ^longs cs (.containers ix)
         stride (.stride ix)
         lim (.data-end ix)
-        m (anchor-count (aget counts (int i)) (long stride))
+        m (anchor-count (count-at r ix i) (long stride))
         w (width-code packed i)
         sz (bit-shift-left 1 w)
         start (long (slot-start packed tbase wstart i))
@@ -2004,13 +2043,30 @@
           [off-stride off-containers off-counts off-slots off-sorted]
           (try (payload-offsets r ptr)
                (catch Exception _ [nil nil nil nil nil]))
-          [stride raw-containers ^ints counts packed sorted]
+          [stride raw-containers packed sorted]
           (when off-stride
             [(.readFrom r (long off-stride))
              (.readFrom r (long off-containers))
-             (.readFrom r (long off-counts))
              (.readFrom r (long off-slots))
              (.readFrom r (long off-sorted))])
+          ;; COUNTS IS NOT DECODED. It is a tag-78 typed array, so its entries
+          ;; are four little-endian bytes each and `count-at` loads one on
+          ;; demand. Materialising it cost 1.07 us per open on a 770-node frame.
+          ;;
+          ;; Deliberately NARROWER than `.readFrom` was: tag 78 only. The width
+          ;; is fixed at 4 and `n` is derived from the byte length, so accepting
+          ;; tag 79 here would silently halve the node count. `.readFrom` also
+          ;; yielded int arrays for the BIG-ENDIAN tags (66, 70, 71, 74, 75),
+          ;; which are now refused -- safe, since refused means scan, but worth
+          ;; naming as a real change rather than a tidy-up.
+          [counts-data counts-len] (when off-counts
+                                     (le-array-at r (long off-counts) 78))
+          ;; `readTypedArray` used to throw on a byte length that is not a
+          ;; multiple of the element width; `quot` truncates instead. Without
+          ;; this a 3081-byte counts string would yield n=770, agree with a
+          ;; 770-entry `containers`, and be ACCEPTED where it is refused today.
+          n (when (and counts-len (zero? (rem (long counts-len) 4)))
+              (quot (long counts-len) 4))
           ;; CONTAINERS ARRIVE AT EITHER WIDTH. `seal-index!` emits int32 when
           ;; every offset fits and sint64 when one does not, and the CBOR tag is
           ;; the declaration -- the same narrowest-that-fits rule the slot
@@ -2032,12 +2088,10 @@
           ;; decodes but whose parts disagree is refused here rather than at
           ;; whichever node a lookup happens to visit. Guarded on the types it
           ;; indexes with, because it runs BEFORE the checks below.
-          table (when (and (bytes? packed)
-                           (instance? ints-array-class counts))
-                  (try (slot-table packed (alength ^ints counts))
+          table (when (and (bytes? packed) n)
+                  (try (slot-table packed (long n))
                        (catch Exception _ nil)))]
-      (when (and (int? stride) (pos? (long stride)) containers
-                 (instance? ints-array-class counts)
+      (when (and (int? stride) (pos? (long stride)) containers n
                  ;; A BYTE STRING WHERE AN ARRAY USED TO BE. This is what makes
                  ;; the layout change safe in both directions: a frame written
                  ;; by an older writer arrives as a Clojure vector of typed
@@ -2053,10 +2107,10 @@
                  ;; are the one frame fault that costs O(1) to detect and would
                  ;; otherwise surface as a raw IndexOutOfBoundsException from
                  ;; inside `get` rather than as "no usable index, scan instead".
-                 (= (alength containers) (alength counts))
+                 (= (alength containers) (long n))
                  ;; `sorted` is a bit per node, so its byte length is exact --
                  ;; `(quot (+ n 7) 8)` -- and an equality rather than a bound.
-                 (= (alength ^bytes sorted) (quot (+ (alength counts) 7) 8))
+                 (= (alength ^bytes sorted) (quot (+ (long n) 7) 8))
                  ;; `node-slot` BINARY-SEARCHES containers, so they must
                  ;; ascend. O(NODE COUNT), and the only per-node work left at
                  ;; open -- kept because a search over an unordered array does
@@ -2107,21 +2161,22 @@
               ;; Allocated only when there IS a sequence node, so an
               ;; `encode-indexed` blob -- which never has one -- pays nothing.
               ix0 (when seq-slot
-                    (Index. st containers counts packed
+                    (Index. st containers (long counts-data) (long n) packed
                             (long (nth table 0)) (long (nth table 1))
                             sorted ptr nil nil))
-              seq-anchors (when seq-slot (slot-at ix0 (long seq-slot)))
+              seq-anchors (when seq-slot (slot-at r ix0 (long seq-slot)))
               ;; The one validation left, and it is about which FILE this is,
               ;; not about whether the bytes were corrupted -- see
               ;; `seq-node-ok?`. O(stride), on one node.
               seq-ok? (or (nil? seq-slot)
                           (seq-node-ok? r ptr
-                                        (long (aget counts (int seq-slot)))
+                                        (count-at r ix0 (long seq-slot))
                                         st seq-anchors))]
           (when seq-ok?
-            (Index. st containers counts packed (long (nth table 0)) (long (nth table 1))
+            (Index. st containers (long counts-data) (long n) packed
+                    (long (nth table 0)) (long (nth table 1))
                     sorted ptr
-                    (when seq-slot (long (aget counts (int seq-slot))))
+                    (when seq-slot (count-at r ix0 (long seq-slot)))
                     seq-anchors)))))
     (catch Exception _ nil)))
 
@@ -2230,7 +2285,7 @@
                   ;; `containers` nil is how every caller tells this apart --
                   ;; `(if-let [cs (.containers ix)] ...)` -- which is the same
                   ;; test they used when this was a map with one key.
-                  (Index. 0 nil nil nil 0 0 nil ptr nil nil)))))))))
+                  (Index. 0 nil 0 -1 nil 0 0 nil ptr nil nil)))))))))
 
 (deftype Items [^Nav nav ^Index idx]
   clojure.lang.Seqable
