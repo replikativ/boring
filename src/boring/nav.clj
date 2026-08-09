@@ -1459,14 +1459,19 @@
 
     >= 0  the offset
       -1  a step was absent
-      -2  the path ends somewhere NO OFFSET CAN NAME -- a row of a shaped
-          array, whose bytes are an array while its value is a map. Returning
-          the array's offset would answer a vector where the truth is a map,
-          so it is refused instead. `value-at` and the other offset readers
-          reject both negatives, so composing them is correct by default;
-          a caller that wants shaped rows should use `walk`.
+      -2  the path ends somewhere NO OFFSET CAN NAME, and the caller should
+          fall back to `walk`. Two shapes reach it. A ROW OF A SHAPED ARRAY,
+          whose bytes are an array while its value is a map -- the array's
+          offset would answer a vector where the truth is a map. And anything
+          reached THROUGH A TAG THIS NAMESPACE HAS NO VIEW FOR, which is
+          REALISED rather than pointed at, so there is no offset to give: a
+          stringref document is the case that matters in practice, and it is
+          how konserve-lmdb's older blobs read.
 
-  `:shapes` is off unless asked for, so -2 is unreachable for most callers."
+          `value-at` and the other offset readers reject both negatives, so a
+          caller that only checks `neg?` gets not-found rather than a wrong
+          answer -- but for -2 the value is THERE, and `walk` will hand it
+          over."
   ^long [s ^long off path]
   (let [^Nav nav (source-of s)
         ;; INDEXED, NOT SEQ-WALKED, and that is most of what this function
@@ -1496,8 +1501,17 @@
               ;; `walk` rather than reimplemented. One walker, one set of
               ;; answers, which is the whole reason `walk` is public.
               (if-let [c2 (get (cursor-at nav o) k)]
-                (let [fin (walk c2 (subvec kv (inc (long i))))]
+                ;; `get` FOR THE TAIL, and no cast. A tag this namespace has
+                ;; no view for REALISES: `(get tag-cursor k)` hands back a
+                ;; plain value, not a Cursor, and `walk` simply carries on with
+                ;; `get` on it. Casting it was a ClassCastException on the
+                ;; first stringref blob konserve handed this.
+                (let [fin (reduce (fn [cur kk] (when cur (get cur kk)))
+                                  c2 (subvec kv (inc (long i))))]
                   (cond (nil? fin) -1
+                        ;; A realised value has no offset that names it -- the
+                        ;; same answer as a shaped row, for the same reason.
+                        (not (instance? Cursor fin)) -2
                         (.shape ^Cursor fin) -2
                         :else (.off ^Cursor fin)))
                 -1))))))))

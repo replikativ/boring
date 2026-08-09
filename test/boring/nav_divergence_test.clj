@@ -524,6 +524,38 @@
              (nil? cur)
              (and (some? cur) (= (nav/value-at src off) (nav/value cur))))))))
 
+(deftest walk-from-does-not-assume-a-cursor-behind-a-tag
+  (testing "A tag this namespace has no view for REALISES. `(get tag-cursor k)`
+            hands back a plain value -- a String, a vector -- and `walk`
+            carries on with `get` on exactly that.
+
+            `walk-from` assumed the tail was always a Cursor and cast it, which
+            was a raw ClassCastException the first time konserve-lmdb pointed
+            it at a stringref blob: a real store holds a mix of encodings
+            indefinitely, so the old rows are not a corner case there.
+
+            A realised value has no offset that names it, so the answer is -2
+            -- \"there, but ask `walk`\" -- and NOT -1, which would report a
+            present key as absent."
+    (let [v {"a" #{1 2 3} "b" 7}
+          o {:profile :clojure :stringref false :index 16 :index-min 2}
+          bs (boring/encode-indexed v o)
+          src (nav/source bs o)]
+      ;; Stepping TO the set gives a real offset -- its tag's. Stepping INTO
+      ;; it is where the realising happens, because nav has no view for a set:
+      ;; the cursor realises `#{1 2 3}` and `(get #{1 2 3} 1)` is the plain
+      ;; value 1, with no offset behind it.
+      (is (pos? (nav/walk-from src 0 ["a"]))
+          "the set itself is at an offset")
+      (is (= -2 (nav/walk-from src 0 ["a" 1]))
+          "but a step THROUGH it lands on a realised value")
+      (is (= 1 (nav/value (nav/walk (nav/root bs o) ["a" 1])))
+          "and `walk` answers it, which is what -2 tells the caller to do")
+      (is (= 7 (nav/value-at src (nav/walk-from src 0 ["b"])))
+          "while an ordinary step still comes back as an offset")
+      (is (= -1 (nav/walk-from src 0 ["nope"]))
+          "and absent is still -1, distinct from -2"))))
+
 (deftest a-non-integer-key-on-an-array-is-absent-not-a-map-lookup
   (testing "`walk` returned a WRONG VALUE for a string step onto an array.
 
