@@ -1160,8 +1160,9 @@ public final class Writer {
      * bytes of buffer released.
      *
      * A Writer is meant to be long-lived and reused, and every growth it has is
-     * one-way: the byte buffer, the stringref symbol table, and the index
-     * capture arrays all keep their PEAK size for the life of the writer. That
+     * one-way: the byte buffer, the stringref symbol table, the index capture
+     * arrays, the map anchor stack and the canonical staging writer all keep
+     * their PEAK size for the life of the writer. That
      * is the right default -- it is what makes reuse allocation-free -- but a
      * pooled writer that once encoded a 200 MB value then pins a 256 MB buffer
      * forever while it goes back to encoding 200-byte datoms.
@@ -1214,6 +1215,25 @@ public final class Writer {
             idxWalk = null;
         }
         if (idxSeq != null && idxSeq.length > 1024) idxSeq = null;
+        // THE MAP ANCHOR STACK, which this method's own docstring promised and
+        // did not deliver. `idxScratch` grows to the deepest nesting-sum of map
+        // entry counts and NEVER shrank: `idxReset` only zeroes the top
+        // pointer. Measured on one 200 000-entry indexed map -- buffer 4 MiB ->
+        // 256 B, and 1.6 MB of scratch still held afterwards, by the one method
+        // whose whole job is to hand memory back.
+        //
+        // Third time in this method: `idxWalk` above records the second.
+        if (idxScratch != null && idxScratch.length > 64) {
+            idxScratch = null;
+            idxScratchTop = 0;
+        }
+        // THE CANONICAL STAGING WRITER, for the same reason and with a wider
+        // reach: it is a whole Writer, with its own buffer, its own symbol
+        // table, and -- because a canonical map can appear inside a canonical
+        // map's key -- its own `canonicalScratch`. Dropping the head of that
+        // chain drops all of it. It is rebuilt lazily on the next canonical
+        // encode, exactly as the index arrays are.
+        canonicalScratch = null;
         return Math.max(0, freed);
     }
 
