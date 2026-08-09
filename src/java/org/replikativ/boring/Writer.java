@@ -497,7 +497,6 @@ public final class Writer {
     }
 
     /** Move the offset base without disturbing what has been captured. */
-    public void idxBase(long base) { this.idxBase = base; }
 
     // ---- sequence offsets -------------------------------------------------
     //
@@ -831,13 +830,6 @@ public final class Writer {
      * file's stride. Capturing at the finer of the two and dropping what is not
      * needed is the only order that works.
      */
-    private static long[] downsample(long[] all, int n, int stride) {
-        int m = stride == 1 ? n : ((n - 1) / stride) + 1;
-        if (m == n) return all;
-        long[] out = new long[m];
-        for (int a = 0; a < m; a++) out[a] = all[a * stride];
-        return out;
-    }
 
     /**
      * A MAP's node, with its anchors still in the scratch stack at `base`.
@@ -863,8 +855,14 @@ public final class Writer {
         idxWalk[slot] = walk;
     }
 
-    private void fillNode(int slot, long off, int n, long[] anchors, boolean sorted,
-                          long walkAcc, boolean isMap) {
+    /**
+     * AN ARRAY's node. Every call site passes an array, so this cannot be a map
+     * and cannot be sorted -- it carried `sorted` and `isMap` parameters that
+     * were `false` at all eight, and a `downsample` call behind
+     * `if (isMap && sorted)` that no caller could reach. A map's node is built
+     * by {@link #fillNodeScratch}, which selects its own stride.
+     */
+    private void fillNode(int slot, long off, int n, long[] anchors, long walkAcc) {
         // The container's own byte span. `fillNode` runs immediately after the
         // last entry at every call site, so `absOffset()` is its end.
         long bytes = absOffset() - off;
@@ -872,16 +870,11 @@ public final class Writer {
         // is the SUM of per-entry prefixes; `walk` is their mean. An empty
         // container has no entries to average over and no scan to shorten.
         long walk = n > 0 ? walkAcc / n : 0;
-        if (!keepNode(n, sorted, walk, isMap, bytes)) { cancelNode(slot); return; }
-        // THE NODE'S OWN STRIDE. An unsorted map is only usable at 1; anything
-        // else takes the file's. The reader derives the same answer without
-        // being told -- see `slot-at` -- because a node whose anchor count
-        // equals its entry count can only have been written at stride 1.
-        if (isMap && sorted) anchors = downsample(anchors, n, idxStride);
+        if (!keepNode(n, false, walk, false, bytes)) { cancelNode(slot); return; }
         idxOffs[slot] = checkedOffset(off);
         idxCnts[slot] = n;
         idxSlots[slot] = anchors;
-        idxSrt[slot] = sorted;
+        idxSrt[slot] = false;
         idxWalk[slot] = walk;
     }
 
@@ -1839,7 +1832,7 @@ public final class Writer {
             keysWalk += idxItemsWritten - keysAtStart;
             writeValue(keys[i]);
         }
-        if (ka != null) fillNode(keysSlot, keysStart, nk, ka, false, keysWalk, false);
+        if (ka != null) fillNode(keysSlot, keysStart, nk, ka, keysWalk);
 
         if (outer != null && --oc == 0) { outer[oa++] = idxOffset(pos); oc = idxStride; }
         outerWalk += idxItemsWritten - outerAtStart;
@@ -1864,11 +1857,11 @@ public final class Writer {
                 rowWalk += idxItemsWritten - rowAtStart;
                 writeValue(m.get(keys[i]));
             }
-            if (row != null) fillNode(rowSlot, rowStart, nk, row, false, rowWalk, false);
+            if (row != null) fillNode(rowSlot, rowStart, nk, row, rowWalk);
         }
-        if (ra != null) fillNode(rowsSlot, rowsStart, nr, ra, false, rowsWalk, false);
+        if (ra != null) fillNode(rowsSlot, rowsStart, nr, ra, rowsWalk);
 
-        if (outer != null) fillNode(outerSlot, outerStart, 2, outer, false, outerWalk, false);
+        if (outer != null) fillNode(outerSlot, outerStart, 2, outer, outerWalk);
     }
 
     /**
@@ -1957,7 +1950,7 @@ public final class Writer {
             writeValue(s.first());
         }
         if (seen != n) countMismatch(n, seen);
-        if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc, false);
+        if (anchors != null) fillNode(slot, start, n, anchors, walkAcc);
     }
 
     /** An array of `n` elements from any Iterable, indexed if it is big enough. */
@@ -1978,7 +1971,7 @@ public final class Writer {
             writeValue(o);
         }
         if (seen != n) countMismatch(n, seen);
-        if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc, false);
+        if (anchors != null) fillNode(slot, start, n, anchors, walkAcc);
     }
 
     @SuppressWarnings("rawtypes")
@@ -2528,7 +2521,7 @@ public final class Writer {
             System.arraycopy(eb, 0, buf, pos, eb.length);
             pos += eb.length;
         }
-        if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc, false);
+        if (anchors != null) fillNode(slot, start, n, anchors, walkAcc);
     }
 
     /**
@@ -3149,7 +3142,7 @@ public final class Writer {
             boolean exInfo = x instanceof clojure.lang.ExceptionInfo;
             head(TAG, TAG_GENERIC_OBJ); head(ARRAY, 2);
             writeString(exInfo ? NAME_EX_INFO : NAME_THROWABLE);
-            head(ARRAY, exInfo ? 3 : 3);
+            head(ARRAY, 3);
             if (exInfo) {
                 writeString(t.getMessage() == null ? "" : t.getMessage());
                 writeValue(((clojure.lang.ExceptionInfo) t).getData());
@@ -3355,7 +3348,7 @@ public final class Writer {
                 }
                 if (seen != n) countMismatch(n, seen);
             }
-            if (anchors != null) fillNode(slot, start, n, anchors, false, walkAcc, false);
+            if (anchors != null) fillNode(slot, start, n, anchors, walkAcc);
             return;
         }
         if (x instanceof java.util.Collection) {

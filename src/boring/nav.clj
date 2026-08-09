@@ -498,10 +498,9 @@
     ;; doc/SECURITY.md recommends for untrusted input. `read-index*` refuses the
     ;; nodes instead, which is the shape it already had for a detected-but-
     ;; unusable payload.
-    (let [nav (Nav. r opts probes (volatile! ::unparsed)
-                    (volatile! src) (volatile! nil))]
-      (check-stringref-navigable! nav r)
-      nav)))
+    (doto (Nav. r opts probes (volatile! ::unparsed)
+                (volatile! src) (volatile! nil))
+      (check-stringref-navigable! r))))
 
 (defn- check-stringref-navigable!
   "Refuse a stringref document that carries no pointer table.

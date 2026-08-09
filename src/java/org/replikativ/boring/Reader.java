@@ -570,8 +570,6 @@ public final class Reader {
      *  know when it has run out of items. */
     public long size() { return limit; }
 
-    /** Rewind to an absolute offset. The navigator descends with this. */
-    public void seek(long p) { this.pos = p; }
 
     /**
      * Advance past the value at the cursor without building it.

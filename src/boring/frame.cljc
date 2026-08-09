@@ -110,19 +110,6 @@
      seventeenth is compared against `payload-count-bytes` separately."
      (byte-array (map unchecked-byte (take prefix-head-length prefix-bytes)))))
 
-#?(:clj
-   (def ^:no-doc prefix-array
-     "The same constant as a `byte[]`, for callers that reach bytes through a
-     `Reader` rather than an array -- `boring.nav`, which must also work over a
-     memory-mapped `ByteSource`.
-
-     One constant, two access paths, so the rule cannot differ between them.
-     It differed before: `nav` checked tag 27, then that the payload was an
-     array, then the name -- but never the array's ELEMENT COUNT. Widen a
-     genuine frame's payload from six elements to seven and `nav` used it as an
-     index while `decode-seq` published it as a phantom trailing data item. One
-     file, two logical contents. The 0x86 in these bytes is that count."
-     (byte-array (map unchecked-byte prefix-bytes))))
 
 (defn- be64
   "The 8 big-endian bytes at `off` as a number.
