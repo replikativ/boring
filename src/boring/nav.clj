@@ -2512,13 +2512,6 @@
                      (pos? (quot body pw)))
             [(inc (long data)) (quot body pw) iw ow]))))))
 
-(defn- anchor-count
-  "How many anchors a container of `n` entries carries at `stride`. Must agree
-  exactly with `boring.core/anchor-count` and `Writer.anchorCount` -- this is
-  what replaces a stored per-node segment length."
-  ^long [^long n ^long stride]
-  (if (<= n 0) 0 (if (= stride 1) n (inc (quot (dec n) stride)))))
-
 (defn- slot-le
   "The `w`-byte little-endian value at ABSOLUTE offset `p`.
 
