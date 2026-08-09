@@ -666,6 +666,51 @@
                   (let [q (.headEndAt r p)]
                     (and (= MAJOR-TAG (.majorAt r q)) (= 25 (.headArgAt r q)))))))))
 
+(defn- stringref-key-matches?
+  "Whether the REFERENCE key at `p` names the same bytes as `probe`.
+
+  `bytesEqualAt` is a memcmp against an encoded probe, so `d8 19 05` never
+  equals an encoded `:profile` -- and on konserve-shaped data that is 199 key
+  occurrences in 200, every one of them a present key reported absent.
+
+  Rather than compile the probe into its reference form, which needs a
+  string-to-index pass over the pointer table per document, the comparison
+  moves: the table gives the DEFINING LITERAL's offset, and the literal is
+  byte-identical to what the probe encodes. Same memcmp, different offset, no
+  per-document state and nothing decoded.
+
+  The two shapes differ by what the reference carries that the literal does
+  not. A bare `tag 25` stands for the string itself, so the whole probe is
+  compared. A repeated keyword is `tag 39` wrapping the reference, and the
+  defining literal is the TEXT alone -- `boring.core/pack-stringrefs` records
+  where the text starts, not where its tag-39 wrapper does -- so the probe is
+  compared past its own two-byte `d8 27`.
+
+  False whenever anything is unavailable: no table, no pointer for that index,
+  a damaged offset. A miss here is answered by the ordinary walk, and a key
+  that really is absent must not become an exception."
+  [^Reader r ^long p ^bytes probe]
+  (and (.hasStringrefPointers r)
+       (= MAJOR-TAG (.majorAt r p))
+       (let [a (.headArgAt r p)]
+         (cond
+           (= 25 a)
+           (let [off (.stringrefOffsetFor r (.headArgAt r (.headEndAt r p)))]
+             (and (nat-int? off) (.bytesEqualAtFrom r (long off) probe 0)))
+
+           (= 39 a)
+           (let [q (.headEndAt r p)]
+             (and (= MAJOR-TAG (.majorAt r q))
+                  (= 25 (.headArgAt r q))
+                  ;; The probe's own tag-39 head is two bytes -- `d8 27` -- and
+                  ;; `probe-for` encodes it exactly that way, so this is a
+                  ;; constant rather than a head-length computation.
+                  (> (alength probe) 2)
+                  (let [off (.stringrefOffsetFor r (.headArgAt r (.headEndAt r q)))]
+                    (and (nat-int? off) (.bytesEqualAtFrom r (long off) probe 2)))))
+
+           :else false))))
+
 (defn- scan-map
   "Linear walk of a map's entries from `start`, at most `limit` of them.
 
@@ -698,7 +743,8 @@
       (loop [i 0 p start]
         (if (or (>= i limit) (>= p end) (neg? p))
           -1
-          (if (.bytesEqualAt r p probe)
+          (if (or (.bytesEqualAt r p probe)
+                  (stringref-key-matches? r p probe))
             (skip r p)
             ;; A KEY THAT IS A STRINGREF REFERENCE CANNOT BE COMPARED, so a miss
             ;; on one is not an answer. It is the cursor reporting that it
@@ -714,7 +760,14 @@
             ;;
             ;; One `majorAt` on the miss path, where a memcmp and two skips have
             ;; already happened.
-            (if (stringref-key? r p)
+            ;; ONLY WHEN IT CANNOT BE RESOLVED. With a pointer table a
+            ;; reference key compares fine (see `stringref-key-matches?`), so a
+            ;; non-match is an ordinary MISS and the walk goes on to the next
+            ;; entry -- refusing here would turn "this is not the key you asked
+            ;; for" into an exception, and every map with more than one
+            ;; referenced key would raise on the first entry that is not the
+            ;; one sought.
+            (if (and (stringref-key? r p) (not (.hasStringrefPointers r)))
               (fail :boring/stringref-not-navigable
                     (str "boring.nav: the key at offset " p " is a stringref "
                          "reference, so this cursor stands inside a stringref "
@@ -1344,7 +1397,37 @@
   Object
   (toString [_] (str "#boring.nav/cursor[" off (when shape " shaped") "]")))
 
-(defn- cursor-at [^Nav nav ^long off] (->Cursor nav off nil))
+(defn- past-stringref-ns
+  "`off`, advanced past a stringref namespace head if one sits there.
+
+  A tag 256 is an ENVELOPE, not a value: it says \"references inside here are
+  numbered from zero\", and `boring/decode` accordingly returns the item inside
+  it, never a tagged wrapper. A cursor has to agree, or an offset means
+  different things depending on whether the document happens to use stringrefs
+  -- and `(nav/cursor (nav/source blob ctx) 0)`, which is how a store reaches a
+  value, would land on the tag and fail `count` for exactly the documents
+  stringref-plus-index exists to serve.
+
+  ONE PLACE, deliberately. Doing this per accessor would leave each one free to
+  disagree, which is the shape of defect `container?` records between `zipper`
+  and the Cursor. Every cursor is built here.
+
+  Only ONE level is skipped, and one is all there is: `write-root!` opens a
+  single namespace at the root. A second would be foreign input, where the tag
+  keeps its ordinary meaning and the reader's own scoping applies."
+  ^long [^Reader r ^long off]
+  (try
+    (if (and (= MAJOR-TAG (.majorAt r off))
+             (= 256 (.headArgAt r off)))
+      (.headEndAt r off)
+      off)
+    ;; A damaged or out-of-range offset is not this function's business -- it is
+    ;; already documented as trusted, and the accessors report what they find
+    ;; there. Answering `off` unchanged leaves that behaviour exactly as it was.
+    (catch Exception _ off)))
+
+(defn- cursor-at [^Nav nav ^long off]
+  (->Cursor nav (past-stringref-ns ^Reader (.rdr nav) off) nil))
 
 ;; ------------------------------------------------ the two layers, and the
 ;;                                                   bridge between them

@@ -932,9 +932,20 @@ public final class Reader {
      * the entire point of not materialising what you did not ask for.
      */
     public boolean bytesEqualAt(long p, byte[] probe) {
-        int n = probe.length;
-        if (p < 0 || n > limit - p) return false;   // no overflow-prone addition
-        for (int i = 0; i < n; i++) if (sb(p + i) != probe[i]) return false;
+        return bytesEqualAtFrom(p, probe, 0);
+    }
+
+    /**
+     * As {@link #bytesEqualAt}, comparing only `probe[from..]`.
+     *
+     * For a key written as a stringref: the reference carries a tag 39 that the
+     * defining literal does not, so matching a repeated keyword means comparing
+     * the probe past its own `d8 27` against the text where it was defined.
+     */
+    public boolean bytesEqualAtFrom(long p, byte[] probe, int from) {
+        int n = probe.length - from;
+        if (p < 0 || n < 0 || n > limit - p) return false;  // no overflow-prone addition
+        for (int i = 0; i < n; i++) if (sb(p + i) != probe[from + i]) return false;
         return true;
     }
 
@@ -1348,6 +1359,34 @@ public final class Reader {
      * one it cannot, and that is the whole of the difference.
      */
     public boolean hasStringrefPointers() { return srPtrCount > 0; }
+
+    /**
+     * Where stringref `idx` was defined, or -1 if nothing says.
+     *
+     * This is what lets a navigator compare a key that is a REFERENCE without
+     * decoding it. `bytesEqualAt` is a memcmp against an encoded probe, and
+     * `d8 19 05` never equals an encoded `:profile` -- so a repeated key
+     * matched nothing, which on konserve-shaped data is 199 occurrences in 200.
+     *
+     * The obvious repair is to compile the probe into its reference form, which
+     * needs a string-to-index pass over the table per document. This is
+     * cheaper and needs no per-document state: the pointer names the DEFINING
+     * LITERAL, and the literal is byte-identical to what the probe encodes, so
+     * the comparison is the same memcmp taken at a different offset.
+     *
+     * Never throws: a miss is -1, so a damaged table costs a failed comparison
+     * rather than an exception out of `get`.
+     */
+    public long stringrefOffsetFor(long idx) {
+        if (srPtrCount <= 0) return -1L;
+        try {
+            int slot = srPtrSlot(idx);
+            if (slot < 0) return -1L;
+            return srLe(srPtrBase + (long) slot * (srPtrIw + srPtrOw) + srPtrIw, srPtrOw);
+        } catch (RuntimeException e) {
+            return -1L;
+        }
+    }
 
     /** Little-endian unsigned value of `w` bytes at `p`. Every byte goes
      *  through `b`, which bounds-checks and raises a typed truncated-input. */
