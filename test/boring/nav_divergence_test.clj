@@ -524,6 +524,35 @@
              (nil? cur)
              (and (some? cur) (= (nav/value-at src off) (nav/value cur))))))))
 
+(deftest a-compiled-path-answers-what-a-raw-one-answers
+  (testing "A key step is matched by comparing BYTES, so a scan should encode
+            each key once rather than once per row. `probe-for` passes
+            already-encoded bytes through, which means a compiled path is just
+            the path with `probe` substituted -- no second API, and nothing to
+            keep in step with the uncompiled one.
+
+            Worth 0.658 us against 0.535 on a four-step path, at the same
+            allocation: the cache hit does not allocate, it simply is not free.
+
+            The risk a compiled path introduces is that it stops being checked
+            against the raw one, so it is checked here, INCLUDING the mixed
+            case -- an integer step must survive compilation unchanged and keep
+            meaning position-on-array, key-on-map."
+    (let [v {"m" {"a" {"b" 1} "2" "by-key"}
+             "v" [10 20 30]
+             "mixed" [{"k" "in-vec"}]}
+          o {:profile :clojure :stringref false :index 16 :index-min 2}
+          bs (boring/encode-indexed v o)
+          src (nav/source bs o)
+          compile (fn [p] (mapv #(if (integer? %) % (nav/probe src %)) p))]
+      (doseq [path [["m" "a" "b"] ["v" 2] ["mixed" 0 "k"] ["m" "2"] ["v" 9] ["nope"]]]
+        (let [raw (nav/walk-from src 0 path)
+              cmp (nav/walk-from src 0 (compile path))]
+          (is (= raw cmp) (str (pr-str path) ": compiled must equal raw"))
+          (is (= (some-> (nav/walk (nav/root bs o) path) nav/value)
+                 (when-not (neg? cmp) (nav/value-at src cmp)))
+              (str (pr-str path) ": and both must equal `walk`")))))))
+
 (deftest walk-from-does-not-assume-a-cursor-behind-a-tag
   (testing "A tag this namespace has no view for REALISES. `(get tag-cursor k)`
             hands back a plain value -- a String, a vector -- and `walk`

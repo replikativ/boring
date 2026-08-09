@@ -1471,7 +1471,23 @@
           `value-at` and the other offset readers reject both negatives, so a
           caller that only checks `neg?` gets not-found rather than a wrong
           answer -- but for -2 the value is THERE, and `walk` will hand it
-          over."
+          over.
+
+  A PATH MAY BE COMPILED, and for a scan it should be. `probe-for` passes
+  already-encoded bytes straight through, so substituting `probe` for each key
+  step gives a path that costs no cache lookup per step per row:
+
+      (def p (mapv #(if (integer? %) % (nav/probe src %)) [\"a\" \"b\" 2]))
+      (nav/walk-from src 0 p)
+
+  Measured on a four-step path: 0.658 us against 0.535, at the SAME
+  allocation -- a cache hit does not allocate, it simply is not free. Integer
+  steps survive compilation unchanged and still mean POSITION on an array and
+  KEY on a map, decided from the container.
+
+  That is the whole of \"compiled path\": no second API to keep in step with
+  this one, and nothing a caller can compile wrongly except by encoding under
+  different options, which `probe` ties to the source."
   ^long [s ^long off path]
   (let [^Nav nav (source-of s)
         ;; INDEXED, NOT SEQ-WALKED, and that is most of what this function
