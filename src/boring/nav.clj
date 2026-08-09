@@ -489,8 +489,16 @@
     ;; document with no frame costs nothing to find that out, and one with a
     ;; frame pays only if something consults it. See `nav-idx` for why this is
     ;; not a `delay` any more -- 96 bytes per source, on every source.
-    (let [nav (Nav. r opts probes
-                    (when-not (= :ignore (:trust-index opts)) (volatile! ::unparsed))
+    ;; `:trust-index :ignore` STILL DETECTS THE FRAME. It used to leave `.idx`
+    ;; nil, which conflated the two questions `read-index*` is careful to keep
+    ;; apart: "where does the data end" and "are these anchors usable". With no
+    ;; Index at all there is no `data-end`, so `Items` walked to the end of the
+    ;; BUFFER and republished the footer as a data item -- `nav/items` reporting
+    ;; 41 where `decode-seq` reported 40, through the very option
+    ;; doc/SECURITY.md recommends for untrusted input. `read-index*` refuses the
+    ;; nodes instead, which is the shape it already had for a detected-but-
+    ;; unusable payload.
+    (let [nav (Nav. r opts probes (volatile! ::unparsed)
                     (volatile! src) (volatile! nil))]
       (check-stringref-navigable! nav r)
       nav)))
@@ -3176,7 +3184,8 @@
               ;; does: detection has succeeded by here, so an UNUSABLE payload
               ;; must still yield `:data-end` or `items` walks past the data
               ;; section and republishes the footer as a data item.
-              (or (index-payload r ptr)
+              (or (when-not (= :ignore (:trust-index (.opts nav)))
+                    (index-payload r ptr))
                   ;; DETECTED BUT REFUSED: an Index carrying only `data-end`.
                   ;; `n` is -1, the "no nodes" sentinel, and every other
                   ;; primitive is 0. THERE IS NO NIL IN THIS CALL AND THERE
