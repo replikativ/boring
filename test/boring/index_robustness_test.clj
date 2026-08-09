@@ -1393,8 +1393,26 @@
     ;; table has exactly two entries -- the whole per-node table machinery sat
     ;; outside the sweep it was supposed to be inside.
     (let [o (assoc opts :index 1 :index-min 2)
-          doc (vec (for [i (range 60)]
-                     (into {} (for [j (range 3)] [(format "k%d" j) (+ (* 10 i) j)]))))
+          ;; TWENTY-ONE NODES, AND BOTH STRIDES. The previous fixture -- 60
+          ;; three-entry maps -- collapsed to ONE node the moment the writer
+          ;; started refusing containers a scan crosses cheaply, which is
+          ;; exactly the degeneracy this test was rewritten to remove: at one
+          ;; node, `width-code` and `sorted-at?` are only ever evaluated at
+          ;; i = 0, the start table has a single span, and the whole per-node
+          ;; machinery sits outside the sweep that is supposed to cover it.
+          ;;
+          ;; That collapse is why `a-declared-stride-cannot-overflow-the-span-
+          ;; arithmetic` below had to be written by hand: the defect lived in
+          ;; `span`, which a one-node frame reaches with anchor 0 only.
+          ;;
+          ;; This shape keeps 21: an outer array at the file's stride beside
+          ;; twenty inner maps at stride 1 (unsorted, and large enough to clear
+          ;; the anchor budget). Width codes then span 6 bytes and the sorted
+          ;; bitset 3, so both are indexed well past their first byte.
+          doc {"A" (vec (for [_ (range 20)]
+                          (into {} (for [j (range 20)]
+                                     [(format "k%02d" j) (vec (range 6))]))))
+               "B" (vec (for [_ (range 12)] (vec (range 80))))}
           ^bytes flat (boring/encode-indexed doc o)
           ^bytes seq-bs (seal (mapv #(hash-map :id % :name (str "r" %)) (range 60))
                               (assoc opts :index 1 :index-min 2))
@@ -1431,6 +1449,49 @@
       (is (empty? seq-bad)
           (str "untyped failures from a write-seq! frame: "
                (vec (take 4 seq-bad)))))))
+
+(deftest a-declared-stride-cannot-overflow-the-span-arithmetic
+  (testing "`lookup-map` computes `(* anchor stride)` on primitive longs, and
+            Clojure's `*` on longs THROWS on overflow. A frame declaring a
+            stride near 2^63 therefore raised a raw ArithmeticException out of
+            `get` -- the untyped failure this namespace promises cannot happen.
+
+            IT WAS UNREACHABLE UNTIL THE ANCHOR COUNT STOPPED DEPENDING ON THE
+            STRIDE. `slot-at` used to derive `m` as `anchor-count(count,
+            stride)`, which clamps to 1 for any huge stride, so `span` could
+            only ever compute `0 * stride`. Deriving `m` from the start table
+            instead -- which per-node stride requires -- removed a coupling
+            that was accidental and load-bearing at once.
+
+            A single flipped bit cannot express this: widening a CBOR head from
+            one byte to nine is a multi-byte edit, which is why the every-bit
+            sweep is green on the same file. Constructed by hand for that
+            reason.
+
+            The stride is now bounded above by what the writer can emit, so a
+            frame declaring more is refused and the file answers by scanning."
+    (let [v {"sorted" (into {} (for [i (range 120)]
+                                 [(format "s%03d" i) (str "v5-" i)]))}
+          o {:profile :canonical :index 16 :index-min 2}
+          bs (boring/encode-indexed v o)
+          p (long (#'boring.frame/footer-start bs))
+          ;; The stride is the payload's first element, right after the 17-byte
+          ;; prefix. Replace its one byte with a 9-byte uint64.
+          at (+ p 17)
+          out (byte-array (+ (alength ^bytes bs) 8))]
+      (System/arraycopy bs 0 out 0 at)
+      (aset-byte out at (unchecked-byte 0x1b))
+      (aset-byte out (+ at 1) (unchecked-byte 0x40))
+      (System/arraycopy bs (inc at) out (+ at 9) (- (alength ^bytes bs) at 1))
+      (is (not (some? (:containers (#'boring.nav/read-index
+                                    (#'boring.nav/nav-of out o)))))
+          "a stride the writer could never emit must be refused")
+      (doseq [k ["s000" "s050" "s119"]]
+        (is (= (str "v5-" (Long/parseLong (subs k 1))) 
+               (nav/value (get (get (nav/root out o) "sorted") k)))
+            (str k ": and every key still answers, by scanning")))
+      (is (nil? (get (get (nav/root out o) "sorted") "zzz9"))
+          "and an absent key is still absent, not an exception"))))
 
 (deftest a-lookup-miss-is-re-derived-by-walking
   (testing "Validation proves the FIRST anchor is a real entry and that the

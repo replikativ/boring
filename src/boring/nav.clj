@@ -2617,7 +2617,25 @@
           table (when (and slots-data n)
                   (try (slot-table r (long slots-data) (long slots-len) (long n))
                        (catch Exception _ nil)))]
-      (when (and stride (pos? (long stride)) containers-data n
+      ;; AND BOUNDED ABOVE, not merely positive. `lookup-map`'s `span` computes
+      ;; `(* a stride)` on longs, and Clojure's `*` on primitive longs THROWS on
+      ;; overflow -- so a frame declaring a stride near 2^63 raised a raw
+      ;; ArithmeticException out of `get`, which is precisely the untyped
+      ;; failure this namespace promises cannot happen.
+      ;;
+      ;; It was unreachable until `slot-at` began deriving the anchor count from
+      ;; the start table instead of from `anchor-count` of the wire count and
+      ;; the stride: that derivation CLAMPED `m` to 1 for any huge stride, so
+      ;; `span` could only ever compute `0 * stride`. The coupling was
+      ;; accidental and load-bearing, and removing it is what exposed this.
+      ;;
+      ;; `max-index-stride` is what the writer will emit at most (`options`
+      ;; refuses more), so nothing legitimate is refused here. With the stride
+      ;; under 2^31 and `m` bounded by the file's own bytes, `(* a stride)`
+      ;; cannot overflow.
+      (when (and stride (pos? (long stride))
+                 (<= (long stride) opt/max-index-stride)
+                 containers-data n
                  ;; A BYTE STRING WHERE AN ARRAY USED TO BE. This is what makes
                  ;; the layout change safe in both directions: a frame written
                  ;; by an older writer arrives as a Clojure vector of typed

@@ -636,6 +636,14 @@ public final class Writer {
             idxSlots = java.util.Arrays.copyOf(idxSlots, m);
             idxWalk = java.util.Arrays.copyOf(idxWalk, m);
         }
+        // MARKED DEAD UNTIL FILLED. `-1` in `idxCnts` means refused, and a
+        // slot claimed but never filled -- an exception between here and
+        // `fillNode` -- would otherwise inherit the previous document's count
+        // and survive compaction as a live node describing nothing. Both
+        // library entry points reset on the throw path; an interop caller
+        // driving `setIndex` and `encode-buffered!` by hand is not so lucky.
+        idxCnts[idxN] = -1;
+        idxDirty = true;
         return idxN++;
     }
 
@@ -1007,6 +1015,11 @@ public final class Writer {
             idxCnts = null;
             idxSrt = null;
             idxSlots = null;
+            // AND idxWalk, which was added later and missed here: 262 KB
+            // measured, pinned for the life of the writer by the one method
+            // whose whole job is to hand memory back. The five arrays grow
+            // together in `reserveNode` and must be released together.
+            idxWalk = null;
         }
         if (idxSeq != null && idxSeq.length > 1024) idxSeq = null;
         return Math.max(0, freed);
