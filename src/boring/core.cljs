@@ -672,11 +672,17 @@
         ;; different anchor count would shift every LATER node's deltas rather
         ;; than corrupt this one. Checked on both platforms because the two
         ;; walks are separate implementations of the same rule.
-        (when-not (== m (anchor-count (nth counts i) stride))
+        ;; EITHER OF THE TWO LEGAL STRIDES -- see the JVM's `pack-slots`.
+        ;; Stride is per node now, and which one a node used is derived by the
+        ;; reader rather than stored.
+        (when-not (or (== m (anchor-count (nth counts i) stride))
+                      (== m (anchor-count (nth counts i) 1)))
           (throw (ex-info (str "boring: index node " i " has " m " anchors but "
-                               (nth counts i) " entries at stride " stride
-                               " implies " (anchor-count (nth counts i) stride)
-                               ". The index walk and `anchor-count` disagree.")
+                               (nth counts i) " entries implies "
+                               (anchor-count (nth counts i) stride) " at stride "
+                               stride " or " (anchor-count (nth counts i) 1)
+                               " at stride 1."
+                               " The index walk and `anchor-count` disagree.")
                           {:type :boring/bad-index :node i :anchors m
                            :entries (nth counts i) :stride stride})))
         (loop [k 0 prev (max 0 (nth containers i))]
@@ -785,7 +791,9 @@
   (and (>= (if (<= n 0) 0 (if (== stride 1) n (inc (quot (dec n) stride)))) 2)
        (if (or (not map?) sorted)
          (>= walk walk-threshold)
-         (and (== stride 1) (<= (* unsorted-anchor-budget n) bytes)))))
+         ;; An unsorted map is written at stride 1 whatever the file's
+         ;; stride, so only the size budget decides.
+         (<= (* unsorted-anchor-budget n) bytes))))
 
 (defn- index-walk*
   "Walk the value at `p`, returning where it ends, accumulating nodes into `acc`.
@@ -828,10 +836,14 @@
             e)
           (let [keep? (and (>= n min-entries)
                            (not (frame-payload-array? r q0 p mj n)))
+                ;; A MAP CAPTURES ONE ANCHOR PER ENTRY -- see the JVM
+                ;; `index-walk*` and `Writer.downsample`. Narrowed below, once
+                ;; `sorted` is known.
+                cap-stride (if map? 1 stride)
                 m (if keep?
                     (cond (<= n 0) 0
-                          (== stride 1) n
-                          :else (inc (quot (dec n) stride)))
+                          (== cap-stride 1) n
+                          :else (inc (quot (dec n) cap-stride)))
                     0)
                 kept (when keep? (js/Array. m))
                 ;; EVERY adjacent key pair decides `sorted`, not the anchors --
@@ -848,8 +860,8 @@
                 end (loop [i 0 q (rd/head-end-at r p) prev -1]
                       (if (== i n)
                         q
-                        (do (when (and keep? (zero? (rem i stride)))
-                              (aset kept (quot i stride) q))
+                        (do (when (and keep? (zero? (rem i cap-stride)))
+                              (aset kept (quot i cap-stride) q))
                             (when (and srt (aget srt 0) (>= prev 0)
                                        (>= (rd/compare-items-at r prev q) 0))
                               (aset srt 0 false))
@@ -871,7 +883,15 @@
             (when keep?
               ;; FLOOR DIVISION, matching `Writer.fillNode` and the JVM walk.
               (let [sorted (boolean (and srt (aget srt 0)))
-                    walk (if (pos? n) (quot (aget walk-acc 0) n) 0)]
+                    walk (if (pos? n) (quot (aget walk-acc 0) n) 0)
+                    ;; Narrowed now that `sorted` is known. `(pos? n)` because
+                    ;; this runs before the keep decision.
+                    kept (if (and map? sorted (pos? n) (> stride 1))
+                           (let [mm (inc (quot (dec n) stride))
+                                 out (js/Array. mm)]
+                             (dotimes [a mm] (aset out a (nth kept (* a stride))))
+                             (vec out))
+                           kept)]
                 (when (keep-node? map? sorted walk stride n (- end p))
                   (.push acc [(+ p base) n (vec kept) sorted walk]))))
             end))))))

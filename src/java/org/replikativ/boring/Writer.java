@@ -695,6 +695,24 @@ public final class Writer {
 
     /** `off` is a FILE offset, captured by `absOffset()` when the container
      *  started -- not a buffer position to be resolved now. See absOffset(). */
+    /**
+     * Every `stride`th element of `all`, which holds one entry per anchor at
+     * stride 1.
+     *
+     * A map is CAPTURED AT STRIDE 1 and narrowed here, because which stride it
+     * wants is not known until its last key has been compared -- an unsorted
+     * map is usable only at stride 1, a sorted one is better served by the
+     * file's stride. Capturing at the finer of the two and dropping what is not
+     * needed is the only order that works.
+     */
+    private static long[] downsample(long[] all, int n, int stride) {
+        int m = stride == 1 ? n : ((n - 1) / stride) + 1;
+        if (m == n) return all;
+        long[] out = new long[m];
+        for (int a = 0; a < m; a++) out[a] = all[a * stride];
+        return out;
+    }
+
     private void fillNode(int slot, long off, int n, long[] anchors, boolean sorted,
                           long walkAcc, boolean isMap) {
         // The container's own byte span. `fillNode` runs immediately after the
@@ -705,6 +723,11 @@ public final class Writer {
         // container has no entries to average over and no scan to shorten.
         long walk = n > 0 ? walkAcc / n : 0;
         if (!keepNode(n, sorted, walk, isMap, bytes)) { cancelNode(slot); return; }
+        // THE NODE'S OWN STRIDE. An unsorted map is only usable at 1; anything
+        // else takes the file's. The reader derives the same answer without
+        // being told -- see `slot-at` -- because a node whose anchor count
+        // equals its entry count can only have been written at stride 1.
+        if (isMap && sorted) anchors = downsample(anchors, n, idxStride);
         idxOffs[slot] = checkedOffset(off);
         idxCnts[slot] = n;
         idxSlots[slot] = anchors;
@@ -763,10 +786,12 @@ public final class Writer {
         // stride 16 is one anchor.
         if (anchorCount(n) < 2) return false;
         if (!isMap || sorted) return walk >= WALK_THRESHOLD;
-        // An unsorted map: usable only at stride 1, and only when one anchor
-        // per entry is a small enough share of the container. See
+        // An unsorted map is written at STRIDE 1 whatever the file's stride --
+        // it is the only stride that helps one -- so the file's stride does not
+        // enter into the decision. All that matters is whether one anchor per
+        // entry is a small enough share of the container. See
         // UNSORTED_ANCHOR_BUDGET for why the test is on SIZE and not on `walk`.
-        return idxStride == 1 && UNSORTED_ANCHOR_BUDGET * n <= bytes;
+        return UNSORTED_ANCHOR_BUDGET * n <= bytes;
     }
 
     /**
@@ -1753,12 +1778,15 @@ public final class Writer {
         head(MAP, n);
         // Iterated as a SEQ rather than an entrySet, so this cannot delegate to
         // writeMapValue without changing field order on some record types.
-        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
+        // ONE ANCHOR PER ENTRY, always, for a map. See `downsample`: which
+        // stride this node wants is not known until the last key is compared,
+        // so it is captured at the finer of the two and narrowed at `fillNode`.
+        long[] anchors = indexing(n) ? new long[n] : null;
         int slot = anchors != null ? reserveNode() : -1;
         boolean sorted = true;
         int prevK0 = -1, prevK1 = -1;
         KeyOrder ko = null;
-        int a = 0, countdown = 1;
+        int a = 0;
         // A MAP ENTRY IS KEY AND VALUE TOGETHER: a scan reaching entry j
         // crosses both halves of every earlier entry, so the prefix is taken
         // once per PAIR, before the key.
@@ -1769,9 +1797,7 @@ public final class Writer {
         for (clojure.lang.ISeq s = clojure.lang.RT.seq(fields); s != null; s = s.next()) {
             Map.Entry e = (Map.Entry) s.first();
             if (++seen > n) countMismatch(n, seen);
-            if (anchors != null && --countdown == 0) {
-                anchors[a++] = idxOffset(pos); countdown = idxStride;
-            }
+            if (anchors != null) anchors[a++] = idxOffset(pos);
             walkAcc += idxItemsWritten - itemsAtStart;
             int k0 = pos;
             long flushedAtKey = flushed;
@@ -1888,7 +1914,8 @@ public final class Writer {
             return;
         }
 
-        long[] anchors = new long[anchorCount(n)];
+        // See writeRecordFields: a map captures one anchor per entry.
+        long[] anchors = new long[n];
         int slot = reserveNode();
         // EVERY adjacent key pair, not just the anchors.
         //
@@ -1906,14 +1933,14 @@ public final class Writer {
         boolean sorted = true;
         int prevK0 = -1, prevK1 = -1;
         KeyOrder ko = null;
-        int a = 0, countdown = 1, seen = 0;
+        int a = 0, seen = 0;
         // See writeRecordFields: one prefix per key/value PAIR.
         long itemsAtStart = idxItemsWritten, walkAcc = 0;
 
         for (Object o : m.entrySet()) {
             Map.Entry e = (Map.Entry) o;
             if (++seen > n) countMismatch(n, seen);
-            if (--countdown == 0) { anchors[a++] = idxOffset(pos); countdown = idxStride; }
+            anchors[a++] = idxOffset(pos);
             walkAcc += idxItemsWritten - itemsAtStart;
             int k0 = pos;
             long flushedAtKey = flushed;
@@ -2413,15 +2440,14 @@ public final class Writer {
 
         long start = absOffset();
         head(MAP, n);
-        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
+        // See writeRecordFields: a map captures one anchor per entry.
+        long[] anchors = indexing(n) ? new long[n] : null;
         int slot = anchors != null ? reserveNode() : -1;
         long itemsAtStart = idxItemsWritten, walkAcc = 0;
-        int a = 0, countdown = 1;
+        int a = 0;
         for (int j = 0; j < n; j++) {
             int k = order[j];
-            if (anchors != null && --countdown == 0) {
-                anchors[a++] = idxOffset(pos); countdown = idxStride;
-            }
+            if (anchors != null) anchors[a++] = idxOffset(pos);
             walkAcc += idxItemsWritten - itemsAtStart;
             // See writeSetCanonical: staged bytes bypass every emit site.
             idxItemsWritten += encodedKeyItems[k];

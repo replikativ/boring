@@ -364,18 +364,17 @@
             idxed (boring/encode-indexed wide-map (assoc o :index 16 :index-min 8))
             cp (nav/root plain o)
             ci (nav/root idxed o)]
-        ;; ONLY UNDER THE SORTING PROFILE. `wide-map` is 300 entries whose
-        ;; values are 2-entry maps: under `sorted-opts` the outer map is
-        ;; binary-searchable and earns a node, but UNSORTED at stride 16 it
-        ;; earns nothing -- `boring.nav` refuses an unsorted map's node above
-        ;; stride 1 (an anchor loop over an unordered map visits every entry,
-        ;; exactly as a scan does), so the writer stopped emitting one. The
-        ;; index is then genuinely free, and the answers below must still
-        ;; agree, which is the actual subject of this test.
-        (if (:profile o)
-          (is (< (alength ^bytes plain) (alength ^bytes idxed)) "index costs something")
-          (is (= (alength ^bytes plain) (alength ^bytes idxed))
-              "an unsorted map above stride 1 earns no node, so no cost"))
+        ;; BOTH PROFILES EARN A NODE, by different routes, and that is the
+        ;; point of per-node stride. Under `sorted-opts` the outer map is
+        ;; binary-searchable and takes the file's stride of 16. Unsorted, it
+        ;; cannot be binary-searched at all -- so it takes stride 1, where
+        ;; moving anchor to anchor jumps OVER each value instead of walking it.
+        ;; One file, two strides, neither of them written down: the reader
+        ;; derives which is which from the anchor count.
+        ;;
+        ;; This assertion read `(= plain idxed)` for the unsorted case for one
+        ;; commit, when such a map earned nothing at all above stride 1.
+        (is (< (alength ^bytes plain) (alength ^bytes idxed)) "index costs something")
         (doseq [k (keys wide-map)]
           (is (= (nav/value (get-in cp [k "v"]))
                  (nav/value (get-in ci [k "v"]))

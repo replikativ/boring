@@ -777,13 +777,30 @@
     ;; walking it. Measured 2.72x on a 20-key hash map of 1000-int vectors --
     ;; and Clojure maps are unsorted by default, so that is the ordinary case
     ;; rather than a corner. See `boring.core/pack-sorted` and commit 825657f.
-    (if (or (neg? ns)
-            (zero? (alength ^longs (slot-at r idx ns)))
-            (and (> (.stride idx) 1) (not (sorted-at? r (.sorted-data idx) ns))))
-      (scan-map r (.headEndAt r off) n probe)
-      (let [^longs slot (slot-at r idx ns)
-            stride (.stride idx)
-            m (alength slot)]
+    ;; THE STRIDE IS PER NODE, and the reader is not told which one -- it
+    ;; derives it. A node's anchor count equals its entry count only when it was
+    ;; written at stride 1, because `anchor-count(n, k) = ((n-1)/k)+1` reaches
+    ;; `n` for no other `k`. So `m == n` IS "stride 1", exactly, and costs a
+    ;; comparison rather than a payload element.
+    ;;
+    ;; That is what lets one file hold both: a large array at the file's stride,
+    ;; where anchors are cheap and a binary search is legal, beside an unsorted
+    ;; map at stride 1, where they are the only thing that helps.
+    (let [^longs slot (when-not (neg? ns) (slot-at r idx ns))
+          ;; `long`, for the same reason as `stride` below: this feeds the
+          ;; binary search's bounds, and an `if` expression is an Object.
+          m (long (if slot (alength slot) 0))
+          ;; `long`, or the binary search below auto-boxes its bounds -- the
+          ;; one loop in this namespace that must not.
+          ;; GUARDED ON `slot`, because `idx` is nil whenever this container
+          ;; has no node -- the old guard tested `ns` first and never reached a
+          ;; field read. With `slot` nil the value is unused (the branch below
+          ;; scans), but it is still evaluated, and `(.stride nil)` is an NPE
+          ;; out of `get` rather than a scan.
+          stride (long (if slot (if (= m (long n)) 1 (.stride idx)) 1))]
+      (if (or (nil? slot) (zero? m)
+              (and (> (long stride) 1) (not (sorted-at? r (.sorted-data idx) ns))))
+        (scan-map r (.headEndAt r off) n probe)
         ;; Entries after anchor a, which is NOT always `stride`: the last
         ;; anchor covers the remainder. Walking a full stride from it ran off
         ;; the end of the container and into whatever followed -- found by the
@@ -900,7 +917,10 @@
               ;; every node in the document.
               ns (if (or (nil? ix) (< idx stride0)) -1 (node-slot nav off))
               ^longs slot (when-not (neg? ns) (slot-at r ix ns))
-              stride (when slot stride0)
+              ;; PER-NODE STRIDE, derived -- see `lookup-map`. An array written
+              ;; at the file's stride keeps it; one whose anchors equal its
+              ;; elements was written at 1.
+              stride (when slot (if (= (alength slot) (long n)) 1 stride0))
               anchor (when slot (quot idx (long stride)))]
         ;; THE ANCHOR MUST BE THERE, which `lookup-map` has always checked and
         ;; this never did -- `node-sound?` was rejecting such a node before it
@@ -2398,14 +2418,27 @@
   ^longs [^Reader r ^Index ix ^long i]
   (let [sdata (.slots-data ix)
         slen (.slots-len ix)
-        stride (.stride ix)
         lim (.data-end ix)
-        m (anchor-count (count-at r ix i) (long stride))
         w (width-code r sdata i)
         sz (bit-shift-left 1 w)
         ;; RELATIVE to `slots-data`, so the bound below compares against
         ;; `slots-len` and only the delta reads add the base back.
-        start (slot-start r (.slots-tbase ix) (.slots-wstart ix) i)]
+        start (slot-start r (.slots-tbase ix) (.slots-wstart ix) i)
+        ;; THE ANCHOR COUNT COMES FROM THE TABLE, not from `anchor-count` of a
+        ;; wire count and the stride.
+        ;;
+        ;; It has to, now that stride is PER NODE -- there is no single stride
+        ;; to derive it from. But it is also the safer of the two, which is why
+        ;; the change is a simplification rather than a cost. `count-at` is a
+        ;; raw sint32 load off the wire that nothing cross-checks against the
+        ;; container, and at stride 1 `anchor-count` returned it verbatim: one
+        ;; flipped bit reached 2^31-1 and `(long-array m)` raised
+        ;; OutOfMemoryError, an ERROR that walks through every catch here and
+        ;; out of `get`. The table is bounded by the O(1) structural gate --
+        ;; its last entry must equal the byte string's own length -- so a span
+        ;; taken between two of its entries cannot exceed the bytes that exist.
+        nxt (slot-start r (.slots-tbase ix) (.slots-wstart ix) (inc i))
+        m (quot (- nxt start) sz)]
     ;; AND THE DELTA RUN ITSELF IS BOUNDED, which nothing states elsewhere.
     ;; `slot-table` checks the start table's LAST entry against the byte
     ;; string's length; it never checks that the entries ascend, so one damaged
@@ -2431,7 +2464,7 @@
     ;;
     ;; After the check `m * sz <= alength packed`, and `sz >= 1`, so the array
     ;; is bounded by bytes that actually exist in the file.
-    (when (or (neg? start) (> (+ start (* m sz)) slen))
+    (when (or (neg? start) (neg? m) (> (+ start (* m sz)) slen))
       (throw (ex-info "boring: index slot segment outside the packed slots"
                       {:type :boring/bad-index :node i :start start
                        :anchors m :width sz :slots-length slen})))
@@ -2864,8 +2897,22 @@
             ;; documented consequence of trusting the frame rather than a
             ;; defect. See doc/SHAPES.md.
             (let [anchor (quot (long i) stride)]
-              (loop [k (* anchor stride) p (long (aget offsets anchor))]
-                (if (= k (long i)) (cursor-at nav p) (recur (inc k) (skip r p)))))))
+              ;; THE ANCHOR MUST BE THERE. `total` and the anchor array's
+              ;; length are INDEPENDENT now: the count comes off the wire and
+              ;; the length is derived from the start table, where it used to
+              ;; be `anchor-count` of the one from the other and the two agreed
+              ;; by construction. A damaged table therefore yields a short
+              ;; array against a large count, which was a raw
+              ;; ArrayIndexOutOfBoundsException out of `nth` -- found by the
+              ;; every-bit sweep, not by reasoning. Same guard `nth-item`
+              ;; already carries, and the same fallback: walk honestly.
+              (if (>= anchor (alength offsets))
+                (loop [k 0 p 0]
+                  (cond (>= p end) nf
+                        (= k (long i)) (cursor-at nav p)
+                        :else (recur (inc k) (skip r p))))
+                (loop [k (* anchor stride) p (long (aget offsets anchor))]
+                  (if (= k (long i)) (cursor-at nav p) (recur (inc k) (skip r p))))))))
         ;; No sequence index: skip i times, or run out.
         (loop [k 0 p 0]
           (cond (>= p end) nf

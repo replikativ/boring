@@ -1275,8 +1275,9 @@
                          (inc (quot (dec (long n)) (long stride)))))) 2)
        (if (or (not map?) sorted)
          (>= (long walk) walk-threshold)
-         (and (= (long stride) 1)
-              (<= (* unsorted-anchor-budget (long n)) (long bytes))))))
+         ;; An unsorted map is written at stride 1 whatever the file's
+         ;; stride, so only the size budget decides.
+         (<= (* unsorted-anchor-budget (long n)) (long bytes)))))
 
 (defn- frame-payload-array?
   "Is the container at `p` the 2-element `[name, args]` array of a TAG-27 FRAME?
@@ -1401,14 +1402,21 @@
                                       {:type :boring/bad-count :count n :offset p}))))
                 keep? (and (>= n min-entries)
                            (not (frame-payload-array? r q0 p mj n)))
+                ;; A MAP CAPTURES ONE ANCHOR PER ENTRY, whatever the file's
+                ;; stride, and is narrowed below once `sorted` is known -- an
+                ;; unsorted map is usable only at stride 1 and a sorted one is
+                ;; better served by the file's stride, and which it is cannot
+                ;; be known until the last key has been compared. Same order as
+                ;; `Writer.downsample`.
+                cap-stride (if map? 1 stride)
                 m (if keep?
                       ;; An empty container needs no anchors. The `(max n 1)`
                       ;; this replaces yielded ONE for n=0, and the loop never
                       ;; wrote it, leaving a phantom offset pointing at the
                       ;; document's start. Same defect as Writer.anchorCount.
                     (cond (<= n 0) 0
-                          (= stride 1) n
-                          :else (inc (quot (dec n) stride)))
+                          (= cap-stride 1) n
+                          :else (inc (quot (dec n) cap-stride)))
                     0)
                 kept (when keep? (long-array m))
                   ;; EVERY adjacent key pair decides `sorted`, not the anchors.
@@ -1430,8 +1438,8 @@
                 end (loop [i 0 q (long (.headEndAt r p)) prev -1]
                       (if (= i n)
                         q
-                        (do (when (and keep? (zero? (rem i stride)))
-                              (aset ^longs kept (quot i stride) (long q)))
+                        (do (when (and keep? (zero? (rem i cap-stride)))
+                              (aset ^longs kept (quot i cap-stride) (long q)))
                             (when (and srt (aget ^booleans srt 0) (>= (long prev) 0)
                                        (>= (.compareItemsAt r (long prev) q) 0))
                               (aset ^booleans srt 0 false))
@@ -1470,6 +1478,20 @@
                 ;; Reader is positioned over this item's own buffer.
               (let [sorted (boolean (and srt (aget ^booleans srt 0)))
                     walk (if (pos? n) (quot (aget walk-acc 0) n) 0)
+                    ;; NARROWED HERE, now that `sorted` is known. See
+                    ;; `Writer.downsample`.
+                    ;; `(pos? n)` because this runs BEFORE the keep decision,
+                    ;; and an empty container derives `mm` of 1 from a
+                    ;; zero-length capture -- `(quot -1 16)` truncates to 0.
+                    ;; It is refused a line later, but not before this reads
+                    ;; anchor 0 of nothing.
+                    ^longs kept (if (and map? sorted (pos? n) (> (long stride) 1))
+                                  (let [mm (inc (quot (dec n) (long stride)))
+                                        out (long-array mm)]
+                                    (dotimes [a mm]
+                                      (aset out a (aget ^longs kept (* a (long stride)))))
+                                    out)
+                                  kept)
                     ;; SLOTS ARE REBASED TOO, and the container offset alone was
                     ;; not enough. A node is (container-offset, count, entry
                     ;; offsets), and every one of those is a position in the
@@ -1712,11 +1734,23 @@
         ;; number of anchors would not corrupt one node, it would shift every
         ;; node after it -- silently, into other nodes' deltas. Cheap: one
         ;; integer per node, on the writing side, which is the expensive side.
-        (when-not (= m (anchor-count (aget counts i) stride))
+        ;; EITHER OF THE TWO LEGAL STRIDES. Stride is per node now: an unsorted
+        ;; map is only usable at 1, everything else takes the file's. So a
+        ;; node's anchor count must match `anchor-count` at ONE of them, and
+        ;; which one is not stored -- the reader derives it, because a node
+        ;; whose anchors equal its entries can only have been written at 1.
+        ;;
+        ;; Still the invariant the layout rests on, just widened by one case:
+        ;; no segment length goes on the wire, so a walk that emitted some
+        ;; other number would shift every node after it.
+        (when-not (or (= m (anchor-count (aget counts i) stride))
+                      (= m (anchor-count (aget counts i) 1)))
           (throw (ex-info (str "boring: index node " i " has " m " anchors but "
-                               (aget counts i) " entries at stride " stride
-                               " implies " (anchor-count (aget counts i) stride)
-                               ". The index walk and `anchor-count` disagree.")
+                               (aget counts i) " entries implies "
+                               (anchor-count (aget counts i) stride) " at stride "
+                               stride " or " (anchor-count (aget counts i) 1)
+                               " at stride 1."
+                               " The index walk and `anchor-count` disagree.")
                           {:type :boring/bad-index :node i :anchors m
                            :entries (aget counts i) :stride stride})))
         ;; Offsets inside a container ascend, so consecutive differences are
