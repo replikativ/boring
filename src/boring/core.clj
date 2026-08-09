@@ -1060,7 +1060,11 @@
         (aset counts 0 (int (.idxItemTotal ^Writer w)))
         (System/arraycopy cs 0 containers 1 m)
         (System/arraycopy ns 0 counts 1 m)
-        (let [items (.idxItemOffsets ^Writer w)]
+        (let [items (.idxItemOffsets ^Writer w)
+              ;; READ BEFORE `seal-index!`, which calls `write-root!` and so
+              ;; `.reset` -- and reset clears the stringref namespace. Read
+              ;; afterwards this is always empty, and silently so.
+              srp (.stringrefPointers ^Writer w)]
           (.setIndex ^Writer w (int 0) (int 0) 0)   ; capture off again
           (+ total
              (long (seal-index!
@@ -1069,7 +1073,8 @@
                      :containers containers
                      :counts counts
                      :slots (into [items] sl)
-                     :sorted (into [false] so)}
+                     :sorted (into [false] so)
+                     :stringrefs srp}
                     total
                     o)))))
       ;; Capture must go off on THIS path too. It is switched on above whenever
@@ -1105,12 +1110,16 @@
       (let [containers (.idxContainers ^Writer w)
             counts (.idxCounts ^Writer w)
             sl (.idxSlots ^Writer w)
-            so (.idxSorted ^Writer w)]
+            so (.idxSorted ^Writer w)
+            ;; Before `seal-index!`, for the reason `write-seq!` gives: sealing
+            ;; resets the writer, and reset clears the stringref namespace.
+            srp (.stringrefPointers ^Writer w)]
         (.setIndex ^Writer w (int 0) (int 0) 0)
         (+ total
            (long (seal-index! w out
                               {:stride stride :containers containers :counts counts
-                               :slots (vec sl) :sorted (vec so)}
+                               :slots (vec sl) :sorted (vec so)
+                               :stringrefs srp}
                               total o))))
       (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
           total))))
@@ -1899,6 +1908,81 @@
                                     (bit-shift-left 1 (rem i 8))))))))
     out))
 
+(def ^:no-doc ^:const stringref-layout-v1
+  "Version nibble for the stringref pointer table -- payload element 6.
+
+  Its own version rather than the frame's, for the reason every other element
+  carries one: elements are optional and independently extensible, so a reader
+  that meets a shape it does not know must be able to say which element it
+  failed on."
+  1)
+
+(defn- unsigned-width-code
+  "The narrowest unsigned width holding `mx`: 0 = u8, 1 = u16, 2 = u32, 3 = u64.
+
+  UNSIGNED, unlike `slot-width-code`, whose upper two tiers are signed because
+  a delta can in principle be negative. Neither a stringref index nor a file
+  offset can be, so the sign bit is a byte-eighth this can spend on range --
+  and it is the difference between a 64 KiB and a 4 GiB document keeping
+  two-byte offsets."
+  ^long [^long mx]
+  (cond (< mx 0x100)        0
+        (< mx 0x10000)      1
+        (< mx 0x100000000)  2
+        :else               3))
+
+(defn- pack-stringrefs
+  "The referenced stringref slots, as ONE byte string.
+
+      [ layout byte | (index, offset) | (index, offset) | ... ]
+
+  The layout byte is version in the low nibble, the index width code in bits
+  4-5 and the offset width code in bits 6-7. Pairs follow back to back,
+  ascending by index, each field little-endian at its own width. THE COUNT IS
+  NOT STORED: it is `(quot (dec len) (+ iw ow))`, and the structural gate is
+  that the division is exact -- one modulo, no sum over N, exactly as the slot
+  table's final entry gates that layout.
+
+  WHY THIS EXISTS. A stringref is an index into a table built by decoding every
+  preceding string, so a reader holding nothing but an offset cannot resolve
+  one -- which is why `:stringref` and `:index` were mutually exclusive. Given
+  (index -> defining offset) for the entries something actually references, the
+  reader resolves by jumping instead of by remembering, and the two compose.
+
+  ONLY REFERENCED ENTRIES. A registered-but-unreferenced slot is one nothing
+  will ever ask for, and on konserve-shaped data most slots are exactly that:
+  200 records carry ~256 registered strings and ~56 referenced ones. Dense
+  offsets would be 768 bytes where these are 224.
+
+  TWO WIDTHS, NOT ONE. Indices are small and dense from zero while offsets span
+  the document, so a single width would promote every index to the offset's
+  tier -- the same mistake `pack-slots` records for a single flat typed array,
+  in miniature.
+
+  `pairs` is the interleaved `long[]` from `Writer.stringrefPointers`, already
+  ascending; empty in means nil out, and the element is then omitted entirely."
+  ^bytes [^longs pairs]
+  (when (pos? (alength pairs))
+    (let [n (quot (alength pairs) 2)
+          mx-i (loop [k 0 m 0] (if (= k n) m (recur (inc k) (max m (aget pairs (* 2 k))))))
+          mx-o (loop [k 0 m 0] (if (= k n) m (recur (inc k) (max m (aget pairs (inc (* 2 k)))))))
+          ic (unsigned-width-code mx-i)
+          oc (unsigned-width-code mx-o)
+          iw (bit-shift-left 1 ic)
+          ow (bit-shift-left 1 oc)
+          out (byte-array (+ 1 (* n (+ iw ow))))
+          put! (fn [^long o ^long v ^long sz]
+                 (dotimes [j sz]
+                   (aset-byte out (+ o j) (unchecked-byte (bit-shift-right v (* 8 j))))))]
+      (aset-byte out 0 (unchecked-byte (bit-or stringref-layout-v1
+                                               (bit-shift-left ic 4)
+                                               (bit-shift-left oc 6))))
+      (dotimes [k n]
+        (let [p (+ 1 (* k (+ iw ow)))]
+          (put! p (aget pairs (* 2 k)) iw)
+          (put! (+ p iw) (aget pairs (inc (* 2 k))) ow)))
+      out)))
+
 (defn- long->8-bytes* ^bytes [^long v]
   (let [b (byte-array 8)]
     (dotimes [i 8] (aset-byte b i (unchecked-byte (bit-shift-right v (* 8 (- 7 i))))))
@@ -1988,7 +2072,7 @@
             (let [n (long (.position ^Writer (write-root! w item opts)))]
               (.write out (.buffer w) 0 (int n))
               n))]
-    (let [{:keys [stride ^longs containers counts slots sorted]} index
+    (let [{:keys [stride ^longs containers counts slots sorted stringrefs]} index
           ;; NARROWEST TYPE THAT HOLDS THEM, exactly as the slot deltas do. A
           ;; file whose offsets fit in int32 emits int32 and is byte-identical
           ;; to what it was before offsets became 64-bit; one that does not
@@ -2005,12 +2089,36 @@
                               (dotimes [i (alength containers)]
                                 (aset-int a i (unchecked-int (aget containers i))))
                               a))
+          ;; OMITTED WHEN THERE IS NOTHING TO POINT AT, which is every document
+          ;; written without a stringref namespace and every one whose strings
+          ;; never repeat. Existing files stay byte-identical rather than
+          ;; gaining an empty element.
+          srp (when stringrefs (pack-stringrefs stringrefs))
+          ;; `data-end` IS LAST, AND THAT IS LOAD-BEARING -- it is not merely
+          ;; the sixth thing in a list. `nav/read-index` finds the whole frame
+          ;; by reading the FINAL NINE BYTES of the file: an 8-byte byte string
+          ;; always encodes as 0x48 plus its eight bytes, so those nine are a
+          ;; recognisable trailer holding a back-pointer to the frame's start.
+          ;; CBOR cannot be parsed backwards; this is the only way in.
+          ;;
+          ;; So a new element APPENDED after it is not the harmless extra that
+          ;; #20's 6-15 prefix widening makes it look like. Tried, and the file
+          ;; then ended in pointer-table bytes: the trailer no longer sits at
+          ;; the end, `read-index` finds nothing, and every indexed document
+          ;; silently falls back to scanning.
+          ;;
+          ;; Optional elements therefore go BETWEEN `sorted` and `data-end`,
+          ;; and the rule for readers is "data-end is the LAST element", never
+          ;; "data-end is element 5". nav does not read it positionally at all
+          ;; -- `payload-offsets` stops at `sorted` and the back-pointer IS the
+          ;; data end -- so shifting it costs existing readers nothing.
           item (data/unknown-record
                 index-name
-                [(long stride) wire-containers counts
-                 (pack-slots slots containers counts (long stride))
-                 (pack-sorted sorted)
-                 (long->8-bytes* (long data-len))])]
+                (-> [(long stride) wire-containers counts
+                     (pack-slots slots containers counts (long stride))
+                     (pack-sorted sorted)]
+                    (cond-> srp (conj srp))
+                    (conj (long->8-bytes* (long data-len)))))]
     ;; The frame goes out under the SAME options as the data it describes.
     ;; `write-to!`'s 2-arity resolves the WRITER's options instead, so
     ;; `write-seq!`'s 4-arity wrote the data with the caller's opts and the
