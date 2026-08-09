@@ -740,7 +740,8 @@
 ;; cannot be split. Not implemented; chunk size is the knob for that tradeoff.
 
 (declare seal-index! seal-index-with! scan-index scan-into! nodes->index
-         build-index write-seq-resolved!)
+         build-index write-seq-resolved! write-indexed-resolved!
+         derive-stringref-pointers default-index-stride)
 
 (defn encode-indexed
   "Encode `v` and seal an index onto it, returning a byte[].
@@ -787,21 +788,55 @@
   Three functions, one rule, and this was the one that did not follow it."
   (^bytes [v] (encode-indexed v nil))
   (^bytes [v opts]
+   ;; THIS IS `write-indexed!` INTO A BYTE ARRAY, and it used to be its own
+   ;; implementation: encode the whole value, then WALK the finished bytes to
+   ;; derive the index. That is two full passes and two copies of the document,
+   ;; where the streaming writer already captures every node as it encodes --
+   ;; it knows a container's offset and entry count before it emits the head,
+   ;; so the nodes fall out of encoding for free.
+   ;;
+   ;; Measured, byte-identical output either way: 200 konserve-shaped records
+   ;; 3.214 ms -> 0.584 ms, a flat 2000 records 2.973 ms -> 0.717 ms. Four to
+   ;; five and a half times faster for strictly less code.
+   ;;
+   ;; AND IT REMOVES A SECOND BUILDER FROM THIS PATH, which matters more than
+   ;; the speed. Two implementations of "where do the index nodes go" have
+   ;; disagreed before -- see #30 and #34 -- and each divergence was found by a
+   ;; test comparing them rather than by either one being obviously wrong.
+   ;; There is now one builder for every value boring encodes itself.
+   ;;
+   ;; `build-index` KEEPS the byte walk, because it has a job this does not: it
+   ;; indexes bytes somebody else wrote, or re-indexes after a compaction, and
+   ;; there is no writer in either story.
+   ;; `:stringref` IS STILL FORCED OFF HERE, and lifting it is a SEPARATE
+   ;; change from this one. Delegating is a pure refactor -- byte-identical
+   ;; output, verified -- while letting the default profile's `:stringref true`
+   ;; through alters what this function emits, which moves sizes, makes the
+   ;; frame seven elements, and is visible to `boring.frame`'s footer gate. Two
+   ;; changes at once cost 25 test failures that took a bisect to attribute.
    (when (true? (:stringref opts))
      (throw (ex-info (str "boring: :stringref true cannot be combined with an index -- "
                           "boring.nav cannot resolve string references from an offset, "
                           "so the index would be unusable. Drop one of the two.")
                      {:type :boring/incompatible-options :stringref true})))
-   (let [opts (if (contains? opts :stringref) opts (assoc opts :stringref false))
-         ^bytes body (encode v opts)
-         idx (build-index body opts)]
-     (if-not idx
-       body
-       (let [w (writer (max 1024 (alength body)) opts)
-             out (java.io.ByteArrayOutputStream. (+ (alength body) 256))]
-         (.write out body)
-         (seal-index! w out idx (alength body) (resolve-opts opts))
-         (.toByteArray out))))))
+   (let [o (resolve-opts opts)
+         stride (long (get o :index default-index-stride))
+         ;; `:index 0` IS REFUSED HERE, not treated as "off". It means off
+         ;; everywhere else, but sealing an index with no index is not a thing
+         ;; this function can do, and silently substituting the default made the
+         ;; documented off switch produce a LARGER file than omitting the
+         ;; option. The refusal used to come from `build-index`; delegating to
+         ;; the streaming writer, which legitimately reads 0 as off, would have
+         ;; dropped it -- so it moves here rather than disappearing.
+         _ (when (zero? stride)
+             (throw (ex-info (str "boring: :index 0 turns indexing off, which "
+                                  "encode-indexed cannot do; use `encode` instead")
+                             {:type :boring/bad-option :option :index :value 0})))
+         o (cond-> o (pos? stride) (assoc :stringref false))
+         w (writer 1024 o)
+         out (java.io.ByteArrayOutputStream. 1024)]
+     (write-indexed-resolved! w v out o stride (long (get o :index-min 16)))
+     (.toByteArray out))))
 
 (def ^:const default-index-stride
   "Stride `write-seq!` indexes at unless told otherwise. See its docstring for
@@ -1721,7 +1756,13 @@
                  (throw (ex-info "boring: index walk ran out of stack; this document is too deeply nested to index"
                                  {:type :boring/max-depth-exceeded}))))]
      (when (pos? (alength ^longs (:containers idx)))
-       (assoc idx :stride stride)))))
+       (cond-> (assoc idx :stride stride)
+         ;; ONLY FOR A DOCUMENT THAT OPENS A NAMESPACE, which is the test
+         ;; `derive-stringref-pointers` makes first -- three bytes, and it is
+         ;; false for every non-stringref document, so nothing that does not
+         ;; use the feature walks anything twice.
+         (.hasStringrefRoot r)
+         (assoc :stringrefs (derive-stringref-pointers r (alength bs))))))))
 
 (def ^:no-doc ^:const slot-layout-v2
   "Version nibble for a DENSE start table -- one entry per node.
@@ -2010,6 +2051,87 @@
           (put! p (aget pairs (* 2 k)) iw)
           (put! (+ p iw) (aget pairs (inc (* 2 k))) ow)))
       out)))
+
+(defn- min-len-for-index
+  "The shortest encoded length that earns stringref index `idx`.
+
+  Must agree EXACTLY with `Writer.minLenForIndex` and `Reader.minLenForIndex`:
+  all three decide independently whether a given string took an index at all,
+  and a disagreement shifts every later index rather than one."
+  ^long [^long idx]
+  (cond (< idx 24)    3
+        (< idx 256)   4
+        (< idx 65536) 5
+        :else         7))
+
+(defn- derive-stringref-pointers
+  "The pointer table for an already-encoded document, or nil.
+
+  The counterpart of `Writer.stringrefPointers` for the byte-walk builder, and
+  it exists because the two builders must write the SAME FILE. `write-indexed!`
+  streams through the Writer and takes the pointers from its symbol table;
+  `encode-indexed` and `build-index` walk finished bytes and have no symbol
+  table, so they re-derive the numbering from the only thing that defines it --
+  the order literals appear in.
+
+  A FLAT LOOP OVER ITEM HEADS, with no recursion and no structure. CBOR is
+  prefix-encoded, so a container's elements follow its head IMMEDIATELY in the
+  byte stream: stepping past each head in turn therefore visits every item in
+  exactly the order a decoder reads them, which is exactly the order the
+  stringref index space is defined by. Only a string's PAYLOAD has to be
+  stepped over, because payload bytes are not items.
+
+  That is also why this needs no depth bound and cannot overflow a stack, where
+  the container walk in `index-walk*` needs both -- it has to know the shape,
+  and this does not.
+
+  nil for anything that cannot reproduce the decoder's numbering: a document
+  that opens no namespace, an indefinite-length item, or a NESTED tag 256,
+  which resets the table so that one index space no longer describes the
+  document. nil means no pointer table, and such a document is then refused as
+  unnavigable -- the honest outcome, never a table that is subtly wrong."
+  ^longs [^Reader r ^long end]
+  (when (.hasStringrefRoot r)
+    (let [offs (java.util.ArrayList.)
+          refs (java.util.HashSet.)
+          ok (loop [p (long (.headEndAt r 0))]
+               (if (>= p end)
+                 true
+                 (let [info (.infoAt r p)]
+                   (if (= info 31)
+                     false                        ; indefinite: not reproduced
+                     (let [major (.majorAt r p)
+                           after (long (.headEndAt r p))]
+                       (case major
+                         (2 3) (let [n (long (.headArgAt r p))]
+                                 ;; THE HEAD IS RECORDED, not the payload: that
+                                 ;; is what a reader jumps to and reads from.
+                                 (when (>= n (min-len-for-index (.size offs)))
+                                   (.add offs (Long/valueOf p)))
+                                 (recur (+ after n)))
+                         6 (let [tag (long (.headArgAt r p))]
+                             (cond
+                               ;; A nested namespace shadows the outer one, so
+                               ;; every index below it means something else.
+                               (= 256 tag) false
+                               (= 25 tag) (if (zero? (.majorAt r after))
+                                            (do (.add refs (Long/valueOf (.headArgAt r after)))
+                                                (recur after))
+                                            false)
+                               :else (recur after)))
+                         ;; Containers advance past the head only -- their
+                         ;; elements are the next items. Scalars are their head.
+                         (recur after)))))))]
+      (when ok
+        (let [ks (sort (filter #(< (long %) (.size offs)) refs))
+              out (long-array (* 2 (count ks)))]
+          (loop [i 0 ks ks]
+            (when (seq ks)
+              (let [k (long (first ks))]
+                (aset out i k)
+                (aset out (inc i) (long (.get offs (int k))))
+                (recur (+ i 2) (next ks)))))
+          out)))))
 
 (defn- long->8-bytes* ^bytes [^long v]
   (let [b (byte-array 8)]
