@@ -646,6 +646,49 @@ public final class Writer {
         return idxWalk == null ? NO_LONGS : java.util.Arrays.copyOf(idxWalk, idxN);
     }
 
+    /**
+     * The referenced stringref slots as interleaved `(index, offset)` pairs,
+     * ascending by index; empty when nothing was referenced.
+     *
+     * Ascending because the reader binary-searches it. Sorting here rather than
+     * on the reader is the same trade the rest of the frame makes: the writer
+     * sees each document once, a reader may open it a million times.
+     *
+     * Interleaved in one `long[]` rather than two arrays or a list of pairs,
+     * because this crosses into Clojure and every wrapper on that boundary is
+     * an allocation the sealer would have to unpick again.
+     */
+    public long[] stringrefPointers() {
+        if (srOffs == null || srCount == 0) return NO_LONGS;
+        int n = 0;
+        for (int i = 0; i <= srMask; i++) if (srKeys[i] != null && srUsed[i]) n++;
+        if (n == 0) return NO_LONGS;
+        long[] out = new long[n << 1];
+        int j = 0;
+        for (int i = 0; i <= srMask; i++) {
+            if (srKeys[i] != null && srUsed[i]) {
+                out[j++] = srVals[i];
+                out[j++] = srOffs[i];
+            }
+        }
+        // Insertion sort on pairs. The table is walked in hash order, so this
+        // arrives shuffled; `n` is the number of DISTINCT REFERENCED strings,
+        // measured at 3-56 on konserve-shaped data, where insertion sort beats
+        // boxing the pairs to hand them to a comparator sort.
+        for (int a = 2; a < out.length; a += 2) {
+            long ki = out[a], ko = out[a + 1];
+            int b = a - 2;
+            while (b >= 0 && out[b] > ki) {
+                out[b + 2] = out[b];
+                out[b + 3] = out[b + 1];
+                b -= 2;
+            }
+            out[b + 2] = ki;
+            out[b + 3] = ko;
+        }
+        return out;
+    }
+
     /** Anchors an indexed container of `n` entries needs at the current stride. */
     private int anchorCount(int n) {
         // An EMPTY container needs no anchors. `((0 - 1) / stride) + 1` is 1 in
@@ -1024,6 +1067,30 @@ public final class Writer {
     private int srCount;
     private int srNextIndex;
 
+    /**
+     * Where each table entry's DEFINING LITERAL starts, and whether anything
+     * ever referenced it. Parallel to `srKeys`/`srVals`, so `rehash` carries
+     * them and `reset` clears them with the rest of the namespace.
+     *
+     * This is what lets an index and a stringref namespace coexist. A reference
+     * is only resolvable by a reader that has decoded every preceding string --
+     * which is exactly what an index exists to avoid -- so the frame carries
+     * (index -> defining offset) for the referenced entries and the reader
+     * resolves by jumping instead of by remembering.
+     *
+     * ONLY THE REFERENCED ONES ARE EMITTED, which is why `srUsed` exists at all
+     * rather than the offsets being written densely: a slot nothing points at
+     * costs a reader nothing to be missing. On 200 records of konserve shape
+     * that is ~56 pairs against ~256 dense offsets.
+     *
+     * ALLOCATED ONLY WHEN INDEXING (`idxStride > 0`). A stringref-only writer --
+     * every `:clojure` encode -- must not pay a long[] and a boolean[] plus a
+     * store per literal for a frame it will never seal. Both arrays stay null
+     * and every use below is guarded.
+     */
+    private long[] srOffs;
+    private boolean[] srUsed;
+
     /** What {@link #trim()} goes back to. */
     private final int initialSize;
 
@@ -1046,6 +1113,25 @@ public final class Writer {
         srMask = cap - 1;
         srCount = 0;
         srNextIndex = 0;
+        srOffs = null;
+        srUsed = null;
+    }
+
+    /**
+     * Whether stringref pointers are being captured, allocating the two arrays
+     * on the first qualifying literal.
+     *
+     * Lazy for the reason the symbol table itself is: `setIndex` can be called
+     * on a writer that then encodes something with no strings in it at all, and
+     * an unconditional allocation here would be paid by every such writer.
+     */
+    private boolean srTracking() {
+        if (idxStride <= 0) return false;
+        if (srOffs == null) {
+            srOffs = new long[srKeys.length];
+            srUsed = new boolean[srKeys.length];
+        }
+        return true;
     }
 
     /** Reset for reuse. Keeps the buffer; clears the stringref namespace. */
@@ -1112,6 +1198,12 @@ public final class Writer {
         long freed = buf.length - initialSize;
         if (freed > 0) { buf = new byte[initialSize]; pos = 0; }
         if (srKeys.length > 16) initSymtab(16);
+        // Released even when the symbol table was already at its floor, which
+        // `initSymtab` above would not have reached: these two are allocated on
+        // the first indexed literal, not with the table, so a small table can
+        // still be holding them.
+        srOffs = null;
+        srUsed = null;
         idxReset();
         // RELEASED, not reallocated to the default size. `trim()` exists to
         // give memory back, and the arrays are lazy now, so dropping them
@@ -2656,6 +2748,10 @@ public final class Writer {
             if (cur == s || cur.equals(s)) {
                 head(TAG, TAG_STRINGREF);
                 head(UINT, srVals[i]);
+                // THE ONLY PLACE A REFERENCE IS EMITTED, so it is the only place
+                // that can mark a slot worth a pointer. Slots that are merely
+                // registered are not emitted: nothing will ever ask for them.
+                if (srTracking()) srUsed[i] = true;
                 return;
             }
             i = (i + 1) & srMask;
@@ -2664,20 +2760,31 @@ public final class Writer {
     }
 
     /** Insert `s` at the slot a miss landed on, if it earns an index. */
-    private void srInsertAt(int slot, String s, int byteLen) {
+    private void srInsertAt(int slot, String s, int byteLen, long off) {
         if (byteLen < minLenForIndex(srNextIndex)) return;
         if (srCount + 1 > (srMask + 1) * 3 / 4) {
             rehash();                          // slot is stale after a rehash
-            srRegister(s, byteLen);
+            srRegister(s, byteLen, off);
             return;
         }
         srKeys[slot] = s;
         srVals[slot] = srNextIndex++;
+        // `srUsed` is cleared HERE rather than in `reset`, because `reset` nulls
+        // `srKeys` and leaves these two arrays alone -- so a slot reused by the
+        // next document would otherwise inherit the previous one's "referenced"
+        // bit and emit a pointer nothing points at.
+        if (srTracking()) { srOffs[slot] = off; srUsed[slot] = false; }
         srCount++;
     }
 
     private void writeStringLiteral(String s, int slot) {
         int n = s.length();
+        // CAPTURED BEFORE `ensure`, and that is safe rather than lucky:
+        // `absOffset` is `pos + flushed + idxBase`, so a flush inside `ensure`
+        // moves both halves by the same amount and leaves the sum alone. This
+        // is the offset a reader will jump to, so it must name the HEAD of the
+        // literal, not its payload.
+        long off = absOffset();
         // A string that cannot fit the buffer skips the speculative path
         // entirely. Speculating means reserving the whole payload up front so
         // the loop can bail out to writeStringSlow on the first non-ASCII
@@ -2685,7 +2792,7 @@ public final class Writer {
         // and cannot be retracted once part of it has gone to the sink.
         // writeStringSlow streams the payload after its head.
         if (sink != null && pinDepth == 0 && (long) n + 5 > buf.length) {
-            writeStringSlow(s, slot);
+            writeStringSlow(s, slot, off);
             return;
         }
         // Speculate ASCII: reserve worst-case-for-ASCII and bail out if wrong.
@@ -2695,14 +2802,14 @@ public final class Writer {
         int p = hdrStart + hdrLen;
         for (int i = 0; i < n; i++) {
             char c = s.charAt(i);
-            if (c >= 0x80) { writeStringSlow(s, slot); return; }
+            if (c >= 0x80) { writeStringSlow(s, slot, off); return; }
             buf[p++] = (byte) c;
         }
         // ASCII: byte length == char length, so the reserved header size is right.
         pos = hdrStart;
         head(TEXT, n);
         pos = p;
-        if (slot >= 0) srInsertAt(slot, s, n);
+        if (slot >= 0) srInsertAt(slot, s, n, off);
     }
 
     private static int headLen(long v) {
@@ -2743,7 +2850,7 @@ public final class Writer {
         }
     }
 
-    private void writeStringSlow(String s, int slot) {
+    private void writeStringSlow(String s, int slot, long off) {
         checkWellFormedUtf16(s);
         byte[] utf = s.getBytes(StandardCharsets.UTF_8);
         head(TEXT, utf.length);
@@ -2755,7 +2862,7 @@ public final class Writer {
         writePayload(utf, 0, utf.length);
         // Byte length differs from char length here, so the slot from the
         // char-length probe is still valid but the threshold uses utf.length.
-        if (slot >= 0) srInsertAt(slot, s, utf.length);
+        if (slot >= 0) srInsertAt(slot, s, utf.length, off);
     }
 
     // ---- stringref ----------------------------------------------------------
@@ -2766,7 +2873,7 @@ public final class Writer {
      * octets, 24-255 needs >=4, and so on. The decoder applies the identical
      * rule, so the two index spaces stay in lockstep.
      */
-    private void srRegister(String s, int byteLen) {
+    private void srRegister(String s, int byteLen, long off) {
         if (!stringref) return;
         if (byteLen < minLenForIndex(srNextIndex)) return;
         if (srCount + 1 > (srMask + 1) * 3 / 4) rehash();
@@ -2779,6 +2886,7 @@ public final class Writer {
         }
         srKeys[i] = s;
         srVals[i] = srNextIndex++;
+        if (srTracking()) { srOffs[i] = off; srUsed[i] = false; }
         srCount++;
     }
 
@@ -2816,8 +2924,20 @@ public final class Writer {
         // 48.0 KB on a reused one -- so the reasoning is recorded as wrong
         // rather than repeated.
         int newCap = (srMask + 1) << 1;
+        // CARRIED, NOT DROPPED. `srOffs`/`srUsed` are indexed by table slot, and
+        // a rehash moves every entry -- so rebuilding the table without them
+        // would silently lose the defining offset of every string registered so
+        // far, and the frame would then omit pointers for references it really
+        // emits. That is a document a reader cannot resolve, produced only for
+        // documents big enough to rehash.
+        long[] oo = srOffs;
+        boolean[] ou = srUsed;
         srKeys = new Object[newCap];
         srVals = new int[newCap];
+        if (oo != null) {
+            srOffs = new long[newCap];
+            srUsed = new boolean[newCap];
+        }
         srMask = newCap - 1;
         srCount = 0;
         for (int j = 0; j < ok.length; j++) {
@@ -2828,6 +2948,7 @@ public final class Writer {
                 while (srKeys[i] != null) i = (i + 1) & srMask;
                 srKeys[i] = ok[j];
                 srVals[i] = ov[j];
+                if (oo != null) { srOffs[i] = oo[j]; srUsed[i] = ou[j]; }
                 srCount++;
             }
         }
