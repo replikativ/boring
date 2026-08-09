@@ -374,6 +374,35 @@ public final class Reader {
      *  repeated keyword costs one array load — the same trick as hako's symref. */
     private Object[] srIdents;
 
+    // ---- offset-resolution mode ---------------------------------------------
+    /**
+     * The index frame's stringref pointer table, as a WINDOW INTO THIS READER'S
+     * OWN BUFFER rather than a copy: the frame is in the same bytes the data is.
+     *
+     * <p>This is the second way to resolve a stringref, and it exists because
+     * the first one cannot serve a navigator. Incrementally, index <i>n</i>
+     * means "the nth qualifying string in document order", which is knowable
+     * only by having decoded all of them — exactly what an index exists to
+     * avoid. Given (index -&gt; defining offset) for the referenced entries, a
+     * reader holding nothing but an offset resolves by JUMPING instead of by
+     * remembering, and `:stringref` and `:index` stop being mutually exclusive.
+     *
+     * <p>The two modes are exclusive per document: when {@code srPtrCount > 0}
+     * the incremental table is never built and {@code srActive} stays false —
+     * which is also why {@link #skipValue} needs no change, since its fallback
+     * is gated on {@code srActive}.
+     *
+     * <p>Set by the navigator once it has parsed the frame; cleared by
+     * {@link #resetState}, so it can never outlive the buffer it indexes.
+     */
+    private long srPtrBase;      // absolute offset of the first pair
+    private int  srPtrCount;     // number of (index, offset) pairs
+    private int  srPtrIw;        // bytes per index field
+    private int  srPtrOw;        // bytes per offset field
+    /** Resolved text per PAIR SLOT — not per stringref index, because the table
+     *  is sparse. Lazily allocated on the first resolution. */
+    private Object[] srPtrCache;
+
     public Reader(byte[] b) { bindArray(b); }
 
     public Reader(ByteSource s) { bind(s); }
@@ -483,11 +512,40 @@ public final class Reader {
         resetState();
     }
 
+    /**
+     * Point this reader at an index frame's stringref pointer table.
+     *
+     * `base` is the absolute offset of the first pair, `count` how many, `iw`
+     * and `ow` the field widths in bytes. Called by the navigator after it has
+     * parsed and validated the frame; `count == 0` turns the mode off, which is
+     * what a document without the element gets.
+     *
+     * <p>Deliberately NOT carried on Index: #12 removed the Reader from Index
+     * so a forked navigator could not read through a stale one, and pushing
+     * Index back onto the Reader would only re-tie that knot from the other
+     * side. What crosses is four primitives naming a region of bytes this
+     * reader already owns.
+     */
+    public void setStringrefPointers(long base, int count, int iw, int ow) {
+        this.srPtrBase = base;
+        this.srPtrCount = count;
+        this.srPtrIw = iw;
+        this.srPtrOw = ow;
+        // Dropped rather than cleared: a new table means every cached
+        // resolution belongs to a different document.
+        this.srPtrCache = null;
+    }
+
     private void resetState() {
         items = 0;
         this.reused = true;
         this.depth = 0;
         srActive = false;
+        // The table names offsets in the buffer being replaced, so it cannot
+        // survive a reset -- reading through it afterwards would resolve
+        // against whatever the new document happens to have at those offsets.
+        srPtrBase = 0; srPtrCount = 0; srPtrIw = 0; srPtrOw = 0;
+        srPtrCache = null;
         if (srCount > 0) {
             java.util.Arrays.fill(srStrings, 0, srCount, null);
             java.util.Arrays.fill(srIdents, 0, srCount, null);
@@ -1278,6 +1336,111 @@ public final class Reader {
         return arg(h & 0x1F);
     }
 
+    /** Whether this document resolves stringrefs by jumping rather than by
+     *  remembering. Checked before every use of the incremental table. */
+    private boolean srOffsetMode() { return srPtrCount > 0; }
+
+    /** Little-endian unsigned value of `w` bytes at `p`. Every byte goes
+     *  through `b`, which bounds-checks and raises a typed truncated-input. */
+    private long srLe(long p, int w) {
+        long v = 0;
+        for (int i = 0; i < w; i++) v |= ((long) b(p + i)) << (8 * i);
+        return v;
+    }
+
+    /**
+     * The pair slot holding `idx`, or -1.
+     *
+     * Binary search, because the writer emits the pairs ascending — see
+     * `Writer.stringrefPointers`. Sorting on the writing side is the trade the
+     * rest of the frame makes: a document is written once and opened many
+     * times.
+     */
+    private int srPtrSlot(long idx) {
+        int lo = 0, hi = srPtrCount - 1;
+        int stride = srPtrIw + srPtrOw;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            long at = srLe(srPtrBase + (long) mid * stride, srPtrIw);
+            if (at == idx) return mid;
+            if (at < idx) lo = mid + 1; else hi = mid - 1;
+        }
+        return -1;
+    }
+
+    /**
+     * Resolve stringref `idx` by jumping to its defining literal.
+     *
+     * <p><b>Only a string is read there, never an arbitrary item.</b> The
+     * obvious implementation is to seek and call `read()`, and it is wrong: the
+     * pointer comes from the index, the index is a trust boundary, and a
+     * damaged pointer would then have this decode whatever it happens to land
+     * on — an arbitrary amount of work, and arbitrary allocation, inside what
+     * the caller thinks is a map lookup. A stringref slot can only ever hold a
+     * text or byte string, so anything else is refused by shape.
+     */
+    private Object srResolve(long idx) {
+        int slot = srPtrSlot(idx);
+        if (slot < 0)
+            throw Err.of("bad-stringref",
+                "boring: stringref " + idx + " has no pointer in the index frame",
+                "index", idx);
+        if (srPtrCache == null) srPtrCache = new Object[srPtrCount];
+        Object hit = srPtrCache[slot];
+        if (hit != null) return hit;
+
+        long off = srLe(srPtrBase + (long) slot * (srPtrIw + srPtrOw) + srPtrIw, srPtrOw);
+        int h = b(off);
+        int major = h >>> 5;
+        if (major != 2 && major != 3)
+            throw Err.of("bad-stringref",
+                "boring: the stringref pointer for " + idx + " names offset " + off
+                + ", which holds major " + major + ", not a string",
+                "index", idx, "offset", off);
+        long save = pos;
+        Object made;
+        try {
+            pos = off + 1;
+            long n = arg(h & 0x1F);
+            if (n < 0)
+                throw Err.of("bad-stringref",
+                    "boring: the stringref pointer for " + idx
+                    + " names an indefinite-length string, which cannot take a slot",
+                    "index", idx, "offset", off);
+            // Bounds are the reader's own: `stringAt` and the byte copy below
+            // both read through the checked path, so a pointer naming a length
+            // that runs past the buffer is a typed truncated-input.
+            if (n > limit - pos)
+                throw Err.of("bad-stringref",
+                    "boring: the stringref pointer for " + idx + " names a string of "
+                    + n + " bytes, which runs past the end of the input",
+                    "index", idx, "offset", off);
+            if (major == 3) {
+                made = stringAt(pos, (int) n, StandardCharsets.UTF_8);
+            } else {
+                byte[] bs = new byte[(int) n];
+                for (int i = 0; i < n; i++) bs[i] = (byte) b(pos + i);
+                made = bs;
+            }
+        } finally {
+            pos = save;
+        }
+        srPtrCache[slot] = made;
+        return made;
+    }
+
+    /** `srResolve`, for the callers that require TEXT — tag 39 and anything
+     *  interning an identifier. A byte string legally occupies a slot, so this
+     *  is a refusal by shape rather than an impossible case. */
+    private String srResolveText(long idx) {
+        Object o = srResolve(idx);
+        if (!(o instanceof String))
+            throw Err.of("bad-tag-content",
+                "boring: tag 39 references stringref " + idx
+                + ", which holds a byte string, not text", "tag", 39L);
+        return (String) o;
+    }
+
     private void srPut(Object s) {
         // Allocated on the first stringref rather than eagerly at 64 slots:
         // a document with no stringref namespace -- anything under the
@@ -1630,6 +1793,12 @@ public final class Reader {
             int idx = b(pos + 4);
             if (idx < 24) {                       // inline uint: byte IS the index
                 pos += 5;
+                // The shortcut is for the INCREMENTAL table, whose `srIdents`
+                // is indexed by stringref index. Offset mode has no such array
+                // -- its cache is keyed by pair slot, because the table is
+                // sparse -- so it takes the ordinary resolution path instead of
+                // a second, subtly different copy of it here.
+                if (srOffsetMode()) return internIdent(srResolveText(idx));
                 stringrefIndex(idx);              // may not be registered yet
                 Object cached = srIdents[idx];
                 return cached != null ? cached : internAt(idx);
@@ -2530,6 +2699,22 @@ public final class Reader {
                 // A fresh table, and the enclosing one restored on the way out.
                 // Nested namespaces SHADOW rather than extend, so an index can
                 // never leak across a boundary in either direction.
+                // TRANSPARENT IN OFFSET MODE, and it has to be: the ROOT
+                // namespace is a tag 256 at offset 0, so a blanket refusal here
+                // would reject every document this mode exists to read. The
+                // shadowing below is bookkeeping for the incremental table, and
+                // offset mode has no incremental table to shadow.
+                //
+                // A NESTED namespace therefore resolves against the frame's one
+                // table. For anything boring wrote that is exactly right --
+                // `write-root!` is the sole caller of
+                // `writeStringrefNamespace` and opens one namespace at the
+                // root, so there is no second table for it to be wrong about.
+                // Reaching here with real nesting means a damaged frame, where
+                // doc/SHAPES.md already allows a wrong answer; what it does not
+                // allow is an untyped throw or a read outside the file, and
+                // `srResolve` refuses by shape and bounds-checks every byte.
+                if (srOffsetMode()) return read();
                 Object[] savedStrings = srStrings;
                 Object[] savedIdents  = srIdents;
                 int      savedCount   = srCount;
@@ -2543,6 +2728,7 @@ public final class Reader {
                 }
             }
             case 25:                                         // stringref
+                if (srOffsetMode()) return srResolve(stringrefArg());
                 return srStrings[stringrefIndex(stringrefArg())];
             case 39: {                                       // identifier
                 // Peek: a stringref here means we can reuse the interned ident.
@@ -2551,6 +2737,15 @@ public final class Reader {
                 if ((h >>> 5) == 6) {                        // nested tag => stringref
                     int inner = (int) arg(h & 0x1F);
                     if (inner == 25) {
+                        // OFFSET MODE INTERNS THROUGH THE SAME `internIdent`, so
+                        // a keyword read by jumping is the identical interned
+                        // object a keyword read incrementally would be. The
+                        // per-index `srIdents` cache is not available here --
+                        // the pointer table is sparse and keyed by slot -- but
+                        // `internIdent` has its own cache, which is what made
+                        // that array an optimisation rather than a requirement.
+                        if (srOffsetMode())
+                            return internIdent(srResolveText(stringrefArg()));
                         // stringrefArg + stringrefIndex, NOT a raw read. This
                         // path used to mask the major type and index srIdents
                         // directly, so `d8 27 d9 00 19 00` (an alternate-width
