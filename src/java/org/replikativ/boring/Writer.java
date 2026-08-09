@@ -602,10 +602,24 @@ public final class Writer {
         // leaves it wherever it stopped. Both entry points reset on the throw
         // path, so this is where it is put right.
         idxScratchTop = 0;
+        idxSuspend = 0;
         idxSeqN = 0;
         idxItems = 0;
         idxItemCountdown = 1;
     }
+    // ---- node accessors -----------------------------------------------
+    //
+    // THESE ARE NOT PURE READS. Each one compacts first, and compaction
+    // RENUMBERS slots -- so calling any of them while a container is still
+    // being written would renumber under the `int slot` locals that in-flight
+    // `writeMapValue`/`writeArrayOf`/`writeRecordFields` frames are holding,
+    // and those frames would then fill the wrong node.
+    //
+    // Safe today because nothing calls them mid-document: both seal paths
+    // (`core/write-seq-resolved!`, `core/write-indexed-resolved!`) read them
+    // after the value has been written, and a custom tag writer never receives
+    // the Writer. Written down because "getter" stopped being an accurate
+    // description of them and nothing said so.
     public int idxCount() { compactNodes(); return idxN; }
     // Null-safe because the backing arrays are lazy now: a writer that never
     // indexed has none, and `idxN` is 0, so an empty result is the right
@@ -644,8 +658,30 @@ public final class Writer {
         return idxStride == 1 ? n : ((n - 1) / idxStride) + 1;
     }
 
+    /**
+     * Capture is SUSPENDED inside a map key and inside a set element.
+     *
+     * `boring.nav` cannot reach either. A map entry is handed out as
+     * `MapEntry(realize(key), cursor(value))` -- the key is realised, never a
+     * cursor -- and a set is realised whole, so `(get set-cursor 0)` is nil. A
+     * node on a container inside one is therefore unusable by construction,
+     * exactly like the tag-27 frame's own `[name, args]` array that
+     * `frame-payload-array?` drops for the same reason.
+     *
+     * It also removes a divergence between the two index builders. Canonical
+     * maps and sets stage their keys and elements through a scratch writer
+     * that never indexes, so the writer already emitted no node there -- while
+     * the byte walk descended and emitted one. Same value, two files. Plain
+     * maps had the mirror problem: both builders agreed, and both were
+     * emitting nodes nothing could use.
+     *
+     * A counter rather than a flag, because these nest, and it covers the
+     * whole subtree for free since `writeValue` recurses beneath it.
+     */
+    private int idxSuspend;
+
     private boolean indexing(int n) {
-        return idxStride > 0 && n >= idxMinEntries;
+        return idxStride > 0 && idxSuspend == 0 && n >= idxMinEntries;
     }
 
     /**
@@ -1885,8 +1921,8 @@ public final class Writer {
             walkAcc += idxItemsWritten - itemsAtStart;
             int k0 = pos;
             long flushedAtKey = flushed;
-            pinDepth++;
-            try { writeValue(e.getKey()); } finally { pinDepth--; }
+            pinDepth++; idxSuspend++;
+            try { writeValue(e.getKey()); } finally { pinDepth--; idxSuspend--; }
             if (cap) {
                 if (sink == null) {
                     if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
@@ -1992,7 +2028,13 @@ public final class Writer {
             for (Object o : m.entrySet()) {
                 Map.Entry e = (Map.Entry) o;
                 if (++seen > n) countMismatch(n, seen);
-                writeValue(e.getKey());
+                // SUSPENDED HERE TOO. This map is not itself indexed, but its
+                // KEYS can still hold containers that are -- and a container
+                // inside a key is unreachable whether or not its parent earned
+                // a node. Missing it here left the writer emitting nodes the
+                // byte walk (correctly) did not.
+                idxSuspend++;
+                try { writeValue(e.getKey()); } finally { idxSuspend--; }
                 writeValue(e.getValue());
             }
             if (seen != n) countMismatch(n, seen);
@@ -2029,8 +2071,8 @@ public final class Writer {
             walkAcc += idxItemsWritten - itemsAtStart;
             int k0 = pos;
             long flushedAtKey = flushed;
-            pinDepth++;
-            try { writeValue(e.getKey()); } finally { pinDepth--; }
+            pinDepth++; idxSuspend++;
+            try { writeValue(e.getKey()); } finally { pinDepth--; idxSuspend--; }
             if (sink == null) {
                 if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
                     sorted = false;
@@ -3142,13 +3184,21 @@ public final class Writer {
         if (x instanceof Map) { writeMapValue((Map) x); return; }
         if (x instanceof Set) {
             Set s = (Set) x;
-            if (canonical) { writeSetCanonical(s); return; }
-            head(TAG, TAG_SET);
-            // The node describes the ARRAY, not the tag: the byte walk descends
-            // tags and indexes the container beneath, so `start` is taken after
-            // the tag head or the two would disagree about this container's
-            // offset.
-            writeArrayOf(s, s.size());
+            // A SET IS INDEXED NOWHERE, not even its own array. `boring.nav`
+            // realises a set whole -- `(get set-cursor 0)` is nil -- so no
+            // offset inside one is reachable, and a node there is bytes that
+            // nothing can read. Same argument, and the same conclusion, as the
+            // tag-27 frame's `[name, args]` array.
+            //
+            // It also settles a divergence: a CANONICAL set stages its
+            // elements through a scratch writer that never indexes, so the two
+            // builders disagreed about every container inside one.
+            idxSuspend++;
+            try {
+                if (canonical) { writeSetCanonical(s); return; }
+                head(TAG, TAG_SET);
+                writeArrayOf(s, s.size());
+            } finally { idxSuspend--; }
             return;
         }
         if (x instanceof List) {

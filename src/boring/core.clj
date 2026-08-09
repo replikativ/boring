@@ -1232,7 +1232,7 @@
   ;; container started). It is exactly what `Writer.idxItemsWritten` does on
   ;; the other side, which is also why the two agree by construction rather
   ;; than by coincidence.
-  (index-walk* r p stride min-entries base acc 0 (long-array 1)))
+  (index-walk* r p stride min-entries base acc 0 (long-array 1) false))
 
 (def ^:private ^:const walk-threshold
   "Where a binary search starts to repay the frame, in mean prefix items.
@@ -1307,7 +1307,8 @@
                        t))))))
 
 (defn- index-walk*
-  [^Reader r p stride min-entries base ^java.util.ArrayList acc depth ^longs items]
+  [^Reader r p stride min-entries base ^java.util.ArrayList acc depth ^longs items
+   suppress?]
   ;; CONTAINER nesting is bounded too, not only the tag chain. `build-index` is
   ;; public and documented for "a file somebody else wrote", and ~1.2 KB of
   ;; `81 81 81 ...` was a StackOverflowError where `decode` on the same bytes
@@ -1367,6 +1368,18 @@
                       (if (= 6 (.majorAt r q))
                         (recur (long (.headEndAt r q)) (inc (long t)))
                         t)))
+        ;; A SET IS INDEXED NOWHERE -- see `Writer.writeValue`'s Set branch.
+        ;; `boring.nav` realises a set whole, so no offset inside one is
+        ;; reachable, and the writer emits nothing there. Detected by walking
+        ;; the tag chain again, which costs nothing for the untagged container
+        ;; that nearly every container is.
+        set? (boolean (loop [q (long p)]
+                        (if (= 6 (.majorAt r q))
+                          (if (= 258 (long (.headArgAt r q)))
+                            true
+                            (recur (long (.headEndAt r q))))
+                          false)))
+        suppress? (boolean (or suppress? set?))
         p (long (loop [q (long p)]
                   (if (= 6 (.majorAt r q)) (recur (long (.headEndAt r q))) q)))
         mj (.majorAt r p)]
@@ -1415,7 +1428,8 @@
                                            (if map? " pairs" " elements")
                                            " but only " avail " bytes remain")
                                       {:type :boring/bad-count :count n :offset p}))))
-                keep? (and (>= n min-entries)
+                keep? (and (not suppress?)
+                           (>= n min-entries)
                            (not (frame-payload-array? r q0 p mj n)))
                 ;; A MAP CAPTURES ONE ANCHOR PER ENTRY, whatever the file's
                 ;; stride, and is narrowed below once `sorted` is known -- an
@@ -1498,11 +1512,18 @@
                                    (long (index-walk*
                                           r
                                           (if map?
+                                            ;; THE KEY, WITH NODES SUPPRESSED.
+                                            ;; `boring.nav` realises a map key
+                                            ;; -- an entry is
+                                            ;; `MapEntry(realize(k), cursor(v))`
+                                            ;; -- so nothing inside one is
+                                            ;; reachable. The writer suspends
+                                            ;; capture over exactly this span.
                                             (long (index-walk* r q stride min-entries base acc
-                                                               (inc (long depth)) items))
+                                                               (inc (long depth)) items true))
                                             q)
                                           stride min-entries base acc (inc (long depth))
-                                          items))
+                                          items suppress?))
                                    q))))]
             (when keep?
                 ;; Decided on RAW offsets, before `base` is folded in: the

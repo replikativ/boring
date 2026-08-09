@@ -531,15 +531,30 @@
   (testing "each slot is its own int[], so forgetting the COUNT while leaving
             the references reachable pins one array per indexed container for
             the life of a long-lived writer. Same fix as the stringref table."
-    (let [^org.replikativ.boring.Writer w (boring/writer 65536 opts)]
+    ;; A FIXTURE THAT KEEPS MANY NODES, and the count read through reflection
+    ;; rather than through `.idxCount`.
+    ;;
+    ;; Both matter now. The old fixture -- 50 vectors of 10 -- kept ONE node
+    ;; once the writer began refusing containers a scan crosses cheaply, so
+    ;; "one array per indexed container" was being asserted about one array.
+    ;; And `.idxCount` COMPACTS, which nulls refused slots itself, so calling
+    ;; it first did the very thing the assertion then attributed to
+    ;; `idxReset`: the test passed whether or not `idxReset` released
+    ;; anything.
+    (let [^org.replikativ.boring.Writer w (boring/writer 65536 opts)
+          slots (doto (.getDeclaredField org.replikativ.boring.Writer "idxSlots")
+                  (.setAccessible true))
+          live (fn [] (count (remove nil? (seq ^objects (.get slots w)))))]
       (.setIndex w (int 1) (int 2) 0)
-      (boring/encode-buffered! w (vec (for [i (range 50)] (vec (range 10)))))
-      (is (pos? (.idxCount w)))
+      (boring/encode-buffered! w (vec (for [i (range 40)]
+                                        (into {} (for [j (range 20)]
+                                                   [(format "k%02d" j)
+                                                    (format "v%03d-%03d" i j)])))))
+      (is (< 1 (live))
+          "the fixture must keep MANY nodes, or this asserts nothing")
       (.idxReset w)
-      (let [f (doto (.getDeclaredField org.replikativ.boring.Writer "idxSlots")
-                (.setAccessible true))]
-        (is (every? nil? (seq ^objects (.get f w)))
-            "no anchor array may stay reachable after a reset")))))
+      (is (zero? (live))
+          "no anchor array may stay reachable after a reset"))))
 
 (deftest an-index-offset-past-2gb-is-carried-not-wrapped
   (testing "index offsets are 64-bit. They used to be int32, which capped an
@@ -2098,6 +2113,60 @@
               (str tag ": the two builders must agree byte for byte"))
           (is (= (nav/value (nav/root c o)) v)
               (str tag ": and the file must read back as the value")))))))
+
+(deftest nothing-inside-a-map-key-or-a-set-is-indexed
+  (testing "`boring.nav` cannot reach either, so a node there is bytes nothing
+            can read -- and the two index builders disagreed about whether to
+            write them.
+
+            A map entry is handed out as `MapEntry(realize(key), cursor(val))`,
+            so a KEY is never a cursor; and a set is realised whole, so
+            `(get set-cursor 0)` is nil. Same argument as the tag-27 frame's
+            own `[name, args]` array, which `frame-payload-array?` has always
+            dropped for exactly this reason.
+
+            THE DIVERGENCE: canonical maps and sets stage their keys and
+            elements through a scratch writer that never indexes, so the writer
+            emitted nothing there while the byte walk descended and emitted
+            nodes. Same value, two files -- 193 bytes against 245. Plain maps
+            had the mirror problem: both builders agreed, and both were writing
+            nodes nothing could use.
+
+            Invisible to the agreement sweep because none of its fixtures put a
+            CONTAINER in a key or in a set. That is the whole reason this
+            exists as its own test."
+    (let [heavy (vec (for [i (range 17)] (vec (range i (+ i 10)))))
+          capture (fn [v opts]
+                    (let [w (boring/writer 65536 opts)
+                          out (ByteArrayOutputStream.)]
+                      (boring/write-indexed! w v out opts)
+                      (.toByteArray out)))
+          nodes (fn [^bytes bs opts]
+                  (let [ix (#'boring.nav/read-index (#'boring.nav/nav-of bs opts))]
+                    (if (:containers ix) (:n ix) 0)))]
+      (doseq [profile [:canonical :archival :clojure :canonical-rfc7049]
+              [label v indexed?]
+              [["container as a map KEY"   {heavy 0} false]
+               ["container in a SET"       #{heavy 1} false]
+               ["a SET as a map value"     {"s" #{heavy 1}} false]
+               ;; The controls: the same container as a map VALUE, and inside a
+               ;; plain vector, must still earn its node.
+               ["container as a map VALUE" {0 heavy} true]
+               ["container in a VECTOR"    [heavy] true]]]
+        (let [o (cond-> {:profile profile :index 16 :index-min 2}
+                  (not (#{:canonical :canonical-rfc7049 :archival} profile))
+                  (assoc :stringref false))
+              tag (str label " | " profile)
+              c (capture v o)
+              w (boring/encode-indexed v o)]
+          (is (= (seq c) (seq w))
+              (str tag ": the two builders must agree byte for byte"))
+          (if indexed?
+            (is (pos? (long (nodes w o))) (str tag ": must still earn a node"))
+            (is (zero? (long (nodes w o)))
+                (str tag ": must earn NO node -- nothing there is reachable")))
+          (is (= v (nav/value (nav/root c o)))
+              (str tag ": and the value still reads back")))))))
 
 (deftest indexed-and-unindexed-agree-across-shapes
   (testing "the correctness spine: for every container shape, stride and

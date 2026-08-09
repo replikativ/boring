@@ -808,7 +808,7 @@
   a chain of them is not a stack hazard. Container nesting carries an explicit
   bound for the same reason the JVM does: this is public and runs on bytes
   somebody else wrote."
-  [r p stride min-entries base acc depth items]
+  [r p stride min-entries base acc depth items suppress?]
   (when (> depth INDEX-WALK-MAX-DEPTH)
     (throw (ex-info (str "boring: nesting deeper than the index walk's bound ("
                          INDEX-WALK-MAX-DEPTH "). This document can be decoded "
@@ -819,6 +819,14 @@
         ;; emits one head per tag, and most of what boring writes is tagged.
         ntags (loop [q p t 0]
                 (if (== 6 (rd/major-at r q)) (recur (rd/head-end-at r q) (inc t)) t))
+        ;; A SET IS INDEXED NOWHERE -- see the JVM `index-walk*` and
+        ;; `Writer.writeValue`'s Set branch. `boring.nav` realises a set whole,
+        ;; so nothing inside one is reachable.
+        set? (loop [q p]
+               (if (== 6 (rd/major-at r q))
+                 (if (== 258 (rd/head-arg-at r q)) true (recur (rd/head-end-at r q)))
+                 false))
+        suppress? (boolean (or suppress? set?))
         p (loop [q p] (if (== 6 (rd/major-at r q)) (recur (rd/head-end-at r q)) q))
         mj (rd/major-at r p)]
     (if-not (or (== mj 4) (== mj 5))
@@ -836,7 +844,8 @@
                 e (rd/skip-from r p items)]
             (aset items 0 (+ before ntags (- (aget items 0) before)))
             e)
-          (let [keep? (and (>= n min-entries)
+          (let [keep? (and (not suppress?)
+                           (>= n min-entries)
                            (not (frame-payload-array? r q0 p mj n)))
                 ;; A MAP CAPTURES ONE ANCHOR PER ENTRY -- see the JVM
                 ;; `index-walk*` and `Writer.downsample`. Narrowed below, once
@@ -901,11 +910,15 @@
                                    (if map?
                                      ;; A map entry is a key AND a value, and
                                      ;; the anchor points at the key.
+                                     ;; The KEY, with nodes suppressed: nav
+                                     ;; realises a map key, so nothing inside
+                                     ;; one is reachable. See the JVM walk.
                                      (index-walk* r (index-walk* r q stride min-entries
-                                                                 base acc (inc depth) items)
-                                                  stride min-entries base acc (inc depth) items)
+                                                                 base acc (inc depth) items true)
+                                                  stride min-entries base acc (inc depth)
+                                                  items suppress?)
                                      (index-walk* r q stride min-entries base acc
-                                                  (inc depth) items))
+                                                  (inc depth) items suppress?))
                                    q))))]
             (when keep?
               ;; FLOOR DIVISION, matching `Writer.fillNode` and the JVM walk.
@@ -948,7 +961,7 @@
          acc (array)
          end (.-length bs)]
      (loop [p 0] (when (< p end)
-                   (recur (index-walk* r p stride min-entries 0 acc 0 #js [0]))))
+                   (recur (index-walk* r p stride min-entries 0 acc 0 #js [0] false))))
      (when (pos? (.-length acc))
        (let [idx (vec (sort-by first (vec acc)))]
          ;; `:stride` INCLUDED. The JVM's `build-index` returns it and
