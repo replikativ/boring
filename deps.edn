@@ -29,6 +29,19 @@
    :extra-deps {io.github.cognitect-labs/test-runner
                 {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                 org.clojure/test.check {:mvn/version "1.1.1"}}
+   ;; A HEAP CEILING, because without one the suite MISREPORTS resource
+   ;; exhaustion as a codec defect. `generative-test/decode-outcome` catches
+   ;; Throwable and classifies OutOfMemoryError as `:untyped` -- the category
+   ;; that means "boring let a raw host exception escape" -- so a tight heap
+   ;; turns into a correctness failure, and it fires hardest during test.check
+   ;; SHRINKING, exactly when the diagnostic is needed. Seen twice: a green
+   ;; suite, then an OOM inside a rose-tree generator, on unchanged code.
+   ;;
+   ;; `:dev` and `:bench` both set -Xmx4g; this alias set nothing, so it took
+   ;; the JVM default -- 25% of a CI container is about 1 GB. 2g is comfortably
+   ;; above the real peak (`writer-streaming-test` holds five boxed copies of a
+   ;; generated value live at once) and low enough to stay honest.
+   :jvm-opts ["-Xmx2g"]
    :main-opts ["-m" "cognitect.test-runner"]}
 
   ;; boring measured against nippy's own reference stress data. Isolated in its

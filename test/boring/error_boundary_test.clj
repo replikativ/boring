@@ -115,6 +115,17 @@
             from their own recursion overflowing inside a nav traversal"
     (let [r (on-small-stack #(nav/value (nav/root (tag-chain 1000))))
           t (:threw r)]
+      ;; THE PRECONDITION IS ASSERTED, not assumed. This whole body used to sit
+      ;; inside `(when (instance? ExceptionInfo t) ...)`, so if `nav/value`
+      ;; succeeded, timed out, or threw anything else, ZERO assertions ran and
+      ;; the test was green. Its sibling above already carries this guard --
+      ;; `(is (some true? outcomes))`, "the assertions above were reached rather
+      ;; than skipped" -- for exactly this reason.
+      (is (instance? clojure.lang.ExceptionInfo t)
+          (str "expected a typed error, got "
+               (cond (nil? t) "no throw at all"
+                     (= ::timeout t) "nothing (timed out)"
+                     :else (.getName (class t)))))
       (when (instance? clojure.lang.ExceptionInfo t)
         (is (= :boring/max-depth-exceeded (:type (ex-data t))))
         (is (instance? StackOverflowError (.getCause ^Throwable t)))))))

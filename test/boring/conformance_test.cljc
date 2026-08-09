@@ -80,15 +80,25 @@
             (str hex " re-encoded as " (:ok ours)
                  " decodes to " (pr-str (or (:ok back) (:err back)))))))))
 
-(deftest rfc8949-forbidden-encodings-are-refused
-  (testing "vectors that RFC 8949 forbids an encoder from producing must be
-            refused, not silently emitted — they remain decodable"
-    (doseq [{:keys [hex value encode-forbidden encode-forbidden-reason]} v/appendix-a
-            :when encode-forbidden]
-      (let [r (try-encode (c/->expected value) interop-opts)]
-        (is (contains? r :err)
-            (str hex " should be refused on encode (" encode-forbidden-reason
-                 ") but produced " (pr-str (:ok r))))))))
+;; DELETED: `rfc8949-forbidden-encodings-are-refused`.
+;;
+;; It filtered `v/appendix-a` on `:when encode-forbidden`, and no row in
+;; `vectors.cljc` carries that key -- `grep -c encode-forbidden` is 0. The
+;; doseq therefore had an empty body and the deftest asserted NOTHING, while
+;; reporting green and reading like coverage of a real RFC 8949 rule.
+;;
+;; It is deleted rather than repointed. The obvious candidate, `:decode-only`
+;; (17 rows), is a DIFFERENT property: those are f32/f64 Infinity and NaN,
+;; which boring encodes perfectly well, just not at the width they arrived in.
+;; "Cannot round-trip byte-identically" is not "an encoder must refuse to
+;; produce this", and conflating them would replace a test that asserts nothing
+;; with one that asserts the wrong thing.
+;;
+;; THE COVERAGE IS GENUINELY MISSING and is tracked -- the corpus has no
+;; encode-forbidden rows to test against, so restoring the test means first
+;; deciding which Appendix A vectors RFC 8949 forbids an encoder from
+;; producing, and marking them. A green test asserting nothing is worse than an
+;; absent one, because only the absent one is visible.
 
 (deftest preserve-width-differs-on-narrow-floats
   (testing ":preserve-width must NOT reproduce f16/f32 vectors — it widens by
