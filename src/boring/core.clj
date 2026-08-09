@@ -1523,8 +1523,22 @@
                 ;; `bytes` too, the unsorted branch is refused whatever the
                 ;; keys turn out to be, and capturing finer than the file's
                 ;; stride cannot change a single decision.
+                ;; AGAINST THE SAME SPAN THE WRITER MEASURES. `avail` starts
+                ;; after this container's HEAD, because it exists to bound the
+                ;; payload for the allocation guard above. `Writer.keepNode`
+                ;; takes `absOffset() - off`, which INCLUDES the head -- so the
+                ;; two differed by the head's width, and at the exact boundary
+                ;; they chose different strides for the same container. A
+                ;; 9-entry unsorted map spanning exactly 90 bytes: the writer
+                ;; saw 90 <= 90 and captured at stride 1 (nine anchors), the
+                ;; walk saw 90 <= 89 and captured at the file's stride (one).
+                ;; Same node, same count, same `sorted`, different anchors --
+                ;; two builders writing different files, which is the one thing
+                ;; the differential test exists to prevent. Found by that test,
+                ;; intermittently, because only the exact boundary shows it.
+                span-bound (- (.size r) (long p))
                 cap-stride (if (and map? (<= (* unsorted-anchor-budget (long n))
-                                             (long avail)))
+                                             (long span-bound)))
                              1 stride)
                 m (if keep?
                       ;; An empty container needs no anchors. The `(max n 1)`
