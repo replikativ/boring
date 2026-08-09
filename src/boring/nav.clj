@@ -551,8 +551,29 @@
     ;; Reader, which is the one thing `fork` exists to avoid. Forcing on the
     ;; forking thread keeps the sharing -- 145 us for a 20 000-item index --
     ;; without the aliasing.
-    (let [ix (nav-idx n)]
-      (Nav. r (.opts n) (atom {}) (volatile! ix) (volatile! src) (volatile! nil)))))
+    ;; THE POINTER TABLE IS READER STATE, AND THIS READER IS NEW. Sharing the
+    ;; realised Index is what makes a fork cheap, but the stringref table does
+    ;; NOT live on the Index -- #12 put it on the Reader deliberately -- so a
+    ;; fork that inherited only the Index had no table, and every reference in
+    ;; it raised `:boring/bad-stringref` while the parent read the same offsets
+    ;; fine. `fork` is the documented way to read one source from several
+    ;; threads, so that failed every parallel reader over a stringref document.
+    ;;
+    ;; Such a fork re-parses instead of inheriting, because parsing is what
+    ;; installs the table -- and it is the only way to get one onto this Reader
+    ;; without a second copy of the frame-location logic to drift from the
+    ;; first. It costs the index parse the sharing exists to save, but only for
+    ;; documents that open a namespace; every other fork still inherits.
+    (let [ix (if (.hasStringrefRoot r) ::unparsed (nav-idx n))
+          fork (Nav. r (.opts n) (atom {}) (volatile! ix) (volatile! src) (volatile! nil))]
+      ;; FORCED, not left lazy. Marking the index unparsed is not enough on its
+      ;; own: `nav-idx` runs only when something consults the index, and
+      ;; `value`/`realize` go straight to `Reader.readFrom` without ever asking
+      ;; -- so the fork read references with no table installed and raised
+      ;; `stringref outside any tag-256 namespace`. `source` has the same
+      ;; problem and solves it the same way.
+      (check-stringref-navigable! fork r)
+      fork)))
 
 (defn source
   "A SOURCE over `src` -- a byte[], or a ByteSource such as
@@ -702,10 +723,20 @@
            (let [q (.headEndAt r p)]
              (and (= MAJOR-TAG (.majorAt r q))
                   (= 25 (.headArgAt r q))
-                  ;; The probe's own tag-39 head is two bytes -- `d8 27` -- and
-                  ;; `probe-for` encodes it exactly that way, so this is a
-                  ;; constant rather than a head-length computation.
+                  ;; THE PROBE MUST ITSELF BE A TAG-39 ENCODING. Skipping two
+                  ;; bytes of a probe that never had a `d8 27` compares the
+                  ;; WRONG SUFFIX, and with a three-byte probe that is a
+                  ;; one-byte comparison against the literal's text head -- so
+                  ;; the integer key 365, encoded `19 01 6d`, matched every
+                  ;; keyword whose head byte is 0x6d and `(get row 365)`
+                  ;; returned the value of `:key-number-5`. A sweep of 0..1999
+                  ;; against one 40-key map produced 14 such phantom hits.
+                  ;;
+                  ;; The length test alone did not catch it: `> 2` admits
+                  ;; exactly the three-byte probes that are most dangerous here.
                   (> (alength probe) 2)
+                  (= 0xd8 (bit-and (aget probe 0) 0xff))
+                  (= 0x27 (bit-and (aget probe 1) 0xff))
                   (let [off (.stringrefOffsetFor r (.headArgAt r (.headEndAt r q)))]
                     (and (nat-int? off) (.bytesEqualAtFrom r (long off) probe 2)))))
 
