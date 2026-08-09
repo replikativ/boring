@@ -1253,10 +1253,21 @@
   `boring.nav` REFUSES the node -- an anchor loop over an unordered map visits
   every entry exactly as a plain scan does. Writing one is pure cost, measured
   at 0.43x-0.81x. At stride 1 it is usable and today's behaviour is unchanged."
-  [map? sorted ^long walk ^long stride]
-  (if (or (not map?) sorted)
-    (>= walk walk-threshold)
-    (= stride 1)))
+  ;; NO PRIMITIVE HINTS: a Clojure fn taking primitives is limited to four
+  ;; arguments, and this takes five. Boxing three longs at one call per
+  ;; container is not on any hot path -- the walk it gates is.
+  [map? sorted walk stride n]
+  ;; ONE ANCHOR CANNOT ACCELERATE ANYTHING -- see `Writer.keepNode`. A
+  ;; container of n <= stride entries gets a single anchor, which is its own
+  ;; first entry, so the search lands where the reader already was.
+  ;; Inlined rather than calling `anchor-count`, which is defined further down
+  ;; -- and must stay in agreement with it and with `Writer.anchorCount`.
+  (and (>= (long (if (<= (long n) 0) 0
+                     (if (= (long stride) 1) (long n)
+                         (inc (quot (dec (long n)) (long stride)))))) 2)
+       (if (or (not map?) sorted)
+         (>= (long walk) walk-threshold)
+         (= (long stride) 1))))
 
 (defn- frame-payload-array?
   "Is the container at `p` the 2-element `[name, args]` array of a TAG-27 FRAME?
@@ -1474,7 +1485,7 @@
                                     out))]
                 ;; FLOOR DIVISION, matching `Writer.fillNode`. `walk-acc` is
                 ;; the sum of per-entry prefixes; `walk` is their mean.
-                (when (keep-node? map? sorted walk stride)
+                (when (keep-node? map? sorted walk stride n)
                   (.add acc [(int (+ base p)) (int n) kept sorted walk]))))
             end))))))
 

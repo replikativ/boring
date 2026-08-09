@@ -717,6 +717,22 @@ public final class Writer {
      * and a metric must not silently switch off a feature asked for by name.
      */
     private boolean keepNode(int n, boolean sorted, long walk, boolean isMap) {
+        // ONE ANCHOR CANNOT ACCELERATE ANYTHING, whatever the walk says.
+        //
+        // A container of n <= stride entries gets a single anchor, and that
+        // anchor is its own first entry -- which the reader already has from
+        // `headEndAt`. The binary search lands on it and then scans the whole
+        // container: exactly the plain scan, plus the frame's open cost.
+        //
+        // This is the `stride < n` clause of the measured rule, and it is
+        // PROVABLE rather than economic -- the same class as the two rules the
+        // reader already enforces. It was nearly dropped as vacuous, which it
+        // is only under a per-node stride; under one global stride it is the
+        // clause that catches small-n containers whose entries are large. A
+        // 16-entry map of 16-element vectors walks 135, clears the threshold
+        // comfortably, and measured 0.74x -- a loss, because 16 entries at
+        // stride 16 is one anchor.
+        if (anchorCount(n) < 2) return false;
         if (!isMap || sorted) return walk >= WALK_THRESHOLD;
         return idxStride == 1;
     }

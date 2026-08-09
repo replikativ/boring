@@ -341,10 +341,17 @@
             any sensible entry floor, and walk 66 -- above the threshold for
             arrays and sorted maps. Entry count and scan cost point OPPOSITE
             ways here, which is the whole point."
+    ;; STRIDE 1, and that is part of the finding rather than a detail. Three
+    ;; entries at stride 16 yield ONE anchor, and one anchor is the container's
+    ;; own first entry -- so no node can help however expensive the scan is.
+    ;; A small container with a large walk is reachable only at a stride fine
+    ;; enough to give it more than one anchor, which is why konserve, whose
+    ;; blob root is exactly this shape, runs at `:index 1`.
+    ;;
     ;; `:canonical` so the map is SORTED and therefore gated on walk -- an
     ;; unsorted map is not, because the reader cannot binary-search it.
     (let [v (into {} (for [i (range 3)] [(str "k" i) (vec (range 64))]))
-          o {:profile :canonical :index 16 :index-min 2}
+          o {:profile :canonical :index 1 :index-min 2}
           wlk (walked-nodes v o)]
       (is (= 66 (nth (get wlk 0) 2))
           "three entries, walk 66 -- entry count says tiny, scan cost says index it")
