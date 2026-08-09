@@ -784,9 +784,19 @@
         (when idx
           (doseq [[cnt slot] (map vector (seq ^ints (:counts idx)) (:slots idx))]
             (is (pos? (long cnt)) "no empty container may reach the frame")
-            (is (= (inc (quot (dec (long cnt)) (long stride))) (count slot))
-                (str "stride " stride ": a container of " cnt
-                     " entries must have exactly ceil(n/stride) anchors"))))
+            ;; EITHER OF THE TWO LEGAL STRIDES, as `pack-slots` now checks.
+            ;; Stride is per node: an unsorted map is written at 1 and carries
+            ;; one anchor per entry, so `ceil(n/file-stride)` is the wrong
+            ;; expectation for it -- and the reader tells the two apart by
+            ;; exactly this count.
+            ;; `or`, not a set literal: at stride 1 the two expectations
+            ;; coincide and `#{a a}` throws at read time.
+            (is (or (= (count slot) (inc (quot (dec (long cnt)) (long stride))))
+                    (= (count slot) (long cnt)))
+                (str "stride " stride ": a container of " cnt " entries must have "
+                     (inc (quot (dec (long cnt)) (long stride)))
+                     " anchors at the file's stride or " cnt " at stride 1, got "
+                     (count slot)))))
         (is (= v (nav/value c)) (str "stride " stride ": and the value still reads back"))
         (is (= {} (nav/value (get c "empty-map"))))
         ;; LOOKING INSIDE is the case the first version missed: it only

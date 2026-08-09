@@ -788,7 +788,9 @@
   the JVM `keep-node?` -- see the JVM version for why the two rules differ."
   [map? sorted walk stride n bytes]
   ;; ONE ANCHOR CANNOT ACCELERATE ANYTHING -- see `Writer.keepNode`.
-  (and (>= (if (<= n 0) 0 (if (== stride 1) n (inc (quot (dec n) stride)))) 2)
+  ;; At the node's own stride -- see `Writer.keepNode`.
+  (and (>= (let [ns (if (and map? (not sorted)) 1 stride)]
+             (if (<= n 0) 0 (if (== ns 1) n (inc (quot (dec n) ns))))) 2)
        (if (or (not map?) sorted)
          (>= walk walk-threshold)
          ;; An unsorted map is written at stride 1 whatever the file's
@@ -839,7 +841,32 @@
                 ;; A MAP CAPTURES ONE ANCHOR PER ENTRY -- see the JVM
                 ;; `index-walk*` and `Writer.downsample`. Narrowed below, once
                 ;; `sorted` is known.
-                cap-stride (if map? 1 stride)
+                ;; See the JVM `index-walk*`: stride 1 only where the anchor
+                ;; budget could still be met, so a hostile count cannot make
+                ;; the walk allocate before the node is refused.
+                ;; `avail` is what remains of the buffer after this
+                ;; container's head.
+                avail (- (.-length (.-buf r)) (rd/head-end-at r p))
+                ;; THE DECLARED COUNT, CHECKED AGAINST THE BYTES THAT REMAIN,
+                ;; as the JVM walk has always done and this one never did.
+                ;;
+                ;; It was covered by accident: a hostile count made the walk
+                ;; size an array from it, and the allocation failed. That is a
+                ;; RangeError with empty ex-data on this platform -- the exact
+                ;; untyped failure `skip-from` was rewritten to avoid -- and it
+                ;; stopped happening the moment the capture stride was bounded,
+                ;; because a smaller array succeeds. The guard has to be real.
+                ;;
+                ;; A map pair costs at least two bytes and an array element at
+                ;; least one, so anything larger cannot be present however the
+                ;; rest of the document is arranged.
+                _ (when (> n (if map? (quot avail 2) avail))
+                    (throw (ex-info (str "boring: container at " p " declares " n
+                                         (if map? " pairs" " elements")
+                                         " but only " avail " bytes remain")
+                                    {:type :boring/bad-count :count n :offset p})))
+                cap-stride (if (and map? (<= (* unsorted-anchor-budget n) avail))
+                             1 stride)
                 m (if keep?
                     (cond (<= n 0) 0
                           (== cap-stride 1) n
@@ -886,7 +913,10 @@
                     walk (if (pos? n) (quot (aget walk-acc 0) n) 0)
                     ;; Narrowed now that `sorted` is known. `(pos? n)` because
                     ;; this runs before the keep decision.
-                    kept (if (and map? sorted (pos? n) (> stride 1))
+                    ;; See the JVM walk: only a stride-1 capture can be
+                    ;; narrowed.
+                    kept (if (and map? sorted (pos? n)
+                                  (== cap-stride 1) (> stride 1))
                            (let [mm (inc (quot (dec n) stride))
                                  out (js/Array. mm)]
                              (dotimes [a mm] (aset out a (nth kept (* a stride))))

@@ -1270,9 +1270,13 @@
   ;; first entry, so the search lands where the reader already was.
   ;; Inlined rather than calling `anchor-count`, which is defined further down
   ;; -- and must stay in agreement with it and with `Writer.anchorCount`.
-  (and (>= (long (if (<= (long n) 0) 0
-                     (if (= (long stride) 1) (long n)
-                         (inc (quot (dec (long n)) (long stride)))))) 2)
+  ;; AT THE NODE'S OWN STRIDE -- see `Writer.keepNode`. An unsorted map is
+  ;; written at stride 1 and has `n` anchors, so asking at the file's stride
+  ;; refused every unsorted map of `stride` entries or fewer.
+  (and (>= (long (let [ns (if (and map? (not sorted)) 1 (long stride))]
+                   (if (<= (long n) 0) 0
+                       (if (= ns 1) (long n)
+                           (inc (quot (dec (long n)) ns)))))) 2)
        (if (or (not map?) sorted)
          (>= (long walk) walk-threshold)
          ;; An unsorted map is written at stride 1 whatever the file's
@@ -1348,11 +1352,22 @@
         ;; one would make the two builders disagree on any tagged value, which
         ;; is most of what boring emits -- a set is tag 258, a record tag 27, a
         ;; shaped array tag 39649.
-        ntags (long (loop [q p t 0]
+        ;; PRIMITIVE LOCALS. This loop is walked for EVERY value, and most of
+        ;; what boring emits is tagged -- a set is 258, a record 27, a shaped
+        ;; array 39649 -- so an Object-typed `q` here boxed once per tagged
+        ;; value and cost +14.7% of the walk's allocation on a tag-heavy
+        ;; document (2000 sets: 657 KB against 754 KB).
+        ;;
+        ;; Two loops rather than one that returns both. Packing the count and
+        ;; the offset into a single long would save the second pass, and would
+        ;; silently corrupt any file past the packing width -- boring carries
+        ;; 64-bit offsets on purpose, and a walk that is right up to 1 TiB is
+        ;; not right.
+        ntags (long (loop [q (long p) t 0]
                       (if (= 6 (.majorAt r q))
-                        (recur (long (.headEndAt r q)) (inc t))
+                        (recur (long (.headEndAt r q)) (inc (long t)))
                         t)))
-        p (long (loop [q p]
+        p (long (loop [q (long p)]
                   (if (= 6 (.majorAt r q)) (recur (long (.headEndAt r q))) q)))
         mj (.majorAt r p)]
     (if-not (or (= mj 4) (= mj 5))
@@ -1393,8 +1408,8 @@
                 ;; pairs overflowed and threw a raw ArithmeticException out of
                 ;; the guard whose job is to make this input typed -- 37 of
                 ;; 60000 fuzz probes, and introduced by the guard itself.
-                _ (let [avail (- (.size r) (long (.headEndAt r p)))
-                        budget (if map? (quot avail 2) avail)]
+                avail (- (.size r) (long (.headEndAt r p)))
+                _ (let [budget (if map? (quot avail 2) avail)]
                     (when (> n budget)
                       (throw (ex-info (str "boring: container at " p " declares " n
                                            (if map? " pairs" " elements")
@@ -1408,7 +1423,23 @@
                 ;; better served by the file's stride, and which it is cannot
                 ;; be known until the last key has been compared. Same order as
                 ;; `Writer.downsample`.
-                cap-stride (if map? 1 stride)
+                ;; STRIDE 1 ONLY WHERE IT COULD BE KEPT. Capturing a map at
+                ;; stride 1 costs `n` longs, and `build-index` is public and
+                ;; takes bytes somebody else wrote: a minimal map pair is two
+                ;; bytes, so a well-formed 60 MB file declared 30M pairs and
+                ;; the walk allocated 240 MB before `keep-node?` refused the
+                ;; node. `OutOfMemoryError` is an Error, so it escaped
+                ;; `build-index`'s catch entirely.
+                ;;
+                ;; `bytes` is not known until the container ends, but `avail`
+                ;; -- what is left in the file -- bounds it. So when the anchor
+                ;; budget already fails against `avail` it must fail against
+                ;; `bytes` too, the unsorted branch is refused whatever the
+                ;; keys turn out to be, and capturing finer than the file's
+                ;; stride cannot change a single decision.
+                cap-stride (if (and map? (<= (* unsorted-anchor-budget (long n))
+                                             (long avail)))
+                             1 stride)
                 m (if keep?
                       ;; An empty container needs no anchors. The `(max n 1)`
                       ;; this replaces yielded ONE for n=0, and the loop never
@@ -1485,7 +1516,13 @@
                     ;; zero-length capture -- `(quot -1 16)` truncates to 0.
                     ;; It is refused a line later, but not before this reads
                     ;; anchor 0 of nothing.
-                    ^longs kept (if (and map? sorted (pos? n) (> (long stride) 1))
+                    ;; `(= cap-stride 1)` because narrowing reads
+                    ;; `kept[a*stride]`, which only exists if the capture was
+                    ;; at stride 1. When the anchor budget already failed
+                    ;; against `avail` the capture was taken at the file's
+                    ;; stride and is already the right shape.
+                    ^longs kept (if (and map? sorted (pos? n)
+                                         (= (long cap-stride) 1) (> (long stride) 1))
                                   (let [mm (inc (quot (dec n) (long stride)))
                                         out (long-array mm)]
                                     (dotimes [a mm]

@@ -434,6 +434,41 @@ public final class Writer {
     /** Set when a node has been refused, cleared by {@link #compactNodes}. */
     private boolean idxDirty;
 
+    /**
+     * Scratch space for a MAP's anchors, used as a stack.
+     *
+     * A map captures one anchor per ENTRY, because which stride it wants is
+     * not known until its last key has been compared. Allocating `long[n]` per
+     * map to find that out cost 3.9x to 16.4x more than the old
+     * `long[n/stride]`, measured -- and worst on the shape `write-indexed!`
+     * exists for: 500 rows of 20-entry maps allocated 88 KB of anchor arrays
+     * whose nodes were then all REFUSED, pure per-encode garbage.
+     *
+     * Containers nest, so this is a stack: each map claims a region, fills it,
+     * and pops it. `fillNodeScratch` copies out only the anchors it keeps, at
+     * the stride it chose, so the surviving array is right-sized and the
+     * speculative part is reused rather than collected.
+     *
+     * ARRAYS ARE NOT ROUTED THROUGH IT. They capture at the file's stride
+     * already -- they can never become unsorted maps -- so they were unchanged
+     * by the regression (1.00x measured) and would only pay an extra copy.
+     */
+    private long[] idxScratch;
+    private int idxScratchTop;
+
+    /** Claim `n` longs of scratch, returning the base. */
+    private int idxScratchClaim(int n) {
+        if (idxScratch == null) idxScratch = new long[Math.max(64, n)];
+        else if (idxScratchTop + n > idxScratch.length) {
+            int cap = idxScratch.length;
+            while (cap < idxScratchTop + n) cap <<= 1;
+            idxScratch = java.util.Arrays.copyOf(idxScratch, cap);
+        }
+        int base = idxScratchTop;
+        idxScratchTop += n;
+        return base;
+    }
+
     private static final long[] NO_LONGS = new long[0];
     private static final int[] NO_INTS = new int[0];
     private static final boolean[] NO_BOOLS = new boolean[0];
@@ -563,6 +598,10 @@ public final class Writer {
             java.util.Arrays.fill(idxSlots, 0, idxN, null);
         idxN = 0;
         idxDirty = false;
+        // The stack unwinds with the containers, but an exception mid-document
+        // leaves it wherever it stopped. Both entry points reset on the throw
+        // path, so this is where it is put right.
+        idxScratchTop = 0;
         idxSeqN = 0;
         idxItems = 0;
         idxItemCountdown = 1;
@@ -721,6 +760,30 @@ public final class Writer {
         return out;
     }
 
+    /**
+     * A MAP's node, with its anchors still in the scratch stack at `base`.
+     *
+     * Chooses the node's stride and copies out only what it keeps, so the
+     * speculative capture never becomes garbage. See {@link #idxScratch}.
+     */
+    private void fillNodeScratch(int slot, long off, int n, int base, boolean sorted,
+                                 long walkAcc) {
+        long bytes = absOffset() - off;
+        long walk = n > 0 ? walkAcc / n : 0;
+        if (!keepNode(n, sorted, walk, true, bytes)) { cancelNode(slot); return; }
+        // An unsorted map is only usable at stride 1; a sorted one takes the
+        // file's. The reader derives which from the anchor count alone.
+        int stride = sorted ? idxStride : 1;
+        int m = stride == 1 ? n : ((n - 1) / stride) + 1;
+        long[] anchors = new long[m];
+        for (int a = 0; a < m; a++) anchors[a] = idxScratch[base + a * stride];
+        idxOffs[slot] = checkedOffset(off);
+        idxCnts[slot] = n;
+        idxSlots[slot] = anchors;
+        idxSrt[slot] = sorted;
+        idxWalk[slot] = walk;
+    }
+
     private void fillNode(int slot, long off, int n, long[] anchors, boolean sorted,
                           long walkAcc, boolean isMap) {
         // The container's own byte span. `fillNode` runs immediately after the
@@ -792,7 +855,15 @@ public final class Writer {
         // 16-entry map of 16-element vectors walks 135, clears the threshold
         // comfortably, and measured 0.74x -- a loss, because 16 entries at
         // stride 16 is one anchor.
-        if (anchorCount(n) < 2) return false;
+        // AT THE STRIDE THIS NODE WILL ACTUALLY USE, not the file's. An
+        // unsorted map is written at stride 1 and therefore has `n` anchors --
+        // asking `anchorCount` at a file stride of 16 said "one anchor" about a
+        // node that will have sixteen, and refused every unsorted map of 16
+        // entries or fewer. That is the ordinary Clojure map, so the rule
+        // silently cancelled the per-node stride it sits beside.
+        int nodeStride = (isMap && !sorted) ? 1 : idxStride;
+        int m = n <= 0 ? 0 : (nodeStride == 1 ? n : ((n - 1) / nodeStride) + 1);
+        if (m < 2) return false;
         if (!isMap || sorted) return walk >= WALK_THRESHOLD;
         // An unsorted map is written at STRIDE 1 whatever the file's stride --
         // it is the only stride that helps one -- so the file's stride does not
@@ -1791,11 +1862,11 @@ public final class Writer {
         head(MAP, n);
         // Iterated as a SEQ rather than an entrySet, so this cannot delegate to
         // writeMapValue without changing field order on some record types.
-        // ONE ANCHOR PER ENTRY, always, for a map. See `downsample`: which
-        // stride this node wants is not known until the last key is compared,
-        // so it is captured at the finer of the two and narrowed at `fillNode`.
-        long[] anchors = indexing(n) ? new long[n] : null;
-        int slot = anchors != null ? reserveNode() : -1;
+        // ONE ANCHOR PER ENTRY, always, for a map -- into the scratch stack,
+        // not a fresh array. See `idxScratch`.
+        boolean cap = indexing(n);
+        int base = cap ? idxScratchClaim(n) : -1;
+        int slot = cap ? reserveNode() : -1;
         boolean sorted = true;
         int prevK0 = -1, prevK1 = -1;
         KeyOrder ko = null;
@@ -1810,13 +1881,13 @@ public final class Writer {
         for (clojure.lang.ISeq s = clojure.lang.RT.seq(fields); s != null; s = s.next()) {
             Map.Entry e = (Map.Entry) s.first();
             if (++seen > n) countMismatch(n, seen);
-            if (anchors != null) anchors[a++] = idxOffset(pos);
+            if (cap) idxScratch[base + a++] = idxOffset(pos);
             walkAcc += idxItemsWritten - itemsAtStart;
             int k0 = pos;
             long flushedAtKey = flushed;
             pinDepth++;
             try { writeValue(e.getKey()); } finally { pinDepth--; }
-            if (anchors != null) {
+            if (cap) {
                 if (sink == null) {
                     if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
                         sorted = false;
@@ -1829,7 +1900,8 @@ public final class Writer {
             writeValue(e.getValue());
         }
         if (seen != n) countMismatch(n, seen);
-        if (anchors != null) fillNode(slot, start, n, anchors, sorted, walkAcc, true);
+        if (cap) { fillNodeScratch(slot, start, n, base, sorted, walkAcc);
+                   idxScratchTop = base; }
     }
 
     /**
@@ -1927,8 +1999,8 @@ public final class Writer {
             return;
         }
 
-        // See writeRecordFields: a map captures one anchor per entry.
-        long[] anchors = new long[n];
+        // See writeRecordFields: one anchor per entry, into the scratch stack.
+        int base = idxScratchClaim(n);
         int slot = reserveNode();
         // EVERY adjacent key pair, not just the anchors.
         //
@@ -1953,7 +2025,7 @@ public final class Writer {
         for (Object o : m.entrySet()) {
             Map.Entry e = (Map.Entry) o;
             if (++seen > n) countMismatch(n, seen);
-            anchors[a++] = idxOffset(pos);
+            idxScratch[base + a++] = idxOffset(pos);
             walkAcc += idxItemsWritten - itemsAtStart;
             int k0 = pos;
             long flushedAtKey = flushed;
@@ -1970,7 +2042,8 @@ public final class Writer {
             writeValue(e.getValue());
         }
         if (seen != n) countMismatch(n, seen);
-        fillNode(slot, start, n, anchors, sorted, walkAcc, true);
+        fillNodeScratch(slot, start, n, base, sorted, walkAcc);
+        idxScratchTop = base;
     }
 
     // ---- time, uuid, rational ----------------------------------------------
@@ -2453,14 +2526,15 @@ public final class Writer {
 
         long start = absOffset();
         head(MAP, n);
-        // See writeRecordFields: a map captures one anchor per entry.
-        long[] anchors = indexing(n) ? new long[n] : null;
-        int slot = anchors != null ? reserveNode() : -1;
+        // See writeRecordFields: one anchor per entry, into the scratch stack.
+        boolean cap = indexing(n);
+        int base = cap ? idxScratchClaim(n) : -1;
+        int slot = cap ? reserveNode() : -1;
         long itemsAtStart = idxItemsWritten, walkAcc = 0;
         int a = 0;
         for (int j = 0; j < n; j++) {
             int k = order[j];
-            if (anchors != null) anchors[a++] = idxOffset(pos);
+            if (cap) idxScratch[base + a++] = idxOffset(pos);
             walkAcc += idxItemsWritten - itemsAtStart;
             // See writeSetCanonical: staged bytes bypass every emit site.
             idxItemsWritten += encodedKeyItems[k];
@@ -2469,7 +2543,8 @@ public final class Writer {
             pos += encodedKeys[k].length;
             writeValue(vals[k]);
         }
-        if (anchors != null) fillNode(slot, start, n, anchors, sorted, walkAcc, true);
+        if (cap) { fillNodeScratch(slot, start, n, base, sorted, walkAcc);
+                   idxScratchTop = base; }
     }
 
     public void writeBoolean(boolean b) { u8(SIMPLE | (b ? 21 : 20)); }

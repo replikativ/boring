@@ -74,14 +74,16 @@
         ;; moves it: each entry is an array head plus ten elements.
         (is (= [[0] [214] [false]] (nodes (vec (for [_ (range 40)] (vec (range 10)))) stride))
             (str "stride " stride ": 40 vectors of 10"))
-        ;; THREE ENTRIES ARE ONE ANCHOR AT STRIDE 16, so neither map earns a
-        ;; node there -- the walk of 72 is irrelevant, because a single anchor
-        ;; points at the entry the reader already stands on.
+        ;; THE ONE-ANCHOR RULE IS ASKED AT THE NODE'S OWN STRIDE. Three
+        ;; entries at a file stride of 16 is one anchor for a SORTED map --
+        ;; which takes the file's stride -- so it earns nothing however large
+        ;; the walk. The unsorted one is written at stride 1 and has three
+        ;; anchors, so the rule does not exclude it and its budget decides.
         (when (< 1 stride)
           (is (= [[] [] []] (nodes (array-map "a" big "b" big "c" big) stride))
               (str "stride " stride ": sorted, walk 72, but one anchor"))
-          (is (= [[] [] []] (nodes (array-map "c" big "b" big "a" big) stride))
-              (str "stride " stride ": unsorted, walk 72, but one anchor"))))
+          (is (= [[0] [72] [false]] (nodes (array-map "c" big "b" big "a" big) stride))
+              (str "stride " stride ": unsorted, so stride 1 and three anchors"))))
       ;; At stride 1 both are indexed, for DIFFERENT reasons: the ascending one
       ;; on its walk, the descending one because an unsorted map is usable only
       ;; at stride 1.
