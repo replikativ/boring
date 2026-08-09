@@ -117,7 +117,7 @@
 ;; ---------------------------------------------------------------- the source
 
 (declare slot-at sorted-at? container-at count-at check-stringref-navigable!
-         byte-string-at)
+         byte-string-at root-cursor root-offset)
 
 ;; A TYPE, not a fifteen-key map. `index-payload` used to return one, and on a
 ;; source that is read ONCE -- which is every read of a store handing out a
@@ -1428,37 +1428,30 @@
   Object
   (toString [_] (str "#boring.nav/cursor[" off (when shape " shaped") "]")))
 
-(defn- past-stringref-ns
-  "`off`, advanced past a stringref namespace head if one sits there.
+(defn- root-offset
+  "Where a document's root VALUE begins: 0, or past a stringref namespace head.
 
-  A tag 256 is an ENVELOPE, not a value: it says \"references inside here are
-  numbered from zero\", and `boring/decode` accordingly returns the item inside
-  it, never a tagged wrapper. A cursor has to agree, or an offset means
-  different things depending on whether the document happens to use stringrefs
-  -- and `(nav/cursor (nav/source blob ctx) 0)`, which is how a store reaches a
-  value, would land on the tag and fail `count` for exactly the documents
-  stringref-plus-index exists to serve.
+  A tag 256 at offset 0 is an ENVELOPE, not a value -- it says \"references
+  inside here are numbered from zero\" -- and `boring/decode` accordingly
+  returns the item inside it, never a tagged wrapper. `root` has to agree, or
+  `count` on the root cursor of a stringref document fails with \"count is only
+  defined for arrays and maps\".
 
-  ONE PLACE, deliberately. Doing this per accessor would leave each one free to
-  disagree, which is the shape of defect `container?` records between `zipper`
-  and the Cursor. Every cursor is built here.
-
-  Only ONE level is skipped, and one is all there is: `write-root!` opens a
-  single namespace at the root. A second would be foreign input, where the tag
-  keeps its ordinary meaning and the reader's own scoping applies."
-  ^long [^Reader r ^long off]
+  AT OFFSET 0 ONLY, and that restriction is the whole point. This began as a
+  skip applied inside `cursor-at`, to EVERY offset, and that was wrong twice:
+  a nested tag 256 in the middle of a document is genuine user data whose
+  namespace the reader must enter, and stepping past it made `realize` read the
+  inner item without one -- turning `[1 [\"hello\" \"hello\"] 3]` into a
+  `:boring/bad-stringref` throw. An explicit offset now means exactly the byte
+  it names, which is what `cursor`'s docstring has always promised."
+  ^long [^Reader r]
   (try
-    (if (and (= MAJOR-TAG (.majorAt r off))
-             (= 256 (.headArgAt r off)))
-      (.headEndAt r off)
-      off)
-    ;; A damaged or out-of-range offset is not this function's business -- it is
-    ;; already documented as trusted, and the accessors report what they find
-    ;; there. Answering `off` unchanged leaves that behaviour exactly as it was.
-    (catch Exception _ off)))
+    (if (and (.hasStringrefRoot r) (= MAJOR-TAG (.majorAt r 0)))
+      (.headEndAt r 0)
+      0)
+    (catch Exception _ 0)))
 
-(defn- cursor-at [^Nav nav ^long off]
-  (->Cursor nav (past-stringref-ns ^Reader (.rdr nav) off) nil))
+(defn- cursor-at [^Nav nav ^long off] (->Cursor nav off nil))
 
 ;; ------------------------------------------------ the two layers, and the
 ;;                                                   bridge between them
@@ -1545,9 +1538,16 @@
   because `(root bs)` is what a caller writes first and making them spell
   `(root (source bs))` buys nothing."
   ([s] (if (or (bytes? s) (instance? ByteSource s))
-         (cursor-at (source s nil) 0)
-         (cursor-at (source-of s) 0)))
-  ([src opts] (cursor-at (source src opts) 0)))
+         (root-cursor (source s nil))
+         (root-cursor (source-of s))))
+  ([src opts] (root-cursor (source src opts))))
+
+(defn- root-cursor
+  "A cursor at the document's root VALUE -- past a stringref envelope if there
+  is one. See `root-offset` for why only `root` does this and `cursor` does
+  not."
+  [^Nav nav]
+  (cursor-at nav (root-offset ^Reader (.rdr nav))))
 
 ;; ------------------------------------------------------- the offset layer
 ;;
@@ -2370,7 +2370,17 @@
   `boring.mmap` sources work too -- anything `source` accepts."
   [c src]
   (let [^Nav nav (.nav ^Cursor c)
-        ^Reader r (.rdr nav)]
+        ^Reader r (.rdr nav)
+        ;; READ BEFORE THE RESET, while the reader still holds the OLD bytes.
+        ;; A root cursor's offset is 0 on an ordinary document and past the
+        ;; envelope on a stringref one, so a cursor that was at the old root
+        ;; must land on the NEW root rather than keep a number that meant
+        ;; something about the previous document. Re-pointing a root cursor
+        ;; from a stringref document onto a plain one otherwise kept offset 3
+        ;; and read from the middle of the new value: `[1 2 [7 8 9]]` came back
+        ;; as `[7 8 9]`, no exception. This is the documented zero-allocation
+        ;; scan idiom, so a mixed store hit it on every other row.
+        at-root? (= (.off ^Cursor c) (root-offset r))]
     (cond
       (bytes? src) (.reset r ^bytes src)
       (instance? ByteSource src) (.reset r ^ByteSource src)
@@ -2386,7 +2396,15 @@
     ;; pointers into bytes that are gone. `.reset` above has already cleared the
     ;; table, so a document that turns out to have none simply refuses.
     (check-stringref-navigable! nav r)
-    c))
+    ;; A NEW CURSOR ONLY WHEN THE ROOT MOVED. `Cursor.off` is final, so the
+    ;; offset cannot be corrected in place; allocating here costs one object on
+    ;; the rows where the envelope actually changes shape, and nothing on a
+    ;; store whose blobs are written with one set of options -- which is every
+    ;; store, and why this was invisible until a mixed pair was tried.
+    (let [nr (root-offset r)]
+      (if (and at-root? (not= nr (.off ^Cursor c)))
+        (cursor-at nav nr)
+        c))))
 
 (defn- seq-node-ok?
   "Whether the SEQUENCE node's anchors describe this data section.

@@ -976,6 +976,34 @@
 (defn- write-seq-resolved!
   "`write-seq!` with options already resolved. See the note on its 3-arity."
   [^Writer w values ^java.io.OutputStream out o stride min-entries]
+  ;; A SEQUENCE CANNOT CARRY STRINGREF POINTERS, and this is a property of the
+  ;; format rather than a gap in the implementation.
+  ;;
+  ;; `write-root!` resets the writer per item, so EVERY top-level item opens its
+  ;; own namespace numbered from zero. The frame carries ONE table keyed by
+  ;; stringref index, so it can describe at most one of them -- and it described
+  ;; the last, because the symbol table only still holds that item's strings
+  ;; when the frame is sealed. Item 1's references then resolved against item
+  ;; N's literals: `{:alpha 1 :beta 2 :gamma {:alpha 3 :beta 4}}` read back as
+  ;; `{:alpha 1 :beta 2 :gamma {:zulu 3 :yankee 4}}`, silently.
+  ;;
+  ;; REFUSED HERE, not only at the public arity, because the public guard is
+  ;; going to be lifted for the single-value writers once their builder can
+  ;; emit pointers -- and a lift that reached this path would reintroduce
+  ;; exactly that wrong answer. Single values are what the pointer table is for
+  ;; and what a document store needs: a konserve blob is one top-level item.
+  ;;
+  ;; Supporting sequences would mean an item dimension in the element and a
+  ;; two-level lookup, for a shape nothing has asked for.
+  (when (and (pos? (long stride)) (:stringref o))
+    (throw (ex-info (str "boring: :stringref cannot be combined with :index in "
+                         "write-seq! -- each top-level item restarts the "
+                         "stringref namespace at index 0, so one index frame "
+                         "cannot describe them all. Use write-indexed! or "
+                         "encode-indexed for a single value, or pass "
+                         ":stringref false.")
+                    {:type :boring/incompatible-options
+                     :stringref true :index stride})))
   (let [stride (long stride)
         min-entries (long min-entries)
         indexing? (pos? stride)
