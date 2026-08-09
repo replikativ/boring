@@ -1240,6 +1240,12 @@
   independently and must decide the same way."
   64)
 
+(def ^:private ^:const unsorted-anchor-budget
+  "What an unsorted map's anchors may cost, as a divisor of its own bytes.
+  MUST equal `Writer.UNSORTED_ANCHOR_BUDGET` -- see it for the measurements
+  and for why this branch is gated on SIZE rather than on `walk`."
+  10)
+
 (defn- keep-node?
   "Whether a container is worth an index node. Mirrors `Writer.keepNode`.
 
@@ -1252,11 +1258,13 @@
   An UNSORTED MAP cannot be binary-searched, so at a stride above 1
   `boring.nav` REFUSES the node -- an anchor loop over an unordered map visits
   every entry exactly as a plain scan does. Writing one is pure cost, measured
-  at 0.43x-0.81x. At stride 1 it is usable and today's behaviour is unchanged."
+  at 0.43x-0.81x. At stride 1 it IS usable, and then costs one anchor per
+  entry, so it is gated on the share of the container's own bytes those
+  anchors take -- see `Writer.UNSORTED_ANCHOR_BUDGET`."
   ;; NO PRIMITIVE HINTS: a Clojure fn taking primitives is limited to four
-  ;; arguments, and this takes five. Boxing three longs at one call per
+  ;; arguments, and this takes six. Boxing four longs at one call per
   ;; container is not on any hot path -- the walk it gates is.
-  [map? sorted walk stride n]
+  [map? sorted walk stride n bytes]
   ;; ONE ANCHOR CANNOT ACCELERATE ANYTHING -- see `Writer.keepNode`. A
   ;; container of n <= stride entries gets a single anchor, which is its own
   ;; first entry, so the search lands where the reader already was.
@@ -1267,7 +1275,8 @@
                          (inc (quot (dec (long n)) (long stride)))))) 2)
        (if (or (not map?) sorted)
          (>= (long walk) walk-threshold)
-         (= (long stride) 1))))
+         (and (= (long stride) 1)
+              (<= (* unsorted-anchor-budget (long n)) (long bytes))))))
 
 (defn- frame-payload-array?
   "Is the container at `p` the 2-element `[name, args]` array of a TAG-27 FRAME?
@@ -1485,7 +1494,10 @@
                                     out))]
                 ;; FLOOR DIVISION, matching `Writer.fillNode`. `walk-acc` is
                 ;; the sum of per-entry prefixes; `walk` is their mean.
-                (when (keep-node? map? sorted walk stride n)
+                ;; `(- end p)` is the container's own byte span, in the
+                ;; reader's own coordinates -- `base` belongs to the node's
+                ;; OFFSET, not to its length.
+                (when (keep-node? map? sorted walk stride n (- (long end) (long p)))
                   (.add acc [(int (+ base p)) (int n) kept sorted walk]))))
             end))))))
 

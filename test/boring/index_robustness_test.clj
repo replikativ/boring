@@ -1676,9 +1676,16 @@
 
             The index-free reader is the control: `decode` consults no index, so
             frame damage may never change what IT sees."
+    ;; THE VALUES ARE STRINGS, not integers. An unsorted map is indexed only
+    ;; at stride 1, where it costs ONE ANCHOR PER ENTRY -- so it earns a node
+    ;; only when those anchors are a small share of the container. Twenty
+    ;; scalar pairs are ~140 bytes against 20 anchors, which is not, and the
+    ;; fixture collapsed to a single node again. Twelve-character values put
+    ;; the container comfortably over.
     (let [doc (vec (for [i (range 40)]
                      (into {} (for [j (range 20)]
-                                [(format "k%02d" j) (+ (* 100 i) j)]))))
+                                [(format "k%02d" j)
+                                 (format "v%03d-%06d" j (+ (* 100 i) j))]))))
           ;; STRIDE 1, not 16. The inner maps are UNSORTED, and an unsorted
           ;; map cannot be binary-searched -- so above stride 1 `boring.nav`
           ;; refuses its node and the writer no longer emits one. At stride 16
@@ -1717,7 +1724,8 @@
             never had more than one node to get wrong"
     (let [doc (vec (for [i (range 40)]
                      (into {} (for [j (range 20)]
-                                [(format "k%02d" j) (+ (* 100 i) j)]))))
+                                [(format "k%02d" j)
+                                 (format "v%03d-%06d" j (+ (* 100 i) j))]))))
           ;; Stride 1, matching the property above and for the same reason:
           ;; these inner maps are unsorted, and an unsorted map earns no node
           ;; above stride 1 because the reader would refuse it anyway.
@@ -1729,7 +1737,7 @@
       ;; byte offset into the frame and there is nothing to `alength`.
       (is (< 1 (long (:containers ix)))
           "and has many nodes, which is the whole point of this fixture")
-      (is (= 1907 (some-> (nav/walk (nav/root clean o) [19 "k07"]) nav/value))
+      (is (= "v007-001907" (some-> (nav/walk (nav/root clean o) [19 "k07"]) nav/value))
           "and a key in a middle node reads correctly"))))
 
 (deftest a-sequence-node-claiming-no-items-must-be-backed-by-no-data

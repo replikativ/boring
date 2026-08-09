@@ -772,15 +772,20 @@
   builders decide with it independently and must decide the same way."
   64)
 
+(def ^:private unsorted-anchor-budget
+  "What an unsorted map's anchors may cost, as a divisor of its own bytes. MUST
+  equal `Writer.UNSORTED_ANCHOR_BUDGET` and the JVM `unsorted-anchor-budget`."
+  10)
+
 (defn- keep-node?
   "Whether a container is worth an index node. Mirrors `Writer.keepNode` and
   the JVM `keep-node?` -- see the JVM version for why the two rules differ."
-  [map? sorted walk stride n]
+  [map? sorted walk stride n bytes]
   ;; ONE ANCHOR CANNOT ACCELERATE ANYTHING -- see `Writer.keepNode`.
   (and (>= (if (<= n 0) 0 (if (== stride 1) n (inc (quot (dec n) stride)))) 2)
        (if (or (not map?) sorted)
          (>= walk walk-threshold)
-         (== stride 1))))
+         (and (== stride 1) (<= (* unsorted-anchor-budget n) bytes)))))
 
 (defn- index-walk*
   "Walk the value at `p`, returning where it ends, accumulating nodes into `acc`.
@@ -867,7 +872,7 @@
               ;; FLOOR DIVISION, matching `Writer.fillNode` and the JVM walk.
               (let [sorted (boolean (and srt (aget srt 0)))
                     walk (if (pos? n) (quot (aget walk-acc 0) n) 0)]
-                (when (keep-node? map? sorted walk stride n)
+                (when (keep-node? map? sorted walk stride n (- end p))
                   (.push acc [(+ p base) n (vec kept) sorted walk]))))
             end))))))
 
