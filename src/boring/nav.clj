@@ -116,7 +116,8 @@
 
 ;; ---------------------------------------------------------------- the source
 
-(declare slot-at sorted-at? container-at count-at)
+(declare slot-at sorted-at? container-at count-at check-stringref-navigable!
+         byte-string-at)
 
 ;; A TYPE, not a fifteen-key map. `index-payload` used to return one, and on a
 ;; source that is read ONCE -- which is every read of a store handing out a
@@ -474,13 +475,6 @@
         ;; A context applies its pre-resolved config; everything else resolves
         ;; the map here, exactly as before.
         _ (if cfg (boring/apply-reader-config! r cfg) (boring/configure-reader! r opts))]
-    (when (.hasStringrefRoot r)
-      (fail :boring/stringref-not-navigable
-            (str "boring.nav: this document opens a stringref namespace, and a "
-                 "cursor holding only an offset cannot resolve one. Re-encode "
-                 "with {:stringref false} to navigate it, or decode it whole "
-                 "with boring/decode.")
-            {}))
     ;; ONE Nav, not two. The delay has to close over the Nav it will read from,
     ;; and the Nav has to hold the delay, so this used to build a throwaway Nav
     ;; purely to be captured -- two Navs and two shape atoms per source, on a
@@ -495,9 +489,42 @@
     ;; document with no frame costs nothing to find that out, and one with a
     ;; frame pays only if something consults it. See `nav-idx` for why this is
     ;; not a `delay` any more -- 96 bytes per source, on every source.
-    (Nav. r opts probes
-          (when-not (= :ignore (:trust-index opts)) (volatile! ::unparsed))
-          (volatile! src) (volatile! nil))))
+    (let [nav (Nav. r opts probes
+                    (when-not (= :ignore (:trust-index opts)) (volatile! ::unparsed))
+                    (volatile! src) (volatile! nil))]
+      (check-stringref-navigable! nav r)
+      nav)))
+
+(defn- check-stringref-navigable!
+  "Refuse a stringref document that carries no pointer table.
+
+  A cursor holds an offset, and a stringref is an index into a table built by
+  decoding every preceding string -- so without help it cannot resolve one, and
+  this used to be a flat refusal for every document opening a namespace. The
+  help is the index frame's pointer table: with it, a reference resolves by
+  jumping to where the string was written. So the question is no longer \"does
+  this document use stringrefs\" but \"can this one's references be resolved\".
+
+  THE INDEX PARSE IS FORCED HERE, against the laziness `nav-idx` exists for,
+  and only for documents that open a namespace. Those were refused outright
+  until now, so the open they pay is not a regression on anything -- and a
+  document without a namespace, which is every `:index`-written file today,
+  never reaches this and stays lazy.
+
+  `:trust-index :ignore` has no Index at all, so it refuses -- correctly:
+  ignoring the index means ignoring the only thing that could resolve a
+  reference."
+  [^Nav nav ^Reader r]
+  (when (.hasStringrefRoot r)
+    (nav-idx nav)
+    (when-not (.hasStringrefPointers r)
+      (fail :boring/stringref-not-navigable
+            (str "boring.nav: this document opens a stringref namespace and its "
+                 "index carries no stringref pointer table, so a cursor holding "
+                 "only an offset cannot resolve a reference. Seal it with an "
+                 "index, re-encode with {:stringref false}, or decode it whole "
+                 "with boring/decode.")
+            {}))))
 
 (defn- fork-nav ^Nav [^Nav n]
   (let [src @(.src n)
@@ -2236,14 +2263,15 @@
       :else (fail :boring/unsupported-source
                   "boring.nav: expected a byte[] or a ByteSource"
                   {:got (class src)}))
-    (when (.hasStringrefRoot r)
-      (fail :boring/stringref-not-navigable
-            (str "boring.nav: this document opens a stringref namespace, and a "
-                 "cursor holding only an offset cannot resolve one.")
-            {}))
     (vreset! (.src nav) src)
     (when-let [v (.idx nav)] (vreset! v ::unparsed))
     (vreset! (.views nav) nil)
+    ;; AFTER the invalidation, not before. The check forces the index parse, and
+    ;; parsing is what installs the new document's pointer table -- run it while
+    ;; `.idx` still held the PREVIOUS document's Index and the reader would keep
+    ;; pointers into bytes that are gone. `.reset` above has already cleared the
+    ;; table, so a document that turns out to have none simply refuses.
+    (check-stringref-navigable! nav r)
     c))
 
 (defn- seq-node-ok?
@@ -2310,8 +2338,47 @@
         e1 (.skipFrom r e0)                     ; containers
         e2 (.skipFrom r e1)                     ; counts
         e3 (.skipFrom r e2)                     ; slots
-        e4 (.skipFrom r e3)]                    ; sorted
-    [e0 e1 e2 e3 e4]))
+        e4 (.skipFrom r e3)                     ; sorted
+        ;; The element AFTER `sorted`: `data-end` in a six-element payload, the
+        ;; stringref pointer table in a seven-element one. Which it is cannot be
+        ;; decided here -- the payload's element COUNT says so, and the caller
+        ;; has already read that off the array head.
+        e5 (.skipFrom r e4)]
+    [e0 e1 e2 e3 e4 e5]))
+
+(def ^:private ^:const stringref-layout-v1 1)
+
+(defn- stringref-table-at
+  "The stringref pointer table at `p` as `[base count iw ow]`, or nil.
+
+  Element 5 of a seven-element payload: `(index -> defining offset)` for the
+  entries some tag 25 actually references, so a cursor holding an offset can
+  resolve one by JUMPING to where the string was written instead of by having
+  decoded every string before it. See `boring.core/pack-stringrefs`.
+
+  ONE O(1) GATE, matching the one the slot table gets. The count is not stored,
+  so `(dec len)` must divide exactly by the pair width -- a single modulo rather
+  than a sum over N. Per-entry validation is deliberately NOT done here: the
+  reader bounds-checks every byte it loads through the table and refuses any
+  target that is not a string, so a damaged entry costs one lookup, not the
+  open. Validating N entries at open would put the cost on every document to
+  catch a fault that only matters on the ones that have it.
+
+  nil for any shape this does not recognise, which the caller treats as
+  \"no pointer table\" -- the same answer a six-element payload gives."
+  [^Reader r ^long p]
+  (when-let [[data len] (byte-string-at r p)]
+    (let [len (long len)]
+      (when (>= len 2)
+        (let [lay (.byteAt r (long data))
+              iw (bit-shift-left 1 (bit-and (unsigned-bit-shift-right lay 4) 3))
+              ow (bit-shift-left 1 (bit-and (unsigned-bit-shift-right lay 6) 3))
+              pw (+ iw ow)
+              body (dec len)]
+          (when (and (= stringref-layout-v1 (bit-and lay 0xF))
+                     (zero? (rem body pw))
+                     (pos? (quot body pw)))
+            [(inc (long data)) (quot body pw) iw ow]))))))
 
 (defn- anchor-count
   "How many anchors a container of `n` entries carries at `stride`. Must agree
@@ -2680,9 +2747,28 @@
           ;; the `.readFrom` vector, so `payload-offsets` ran BEFORE the override
           ;; and `slot-table` ran AFTER the restore. Invisible, and a trap to
           ;; preserve blindly.
-          [off-stride off-containers off-counts off-slots off-sorted]
+          [off-stride off-containers off-counts off-slots off-sorted off-after]
           (try (payload-offsets r ptr)
-               (catch Exception _ [nil nil nil nil nil]))
+               (catch Exception _ [nil nil nil nil nil nil]))
+          ;; THE PAYLOAD'S ELEMENT COUNT decides what `off-after` names. Six
+          ;; elements and it is `data-end`; seven and it is the stringref
+          ;; pointer table, with `data-end` after it. `read-index*` has already
+          ;; checked this byte is one of 0x86-0x8f, so the subtraction is safe.
+          payload-n (try (- (.byteAt r (+ ptr frame/prefix-head-length)) 0x80)
+                         (catch Exception _ 6))
+          ;; PUSHED ONTO THE READER, not carried on the Index. #12 took the
+          ;; Reader off Index so a forked navigator could not read through a
+          ;; stale one; carrying the table the other way would re-tie that knot.
+          ;; Set unconditionally -- including the (0 0 0 0) that clears it --
+          ;; because a Reader is reused across documents and a table left over
+          ;; from the previous one names offsets into bytes that are gone.
+          _ (let [t (when (and off-after (>= (long payload-n) 7))
+                      (try (stringref-table-at r (long off-after))
+                           (catch Exception _ nil)))]
+              (if t
+                (.setStringrefPointers r (long (nth t 0)) (int (nth t 1))
+                                       (int (nth t 2)) (int (nth t 3)))
+                (.setStringrefPointers r 0 0 0 0)))
           ;; STRIDE POSITIONALLY, which removes the last `.readFrom` from this
           ;; function. A uint under 2^63; a negint is major 1, a bignum major 6,
           ;; a float major 7, and a uint64 above 2^63 comes back negative -- so

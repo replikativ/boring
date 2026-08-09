@@ -1340,6 +1340,15 @@ public final class Reader {
      *  remembering. Checked before every use of the incremental table. */
     private boolean srOffsetMode() { return srPtrCount > 0; }
 
+    /**
+     * Whether a pointer table has been installed.
+     *
+     * The navigator asks this to decide whether a stringref document is
+     * navigable at all: with a table a cursor can resolve a reference, without
+     * one it cannot, and that is the whole of the difference.
+     */
+    public boolean hasStringrefPointers() { return srPtrCount > 0; }
+
     /** Little-endian unsigned value of `w` bytes at `p`. Every byte goes
      *  through `b`, which bounds-checks and raises a typed truncated-input. */
     private long srLe(long p, int w) {

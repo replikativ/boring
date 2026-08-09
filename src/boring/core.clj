@@ -2069,7 +2069,22 @@
             ;; and write-to!'s 3-arity resolves again -- which throws for every
             ;; profile that locks a key, the same double-resolution trap as
             ;; `write-seq!`'s 3-arity.
-            (let [n (long (.position ^Writer (write-root! w item opts)))]
+            ;;
+            ;; THE FRAME IS NEVER WRITTEN INSIDE A STRINGREF NAMESPACE, whatever
+            ;; the data's options are. `write-root!` opens one whenever
+            ;; `:stringref` is set, and that prepends `d9 01 00` to the frame --
+            ;; which shifts the whole 17-byte prefix `read-index` compares
+            ;; against, so the frame stops being recognised and the index is
+            ;; SILENTLY DEAD. The comment below records this happening once
+            ;; before, when the frame picked up the writer's options instead of
+            ;; the caller's; now that `:stringref` and `:index` can be combined
+            ;; it would happen to every indexed document rather than to a
+            ;; mismatched few.
+            ;;
+            ;; Nothing is lost: a frame's only text is `boring/index`, which
+            ;; occurs once, and the namespace resets per top-level item anyway,
+            ;; so the data's own references are unaffected by this.
+            (let [n (long (.position ^Writer (write-root! w item (assoc opts :stringref false))))]
               (.write out (.buffer w) 0 (int n))
               n))]
     (let [{:keys [stride ^longs containers counts slots sorted stringrefs]} index
