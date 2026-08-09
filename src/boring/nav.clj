@@ -1434,6 +1434,74 @@
   another. Make it from the same source or context you will use it with."
   ^bytes [s k] (probe-for (source-of s) k))
 
+;; `walk` is defined further down, with the cursor layer it belongs to.
+;; `walk-from` hands it the tail of a path that reaches a tag view.
+(declare walk)
+
+(defn walk-from
+  "The OFFSET at `path` from `off`, without building a cursor for any step.
+
+  The offset-layer twin of `walk`, and the primitive a projection over many
+  rows wants: `walk` takes and returns a Cursor, so a scan pays two
+  allocations per row for objects it throws away. Measured on a four-step path,
+  same answer both ways: 304.6 B/row through cursors against 80.6 through
+  offsets, the remainder being the returned value itself.
+
+  Answers exactly what `walk` answers -- it is the same loop over the same
+  `lookup-map`/`nth-item`, so an integer step is a POSITION on an array and a
+  KEY on a map, decided from the container, and every step CONSULTS THE INDEX.
+  That last point is why this is here rather than in a caller: the index lives
+  on the source, and a walker written over `Reader`'s positional primitives
+  cannot reach it. konserve-lmdb wrote such a walker twice and it disagreed
+  with this namespace twice.
+
+  Returns:
+
+    >= 0  the offset
+      -1  a step was absent
+      -2  the path ends somewhere NO OFFSET CAN NAME -- a row of a shaped
+          array, whose bytes are an array while its value is a map. Returning
+          the array's offset would answer a vector where the truth is a map,
+          so it is refused instead. `value-at` and the other offset readers
+          reject both negatives, so composing them is correct by default;
+          a caller that wants shaped rows should use `walk`.
+
+  `:shapes` is off unless asked for, so -2 is unreachable for most callers."
+  ^long [s ^long off path]
+  (let [^Nav nav (source-of s)
+        ;; INDEXED, NOT SEQ-WALKED, and that is most of what this function
+        ;; saves. `(seq path)` and a `next` per step allocate a cell each --
+        ;; on a four-step path that measured 160 of the 224 bytes a row was
+        ;; spending, more than the two Cursors this exists to avoid. A vector
+        ;; is `nth`-able in O(1) with no allocation at all, so the path is
+        ;; coerced ONCE and then indexed.
+        ^clojure.lang.IPersistentVector kv (if (vector? path) path (vec path))
+        n (.count kv)]
+    (if (neg? off)
+      -1
+      (loop [o (long off) i 0]
+        (if (= i (long n))
+          o
+          (let [k (.nth kv i)
+                mj (major nav o)]
+            (if (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP))
+              (let [p (if (= mj MAJOR-ARRAY)
+                        ;; A NON-INTEGER KEY ON AN ARRAY IS ABSENT, as `get`
+                        ;; says and as `clojure.core/get-in` says. See `walk`.
+                        (if (integer? k) (nth-item nav o (long k)) -1)
+                        (lookup-map nav o k))]
+                (if (neg? (long p)) -1 (recur (long p) (inc (long i)))))
+              ;; A TAG OR A SCALAR. The views -- records, shaped arrays, typed
+              ;; arrays -- live on the cursor layer, so the tail is handed to
+              ;; `walk` rather than reimplemented. One walker, one set of
+              ;; answers, which is the whole reason `walk` is public.
+              (if-let [c2 (get (cursor-at nav o) k)]
+                (let [fin (walk c2 (subvec kv (inc (long i))))]
+                  (cond (nil? fin) -1
+                        (.shape ^Cursor fin) -2
+                        :else (.off ^Cursor fin)))
+                -1))))))))
+
 (defn field-offset
   "Byte offset of the value for key `k` in the map at `off`, or -1.
 
@@ -1629,8 +1697,29 @@
             (let [k (first ks)
                   mj (major nav off)]
               (if (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP))
-                (let [p (if (and (= mj MAJOR-ARRAY) (integer? k))
-                          (nth-item nav off (long k))
+                (let [p (if (= mj MAJOR-ARRAY)
+                          ;; A NON-INTEGER KEY ON AN ARRAY IS ABSENT.
+                          ;;
+                          ;; It used to fall through to `lookup-map`, which
+                          ;; reads the container as a MAP -- `n` pairs where
+                          ;; there are `n` elements -- and that is not a slow
+                          ;; path or a typed refusal, it is a WRONG ANSWER:
+                          ;;
+                          ;;   (get-in {"arr" ["k1" "v1"]} ["arr" "k1"])  ; nil
+                          ;;   (walk    cursor             ["arr" "k1"])  ; "v1"
+                          ;;
+                          ;; nav's own `get` chain answers nil, so `walk`
+                          ;; disagreed with `get-in`, with `get`, and with the
+                          ;; rule its own docstring states. On a short document
+                          ;; the over-read runs off the end and raises
+                          ;; `:boring/truncated-input` instead; which of the
+                          ;; two you get depends on what follows the array.
+                          ;;
+                          ;; Found by property-testing `walk-from` against
+                          ;; `walk` -- neither walker was wrong relative to the
+                          ;; other, so only comparing both to `get` could show
+                          ;; it.
+                          (if (integer? k) (nth-item nav off (long k)) -1)
                           (lookup-map nav off k))]
                   (if (neg? p) nil (recur p (next ks))))
                 ;; ANYTHING ELSE GOES THROUGH `get`, which is the only place

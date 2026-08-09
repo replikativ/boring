@@ -33,6 +33,9 @@
    asserted to STILL diverge, so the suite is green today and a fix turns the
    assertion red until the row is removed. A ratchet, not a wish list."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.test.check.clojure-test :refer [defspec]]
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop]
             [boring.core :as boring]
             [boring.nav :as nav]
             [boring.conformance :as c]
@@ -490,3 +493,97 @@
         (is (thrown? clojure.lang.ExceptionInfo
                      (nav/reduce-kv-at s (nav/field-offset s 0 :tags) (fn [a _ _] a) nil))
             "reduce-kv-at on an array")))))
+
+;; ------------------------------------------------- walk-from against walk
+
+(defspec walk-from-answers-exactly-what-walk-answers 400
+  ;; TWO WALKERS AGAIN, which is the thing this namespace keeps having to stop.
+  ;; `walk-from` exists because a projection over many rows should not allocate
+  ;; a Cursor per row to throw away -- but the moment it is a second loop over
+  ;; the same containers it can disagree, and konserve-lmdb has twice shipped a
+  ;; hand-rolled walker that got an integer step wrong in a different
+  ;; direction. Held to `walk` by property rather than by reading.
+  (prop/for-all [v (gen/one-of
+                    [(gen/map gen/string-alphanumeric
+                              (gen/map gen/string-alphanumeric gen/small-integer
+                                       {:max-elements 4})
+                              {:max-elements 4})
+                     (gen/vector (gen/vector gen/small-integer 0 4) 0 4)
+                     (gen/map gen/string-alphanumeric
+                              (gen/vector gen/small-integer 0 5) {:max-elements 4})])
+                 path (gen/vector (gen/one-of [gen/string-alphanumeric
+                                               (gen/choose 0 5)])
+                                  0 3)]
+    (let [o {:profile :clojure :stringref false :index 4 :index-min 2}
+          bs (boring/encode-indexed v o)
+          src (nav/source bs o)
+          off (nav/walk-from src 0 path)
+          cur (nav/walk (nav/root bs o) path)]
+      (and (not= -2 off)                       ; unreachable without :shapes
+           (if (neg? off)
+             (nil? cur)
+             (and (some? cur) (= (nav/value-at src off) (nav/value cur))))))))
+
+(deftest a-non-integer-key-on-an-array-is-absent-not-a-map-lookup
+  (testing "`walk` returned a WRONG VALUE for a string step onto an array.
+
+            It fell through to `lookup-map`, which reads the container as a MAP
+            -- `n` pairs where there are `n` elements -- so a four-element
+            array of alternating strings answered as if it were the map those
+            strings spell:
+
+              (get-in {\"arr\" [\"k1\" \"v1\"]} [\"arr\" \"k1\"])   ; nil
+              (walk    cursor              [\"arr\" \"k1\"])   ; \"v1\"
+
+            nav's own `get` chain answered nil, and so does `clojure.core`, so
+            `walk` disagreed with both and with the rule its own docstring
+            states. On a short document the over-read runs past the end and
+            raises `:boring/truncated-input` instead -- which of the two you
+            get depends on what happens to follow the array.
+
+            PRE-EXISTING, and found only by property-testing `walk-from`
+            against `walk`: the two walkers agreed with each other, because
+            both had it. Comparing them to `get` is what showed it."
+    (let [o {:profile :clojure :stringref false :index 16 :index-min 2}]
+      ;; Long enough that the over-read stays IN BOUNDS and returns a value.
+      (let [v {"arr" ["k1" "v1" "k2" "v2"] "pad" (vec (range 40))}
+            bs (boring/encode-indexed v o)
+            root (nav/root bs o)
+            src (nav/source bs o)]
+        (is (nil? (nav/walk root ["arr" "k1"]))
+            "a string step onto an array is absent, as `get-in` says")
+        (is (= -1 (nav/walk-from src 0 ["arr" "k1"]))
+            "and the offset layer agrees")
+        (is (= "v1" (nav/value (nav/walk root ["arr" 1])))
+            "while an integer step still indexes it"))
+      ;; Short enough that the over-read runs off the end.
+      (let [v [["a"] ["b" "c"]]
+            bs (boring/encode-indexed v o)
+            root (nav/root bs o)
+            src (nav/source bs o)]
+        (is (nil? (nav/walk root [""]))
+            "and where it used to throw, it is simply absent")
+        (is (= -1 (nav/walk-from src 0 [""])))))))
+
+(deftest walk-from-refuses-what-no-offset-can-name
+  (testing "A ROW OF A SHAPED ARRAY has no offset that means it: its bytes are
+            an array while its value is a map, so returning the array's offset
+            would answer a vector where the truth is a map. `walk` can express
+            it -- a Cursor carries the shape -- and `walk-from` cannot, so it
+            says so with -2 rather than returning a plausible wrong offset.
+
+            The offset readers refuse every negative, so the natural
+            composition is correct without the caller thinking about it."
+    (let [v (vec (for [i (range 6)] {"a" i "b" (str i)}))
+          o {:profile :clojure :stringref false :shapes true :index 4 :index-min 2}
+          bs (boring/encode-indexed v o)
+          src (nav/source bs o)]
+      (is (= -2 (nav/walk-from src 0 [2]))
+          "a shaped row cannot be named by an offset")
+      (is (= {"a" 2 "b" "2"} (nav/value (nav/walk (nav/root bs o) [2])))
+          "and `walk` still answers it, which is why the two both exist")
+      (is (thrown? clojure.lang.ExceptionInfo (nav/value-at src -2))
+          "and the sentinel cannot be read as a value by accident")
+      ;; Through the row to a scalar, the answer IS nameable.
+      (is (= 2 (nav/value-at src (nav/walk-from src 0 [2 "a"])))
+          "a path that continues THROUGH a row lands somewhere an offset means"))))
