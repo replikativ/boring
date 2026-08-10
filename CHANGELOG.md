@@ -128,9 +128,12 @@ here.
   is not `ILookup`, and a silently empty projection is exactly what this change
   must not cause.
 
-  `source-at` is deprecated in favour of `cursor`, which is the same function
-  under a name that says what it returns. New: `root`, `cursor`, `offset`,
-  `source-of`. The bridge is exact — `(cursor (source-of c) (offset c))` is
+  `source-at` and `end-at` are **removed** in favour of `cursor`, which is the
+  same function under a name that says what it returns. (They were briefly
+  deprecated-but-present; since this release is the first to carry any of it,
+  shipping a deprecation for something no released version had would be
+  advertising a migration nobody needs to make.) New: `root`, `cursor`,
+  `offset`, `source-of`, `root-offset`. The bridge is exact — `(cursor (source-of c) (offset c))` is
   `c`, for everything except a shaped row, whose `shape` is cursor state an
   offset cannot carry.
 
@@ -169,8 +172,10 @@ here.
   still skips the index entirely.
 
 - **The index frame is recognised with six *through fifteen* payload
-  elements**, where it previously required exactly six. Nothing writes more
-  than six. This is forward compatibility, and the reason it matters is that
+  elements**, where it previously required exactly six. Six and **seven** are
+  written: seven when the document opens a stringref namespace, the extra
+  element being the pointer table. This is forward compatibility, and the
+  reason it matters is that
   the failure mode of *not* recognising a frame is the worst one available: a
   reader that does not recognise it never learns where the data section ends,
   so the frame is republished as a trailing **data** item and a file of N

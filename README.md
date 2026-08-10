@@ -289,9 +289,10 @@ a jump** — opt-in, and a pure optimisation: the answers are identical, and a
 missing, truncated or stale index falls back to scanning.
 
 ```clojure
-;; ONE large value you will navigate into. `encode-indexed` seals an index
-;; onto it and implies :stringref false, so you no longer pass it yourself.
-(def ibs (boring/encode-indexed customers))
+;; ONE large value you will navigate into. `encode-indexed` seals an index onto
+;; it and KEEPS stringref -- see below; the index frame is what makes a
+;; stringref document navigable at all.
+(def ibs (boring/encode-indexed customers {:profile :archival}))
 
 (boring/decode ibs)                              ; => the map, unchanged
 (nav/value (get-in (nav/root ibs) ["customer-137" "name"]))   ; => "name-137"
@@ -299,7 +300,21 @@ missing, truncated or stale index falls back to scanning.
 
 The result is a two-item CBOR sequence — the value, then the index — so
 `decode` still returns the value and any CBOR reader in any language consumes
-both. Here it cost **1.37%** on the wire.
+both. Here it cost **1.17%** on the wire, for one container node.
+
+**`:archival` is doing real work in that call, and the default would not.**
+Anchors only pay where a lookup can use them, so `keep-node?` refuses an
+*unsorted* map at a stride above 1 — without key order you must try every
+anchor's span anyway, which is the scan you were avoiding, plus the jumps.
+`customers` is a hash map, so under the default profile this frame comes back
+with **zero container nodes** and that `get-in` scans exactly like the
+unindexed line above it. `:archival` sorts the keys canonically, which is what
+makes the binary search legal.
+
+An earlier version of this example omitted the profile and quoted the saving
+from a differently-shaped payload. It was measuring a frame that carried
+nothing but the stringref pointer table. See [INDEX.md](doc/INDEX.md) for
+when a node is kept.
 
 For a log, `write-seq!` indexes by default and `nav/items` uses it:
 
@@ -324,16 +339,16 @@ For a log, `write-seq!` indexes by default and `nav/items` uses it:
 On 200 000 small items, reaching the **last** one is a jump of about a
 microsecond instead of a scan of about twelve milliseconds, for **0.34%** more
 file at the default stride. The table with every stride, and the harness that
-produces it, live in [doc/SHAPES.md](doc/SHAPES.md#stride-is-a-parameter-not-a-constant) —
+produces it, live in [doc/INDEX.md](doc/INDEX.md#stride-is-a-parameter-not-a-constant) —
 `clojure -M:bench -m nav index`. This paragraph used to restate its own set of
 figures for the same corpus, and three of the four disagreed with that table.
 
 Build `items` once and reuse it; constructing it reads the index frame, so
 folding that into every lookup measures setup rather than the jump.
 
-Two things the **first** example is carrying, both of which used to be silent —
-and neither applies to the indexed forms above, which set `:stringref false`
-themselves:
+Two things the **first** example is carrying, both of which used to be silent.
+Neither applies to the indexed forms above — not because those turn stringref
+off, which they no longer do, but because the index frame resolves it:
 
 **Index it, and stringref stops being a problem.** boring writes stringref by
 default, and a stringref is an index into a table built from every preceding
@@ -421,6 +436,8 @@ wire, which is where it is exercised on real data.
 - [Compatibility](doc/COMPATIBILITY.md) — the format promise and how it is enforced
 - [Security](doc/SECURITY.md) — threat model, and what is explicitly not guaranteed
 - [Shapes](doc/SHAPES.md) — the key-stripping extension, shipped and proposed
+- [Index](doc/INDEX.md) — the offset index: frame layout, how navigation turns
+  a node into a jump, and where it does not pay
 - [Storage](doc/STORAGE.md) — navigation, memory mapping, log writing,
   compression, and in-place update
 - [Migrate codec](doc/MIGRATE-CODEC.md) — boring vs clj-cbor vs EDN-lines as a

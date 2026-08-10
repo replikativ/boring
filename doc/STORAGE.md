@@ -96,29 +96,56 @@ everything in a small value, `decode` is the cheaper call.
 
 ### Constraints, enforced rather than documented
 
-- **`:stringref false` is required.** A stringref is an index into a table
-  built from every preceding string, so a cursor holding only an offset cannot
-  resolve one. Navigating a stringref document is refused, not silently wrong.
-  boring writes stringref *by default*, so this is a decision at write time.
+- **A stringref document needs an INDEX to be navigable**, not `:stringref
+  false`. A stringref is an index into a table built from every preceding
+  string, so a cursor holding only an offset cannot resolve one by itself — the
+  index frame therefore carries a *pointer table* mapping each referenced index
+  to the offset where that string was defined. `encode-indexed` writes it.
+  A stringref document with **no** index is refused, not silently wrong; so is
+  one read under `{:trust-index :ignore}`, since ignoring the index ignores the
+  table. (This used to say `:stringref false` was required, and it was, until
+  the pointer table existed.)
 - **Indefinite-length containers cannot be descended.** Their count is not on
   the wire, so `count` could not be O(1) and `Counted` would be lying. boring
   never emits them; only a foreign streaming encoder will.
-- **Tags are opaque.** `get` on a tagged value realises it through the ordinary
-  reader and continues with `clojure.core/get`. A tag's reader is an arbitrary
-  function, so structure does not imply semantics — the slow path *is* the
-  reference implementation, which is what makes the fast path safe to trust.
-  A consequence: positional records (a tag 27 wrapping a vector, as datahike's
-  `Datom` uses) can be reached but not descended into.
+- **Tags are opaque *by default*.** `get` on a tagged value realises it through
+  the ordinary reader and continues with `clojure.core/get`. A tag's reader is
+  an arbitrary function, so structure does not imply semantics — the slow path
+  *is* the reference implementation, which is what makes the fast path safe to
+  trust. A consequence: positional records (a tag 27 wrapping a vector, as
+  datahike's `Datom` uses) can be reached but not descended into.
+
+  **Three tags do have structural descent**, because boring wrote them and
+  knows they preserve structure: shaped arrays (39649), records (27) and RFC
+  8746 typed arrays. A cursor on one presents its contents without realising
+  it — a shaped row answers `get` as a map while its bytes are an array. See
+  [PERFORMANCE.md](PERFORMANCE.md). `boring.core/declare-navigable-record` is
+  the extension point for adding your own.
 
 ### The index frame's format, and what is frozen about it
 
 These are cheap to state now and impossible to retrofit, so they are stated.
 
-**The payload is six elements, and readers accept six through fifteen.**
-`boring.frame/prefix-bytes` is 17 exact bytes ending in `0x86` — "array of 6" —
-and that is what this library writes. Readers compare the first 16 and then
-accept any array head from `0x86` to `0x8f`, so a future widening is
-*recognised* rather than mistaken for data.
+**The payload is six or seven elements, and readers accept six through
+fifteen.** Six without a stringref namespace, seven with one — the extra
+element is the stringref pointer table, and it sits between `sorted` and
+`data-end`:
+
+```
+[stride, containers, counts, slots, sorted, data-end]                six
+[stride, containers, counts, slots, sorted, stringrefs, data-end]    seven
+```
+
+**`data-end` is always last, whatever the count**, which is what lets a reader
+find it without knowing the width: the trailing back-pointer already *is* it.
+Everything else is positional, so a reader takes the element count off the
+array head and uses it to decide whether element 5 is `data-end` or the pointer
+table.
+
+`boring.frame/prefix-bytes` is 17 exact bytes ending in `0x86`; readers compare
+the first 16 and then accept any array head from `0x86` to `0x8f`, so a future
+widening is *recognised* rather than mistaken for data. (This section said six
+was "what this library writes", and it was until the pointer table.)
 
 That distinction is the whole point, and it is worth stating why. A reader that
 does not recognise a frame never learns `data-end`, so the frame is republished
@@ -253,10 +280,16 @@ there instead.
 
 Four things follow from the default:
 
-- **`:stringref false` is forced** whenever a stride is set, and passing
-  `:stringref true` alongside `:index` throws rather than one silently winning.
-  On a sequence this costs nothing — the stringref table resets per top-level
-  item, so short records never amortise it and dropping it is a ~1.5% *saving*.
+- **`:stringref false` is forced on a SEQUENCE**, and `write-seq!` throws on an
+  explicit `:stringref true` rather than dropping it silently. It costs nothing
+  there — the stringref table resets per top-level item, so short records never
+  amortise it and dropping it is a ~1.5% *saving*.
+
+  It is **not** forced for a single document: `encode-indexed` and
+  `write-indexed!` keep stringref and are smaller for it, because one document
+  is one namespace and one index frame can carry its pointer table. (This
+  paragraph said the force applied "whenever a stride is set", which was true of
+  all three entry points once and is now true of one.)
 - **A sequence too small to benefit gets no frame at all.** `:index-min`
   (default 16) gates it, so 15 small items cost no more than they did before.
 - **`decode-seq` hides the frame.** You get your items, not your items plus a

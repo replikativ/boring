@@ -555,13 +555,26 @@
   (when (.hasStringrefRoot r)
     (nav-idx nav)
     (when-not (.hasStringrefPointers r)
-      (fail :boring/stringref-not-navigable
-            (str "boring.nav: this document opens a stringref namespace and its "
-                 "index carries no stringref pointer table, so a cursor holding "
-                 "only an offset cannot resolve a reference. Seal it with an "
-                 "index, re-encode with {:stringref false}, or decode it whole "
-                 "with boring/decode.")
-            {}))))
+      ;; TWO CAUSES, TWO REMEDIES. "Seal it with an index" is the right advice
+      ;; for a document that simply has no frame, and NONSENSE for a caller who
+      ;; asked to ignore the one it has -- which is the case doc/SECURITY.md
+      ;; recommends for untrusted input, so it is the one most likely to be hit
+      ;; by someone following the documentation.
+      (let [ignoring? (= :ignore (:trust-index (.opts nav)))]
+        (fail :boring/stringref-not-navigable
+              (if ignoring?
+                (str "boring.nav: {:trust-index :ignore} cannot navigate a "
+                     "stringref document. Ignoring the index means ignoring its "
+                     "pointer table, which is the only thing that can resolve a "
+                     "reference from an offset. Re-encode with {:stringref "
+                     "false} and navigate that, or read it with boring/decode, "
+                     "which builds the table itself and consults no index.")
+                (str "boring.nav: this document opens a stringref namespace and "
+                     "its index carries no stringref pointer table, so a cursor "
+                     "holding only an offset cannot resolve a reference. Seal it "
+                     "with an index, re-encode with {:stringref false}, or "
+                     "decode it whole with boring/decode."))
+              {:trust-index (:trust-index (.opts nav))})))))
 
 (defn- fork-nav ^Nav [^Nav n]
   (let [src @(.src n)

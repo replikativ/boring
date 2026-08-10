@@ -523,11 +523,19 @@ referenced by index. It is strictly more expressive. boring does not use it:
   every document whose shapes do not repeat. A two-pass packer keeps stringref
   by writing table-then-rump in stream order, at the cost of an analysis
   traversal that doubled encode time.
-- **Tag 39649 cannot express one of its rules, and that is a feature here.**
-  Packed's `simple(23)` as a value means the key is ABSENT from the
-  reconstructed map, so "same shape" stops meaning "same key set". Shaped arrays
-  deliberately require an identical key set, which is what makes the decoder a
-  zip with no per-row branching.
+- **Tag 39649 borrows exactly one of its rules.** Packed's `simple(23)` as a
+  value means the key is ABSENT from the reconstructed map, so "same shape"
+  stops meaning "same key set". Shaped arrays now spell absence the same way —
+  see [SHAPES.md](SHAPES.md) — because requiring an identical key set made the
+  encoding all-or-nothing, and one ragged row in a thousand cost a whole table
+  its density.
+
+  An earlier version of this bullet said the opposite: that 39649 *deliberately*
+  required an identical key set, and that this was a feature because it kept the
+  decoder a branch-free zip. The zip is gone; the density is worth more than it
+  was. Only the semantics are borrowed — not the packing framework, and not its
+  tag numbers, which are unassigned while 39649 is registrable First Come First
+  Served.
 
 Revisit when the draft becomes an RFC and the numbers are assigned.
 

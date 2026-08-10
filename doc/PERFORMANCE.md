@@ -210,9 +210,26 @@ probe that reproduces a withdrawn conclusion is worse than no probe: someone
 runs it, sees parity, and re-opens a settled question. What survived is written
 down here and in `SegmentSource`, which is where it is load-bearing.
 
-`ByteBuffer` is the JDK-9-compatible alternative and is worse: it ties `byte[]`
-on sequential scans but runs **2.29×** on the data-dependent walk a head parser
-actually performs, against `MemorySegment`'s 1.22×.
+`ByteBuffer` is the JDK-9-compatible alternative and is worse *for the Reader's
+own accessors*: it ties `byte[]` on sequential scans but runs **2.29×** on the
+data-dependent walk a head parser actually performs, against `MemorySegment`'s
+1.22×. That is why the Reader branches on `byte[]` and reaches
+`MemorySegment` through `SegmentSource` for a mapped file.
+
+**It did not stay rejected as a `ByteSource`, and the reason is reach rather
+than speed.** `BufferSource` wraps any `java.nio.ByteBuffer` — NIO channels,
+Netty, `MappedByteBuffer`, and log engines that hand out a read-only slice into
+an mmap they never copied. `SegmentSource` needs JDK 22; this runs on 9
+alongside the rest of `src/java`, so it is also the only off-heap source
+available to a caller who cannot move yet.
+
+Measured on the same mapping, a column scan over a 1000-row segment:
+`BufferSource` **38.1 µs**, `SegmentSource` **40.3 µs** — parity, so there is
+no foreign-memory win waiting on the other side. An mmap'd slice also costs the
+same as anonymous `allocateDirect` (39.2 µs), which is worth stating because
+the intuition says otherwise. `clojure -M:k7 -m source-shapes <shape>` runs one
+source shape per JVM, deliberately: the accessors go megamorphic if one process
+measures four `ByteBuffer` implementation classes, which is worth ~8%.
 
 ### What shipped: one parser, two accessors
 
@@ -246,7 +263,11 @@ benchmark; it is the question a store asks, and the cost of answering it is
 what `boring.nav` exists to remove.
 
 A table of datom-shaped rows, `{:e :a :v :tx :added}`, written with the
-`:store` profile — `encode-indexed` with `{:shapes true :stringref true}`.
+`:store` settings — `encode-indexed` with `{:shapes true :stringref true}`.
+(**Not a `:profile` value**; `:profile` takes `:clojure`, `:interop`,
+`:archival`, `:canonical` or `:canonical-rfc7049`, and `{:profile :store}`
+raises `:boring/bad-option`. It is shorthand used in this document and in
+`bench/capability.clj` for that combination of options.)
 `clojure -M:bench -m capability`:
 
 | 5 000 rows × 5 fields | boring | hako | nippy |
@@ -381,9 +402,12 @@ Compression and mmap'ed selective access pull against each other: mmap pages at
 
 Lookup cost scales with chunk size; ratio saturates almost immediately. 4 KB
 reaches 77% of whole-file ratio and aligns with the page granularity mmap gives
-you anyway. This is the argument *against* filesystem compression here: btrfs
+you anyway. This is the argument *against* filesystem compression at its defaults: btrfs
 compresses 128 KiB extents and ZFS a 128 KiB recordsize, landing at the bottom
-of that table with no knob. Compression also forecloses zero-copy — a chunk
+of that table. **The knob exists, though** — `zfs create -o recordsize=16K` —
+and [STORAGE.md](STORAGE.md) has the worked version. An earlier draft of this
+sentence said there was none, which was wrong, and the correction had been made
+in one document and not the other. Compression also forecloses zero-copy — a chunk
 must be decompressed to the heap — so it and the blob win are alternatives for
 the same bytes.
 

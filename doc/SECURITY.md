@@ -35,6 +35,16 @@ indexes on both heap and memory-mapped sources. And the attacker wrote every
 byte already, so a value they misdirect you to is one they could have sent
 directly.
 
+**The index now carries a second thing, and it is the same class.** A document
+that opens a stringref namespace stores a *pointer table* in the index frame —
+`(reference index → the offset where that string was defined)` — because a
+cursor holding only an offset has not decoded the strings before it and cannot
+resolve a reference any other way. That table is attacker-chosen too, so a
+chosen index can redirect what a *string* resolves to, not only which position
+a lookup lands on. It is bounded the same way: offsets are range-checked
+against the data section, so the worst case remains a wrong answer inside the
+document rather than a read outside it.
+
 **It matters when an application verifies one part of a document and then acts
 on another.** Two `get`s can be made to resolve to overlapping regions, so you
 checked one thing and used a different one — the shape of Android's Master Key
@@ -46,6 +56,23 @@ Pass `{:trust-index :ignore}` and `nav` never reads the index; it scans, which
 is the reference implementation the indexed paths are checked against. Lookups
 cost what they would on a file with no index — measured, 301 skips against 17
 for one key in a 200-key map — and the question does not arise.
+
+**`:ignore` does not work on a stringref document, and that is not a bug.**
+Ignoring the index means ignoring the pointer table, which is the only thing
+that can resolve a reference from an offset — so `nav/source` refuses with
+`:boring/stringref-not-navigable` rather than answering wrongly. Since
+`encode-indexed` no longer forces `:stringref false`, this is **every
+default-profile indexed document**, so the recipe above needs one of:
+
+| you want | do this |
+|---|---|
+| navigate untrusted bytes, no index trusted | encode with `{:stringref false}`, then `{:trust-index :ignore}` |
+| read untrusted bytes you did not encode | `boring/decode` — it builds the stringref table itself by decoding in order and consults no index at all |
+| navigate, accepting the index as trusted | the default |
+
+`boring/decode` is the honest answer for input you did not produce: it is the
+reference implementation, it never reads the frame, and it therefore has none
+of this section's exposure.
 
 Not yet built, and named here so the gap is visible rather than implied: a
 `:validate` setting that walks every anchor chain at load and refuses an index
