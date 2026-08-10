@@ -339,3 +339,64 @@
       (is (= :boring/bad-argument
              (:type (ex-data (try (f) (catch Exception e e)))))
           label))))
+
+;; `with-mmap` IS A MACRO IN A NAMESPACE THIS FILE MUST NOT REQUIRE at load
+;; time -- see the JDK guard in the ns docstring -- so it cannot be called
+;; normally and cannot be reached through `requiring-resolve` either. The form
+;; is built and `eval`ed instead, and everything inside it is a STRING or a MAP
+;; literal: an `eval`ed form carrying a File object fails to compile, which is
+;; how the first version of this test failed.
+(def escaped-cursor
+  "Where `with-mmap-closes-even-when-the-body-throws` stashes the cursor its
+  body leaks. A VAR the eval'ed form names by symbol, not an atom spliced into
+  it: an `eval`ed form carrying an object -- a File, an Atom -- fails to
+  compile, which is how two versions of that test failed."
+  (atom nil))
+
+(defn- eval-with-mmap [path body-fn]
+  (eval `(do (require 'boring.mmap)
+             (~'boring.mmap/with-mmap [~'c ~path ~opts] ~(body-fn 'c)))))
+
+(deftest with-mmap-maps-binds-and-closes
+  (if-not ffm?
+    (is true "skipped: this JVM has no java.lang.foreign (JDK < 22)")
+    (testing "`with-mmap` had NO TEST. Its only appearance anywhere was a code
+              sample in doc/STORAGE.md, which is the kind of coverage that
+              looks like documentation and is actually an untested claim -- the
+              macro could stop closing the arena, or stop binding, and nothing
+              would notice. Found by an API surface review, not by a failure."
+      (let [^bytes bs (boring/encode {"customer-137" {"name" "Ada"}
+                                      "customer-9"   {"name" "Grace"}}
+                                     opts)
+            path (.getPath (spit-bytes bs))]
+        (testing "the sample from doc/STORAGE.md, run rather than quoted"
+          (is (= "Ada"
+                 (eval-with-mmap
+                  path (fn [c] `(nav/value (get-in ~c ["customer-137" "name"])))))))
+        (testing "the BODY's value is the macro's value -- `with-open` returns
+                  its body, and a macro that returned the arena or nil would
+                  still pass a test that only checked for no exception"
+          (is (= 2 (eval-with-mmap path (fn [c] `(count ~c))))))))))
+
+(deftest with-mmap-closes-even-when-the-body-throws
+  (if-not ffm?
+    (is true "skipped: this JVM has no java.lang.foreign (JDK < 22)")
+    (testing "`with-open` semantics are the whole reason to reach for the macro
+              rather than calling `mmap-source` by hand. A body that throws must
+              still release the mapping, or a failing request leaks an arena per
+              call -- and that leak is invisible until the process runs out of
+              address space."
+      (let [^bytes bs (boring/encode {"a" 1} opts)
+            path (.getPath (spit-bytes bs))]
+        (reset! escaped-cursor nil)
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (eval `(do (require 'boring.mmap)
+                                (~'boring.mmap/with-mmap [~'c ~path ~opts]
+                                 (reset! boring.mmap-test/escaped-cursor ~'c)
+                                 (throw (ex-info "boom" {})))))))
+        (testing "and the arena really did close: the cursor the body leaked is
+                  dead. That is also the hazard the docstring warns about when
+                  it says not to let a cursor escape the body -- pinned here so
+                  the warning is demonstrated rather than asserted"
+          (is (some? @escaped-cursor))
+          (is (thrown? Throwable (nav/value (get @escaped-cursor "a")))))))))
