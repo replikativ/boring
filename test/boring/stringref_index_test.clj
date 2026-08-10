@@ -210,6 +210,50 @@
         ;; registered and never referenced, so they take no space here.
         (is (= 56 (quot (dec (alength e5)) (+ iw ow))))))))
 
+(deftest an-unknown-layout-version-is-refused-rather-than-misread
+  ;; THIS IS WHAT MAKES THE FORMAT EXTENSIBLE, so it is asserted rather than
+  ;; left as a property of the code.
+  ;;
+  ;; Sequences cannot carry a pointer table today: the stringref namespace
+  ;; restarts at every top-level item and one frame holds one table. The fix is
+  ;; designed -- a SECTIONED table keyed by item start offset, binary search
+  ;; sections then pairs -- and measured at 0.4-2.9% of the file against a
+  ;; 22-28% stringref saving. It is not built, because no workload has asked.
+  ;;
+  ;; Leaving it unbuilt is only safe if a reader that predates it REFUSES the
+  ;; new table instead of reading the old layout's bytes out of it. The low
+  ;; nibble of the layout byte is the version, `stringref-table-at` gates on
+  ;; it, and a table it does not recognise reads as "no pointer table" -- which
+  ;; for a document that opens a namespace is a typed refusal, not a guess.
+  ;;
+  ;; So: a v2 table in tomorrow's file is unreadable to today's release, which
+  ;; is correct, and today's v1 files stay readable forever.
+  (let [d (doc records 16)
+        n (alength d)
+        ptr (loop [i 0 v 0]
+              (if (= i 8) v (recur (inc i) (+ (* v 256) (bit-and (aget d (+ (- n 9) 1 i)) 0xff)))))
+        payload (vec (:form (first (b/decode-seq (java.util.Arrays/copyOfRange d (int ptr) n)))))
+        e5 ^bytes (nth payload 5)
+        ;; Where the table's bytes actually sit in the file. The frame is a
+        ;; suffix, and the table is a byte string inside it, so scanning from
+        ;; `ptr` for its content finds it without hard-coding a header width
+        ;; that #20 already widened once.
+        at (loop [i (int ptr)]
+             (cond (> (+ i (alength e5)) n) nil
+                   (java.util.Arrays/equals
+                    e5 (java.util.Arrays/copyOfRange d i (+ i (alength e5)))) i
+                   :else (recur (inc i))))]
+    (is (some? at) "the pointer table must be locatable in the file")
+    (is (= 1 (bit-and (aget d (int at)) 0xF)) "the control: it is v1 as written")
+    (testing "the same file with the version nibble moved on"
+      (let [d2 (java.util.Arrays/copyOf d n)]
+        (aset-byte d2 (int at)
+                   (unchecked-byte (bit-or (bit-and (aget d2 (int at)) 0xF0) 2)))
+        (is (= :boring/stringref-not-navigable
+               (try (do (nav/root d2 nil) nil)
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+            "refused by type, not read as v1 and not thrown untyped")))))
+
 (deftest a-damaged-pointer-table-costs-time-not-correctness
   ;; The frame is untrusted input. doc/SHAPES.md concedes that a damaged index
   ;; may give a WRONG ANSWER; what it does not allow is an untyped exception or
