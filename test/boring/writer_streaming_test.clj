@@ -180,29 +180,53 @@
             emits them and holds one chunk. They must agree byte-for-byte, since
             `boring.writer-index-test` already pins writer-capture against the
             byte walk for sequences and this is the single-value case."
-    (doseq [[label v] [["wide map" (into {} (for [i (range 400)] [(str "k" i) {:v i}]))]
-                       ["wide vec" (mapv (fn [i] {:id i :name (str "n" i)}) (range 400))]
-                       ["nested"   {:a (vec (range 100)) :b (into {} (for [i (range 60)] [i i]))}]
-                       ["tiny"     {:a 1}]]]
-      (let [expect (boring/encode-indexed v {:index 16})
-            got (let [out (ByteArrayOutputStream.)
-                      w (boring/writer 64 o)]           ; tiny buffer: many flushes
-                  (boring/write-indexed! w v out {:index 16})
-                  (.toByteArray out))]
-        (is (= (vec expect) (vec got)) label))))
+    (let [streamed (fn [v opts]
+                     (let [out (ByteArrayOutputStream.)
+                           w (boring/writer 64 o)]      ; tiny buffer: many flushes
+                       (boring/write-indexed! w v out opts)
+                       (.toByteArray out)))]
+      (doseq [[label v] [["wide map" (into {} (for [i (range 400)] [(str "k" i) {:v i}]))]
+                         ["wide vec" (mapv (fn [i] {:id i :name (str "n" i)}) (range 400))]]]
+        (is (= (vec (boring/encode-indexed v {:index 16}))
+               (vec (streamed v {:index 16})))
+            label))
+
+      (testing "BELOW `small-enough-to-encode-twice` THEY MAY DIFFER, and that
+                is deliberate rather than a drift. `encode-indexed` buffers the
+                whole result, so it can encode both ways and keep the shorter;
+                a frame is a rounding error on a large value and most of the
+                file on a small one -- `{:a 1}` was 50 bytes against 7.
+                `write-indexed!` streams to a sink and cannot revisit what it
+                has flushed, so it takes the conservative side.
+
+                What must still hold is that they MEAN the same thing, and
+                that the buffering one is never the larger."
+        (doseq [[label v] [["nested" {:a (vec (range 100))
+                                      :b (into {} (for [i (range 60)] [i i]))}]
+                           ["tiny"   {:a 1}]]]
+          (let [buffered (boring/encode-indexed v {:index 16})
+                flushed (streamed v {:index 16})]
+            (is (<= (alength ^bytes buffered) (alength ^bytes flushed))
+                (str label " -- buffering may win, never lose"))
+            (is (= v (first (boring/decode-seq buffered)))
+                (str label " -- and both decode to the value"))
+            (is (= v (first (boring/decode-seq flushed))) label)
+            (is (= v (nav/value (nav/root buffered)))
+                (str label " -- and both stay navigable"))
+            (is (= v (nav/value (nav/root flushed))) label))))))
   (testing "and the result is navigable, which is the point of having it"
     (let [v (into {} (for [i (range 500)] [(str "key-" i) {:v i}]))
           out (ByteArrayOutputStream.)
           w (boring/writer 64 o)]
       (boring/write-indexed! w v out {:index 16})
       (let [bs (.toByteArray out)
-            c (nav/source bs o)]
+            c (nav/root bs o)]
         (is (= {:v 499} (nav/value (get c "key-499"))))
         (is (= v (nav/value c)))
         (is (= v (boring/decode bs o)) "and `decode` still returns the value")
         (is (= [v] (vec (boring/decode-seq bs o))) "with the frame hidden")))))
 
-(deftest write-indexed-is-bounded-and-refuses-stringref
+(deftest write-indexed-is-bounded-and-composes-with-stringref
   (testing "bounded memory, unlike encode-indexed which holds the whole array"
     (let [sink (proxy [OutputStream] [] (write ([_]) ([_ _ _])))
           big (mapv (fn [i] {:id i :name (str "customer-" i)}) (range 40000))
@@ -210,12 +234,33 @@
           n (boring/write-indexed! w big sink {:index 16})]
       (is (> n 1000000))
       (is (<= (alength ^bytes (boring/buffer w)) 65536))))
-  (testing "an explicit :stringref true alongside :index throws rather than one
-            silently winning -- nav cannot resolve a reference from an offset"
-    (is (thrown? clojure.lang.ExceptionInfo
-                 (boring/write-indexed! (boring/writer 4096 nil) {:a 1}
-                                        (ByteArrayOutputStream.)
-                                        {:index 16 :stringref true})))))
+  (testing "`:stringref true` alongside `:index` used to throw, because a
+            cursor holding an offset could not resolve a reference. The frame's
+            pointer table closed that, and this writer is where the pointers
+            come from -- it takes them off its own symbol table as it encodes,
+            which is why it can carry them and the byte-walk builder has to
+            re-derive them."
+    (let [out (ByteArrayOutputStream.)
+          n (boring/write-indexed! (boring/writer 4096 nil)
+                                   (vec (repeat 40 {:city "amsterdam" :n 1}))
+                                   out {:index 16 :stringref true})]
+      (is (pos? n))
+      (is (= (vec (repeat 40 {:city "amsterdam" :n 1}))
+             (nav/value (nav/root (.toByteArray out)))))))
+  (testing "and a REFERENCE EARNS A FRAME even when no container does. A small
+            value whose strings repeat carries tag-25 references, and #22's
+            walk threshold declines to index it -- so the node count alone as a
+            gate produced a document with references and no table, which
+            `nav/root` refused. The writer cannot go back and re-encode, so the
+            frame is sealed: a reference is only ever written when a table will
+            exist to resolve it."
+    (let [v [{:city "amsterdam" :name "a"} {:city "amsterdam" :name "b"}]
+          out (ByteArrayOutputStream.)]
+      (boring/write-indexed! (boring/writer 4096 nil) v out {:index 16})
+      (let [bs (.toByteArray out)]
+        (is (= 0x48 (bit-and (aget bs (- (alength bs) 9)) 0xff))
+            "the 9-byte trailer is there, so a frame was sealed")
+        (is (= v (nav/value (nav/root bs))))))))
 
 (deftest trim-gives-back-what-one-large-job-grew
   (testing "a writer's growth is one-way -- buffer, symbol table and index

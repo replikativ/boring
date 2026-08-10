@@ -182,6 +182,21 @@ stage_index_mutants () {
 
 stage_interop () {
   if python3 -c "import cbor2" 2>/dev/null; then
+    # THE READ FIXTURE IS REGENERATED FIRST, for the same reason the canonical
+    # one below is, and it was NOT until a doc audit found the gap. A committed
+    # `fixture.cbor` that nothing rebuilds turns `test_read_boring.py` into a
+    # test of cbor2 against a frozen snapshot: it cannot fail on a boring
+    # regression, which is the only regression it exists to catch.
+    #
+    # It had already gone stale. The record wire name changed from
+    # `gen_interop_fixture.Point` to `gen-interop-fixture/Point` when record
+    # names stopped being munged -- a deliberate, documented change (see
+    # `boring.data/record-type-name`) -- and the fixture, both reference
+    # readers and CI all carried on green against bytes no current version of
+    # boring writes.
+    run interop-read-fixture bin/regen-interop
+    run interop-read-fixture-committed \
+        git diff --exit-code -- interop/fixture.cbor
     run interop-python python3 interop/test_read_boring.py
     # A stronger claim than "cbor2 can read us": that boring and cbor2 emit
     # the IDENTICAL octet sequence for a canonical encoding. A reader can be

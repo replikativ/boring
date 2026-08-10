@@ -1,4 +1,4 @@
-(ns boring.reader
+(ns ^:no-doc boring.reader
   "CBOR reader for ClojureScript. Mirrors the JVM decoder's structure and, more
   importantly, its hardening: validated counts, a nesting cap, duplicate-key
   rejection, UTF-8 validation and typed errors. Those were all found the hard
@@ -294,6 +294,18 @@
         (set! (.-pos r) (inc p))
         (let [v (arg! r info)] (set! (.-pos r) save) v)))))
 
+(defn has-stringref-root?
+  "Does the document open with `d9 01 00`, a tag-256 stringref namespace?
+
+  Mirrors `Reader.hasStringrefRoot()`. Three bytes, no parse, and false for
+  every document that does not use the feature -- which is why the index
+  builders can ask it before deciding whether to derive a pointer table, and
+  nothing that never sets `:stringref` pays for the question."
+  [^Reader r]
+  (let [b (.-buf r)]
+    (and (>= (.-length b) 3)
+         (== 0xD9 (aget b 0)) (== 0x01 (aget b 1)) (== 0x00 (aget b 2)))))
+
 (defn head-end-at
   "Offset just past the head at `p` -- where its content begins."
   [^Reader r p]
@@ -368,43 +380,50 @@
   nesting is `(dec (.-length stack))`. `-3` is what makes `bf 01 ff` -- an
   indefinite map that breaks between a key and its value -- come out
   `:boring/unexpected-break` here as it does on the JVM, instead of `:ok`."
-  [^Reader r p]
-  (let [save (.-pos r)
-        limit (skip-limit r)
-        stack #js [1]
-        push! (fn [v]
-                (.push stack v)
-                (when (> (dec (.-length stack)) limit)
-                  (err :boring/max-depth-exceeded
-                       (str "boring: nesting deeper than the skip bound (" limit ")")
-                       {:max-depth limit})))]
-    (set! (.-pos r) p)
-    (while (pos? (.-length stack))
-      (let [d (dec (.-length stack))
-            top (aget stack d)]
-        (cond
+  ([^Reader r p] (skip-from r p nil))
+  ([^Reader r p items]
+   (let [save (.-pos r)
+         limit (skip-limit r)
+         stack #js [1]
+         push! (fn [v]
+                 (.push stack v)
+                 (when (> (dec (.-length stack)) limit)
+                   (err :boring/max-depth-exceeded
+                        (str "boring: nesting deeper than the skip bound (" limit ")")
+                        {:max-depth limit})))]
+     (set! (.-pos r) p)
+     (while (pos? (.-length stack))
+       (let [d (dec (.-length stack))
+             top (aget stack d)]
+         (cond
           ;; A definite container that owes nothing is closed.
-          (zero? top) (.pop stack)
+           (zero? top) (.pop stack)
 
           ;; An indefinite container at a boundary where a break is legal.
-          (and (or (== top -1) (== top -2)) (== 0xff (b-at r (.-pos r))))
-          (do (set! (.-pos r) (inc (.-pos r))) (.pop stack))
+           (and (or (== top -1) (== top -2)) (== 0xff (b-at r (.-pos r))))
+           (do (set! (.-pos r) (inc (.-pos r))) (.pop stack))
 
-          :else
-          (let [q (.-pos r)
-                h (b-at r q)
-                mj (bit-shift-right h 5)
-                info (bit-and h 0x1F)]
-            (set! (.-pos r) (inc q))
+           :else
+           (let [q (.-pos r)
+                 h (b-at r q)
+                 mj (bit-shift-right h 5)
+                 info (bit-and h 0x1F)]
+            ;; ONE ITEM PER HEAD, when the caller asked to count. Mirrors
+            ;; `Reader.skipCountingFrom` on the JVM, and must mirror it
+            ;; EXACTLY: `walk` decides which containers get an index node, so
+            ;; two platforms that count differently write different files for
+            ;; the same value.
+             (when items (aset items 0 (inc (aget items 0))))
+             (set! (.-pos r) (inc q))
             ;; Settle the parent BEFORE dispatching -- except for a tag, which
             ;; owes its payload and is settled by whatever the payload turns
             ;; out to be.
-            (when (not== mj 6)
-              (aset stack d (cond (== top -1) -1        ; indefinite array
-                                  (== top -2) -3        ; key read, value owed
-                                  (== top -3) -2        ; pair complete
-                                  :else (dec top))))
-            (case mj
+             (when (not== mj 6)
+               (aset stack d (cond (== top -1) -1        ; indefinite array
+                                   (== top -2) -3        ; key read, value owed
+                                   (== top -3) -2        ; pair complete
+                                   :else (dec top))))
+             (case mj
               ;; DECLARED COUNTS ARE VALIDATED AGAINST THE BYTES THAT REMAIN,
               ;; as `Reader.skipStructural` has always done with `checkCount`.
               ;; Unchecked, `9b ffffffffffffffff` owed 2^64 items and this loop
@@ -413,52 +432,56 @@
               ;; also bounds the total work: the outstanding item count can
               ;; never exceed the bytes left, so the walk is linear in the
               ;; input rather than in what the input claims.
-              (0 1) (arg! r info)                ; info 28-31 -> :reserved-info
-              (2 3) (if (== info 31)
-                      (skip-indefinite-chunks! r mj)
-                      (let [n (check-count r (arg! r info) 1)]
-                        (set! (.-pos r) (+ (.-pos r) n))))
+               (0 1) (arg! r info)                ; info 28-31 -> :reserved-info
+               (2 3) (if (== info 31)
+                       (skip-indefinite-chunks! r mj)
+                       (let [n (check-count r (arg! r info) 1)]
+                         (set! (.-pos r) (+ (.-pos r) n))))
               ;; An EMPTY DEFINITE ARRAY costs no nesting and an empty definite
               ;; map costs one, because that is what `Reader.skipStructural`
               ;; does -- case 4 returns before `enterSkip()` when n is 0, case 5
               ;; does not. Mirrored rather than tidied: the two walkers agreeing
               ;; is worth more here than either one being tidy, and the
               ;; difference is only observable at the bound itself.
-              4 (if (== info 31)
-                  (push! -1)
-                  (let [n (check-count r (arg! r info) 1)]
-                    (when-not (zero? n) (push! n))))
-              5 (if (== info 31)
-                  (push! -2)
-                  (push! (* 2 (check-count r (arg! r info) 2))))
+               4 (if (== info 31)
+                   (push! -1)
+                   (let [n (check-count r (arg! r info) 1)]
+                     (when-not (zero? n) (push! n))))
+               5 (if (== info 31)
+                   (push! -2)
+                   (push! (* 2 (check-count r (arg! r info) 2))))
               ;; A TAG CHAIN IS CONSUMED INLINE AND BOUNDED BY ITS LENGTH, as
               ;; the JVM does. Charging each tag to the nesting budget instead
               ;; was tried there and was wrong: several tag readers parse their
               ;; payload's head without entering, so a mirrored skip refused
               ;; `#{}` at a depth decode accepted.
-              6 (do (arg! r info)
-                    (loop [chain 1]
-                      (let [h2 (b-at r (.-pos r))]
-                        (when (== 6 (bit-shift-right h2 5))
-                          (when (> (inc chain) limit)
-                            (err :boring/max-depth-exceeded
-                                 (str "boring: tag chain longer than the skip bound ("
-                                      limit ")")
-                                 {:max-depth limit}))
-                          (set! (.-pos r) (inc (.-pos r)))
-                          (arg! r (bit-and h2 0x1F))
-                          (recur (inc chain))))))
+               6 (do (arg! r info)
+                     (loop [chain 1]
+                       (let [h2 (b-at r (.-pos r))]
+                         (when (== 6 (bit-shift-right h2 5))
+                           (when (> (inc chain) limit)
+                             (err :boring/max-depth-exceeded
+                                  (str "boring: tag chain longer than the skip bound ("
+                                       limit ")")
+                                  {:max-depth limit}))
+                          ;; EACH TAG IN THE CHAIN IS ITS OWN ITEM. The head
+                          ;; above counted the first; the rest are consumed
+                          ;; here without passing it.
+                           (when items (aset items 0 (inc (aget items 0))))
+                           (set! (.-pos r) (inc (.-pos r)))
+                           (arg! r (bit-and h2 0x1F))
+                           (recur (inc chain))))))
               ;; Major 7. A break that reaches here is one no indefinite
               ;; container is waiting for -- `83 ff 01 ff 02 03`, a break inside
               ;; a DEFINITE array, which this platform used to skip clean and
               ;; hand to `build-index`.
-              (if (== info 31)
-                (err :boring/unexpected-break
-                     "boring: break code outside an indefinite-length item")
-                (arg! r info)))))))
-    (let [end (.-pos r)]
-      (set! (.-pos r) save)
-      end)))
+               (if (== info 31)
+                 (err :boring/unexpected-break
+                      "boring: break code outside an indefinite-length item")
+                 (arg! r info)))))))
+     (let [end (.-pos r)]
+       (set! (.-pos r) save)
+       end))))
 
 (defn compare-items-at
   "Lexicographic comparison of the ENCODED items at `a` and `b`.
@@ -1493,7 +1516,13 @@
                       (err :boring/bad-tag-content "boring: shaped array row must be an array"
                            {:tag 39649}))
                     (let [vn (check-count r (arg! r (bit-and vh 0x1F)) 1)]
-                      (when (not== vn n)
+                      ;; A ROW MAY BE SHORTER THAN THE SHAPE -- the keys it does
+                      ;; not reach are absent. Longer is still malformed: there
+                      ;; is no key for the extra value to land on. Interior
+                      ;; absences are `undefined` (0xf7), handled below. `null`
+                      ;; (0xf6) stays a PRESENT value, so `{:a nil}` and `{}`
+                      ;; remain distinct. Mirrors the JVM Reader.
+                      (when (> vn n)
                         (err :boring/bad-tag-content
                              (str "boring: shaped array row has " vn " values but the shape has "
                                   n " keys") {:tag 39649}))
@@ -1506,15 +1535,32 @@
                         ;; shape is already validated.
                       (recur (inc i)
                              (conj! acc
-                                    (if (<= n arraymap-max)
-                                      (let [arr (js/Array. (* 2 n))]
-                                        (dotimes [j n]
-                                          (aset arr (* 2 j) (aget ks j))
-                                          (aset arr (inc (* 2 j)) (read! r)))
-                                        (PersistentArrayMap. nil n arr nil))
+                                    (if (<= vn arraymap-max)
+                                      ;; `p` counts PRESENT pairs. Every value is
+                                      ;; still READ -- the bytes must be consumed
+                                      ;; either way -- only the landing is
+                                      ;; skipped. The array is sized for `vn` and
+                                      ;; trimmed only when something was absent,
+                                      ;; so a dense row pays no copy.
+                                      (let [arr (js/Array. (* 2 vn))
+                                            p (loop [j 0 p 0]
+                                                (if (== j vn)
+                                                  p
+                                                  (let [val (read! r)]
+                                                    (if (identical? val data/undefined)
+                                                      (recur (inc j) p)
+                                                      (do (aset arr (* 2 p) (aget ks j))
+                                                          (aset arr (inc (* 2 p)) val)
+                                                          (recur (inc j) (inc p)))))))]
+                                        (PersistentArrayMap.
+                                         nil p (if (== p vn) arr (.slice arr 0 (* 2 p))) nil))
                                       (loop [j 0 m (transient {})]
-                                        (if (< j n)
-                                          (recur (inc j) (assoc! m (aget ks j) (read! r)))
+                                        (if (< j vn)
+                                          (let [val (read! r)]
+                                            (recur (inc j)
+                                                   (if (identical? val data/undefined)
+                                                     m
+                                                     (assoc! m (aget ks j) val))))
                                           (persistent! m)))))))))))))))
 
     258 (let [save (.-pos r)

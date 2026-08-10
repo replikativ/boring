@@ -514,28 +514,54 @@
                            "or write the indexed file on the JVM.")
                       {:type :boring/unsupported-option :option k :value (get opts k)})))))
 
+(defn- reject-stringref-opt!
+  "Refuse an EXPLICIT `{:stringref true}` to `write-seq!`, matching the JVM.
+
+  `write-root!` resets the writer per item, so every top-level item opens its
+  own stringref namespace numbered from zero. One index frame carries one
+  pointer table, so it can describe at most one of them -- which is why the
+  JVM's `write-seq!` refuses the option outright rather than writing a file
+  whose later items resolve against the wrong literals.
+
+  This platform cannot index at all, so there is no frame to be wrong about
+  here; the refusal exists so the SAME call fails the same way on both. A
+  sequence written here and indexed on the JVM is a supported route, and it
+  must not depend on which side rejected the option.
+
+  Takes the RAW map, before `resolve-opts`, and that is the whole reason this
+  is a separate function: resolution merges the `:clojure` profile's
+  `:stringref true` into every call, so a resolved map cannot tell a caller who
+  asked from a caller who was handed the default. Only `true?` refuses --
+  `{:stringref false}` is the way to say so out loud, and must keep working."
+  [opts]
+  (when (true? (:stringref opts))
+    (throw (ex-info (str "boring: :stringref true is not supported by write-seq! -- "
+                         "each top-level item restarts the stringref namespace at "
+                         "index 0, so one index frame cannot describe them all and "
+                         "boring.nav could not resolve a reference from an offset. "
+                         "Use encode-indexed for a single value, or encode-into! in "
+                         "a loop for compression without navigation.")
+                    {:type :boring/incompatible-options :stringref true}))))
+
 (defn- navigable-seq-opts
-  "`write-seq!`'s options with stringref off, unless the caller asked for it.
+  "`write-seq!`'s options with stringref off.
 
   A stringref is an index into a table built from every preceding string, so a
-  cursor holding only an offset cannot resolve one and `boring.nav` refuses
-  such a document outright. The JVM's `write-seq!` indexes by default and
-  therefore forces stringref off already -- indexing declares navigational
-  intent. This arity cannot index, so it had no such trigger, and the default
-  output carried a `d9 0100` namespace per item: the SAME portable call
-  produced a navigable file on the JVM and an unnavigable one in a browser,
-  while this function's own docstring promised `boring.nav` could read it.
+  cursor holding only an offset cannot resolve one, and `boring.nav` refuses
+  such a document unless the index frame carries a pointer table it can jump
+  through. A sequence cannot carry one: the namespace restarts per item and the
+  frame holds a single table.
 
-  Forced off UNCONDITIONALLY, which is what the JVM does when it indexes --
-  `(cond-> o (pos? stride) (assoc :stringref false))` overrides whatever the
-  writer was built with. Honouring an explicit `{:stringref true}` here is not
-  possible anyway: `resolve-opts` merges the profile, so by the time options
-  arrive `:stringref true` is present whether the caller asked for it or was
-  simply handed the `:clojure` default, and the two cannot be told apart.
+  Forced off UNCONDITIONALLY, and the JVM now does the same at every stride.
+  It used to force it only when indexing -- indexing being what declares
+  navigational intent -- which left `{:index 0}` producing stringref items
+  there and plain ones here, the same portable call writing different bytes on
+  the two platforms. An explicit `{:stringref true}` is refused before this
+  point by `reject-stringref-opt!`, which still holds the raw map; by here the
+  profile default is indistinguishable from a request, so this only forces.
 
-  This mirrors the asymmetry the JVM already has -- `encode` keeps stringref,
-  `write-seq!` does not. If you want stringref compression in a sequence and
-  do not need to navigate it, call `encode-into!` in a loop."
+  If you want stringref compression in a sequence and do not need to navigate
+  it, call `encode-into!` in a loop."
   [o]
   (assoc o :stringref false))
 
@@ -550,11 +576,13 @@
   be navigated. READING past an index written elsewhere works on both platforms
   -- see `decode-seq`.
 
-  **Stringref is off**, as it is on the JVM's indexed default, so the output is
-  navigable. It was on, and this docstring claimed navigability anyway: the
-  same portable call produced a `boring.nav`-readable file on the JVM and a
-  `d9 0100`-prefixed one here that `nav` refuses outright. If you want the
-  compression and do not need to navigate, call `encode-into!` in a loop.
+  **Stringref is off**, at every stride and on both platforms, so the output is
+  navigable. Each top-level item restarts the stringref namespace at index 0
+  and one index frame carries one pointer table, so no frame could describe
+  them all -- a reference in item 1 would resolve against item N's literals.
+  An explicit `{:stringref true}` throws `:boring/incompatible-options` rather
+  than being overridden in silence. If you want the compression and do not need
+  to navigate, call `encode-into!` in a loop.
 
   `sink` receives bytes it OWNS. This used to pass `.subarray` of the writer's
   reusable buffer, which is a view rather than a copy: a sink that retained the
@@ -579,7 +607,12 @@
              0 values)))
   ([w values sink opts]
    (reject-index-opts! opts)
-   (let [o (navigable-seq-opts (resolve-opts opts))]
+   (let [resolved (resolve-opts opts)
+         ;; AFTER resolution, matching the JVM's ordering, so a call that is
+         ;; wrong in both ways reports the option error first. The check itself
+         ;; reads the RAW map -- see `reject-stringref-opt!` for why it must.
+         _ (reject-stringref-opt! opts)
+         o (navigable-seq-opts resolved)]
      (reduce (fn [total v]
                (let [n (wr/position (write-root! w v o))]
                  (sink (.slice (wr/buffer w) 0 n))
@@ -613,29 +646,304 @@
 
 (def ^:private INDEX-WALK-MAX-DEPTH 200)
 
-(defn- delta-slot
-  "Entry offsets as deltas, in the narrowest CBOR form that holds them.
+(defn- anchor-count
+  "How many anchors a container of `n` entries carries at `stride`. Mirrors the
+  JVM's `anchor-count` and `Writer.anchorCount`: the reader DERIVES each node's
+  segment length from this rather than reading it, so a disagreement between
+  platforms would shift every subsequent node's anchors.
 
-  Mirrors the JVM's `delta-slot` exactly, including the tier boundaries: a byte
-  string for 0..255, tag 77 (sint16) to 0x7FFF, tag 78 (sint32) beyond. The tag
-  IS the width declaration, so this adds no format surface -- and a reader
-  cannot tell which platform produced the slot, which is the point.
+  An empty container needs no anchors -- `((0 - 1) / stride) + 1` is 1 under
+  truncating division, which would claim a phantom anchor at offset 0."
+  [n stride]
+  (if (<= n 0) 0 (if (== stride 1) n (inc (js/Math.floor (/ (dec n) stride))))))
 
-  `base` is what the first delta is measured from: the container's own offset,
-  or 0 for the sequence node."
-  [offs base]
-  (let [n (count offs)
-        d (js/Array. n)]
-    (loop [i 0 prev base mn js/Number.MAX_SAFE_INTEGER mx js/Number.MIN_SAFE_INTEGER]
+(def ^:private ^:const slot-layout-v2
+  "Version nibble of the `slots` layout byte: a DENSE start table, one entry per
+  node. Mirrors the JVM's `slot-layout-v2` -- see its docstring for why sparse
+  lost."
+  2)
+
+(defn- slot-width-code
+  "The narrowest of four widths that holds every delta: 0 = u8, 1 = u16,
+  2 = i32, 3 = i64. Mirrors the JVM's `slot-width-code`."
+  [d]
+  (let [n (alength d)]
+    (loop [i 0 mn js/Number.MAX_SAFE_INTEGER mx js/Number.MIN_SAFE_INTEGER]
       (if (== i n)
         (cond
-          (or (zero? n) (and (>= mn 0) (<= mx 0xFF)))
-          (js/Uint8Array.from d)
-          (and (>= mn 0) (<= mx 0x7FFF)) (js/Int16Array.from d)
-          :else (js/Int32Array.from d))
-        (let [v (nth offs i) delta (- v prev)]
-          (aset d i delta)
-          (recur (inc i) v (min mn delta) (max mx delta)))))))
+          (or (zero? n) (and (>= mn 0) (<= mx 0xFF))) 0
+          (and (>= mn 0) (<= mx 0xFFFF)) 1
+          (and (>= mn -2147483648) (<= mx 2147483647)) 2
+          :else 3)
+        (let [v (aget d i)]
+          (recur (inc i) (min mn v) (max mx v)))))))
+
+(defn- pack-slots
+  "Every node's anchor deltas as ONE byte string:
+
+      [ layout byte | 2-bit width code per node | dense start table |
+        node 0's deltas | node 1's deltas | ... ]
+
+  Mirrors the JVM's `pack-slots` BYTE FOR BYTE -- see its docstring for why the
+  shape is this and not one typed array per node, or one flat array at a single
+  width. Little-endian, node `i`'s width at bit `(* 2 (rem i 4))` of byte
+  `(+ 1 (quot i 4))` -- the layout byte is byte 0, and no per-node length: that is `anchor-count` of the entry
+  count the frame already carries.
+
+  `base` for each node is the container's own offset, or 0 for the sequence
+  node, whose sentinel offset is -1."
+  [slots containers counts stride]
+  (let [n (count slots)
+        ds (js/Array. n)
+        ws (js/Array. n)]
+    (dotimes [i n]
+      (let [offs (nth slots i)
+            m (count offs)
+            d (js/Array. m)]
+        ;; THE INVARIANT THE WHOLE LAYOUT RESTS ON -- see the JVM's `pack-slots`.
+        ;; No segment length goes on the wire, so a walk that emitted a
+        ;; different anchor count would shift every LATER node's deltas rather
+        ;; than corrupt this one. Checked on both platforms because the two
+        ;; walks are separate implementations of the same rule.
+        ;; EITHER OF THE TWO LEGAL STRIDES -- see the JVM's `pack-slots`.
+        ;; Stride is per node now, and which one a node used is derived by the
+        ;; reader rather than stored.
+        (when-not (or (== m (anchor-count (nth counts i) stride))
+                      (== m (anchor-count (nth counts i) 1)))
+          (throw (ex-info (str "boring: index node " i " has " m " anchors but "
+                               (nth counts i) " entries implies "
+                               (anchor-count (nth counts i) stride) " at stride "
+                               stride " or " (anchor-count (nth counts i) 1)
+                               " at stride 1."
+                               " The index walk and `anchor-count` disagree.")
+                          {:type :boring/bad-index :node i :anchors m
+                           :entries (nth counts i) :stride stride})))
+        (loop [k 0 prev (max 0 (nth containers i))]
+          (when (< k m)
+            (let [v (nth offs k)]
+              (aset d k (- v prev))
+              (recur (inc k) v))))
+        (aset ds i d)
+        (aset ws i (slot-width-code d))))
+    (let [wbytes (js/Math.ceil (/ n 4))
+          seg (fn [i] (* (alength (aget ds i)) (bit-shift-left 1 (aget ws i))))
+          deltas (loop [i 0 t 0] (if (== i n) t (recur (inc i) (+ t (seg i)))))
+          entries (inc n)          ; DENSE: start_0 .. start_n
+          ;; W depends on the total and the total depends on W; widening can
+          ;; only push the total up, so two iterations settle it.
+          w-start (loop [sw 2]
+                    (let [tot (+ 1 wbytes (* entries sw) deltas)]
+                      (if (or (== sw 4) (< tot 0x10000)) sw (recur 4))))
+          header (+ 1 wbytes (* entries w-start))
+          total (+ header deltas)
+          out (js/Uint8Array. total)
+          put! (fn [o v sz]
+                 ;; NOT `bit-shift-right`: 32-bit on ClojureScript. See below.
+                 (loop [j 0 rem-v v]
+                   (when (< j sz)
+                     (aset out (+ o j) (bit-and (js/Math.floor rem-v) 0xFF))
+                     (recur (inc j) (/ rem-v 256)))))]
+      ;; The layout byte -- version low, start-entry width high. Mirrors the
+      ;; JVM's `pack-slots` byte for byte; see its docstring for why it exists.
+      (aset out 0 (bit-or slot-layout-v2
+                          (bit-shift-left (if (== w-start 4) 1 0) 4)))
+      (dotimes [i n]
+        (let [b (+ 1 (js/Math.floor (/ i 4)))]
+          (aset out b (bit-or (aget out b)
+                              (bit-shift-left (aget ws i) (* 2 (mod i 4)))))))
+      ;; The dense start table: one entry per node plus a final total, which
+      ;; is also the structural gate.
+      (let [tbase (+ 1 wbytes)]
+        (loop [i 0 p header]
+          (put! (+ tbase (* i w-start)) p w-start)
+          (when (< i n) (recur (inc i) (+ p (seg i))))))
+      (loop [i 0 p header]
+        (if (== i n)
+          out
+          (let [d (aget ds i)
+                sz (bit-shift-left 1 (aget ws i))
+                m (alength d)]
+            (dotimes [k m]
+              (let [v (aget d k)
+                    o (+ p (* k sz))]
+                ;; NOT `bit-shift-right`: it is 32-BIT on ClojureScript, so the
+                ;; i64 tier would silently write the low word twice. Dividing
+                ;; by 256 and flooring is exact to 2^53, which is past any file
+                ;; length, and agrees with the JVM's shifts on every tier.
+                (loop [j 0 rem-v v]
+                  (when (< j sz)
+                    (aset out (+ o j) (bit-and (js/Math.floor rem-v) 0xFF))
+                    (recur (inc j) (/ rem-v 256))))))
+            (recur (inc i) (+ p (* m sz)))))))))
+
+(defn- pack-sorted
+  "One bit per node -- does this container's keys ascend -- as a byte string,
+  node `i` at bit `(rem i 8)` of byte `(quot i 8)`. Mirrors the JVM's
+  `pack-sorted`."
+  [sorted]
+  (let [v (vec sorted)
+        n (count v)
+        out (js/Uint8Array. (js/Math.ceil (/ n 8)))]
+    (dotimes [i n]
+      (when (nth v i)
+        (let [b (js/Math.floor (/ i 8))]
+          (aset out b (bit-or (aget out b) (bit-shift-left 1 (mod i 8)))))))
+    out))
+
+(def ^:no-doc ^:const stringref-layout-v1
+  "Version nibble for the stringref pointer table -- payload element 6.
+  Mirrors the JVM's `stringref-layout-v1`; a reader gates on it, so a later
+  layout is REFUSED rather than misread as this one."
+  1)
+
+(defn- unsigned-width-code
+  "The narrowest unsigned width holding `mx`: 0 = u8, 1 = u16, 2 = u32, 3 = u64.
+  Mirrors the JVM's, including that it is UNSIGNED where `slot-width-code` is
+  not -- neither a stringref index nor a file offset can be negative."
+  [mx]
+  (cond (< mx 0x100)       0
+        (< mx 0x10000)     1
+        (< mx 0x100000000) 2
+        :else              3))
+
+(defn- pack-stringrefs
+  "The referenced stringref slots as ONE byte string, or nil when there are none.
+
+      [ layout byte | (index, offset) | (index, offset) | ... ]
+
+  Version in the low nibble, index width code in bits 4-5, offset width code in
+  bits 6-7; pairs back to back, ascending by index, each field little-endian at
+  its own width. THE COUNT IS NOT STORED -- the structural gate is that
+  `(dec len)` divides exactly by the pair width.
+
+  Mirrors the JVM's `pack-stringrefs` byte for byte, which is the whole point:
+  `encode-indexed` must write the same file on both platforms, and a width
+  chosen differently here would be a silent divergence rather than a failure.
+
+  EMPTY IS STILL AN ELEMENT -- one layout byte and no pairs. \"The frame
+  carries no table\" is a document nothing can navigate; \"the frame carries an
+  empty table\" is a document that opens a namespace and references nothing,
+  which is perfectly navigable. Collapsing the two made `nav/root` refuse a
+  file with no strings in it at all, because the default profile opens a
+  namespace whatever the content turns out to be.
+
+  `pairs` is a flat seq of interleaved index, offset, already ascending. nil in
+  means nil out -- that is every document opening no namespace."
+  [pairs]
+  (when pairs
+    (let [pairs (vec pairs)
+          n (quot (count pairs) 2)
+          mx-i (reduce max 0 (take-nth 2 pairs))
+          mx-o (reduce max 0 (take-nth 2 (drop 1 pairs)))
+          ic (unsigned-width-code mx-i)
+          oc (unsigned-width-code mx-o)
+          iw (bit-shift-left 1 ic)
+          ow (bit-shift-left 1 oc)
+          out (js/Uint8Array. (+ 1 (* n (+ iw ow))))
+            ;; NOT `bit-shift-right`: it coerces to int32, so byte 4 of a u64
+            ;; -- and any offset at or above 2^31 -- would come out of a wrapped
+            ;; value. Division is exact for the whole 2^53 range JS integers
+            ;; cover, which is past every offset a document can carry here.
+          put! (fn [o v sz]
+                 (loop [j 0 x v]
+                   (when (< j sz)
+                     (aset out (+ o j) (bit-and x 0xff))
+                     (recur (inc j) (js/Math.floor (/ x 256))))))]
+      (aset out 0 (bit-or stringref-layout-v1
+                          (bit-shift-left ic 4)
+                          (bit-shift-left oc 6)))
+      (dotimes [k n]
+        (let [p (+ 1 (* k (+ iw ow)))]
+          (put! p (nth pairs (* 2 k)) iw)
+          (put! (+ p iw) (nth pairs (inc (* 2 k))) ow)))
+      out)))
+
+(defn- min-len-for-index
+  "The shortest encoded length that earns stringref index `idx`.
+
+  Must agree EXACTLY with the other FOUR copies of this rule --
+  `Writer.minLenForIndex`, `Reader.minLenForIndex`, the JVM's
+  `boring.core/min-len-for-index`, and `boring.reader`'s on this platform.
+  Five implementations decide independently whether a given string took an
+  index at all, and a disagreement shifts every LATER index rather than one, so
+  the document decodes to different text with nothing thrown.
+
+  (This said FOUR until the count was checked: it did not know about
+  `boring.reader/min-len-for-index`, which is the one on the cljs decode path.)
+
+  `boring.stringref-threshold-parity-test` asserts the three JVM copies agree
+  over the whole range; the two here are identical source and are covered by
+  the cross-platform byte fixtures."
+  [idx]
+  (cond (< idx 24)    3
+        (< idx 256)   4
+        (< idx 65536) 5
+        :else         7))
+
+(defn- derive-stringref-pointers
+  "The pointer table for an already-encoded document as a flat vector of
+  interleaved index, offset, or nil.
+
+  The counterpart of `Writer.stringrefPointers` for the byte-walk builder, and
+  the mirror of the JVM's `derive-stringref-pointers` -- it exists because the
+  builders must write the SAME FILE. A streaming writer takes pointers from its
+  symbol table; this walks finished bytes and has no symbol table, so it
+  re-derives the numbering from the only thing that defines it: the order
+  literals appear in.
+
+  A FLAT LOOP OVER ITEM HEADS, no recursion and no structure. CBOR is
+  prefix-encoded, so a container's elements follow its head IMMEDIATELY:
+  stepping past each head in turn visits every item in exactly the order a
+  decoder reads them, which is exactly the order the index space is defined by.
+  Only a string's PAYLOAD is stepped over, because payload bytes are not items.
+  That is why this needs no depth bound and cannot overflow a stack, where
+  `index-walk*` needs both -- it has to know the shape and this does not.
+
+  nil for anything that cannot reproduce the decoder's numbering: an
+  indefinite-length item, or a NESTED tag 256, which resets the table so one
+  index space no longer describes the document. nil means no pointer table, and
+  such a document is then refused as unnavigable -- the honest outcome, never a
+  table that is subtly wrong."
+  [r end]
+  (let [offs (array)
+        refs (js/Set.)
+        ok (loop [p (rd/head-end-at r 0)]
+             (if (>= p end)
+               true
+               ;; -1 is `head-arg-at`'s answer for info 31, which is the
+               ;; indefinite forms and the break -- neither reproducible here.
+               (let [n (rd/head-arg-at r p)]
+                 (if (== n -1)
+                   false
+                   (let [major (rd/major-at r p)
+                         after (rd/head-end-at r p)]
+                     (case major
+                       (2 3) (do
+                               ;; THE HEAD IS RECORDED, not the payload: the
+                               ;; head is what a reader jumps to and reads from.
+                               (when (>= n (min-len-for-index (.-length offs)))
+                                 (.push offs p))
+                               (recur (+ after n)))
+                       6 (cond
+                           ;; A nested namespace shadows the outer one, so
+                           ;; every index below it means something else.
+                           (== 256 n) false
+                           (== 25 n) (if (zero? (rd/major-at r after))
+                                       (do (.add refs (rd/head-arg-at r after))
+                                           (recur after))
+                                       false)
+                           :else (recur after))
+                       ;; Containers advance past the head only -- their
+                       ;; elements are the next items. Scalars are their head.
+                       (recur after)))))))]
+    (when ok
+      ;; EMPTY, not nil, when the document opens a namespace and references
+      ;; nothing -- the JVM returns a zero-length array here and
+      ;; `pack-stringrefs` is what turns "no pairs" into "no element". Two
+      ;; different empties would make `build-index`'s public map differ by
+      ;; platform for a document that uses stringref without repeating.
+      (let [ks (sort (filterv #(< % (.-length offs)) (vec (es6-iterator-seq (.values refs)))))]
+        (into [] (mapcat (fn [k] [k (aget offs k)])) ks)))))
 
 (defn- frame-payload-array?
   "Is the container at `p` the 2-element `[name, args]` array of a TAG-27 FRAME?
@@ -652,6 +960,40 @@
                   (recur (rd/head-end-at r q) (rd/head-arg-at r q))
                   t)))))
 
+(def ^:private walk-threshold
+  "Where a binary search starts to repay the frame, in mean prefix items. MUST
+  equal `Writer.WALK_THRESHOLD` and the JVM `walk-threshold` -- three index
+  builders decide with it independently and must decide the same way."
+  64)
+
+(def ^:private map-capture-span-guard
+  "Bytes per entry a map must plausibly have before the walk captures it at
+  stride 1. An ALLOCATION BOUND, not the placement rule -- see the JVM
+  `map-capture-span-guard`. MUST be no stricter than `keep-node?` admits."
+  10)
+
+(def ^:private unsorted-walk-per-entry
+  "Mean prefix items an unsorted map must cross per ENTRY to earn a node. MUST
+  equal `Writer.UNSORTED_WALK_PER_ENTRY` and the JVM `unsorted-walk-per-entry`
+  -- see the Java constant for the measurements, and for why this branch is
+  gated on ITEMS where it used to be gated on bytes."
+  4)
+
+(defn- keep-node?
+  "Whether a container is worth an index node. Mirrors `Writer.keepNode` and
+  the JVM `keep-node?` -- see the JVM version for why the two rules differ."
+  [map? sorted walk stride n]
+  ;; ONE ANCHOR CANNOT ACCELERATE ANYTHING -- see `Writer.keepNode`.
+  ;; At the node's own stride -- see `Writer.keepNode`.
+  (and (>= (let [ns (if (and map? (not sorted)) 1 stride)]
+             (if (<= n 0) 0 (if (== ns 1) n (inc (quot (dec n) ns))))) 2)
+       (if (or (not map?) sorted)
+         (>= walk walk-threshold)
+         ;; An unsorted map is written at stride 1 whatever the file's
+         ;; stride, so what decides is how many ITEMS the node lets a lookup
+         ;; skip. `bytes` is no longer read.
+         (>= walk (* unsorted-walk-per-entry n)))))
+
 (defn- index-walk*
   "Walk the value at `p`, returning where it ends, accumulating nodes into `acc`.
 
@@ -663,27 +1005,81 @@
   a chain of them is not a stack hazard. Container nesting carries an explicit
   bound for the same reason the JVM does: this is public and runs on bytes
   somebody else wrote."
-  [r p stride min-entries base acc depth]
+  [r p stride min-entries base acc depth items suppress?]
   (when (> depth INDEX-WALK-MAX-DEPTH)
     (throw (ex-info (str "boring: nesting deeper than the index walk's bound ("
                          INDEX-WALK-MAX-DEPTH "). This document can be decoded "
                          "but not indexed.")
                     {:type :boring/max-depth-exceeded :max-depth INDEX-WALK-MAX-DEPTH})))
   (let [q0 p
+        ;; EACH TAG IS ITS OWN ITEM -- see the JVM `index-walk*`. The writer
+        ;; emits one head per tag, and most of what boring writes is tagged.
+        ntags (loop [q p t 0]
+                (if (== 6 (rd/major-at r q)) (recur (rd/head-end-at r q) (inc t)) t))
+        ;; A SET IS INDEXED NOWHERE -- see the JVM `index-walk*` and
+        ;; `Writer.writeValue`'s Set branch. `boring.nav` realises a set whole,
+        ;; so nothing inside one is reachable.
+        set? (loop [q p]
+               (if (== 6 (rd/major-at r q))
+                 (if (== 258 (rd/head-arg-at r q)) true (recur (rd/head-end-at r q)))
+                 false))
+        suppress? (boolean (or suppress? set?))
         p (loop [q p] (if (== 6 (rd/major-at r q)) (recur (rd/head-end-at r q)) q))
         mj (rd/major-at r p)]
     (if-not (or (== mj 4) (== mj 5))
-      (rd/skip-from r p)
+      ;; Counted into the enclosing container's walk. A byte string of any size
+      ;; is ONE item, which is the whole reason the metric is items.
+      (let [before (aget items 0)
+            e (rd/skip-from r p items)]
+        (aset items 0 (+ before ntags (- (aget items 0) before)))
+        e)
       (let [n (rd/head-arg-at r p)
             map? (== mj 5)]
         (if (neg? n)
-          (rd/skip-from r p)                    ; indefinite: not indexable
-          (let [keep? (and (>= n min-entries)
+          ;; Indefinite: not indexable, but still counted for its PARENT.
+          (let [before (aget items 0)
+                e (rd/skip-from r p items)]
+            (aset items 0 (+ before ntags (- (aget items 0) before)))
+            e)
+          (let [keep? (and (not suppress?)
+                           (>= n min-entries)
                            (not (frame-payload-array? r q0 p mj n)))
+                ;; A MAP CAPTURES ONE ANCHOR PER ENTRY -- see the JVM
+                ;; `index-walk*` and `Writer.downsample`. Narrowed below, once
+                ;; `sorted` is known.
+                ;; See the JVM `index-walk*`: stride 1 only where the anchor
+                ;; budget could still be met, so a hostile count cannot make
+                ;; the walk allocate before the node is refused.
+                ;; `avail` is what remains of the buffer after this
+                ;; container's head.
+                avail (- (.-length (.-buf r)) (rd/head-end-at r p))
+                ;; THE DECLARED COUNT, CHECKED AGAINST THE BYTES THAT REMAIN,
+                ;; as the JVM walk has always done and this one never did.
+                ;;
+                ;; It was covered by accident: a hostile count made the walk
+                ;; size an array from it, and the allocation failed. That is a
+                ;; RangeError with empty ex-data on this platform -- the exact
+                ;; untyped failure `skip-from` was rewritten to avoid -- and it
+                ;; stopped happening the moment the capture stride was bounded,
+                ;; because a smaller array succeeds. The guard has to be real.
+                ;;
+                ;; A map pair costs at least two bytes and an array element at
+                ;; least one, so anything larger cannot be present however the
+                ;; rest of the document is arranged.
+                _ (when (> n (if map? (quot avail 2) avail))
+                    (throw (ex-info (str "boring: container at " p " declares " n
+                                         (if map? " pairs" " elements")
+                                         " but only " avail " bytes remain")
+                                    {:type :boring/bad-count :count n :offset p})))
+                ;; AN ALLOCATION BOUND, NOT THE PLACEMENT RULE -- `sorted`
+                ;; is not known here, so this cannot ask `keep-node?`. See the
+                ;; JVM `map-capture-span-guard`.
+                cap-stride (if (and map? (<= (* map-capture-span-guard n) avail))
+                             1 stride)
                 m (if keep?
                     (cond (<= n 0) 0
-                          (== stride 1) n
-                          :else (inc (quot (dec n) stride)))
+                          (== cap-stride 1) n
+                          :else (inc (quot (dec n) cap-stride)))
                     0)
                 kept (when keep? (js/Array. m))
                 ;; EVERY adjacent key pair decides `sorted`, not the anchors --
@@ -691,26 +1087,56 @@
                 ;; wrong answers. Arrays are never marked sorted: the flag is
                 ;; about map key order, and `boring.nav` only consults it there.
                 srt (when (and keep? map?) #js [true])
+                ;; The tag chain and this container's own head, charged before
+                ;; any entry -- so no entry's prefix includes them. The JVM
+                ;; captures `itemsAtStart` after `head(..)` for the same reason.
+                _ (aset items 0 (+ (aget items 0) ntags 1))
+                at-start (aget items 0)
+                walk-acc #js [0]
                 end (loop [i 0 q (rd/head-end-at r p) prev -1]
                       (if (== i n)
                         q
-                        (do (when (and keep? (zero? (rem i stride)))
-                              (aset kept (quot i stride) q))
+                        (do (when (and keep? (zero? (rem i cap-stride)))
+                              (aset kept (quot i cap-stride) q))
                             (when (and srt (aget srt 0) (>= prev 0)
                                        (>= (rd/compare-items-at r prev q) 0))
                               (aset srt 0 false))
+                            ;; BEFORE the entry is walked -- one prefix per
+                            ;; ENTRY, which for a map is key and value together.
+                            (when keep?
+                              (aset walk-acc 0 (+ (aget walk-acc 0)
+                                                  (- (aget items 0) at-start))))
                             (recur (inc i)
                                    (if map?
                                      ;; A map entry is a key AND a value, and
                                      ;; the anchor points at the key.
+                                     ;; The KEY, with nodes suppressed: nav
+                                     ;; realises a map key, so nothing inside
+                                     ;; one is reachable. See the JVM walk.
                                      (index-walk* r (index-walk* r q stride min-entries
-                                                                 base acc (inc depth))
-                                                  stride min-entries base acc (inc depth))
+                                                                 base acc (inc depth) items true)
+                                                  stride min-entries base acc (inc depth)
+                                                  items suppress?)
                                      (index-walk* r q stride min-entries base acc
-                                                  (inc depth)))
+                                                  (inc depth) items suppress?))
                                    q))))]
             (when keep?
-              (.push acc [(+ p base) n (vec kept) (boolean (and srt (aget srt 0)))]))
+              ;; FLOOR DIVISION, matching `Writer.fillNode` and the JVM walk.
+              (let [sorted (boolean (and srt (aget srt 0)))
+                    walk (if (pos? n) (quot (aget walk-acc 0) n) 0)
+                    ;; Narrowed now that `sorted` is known. `(pos? n)` because
+                    ;; this runs before the keep decision.
+                    ;; See the JVM walk: only a stride-1 capture can be
+                    ;; narrowed.
+                    kept (if (and map? sorted (pos? n)
+                                  (== cap-stride 1) (> stride 1))
+                           (let [mm (inc (quot (dec n) stride))
+                                 out (js/Array. mm)]
+                             (dotimes [a mm] (aset out a (nth kept (* a stride))))
+                             (vec out))
+                           kept)]
+                (when (keep-node? map? sorted walk stride n)
+                  (.push acc [(+ p base) n (vec kept) sorted walk]))))
             end))))))
 
 (defn build-index
@@ -734,19 +1160,41 @@
          r (rd/reader bs)
          acc (array)
          end (.-length bs)]
-     (loop [p 0] (when (< p end) (recur (index-walk* r p stride min-entries 0 acc 0))))
-     (when (pos? (.-length acc))
-       (let [idx (vec (sort-by first (vec acc)))]
+     (loop [p 0] (when (< p end)
+                   (recur (index-walk* r p stride min-entries 0 acc 0 #js [0] false))))
+     ;; A FRAME IS ALSO EARNED BY A NAMESPACE, not only by a container node.
+     ;; The gate used to be the node count alone, and that returned nil for a
+     ;; small value whose strings repeat -- so `encode-indexed` handed back a
+     ;; document carrying tag-25 references and no table, which `boring.nav`
+     ;; cannot read. #22's walk threshold declines to index a small container,
+     ;; and the writer emits a reference as soon as a string repeats, so the
+     ;; two rules met in the middle and produced an unreadable file.
+     ;;
+     ;; ON THE NAMESPACE, not on whether anything was referenced, matching
+     ;; `write-indexed-resolved!` -- see the long note there for why the
+     ;; narrower gate costs more than the frame it saves.
+     (let [srp (when (rd/has-stringref-root? r) (derive-stringref-pointers r end))]
+       (when (or (pos? (.-length acc)) (some? srp))
+         (let [idx (vec (sort-by first (vec acc)))]
          ;; `:stride` INCLUDED. The JVM's `build-index` returns it and
          ;; `seal-index!` reads it from the index; here it was omitted and
          ;; `seal-index!` took it from its own options map instead, so the
          ;; documented public pair sealed a stride-16 frame over stride-4
          ;; slots whenever the two calls were given different options.
-         {:stride stride
-          :containers (mapv #(nth % 0) idx)
-          :counts (mapv #(nth % 1) idx)
-          :slots (mapv #(nth % 2) idx)
-          :sorted (mapv #(nth % 3) idx)})))))
+           (cond->
+            {:stride stride
+             :containers (mapv #(nth % 0) idx)
+             :counts (mapv #(nth % 1) idx)
+             :slots (mapv #(nth % 2) idx)
+             :sorted (mapv #(nth % 3) idx)
+           ;; `walk` NEVER REACHES THE WIRE -- see the JVM `nodes->index`. It
+           ;; is a decision input, carried so the three builders can be held to
+           ;; the same number before any of them acts on it.
+             :walk (mapv #(nth % 4) idx)}
+           ;; `cond->`, not a nil value: the JVM `build-index` omits the key
+           ;; entirely for a document that opens no namespace, and this map is
+           ;; public, so the two platforms must agree on its shape.
+             (some? srp) (assoc :stringrefs srp))))))))
 
 (defn- long->8-bytes [v]
   (let [b (js/Uint8Array. 8)]
@@ -756,15 +1204,40 @@
         (recur (inc i) (js/Math.floor (/ x 256)))))
     b))
 
+(defn- wire-offsets
+  "`containers` as the narrowest typed array that holds them: tag 78 when every
+  offset fits in int32, tag 79 when one does not.
+
+  `js/Int32Array.from` applies ToInt32, which WRAPS rather than refusing, so
+  emitting it unconditionally turned an offset at or above 2^31 into a negative
+  one silently -- exactly the case 64-bit offsets were added for. A reader
+  normally rejects that at the ascending check, but `:trust-index :trusted`
+  skips it and the lookup jumps somewhere arbitrary. The JVM writer has always
+  promoted here; this is that rule, on this side."
+  [containers]
+  (if (some (fn [v] (or (< v -2147483648) (> v 2147483647))) containers)
+    (js/BigInt64Array.from (clj->js containers) js/BigInt)
+    (js/Int32Array.from (clj->js containers))))
+
 (defn seal-index!
   "Append the tag-27 index frame describing `index` over `data-len` bytes.
 
   The frame is tag 27 wrapping [name, [stride, containers, counts, slots,
-  sorted, <8-byte data-len>]] -- the same item `boring.nav` reads on the JVM. The
-  trailing byte string is always exactly 8 bytes, so a sealed file ends with 9
-  predictable bytes, which is how the frame is found without parsing backwards."
+  sorted, (stringrefs,) <8-byte data-len>]] -- the same item `boring.nav` reads
+  on the JVM. The trailing byte string is always exactly 8 bytes, so a sealed
+  file ends with 9 predictable bytes, which is how the frame is found without
+  parsing backwards.
+
+  `data-end` IS LAST, AND THAT IS LOAD-BEARING, which is why the optional
+  pointer table goes BETWEEN `sorted` and it rather than after. `read-index`
+  finds the frame by the FINAL NINE BYTES of the file -- an 8-byte byte string
+  always encodes as `0x48` plus its bytes, a recognisable trailer holding a
+  back-pointer to the frame's start -- and CBOR cannot be parsed backwards, so
+  those nine bytes are the only way in. An element appended after `data-end`
+  leaves the file ending in pointer-table bytes, and every indexed document
+  silently falls back to scanning."
   [index data-len opts]
-  (let [{:keys [containers counts slots sorted]} index
+  (let [{:keys [containers counts slots sorted stringrefs]} index
         ;; THE INDEX'S OWN STRIDE, not this call's options. `build-index`
         ;; returns the stride it laid the anchors at; reading it from `opts`
         ;; here meant the documented public pair silently sealed a frame
@@ -773,9 +1246,7 @@
         ;; then jumps by the claimed stride and the index is dead: 39 skips
         ;; where 3 would do, with no error. The JVM has always taken it from
         ;; the index map."
-        stride (or (:stride index) (get opts :index default-index-stride))
-        packed (vec (map-indexed (fn [i s] (delta-slot s (max 0 (nth containers i))))
-                                 slots))]
+        stride (or (:stride index) (get opts :index default-index-stride))]
     ;; TYPED ARRAYS, not plain vectors. `boring.nav/read-index*` requires
     ;; `containers` and `counts` to arrive as int arrays -- tag 78 on the wire
     ;; -- and silently IGNORES an index whose shape it does not recognise. So
@@ -783,12 +1254,34 @@
     ;; trailing item and then discarded, and my acceptance test passed because
     ;; nav fell back to scanning: it proved the bytes were harmless, never that
     ;; the index was used. Same class as the vacuous budget tests.
-    (encode (data/unknown-record index-name
-                                 [stride (js/Int32Array.from (clj->js containers))
-                                  (js/Int32Array.from (clj->js counts))
-                                  packed (vec sorted)
-                                  (long->8-bytes data-len)])
+    (encode (data/unknown-record
+             index-name
+             ;; OMITTED WHEN THERE IS NOTHING TO POINT AT, which is every
+             ;; document written without a stringref namespace and every one
+             ;; whose strings never repeat. Existing files stay byte-identical
+             ;; rather than gaining an empty element.
+             (let [srp (when stringrefs (pack-stringrefs stringrefs))]
+               (-> [stride (wire-offsets containers)
+                    (js/Int32Array.from (clj->js counts))
+                    (pack-slots slots containers counts stride)
+                    (pack-sorted sorted)]
+                   (cond-> srp (conj srp))
+                   (conj (long->8-bytes data-len)))))
+            ;; THE FRAME IS NEVER WRITTEN INSIDE A STRINGREF NAMESPACE, whatever
+            ;; the data's options are. A namespace prepends `d9 01 00`, which
+            ;; shifts the 17-byte prefix `read-index` compares against, so the
+            ;; frame stops being recognised and the index is SILENTLY DEAD. Now
+            ;; that `:stringref` and `:index` compose, that would happen to
+            ;; every indexed document rather than to a mismatched few. Nothing
+            ;; is lost: a frame's only text is `boring/index`, which occurs
+            ;; once.
             (assoc (or opts {}) :stringref false))))
+
+(def ^:private small-enough-to-encode-twice
+  "Below this many bytes, `encode-indexed` encodes both ways and keeps the
+  shorter. MUST equal the JVM's constant of the same name, or the two
+  platforms write different files for the same small value."
+  4096)
 
 (defn encode-indexed
   "Encode `v` and seal an index onto it, returning a Uint8Array.
@@ -798,45 +1291,54 @@
   passes it to `boring.nav/source` and lookups inside large containers become
   jumps.
 
-  `:stringref false` IS FORCED: an index records byte offsets, and a string
-  reference resolves against a table built from every preceding string, so an
-  offset alone cannot be decoded inside a stringref namespace.
+  `:stringref` AND `:index` COMPOSE, and the profile's default is honoured
+  rather than forced off. They were mutually exclusive because an index records
+  byte offsets while a string reference resolves against a table built from
+  every preceding string, so an offset alone could not be decoded inside a
+  namespace. The frame now carries a sixth element -- the defining offset of
+  each slot something actually references -- and a reference resolves by
+  JUMPING there. `build-index` re-derives that numbering by walking the
+  finished bytes in document order, which is the same order the JVM's streaming
+  writer assigns indices in, so both platforms and both builders write the same
+  file.
 
-  An EXPLICIT `:stringref true` is therefore REFUSED with
-  `:boring/incompatible-options`, exactly as the JVM's `encode-indexed`,
-  `write-seq!` and `write-indexed!` all refuse it. It used to be overwritten
-  with `false` and encoded anyway, so `seq_index_test.clj`'s
-  `stringref-and-an-index-are-refused-by-every-writer` -- whose docstring ends
-  \"Three functions, one rule, and one of them did not follow it\" -- was
-  counting three writers where there are four. Measured on
-  `(vec (repeat 20 \"aaaaaaaaaa\"))` with `{:index 4 :index-min 4
-  :stringref true}`: `:boring/incompatible-options` on the JVM, 268 silently
-  un-stringref'd bytes here.
+  A SEQUENCE STILL REFUSES the combination -- see `write-seq!`. Each top-level
+  item restarts the namespace at index 0 and one frame carries one table.
 
-  OPTIONS ARE VALIDATED BEFORE `:stringref` IS OVERWRITTEN, which is the other
-  half of the same defect: forcing the key first meant a garbage VALUE for it
-  was thrown away unread, so `{:stringref \"yes\"}` was `:boring/bad-option` on
-  the JVM and `:ok` here -- the single disagreement in a 174-cell option matrix.
+  OPTIONS ARE VALIDATED BEFORE ANYTHING IS OVERWRITTEN. Forcing a key first
+  meant a garbage VALUE for it was thrown away unread, so `{:stringref \"yes\"}`
+  was `:boring/bad-option` on the JVM and `:ok` here -- the single disagreement
+  in a 174-cell option matrix.
 
   Returns the plain encoding when nothing clears `:index-min`, which is what the
   JVM does and why the result is always decodable either way."
   ([v] (encode-indexed v nil))
   ([v opts]
-   (when (true? (:stringref opts))
-     (throw (ex-info (str "boring: :stringref true cannot be combined with an index -- "
-                          "boring.nav cannot resolve string references from an offset, "
-                          "so the index would be unusable. Drop one of the two.")
-                     {:type :boring/incompatible-options :stringref true})))
-   (let [o (assoc (or (opt/check-opts opts) {}) :stringref false)
+   ;; CHECKED, NOT RESOLVED. `encode` and `build-index` each resolve, and
+   ;; `resolve-opts` on an already-resolved map throws for every profile that
+   ;; locks a key -- the double-resolution trap `write-seq!`'s 3-arity records.
+   ;; So this validates and passes the caller's map through untouched; the
+   ;; profile's `:stringref` default is applied downstream, which is what
+   ;; letting the two options compose amounts to.
+   (let [o (or (opt/check-opts opts) {})
          body (encode v o)
-         idx (build-index body o)]
-     (if-not idx
-       body
-       (let [frame (seal-index! idx (.-length body) o)
-             out (js/Uint8Array. (+ (.-length body) (.-length frame)))]
-         (.set out body 0)
-         (.set out frame (.-length body))
-         out)))))
+         idx (build-index body o)
+         bs (if-not idx
+              body
+              (let [frame (seal-index! idx (.-length body) o)
+                    out (js/Uint8Array. (+ (.-length body) (.-length frame)))]
+                (.set out body 0)
+                (.set out frame (.-length body))
+                out))]
+     ;; SMALL VALUES TAKE WHICHEVER NAVIGABLE ENCODING IS SMALLER -- see the
+     ;; JVM `encode-indexed` for the reasoning and the measurements. Mirrored
+     ;; here because the two platforms must write the same file, and the
+     ;; choice changes which bytes come out.
+     (if (and (:stringref (resolve-opts o))
+              (< (.-length bs) small-enough-to-encode-twice))
+       (let [alt (encode-indexed v (assoc (or opts {}) :stringref false))]
+         (if (< (.-length alt) (.-length bs)) alt bs))
+       bs))))
 
 (defn tag-registry
   "An empty registry. Shape:

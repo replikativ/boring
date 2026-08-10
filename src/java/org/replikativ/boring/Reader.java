@@ -190,10 +190,29 @@ public final class Reader {
      */
     public long maxItems = 0;
 
-    /** Items charged so far. Public so the sequence decoders and `boring.nav`
-     *  can save and restore it around reading boring's OWN index frame, which
-     *  must not spend the caller's budget. */
+    /**
+     * Items charged so far, against {@link #maxItems}.
+     *
+     * <p>Public, but NOT because anything outside this class touches it. The
+     * javadoc here used to say "so the sequence decoders and `boring.nav` can
+     * save and restore it around reading boring's OWN index frame" -- no JVM
+     * Clojure reads or writes this field, and nav.clj records that those
+     * overrides are dead. The frame is kept off the caller's budget inside
+     * this class instead.
+     */
     public long items;
+
+    /** Items crossed by the current structural skip. NOT the same quantity as
+     *  `items` above and not interchangeable with it: `items` is the DECODE
+     *  budget, charged by `read` against `maxItems` to bound amplification,
+     *  while this counts heads crossed by `skipStructural` and is charged
+     *  against nothing. They deliberately disagree -- see skipCountingFrom. */
+    private long skipItems;
+
+    /** Whether the current skip is counting. False for every ordinary skip --
+     *  see skipStructural for why this is a flag and not an unconditional
+     *  increment. */
+    private boolean skipCounting;
 
     /** Whether `v` parses as an ordinary RFC 3339 instant. Used to validate the
      *  non-leap part of a leap-second timestamp before preserving it. */
@@ -362,6 +381,50 @@ public final class Reader {
      *  repeated keyword costs one array load — the same trick as hako's symref. */
     private Object[] srIdents;
 
+    // ---- offset-resolution mode ---------------------------------------------
+    /**
+     * The index frame's stringref pointer table, as a WINDOW INTO THIS READER'S
+     * OWN BUFFER rather than a copy: the frame is in the same bytes the data is.
+     *
+     * <p>This is the second way to resolve a stringref, and it exists because
+     * the first one cannot serve a navigator. Incrementally, index <i>n</i>
+     * means "the nth qualifying string in document order", which is knowable
+     * only by having decoded all of them — exactly what an index exists to
+     * avoid. Given (index -&gt; defining offset) for the referenced entries, a
+     * reader holding nothing but an offset resolves by JUMPING instead of by
+     * remembering, and `:stringref` and `:index` stop being mutually exclusive.
+     *
+     * <p>The two modes are exclusive per document: when {@code srPtrCount > 0}
+     * the incremental table is never built and {@code srActive} stays false —
+     * which is also why {@link #skipValue} needs no change, since its fallback
+     * is gated on {@code srActive}.
+     *
+     * <p>Set by the navigator once it has parsed the frame; cleared by
+     * {@link #resetState}, so it can never outlive the buffer it indexes.
+     */
+    private long srPtrBase;      // absolute offset of the first pair
+    private int  srPtrCount;     // number of (index, offset) pairs
+    private int  srPtrIw;        // bytes per index field
+    private int  srPtrOw;        // bytes per offset field
+    /**
+     * Was a table element PRESENT, as distinct from carrying pairs.
+     *
+     * <p>The two are not the same question and collapsing them was a defect.
+     * A frame with no table describes a document nothing can navigate; a frame
+     * with an EMPTY table describes one that opens a namespace and references
+     * nothing, which navigates perfectly. The default profile opens a namespace
+     * whatever the content turns out to be, so the empty case is every indexed
+     * document that happens to hold no repeated string — including one holding
+     * no strings at all.
+     *
+     * <p>{@code srPtrCount > 0} still gates RESOLUTION, because with no pairs
+     * there is nothing to resolve against; this gates ACCEPTANCE.
+     */
+    private boolean srPtrTable;
+    /** Resolved text per PAIR SLOT — not per stringref index, because the table
+     *  is sparse. Lazily allocated on the first resolution. */
+    private Object[] srPtrCache;
+
     public Reader(byte[] b) { bindArray(b); }
 
     public Reader(ByteSource s) { bind(s); }
@@ -395,10 +458,74 @@ public final class Reader {
     }
 
     public void reset(byte[] b) {
-        // Re-binding the SAME array -- a loop over one scratch buffer, which is
-        // exactly what reading items out of a mapping does -- skips the wrapper
-        // entirely.
-        if (arr != b) bindArray(b); else pos = 0;
+        // ASSIGNS UNCONDITIONALLY. This used to skip `bindArray` when re-binding
+        // the SAME array and set only `pos` -- and `bindArray` is what sets
+        // `limit`. Once reset(byte[], int) existed, a caller could narrow the
+        // limit to a row length and a later reset(byte[]) on that same array
+        // would keep it: the reader then reported the buffer as 4 bytes long
+        // when it was 256, and a decode through it raised :boring/bad-count
+        // where a fresh reader succeeded.
+        //
+        // Fail-safe rather than dangerous -- reset(b, len) guarantees
+        // len <= b.length, so the stale limit is only ever too small, giving a
+        // truncation error and never an over-read. Fixed anyway, because
+        // `decode-with` is public and the shortcut saved nothing measurable
+        // once these are plain field assignments.
+        this.src = null;
+        this.arr = b;
+        this.pos = 0;
+        this.limit = b.length;
+        resetState();
+    }
+
+    /**
+     * Point at the FIRST `len` bytes of `b`, treating the rest as absent.
+     *
+     * <p><b>Why the one-argument form is not enough.</b> {@link #reset(byte[])}
+     * takes the array's whole length as the limit -- there is nothing else it
+     * could take. A caller reading many short messages through ONE REUSED
+     * BUFFER therefore left the limit at the buffer's capacity, and every
+     * truncation check ran against bytes the PREVIOUS message had left behind.
+     * A damaged message then decoded as whatever was still lying there:
+     *
+     * <pre>
+     *   fresh reader on a truncated row:  boring: declared count 27 needs at
+     *                                     least 27 bytes but only 21 remain
+     *   reused buffer, same bytes:        {:aaa 1, :bbb "hello world ..."}
+     *                                     -- silently the PREVIOUS row
+     * </pre>
+     *
+     * That is the reader's stated contract inverted. Damaged input is supposed
+     * to become a typed error, and instead it became a plausible wrong value,
+     * which is the one outcome a decoder must never produce.
+     *
+     * <p>{@link #reset(ByteSource)} never had this problem -- {@code bind}
+     * takes {@code s.size()} -- so it was only ever the array path, and only
+     * when the array outlives the message in it.
+     *
+     * <p>The other caller is {@code decode-seq-from}, which copied its buffer
+     * on EVERY refill purely for want of this method: 3.2x to 5.5x the
+     * allocation of decoding the same bytes from memory, rising with item size.
+     * A length argument makes the copy unnecessary.
+     *
+     * <p>Fields are assigned directly rather than through {@code bindArray},
+     * which would set the limit to the array's length and have to be corrected
+     * -- and rather than through the same-array shortcut in
+     * {@link #reset(byte[])}, which would leave a stale {@code src} behind if
+     * the previous bind came from a ByteSource whose {@code heapArray} was this
+     * array.
+     *
+     * @param len bytes of `b` that are valid, from offset 0
+     * @throws IllegalArgumentException if `len` is negative or past the array
+     */
+    public void reset(byte[] b, int len) {
+        if (len < 0 || len > b.length)
+            throw new IllegalArgumentException(
+                "reset length " + len + " outside an array of " + b.length);
+        this.src = null;
+        this.arr = b;
+        this.pos = 0;
+        this.limit = len;
         resetState();
     }
 
@@ -407,11 +534,60 @@ public final class Reader {
         resetState();
     }
 
+    /**
+     * Point this reader at an index frame's stringref pointer table.
+     *
+     * `base` is the absolute offset of the first pair, `count` how many, `iw`
+     * and `ow` the field widths in bytes. Called by the navigator after it has
+     * parsed and validated the frame; `count == 0` turns the mode off, which is
+     * what a document without the element gets.
+     *
+     * <p>Deliberately NOT carried on Index: #12 removed the Reader from Index
+     * so a forked navigator could not read through a stale one, and pushing
+     * Index back onto the Reader would only re-tie that knot from the other
+     * side. What crosses is four primitives naming a region of bytes this
+     * reader already owns.
+     */
+    public void setStringrefPointers(long base, int count, int iw, int ow) {
+        this.srPtrBase = base;
+        this.srPtrCount = count;
+        this.srPtrIw = iw;
+        this.srPtrOw = ow;
+        this.srPtrTable = true;
+        // Dropped rather than cleared: a new table means every cached
+        // resolution belongs to a different document.
+        this.srPtrCache = null;
+    }
+
+    /**
+     * Record that the frame carries NO pointer table.
+     *
+     * <p>Its own method rather than {@code setStringrefPointers(0, 0, 0, 0)},
+     * which is what the navigator used to call. Once an empty table became a
+     * meaningful state — a document that opens a namespace and references
+     * nothing — "all four numbers are zero" stopped being able to mean "there
+     * is no table", because that is also what an empty one looks like.
+     */
+    public void clearStringrefPointers() {
+        this.srPtrBase = 0;
+        this.srPtrCount = 0;
+        this.srPtrIw = 0;
+        this.srPtrOw = 0;
+        this.srPtrTable = false;
+        this.srPtrCache = null;
+    }
+
     private void resetState() {
         items = 0;
         this.reused = true;
         this.depth = 0;
         srActive = false;
+        // The table names offsets in the buffer being replaced, so it cannot
+        // survive a reset -- reading through it afterwards would resolve
+        // against whatever the new document happens to have at those offsets.
+        srPtrBase = 0; srPtrCount = 0; srPtrIw = 0; srPtrOw = 0;
+        srPtrTable = false;
+        srPtrCache = null;
         if (srCount > 0) {
             java.util.Arrays.fill(srStrings, 0, srCount, null);
             java.util.Arrays.fill(srIdents, 0, srCount, null);
@@ -436,8 +612,6 @@ public final class Reader {
      *  know when it has run out of items. */
     public long size() { return limit; }
 
-    /** Rewind to an absolute offset. The navigator descends with this. */
-    public void seek(long p) { this.pos = p; }
 
     /**
      * Advance past the value at the cursor without building it.
@@ -468,6 +642,22 @@ public final class Reader {
     }
 
     private void skipStructural() {
+        // ONE ITEM PER HEAD. See skipCountingFrom for what this is for and why
+        // the count is defined structurally rather than as "what `read` would
+        // charge".
+        //
+        // GUARDED, not unconditional, on the PRINCIPLE that the skip path every
+        // navigation runs should not maintain a counter only the two index
+        // builders ever read. Not on a measurement: on a 42 KB document of
+        // 18 000 items, minima over four runs each were 142.0 us unguarded
+        // against 145.9 with an unconditional increment and 146.9 with this
+        // branch -- a ~3% band that run-to-run spread (~6%) does not resolve.
+        // The guard is not demonstrably faster than the store; it is simply
+        // the version whose cost is confined to the callers that want it.
+        //
+        // Said plainly because a single tighter-looking pair of runs here read
+        // as 7.6% and did not survive being repeated.
+        if (skipCounting) skipItems++;
         int h = u8();
         int major = h >>> 5;
         int info = h & 0x1F;
@@ -559,6 +749,13 @@ public final class Reader {
                             + skipLimit() + ")", "max-depth", (long) skipLimit());
                     arg(h2 & 0x1F);
                 }
+                // EACH TAG IN THE CHAIN IS ITS OWN ITEM. The loop above
+                // collapses the chain rather than recursing, so the `++` at the
+                // top charged the whole chain once. The writer emits one
+                // `head(TAG, ..)` per tag, so leaving it at one would make the
+                // two index builders disagree on any doubly-tagged value --
+                // exactly the divergence skipCountingFrom exists to rule out.
+                if (skipCounting) skipItems += chain - 1;
                 skipStructural();
                 return;
             }
@@ -582,6 +779,38 @@ public final class Reader {
 
     /** Additional-info nibble of the item at `p`. */
     public int infoAt(long p) { return b(p) & 0x1F; }
+
+    /**
+     * The unsigned byte at `p`, 0-255.
+     *
+     * <p>For a caller reading its OWN bytes rather than CBOR's -- a container
+     * format that puts a tag or a length in front of the item, and wants to
+     * read it through the same bounds-checked accessor the decoder uses rather
+     * than reaching around the Reader to the buffer. {@code majorAt} and
+     * {@code infoAt} are this byte split in two, and reassembling it from them
+     * is two virtual calls and a shift to recover something already at hand.
+     */
+    public int byteAt(long p) { return b(p); }
+
+    /**
+     * Big-endian unsigned 32-bit value at `p`. Unaligned. Same purpose as
+     * {@link #byteAt}: a length a container format wrote itself.
+     *
+     * <p><b>One word, not four bytes.</b> This spelled itself out as
+     * {@code b(p)<<24 | b(p+1)<<16 | ...}, which is four bounds checks, four
+     * {@code arr != null} branches, and -- on a segment -- four interface calls
+     * into four {@code seg.get(JAVA_BYTE, p)}. {@link #s32} has existed the
+     * whole time and does one: a {@code VarHandle} load on the heap path,
+     * {@code src.i32} on the segment path, one bounds check either way.
+     *
+     * <p>That the access COUNT matters here is not incidental. The JIT cannot
+     * see a segment's size when the segment is loaded from a field, so the
+     * per-access bounds check inside {@code MemorySegment.get} does not fold
+     * away -- fewer, wider accesses is the whole lever on this path.
+     */
+    public long u32At(long p) {
+        return s32(p) & 0xFFFFFFFFL;
+    }
 
     /**
      * The head's argument at `p`: element count for an array, pair count for a
@@ -667,6 +896,66 @@ public final class Reader {
         finally { pos = save; depth = d; skipDepth = sd; busy = false; }
     }
 
+    /**
+     * Skip the value at `p` like {@link #skipFrom}, and also COUNT the CBOR
+     * items crossed. Returns the end offset; {@link #skipItemCount} then gives
+     * the count.
+     *
+     * <p>This is the `walk` metric's input. `walk` is the mean number of items
+     * a scan crosses to reach a random entry of a container, and it is what
+     * decides whether that container is worth an index node at all -- so the
+     * WRITER, which counts items as it emits them, and the BYTE WALK, which
+     * counts them here, must arrive at the same number for the same bytes.
+     * They produce the same file only if they do.
+     *
+     * <p>ONE ITEM PER HEAD, and that is the whole definition. Deliberately NOT
+     * "what `read` would charge to the item budget": `skipStructural` above
+     * records three attempts at making a generic walker agree with `read`, each
+     * of which broke a different value, and concludes that mirroring it is not
+     * a reachable goal -- a tag reader that parses its payload inline charges
+     * nothing for the containers under it, and the gap is unbounded. None of
+     * that matters here, because both sides of THIS agreement are structural:
+     * bytes emitted against the same bytes walked.
+     *
+     * <p>Items, not bytes, because CBOR containers are element-counted and
+     * stepping over a subtree means walking it item by item. A 70 KB byte
+     * string is ONE item and skips in O(1); 70 KB of small integers is 35 000.
+     * Measuring the span in bytes gets that backwards, which is the error two
+     * earlier versions of the index policy made.
+     *
+     * <p>Refuses while a stringref namespace is ACTIVELY BEING DECODED, where
+     * `skipValue` falls back to a full `read` and would count nothing.
+     *
+     * <p>This used to say the restriction was not live "because `:stringref`
+     * and `:index` cannot be combined". They compose now -- the index frame
+     * carries a pointer table -- and the runtime message said so too, which
+     * made it a user-visible string asserting a rule the library had dropped.
+     * The guard is still unreachable in practice, but for a different reason:
+     * the index builders walk a finished document with `srActive` false, and
+     * `build-index` over a stringref document is exercised and works.
+     */
+    public long skipCountingFrom(long p) {
+        if (busy) throw concurrentUse();
+        if (srActive) throw Err.of("unsupported-option",
+            "boring: items cannot be counted while a stringref namespace is"
+            + " being decoded -- skipping cannot resolve a reference, so the"
+            + " count would be wrong rather than merely slow");
+        skips++;
+        busy = true;
+        long save = pos; int d = depth, sd = skipDepth;
+        try {
+            pos = p; skipDepth = 0; skipItems = 0; skipCounting = true;
+            skipStructural();
+            return pos;
+        } finally {
+            pos = save; depth = d; skipDepth = sd; skipCounting = false;
+            busy = false;
+        }
+    }
+
+    /** Items crossed by the most recent {@link #skipCountingFrom}. */
+    public long skipItemCount() { return skipItems; }
+
     /** Decode the value at `p`. Does not disturb the caller's position or depth. */
     public Object readFrom(long p) {
         if (busy) throw concurrentUse();
@@ -690,9 +979,20 @@ public final class Reader {
      * the entire point of not materialising what you did not ask for.
      */
     public boolean bytesEqualAt(long p, byte[] probe) {
-        int n = probe.length;
-        if (p < 0 || n > limit - p) return false;   // no overflow-prone addition
-        for (int i = 0; i < n; i++) if (sb(p + i) != probe[i]) return false;
+        return bytesEqualAtFrom(p, probe, 0);
+    }
+
+    /**
+     * As {@link #bytesEqualAt}, comparing only `probe[from..]`.
+     *
+     * For a key written as a stringref: the reference carries a tag 39 that the
+     * defining literal does not, so matching a repeated keyword means comparing
+     * the probe past its own `d8 27` against the text where it was defined.
+     */
+    public boolean bytesEqualAtFrom(long p, byte[] probe, int from) {
+        int n = probe.length - from;
+        if (p < 0 || n < 0 || n > limit - p) return false;  // no overflow-prone addition
+        for (int i = 0; i < n; i++) if (sb(p + i) != probe[from + i]) return false;
         return true;
     }
 
@@ -1094,6 +1394,207 @@ public final class Reader {
         return arg(h & 0x1F);
     }
 
+    /**
+     * Whether this document resolves stringrefs by jumping rather than by
+     * remembering. Checked before every use of the incremental table.
+     *
+     * <p>Gated on the COUNT, not on {@link #srPtrTable}: an empty table means
+     * the document references nothing, so there is nothing for either mechanism
+     * to do and the cheaper answer is to stay out of offset mode entirely.
+     */
+    private boolean srOffsetMode() { return srPtrCount > 0; }
+
+    /**
+     * Whether a pointer table has been installed — INCLUDING AN EMPTY ONE.
+     *
+     * <p>The navigator asks this to decide whether a stringref document is
+     * navigable at all. That is a different question from whether there is
+     * anything to resolve, and answering it with {@code srPtrCount > 0} got it
+     * wrong for every indexed document whose strings happen not to repeat: the
+     * default profile opens a namespace before it knows the content, so
+     * {@code (nav/root (encode-indexed (vec (range 40))))} — a file with no
+     * strings in it at all — was refused as unnavigable.
+     *
+     * <p>The writers now always emit the element for a document that opens a
+     * namespace, empty if need be, so "no table" once again means only what it
+     * says: nothing here can resolve a reference.
+     */
+    public boolean hasStringrefPointers() { return srPtrTable; }
+
+    /**
+     * Where stringref `idx` was defined, or -1 if nothing says.
+     *
+     * This is what lets a navigator compare a key that is a REFERENCE without
+     * decoding it. `bytesEqualAt` is a memcmp against an encoded probe, and
+     * `d8 19 05` never equals an encoded `:profile` -- so a repeated key
+     * matched nothing, which on konserve-shaped data is 199 occurrences in 200.
+     *
+     * The obvious repair is to compile the probe into its reference form, which
+     * needs a string-to-index pass over the table per document. This is
+     * cheaper and needs no per-document state: the pointer names the DEFINING
+     * LITERAL, and the literal is byte-identical to what the probe encodes, so
+     * the comparison is the same memcmp taken at a different offset.
+     *
+     * Never throws: a miss is -1, so a damaged table costs a failed comparison
+     * rather than an exception out of `get`.
+     */
+    public long stringrefOffsetFor(long idx) {
+        if (srPtrCount <= 0) return -1L;
+        try {
+            int slot = srPtrSlot(idx);
+            if (slot < 0) return -1L;
+            return srLe(srPtrBase + (long) slot * (srPtrIw + srPtrOw) + srPtrIw, srPtrOw);
+        } catch (RuntimeException e) {
+            return -1L;
+        }
+    }
+
+    /**
+     * The stringref index whose DEFINING LITERAL is `probe[from..]`, or -1.
+     *
+     * The inverse of {@link #stringrefOffsetFor}, and the one thing a binary
+     * search over reference-keyed anchors cannot do without. Those anchors are
+     * ordered by REFERENCE INDEX -- indices are handed out in first-occurrence
+     * order, so `d8 19 00 < d8 19 01 < ...` really does ascend bytewise, and
+     * the index frame's `sorted` bit is honest about it. What it is not is
+     * comparable against a probe encoded as a LITERAL, which is every probe
+     * `boring.nav` builds. Resolving the anchors instead does not help: they
+     * are not in resolved-literal order (measured: 19 of 39 adjacent pairs
+     * descend), so a search under that comparator is unsound.
+     *
+     * So the probe moves into reference space, and this is the pass that takes
+     * it there. LINEAR, unlike `stringrefOffsetFor`'s binary search, because
+     * the table is sorted by index and this asks the other question. It is a
+     * memcmp per pair against bytes already in the buffer, no decoding, and a
+     * caller that repeats a key is expected to hold the answer -- see
+     * `boring.nav/reference-probe`.
+     *
+     * A PREFIX CANNOT MATCH. The first compared byte is a CBOR head carrying
+     * its own length, so `"abc"` cannot match the start of `"abcd"` -- the
+     * heads are `0x63` and `0x64`. That is what makes a bare memcmp sound here
+     * and in `stringrefKeyMatches`.
+     *
+     * Never throws: a damaged table costs failed comparisons and a -1, not an
+     * exception out of `get`.
+     */
+    public long stringrefIndexForBytes(byte[] probe, int from) {
+        if (srPtrCount <= 0 || probe == null || from < 0 || from >= probe.length)
+            return -1L;
+        int stride = srPtrIw + srPtrOw;
+        try {
+            for (int i = 0; i < srPtrCount; i++) {
+                long pair = srPtrBase + (long) i * stride;
+                long off = srLe(pair + srPtrIw, srPtrOw);
+                if (off >= 0 && bytesEqualAtFrom(off, probe, from))
+                    return srLe(pair, srPtrIw);
+            }
+        } catch (RuntimeException e) {
+            return -1L;
+        }
+        return -1L;
+    }
+
+    /** Little-endian unsigned value of `w` bytes at `p`. Every byte goes
+     *  through `b`, which bounds-checks and raises a typed truncated-input. */
+    private long srLe(long p, int w) {
+        long v = 0;
+        for (int i = 0; i < w; i++) v |= ((long) b(p + i)) << (8 * i);
+        return v;
+    }
+
+    /**
+     * The pair slot holding `idx`, or -1.
+     *
+     * Binary search, because the writer emits the pairs ascending — see
+     * `Writer.stringrefPointers`. Sorting on the writing side is the trade the
+     * rest of the frame makes: a document is written once and opened many
+     * times.
+     */
+    private int srPtrSlot(long idx) {
+        int lo = 0, hi = srPtrCount - 1;
+        int stride = srPtrIw + srPtrOw;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            long at = srLe(srPtrBase + (long) mid * stride, srPtrIw);
+            if (at == idx) return mid;
+            if (at < idx) lo = mid + 1; else hi = mid - 1;
+        }
+        return -1;
+    }
+
+    /**
+     * Resolve stringref `idx` by jumping to its defining literal.
+     *
+     * <p><b>Only a string is read there, never an arbitrary item.</b> The
+     * obvious implementation is to seek and call `read()`, and it is wrong: the
+     * pointer comes from the index, the index is a trust boundary, and a
+     * damaged pointer would then have this decode whatever it happens to land
+     * on — an arbitrary amount of work, and arbitrary allocation, inside what
+     * the caller thinks is a map lookup. A stringref slot can only ever hold a
+     * text or byte string, so anything else is refused by shape.
+     */
+    private Object srResolve(long idx) {
+        int slot = srPtrSlot(idx);
+        if (slot < 0)
+            throw Err.of("bad-stringref",
+                "boring: stringref " + idx + " has no pointer in the index frame",
+                "index", idx);
+        if (srPtrCache == null) srPtrCache = new Object[srPtrCount];
+        Object hit = srPtrCache[slot];
+        if (hit != null) return hit;
+
+        long off = srLe(srPtrBase + (long) slot * (srPtrIw + srPtrOw) + srPtrIw, srPtrOw);
+        int h = b(off);
+        int major = h >>> 5;
+        if (major != 2 && major != 3)
+            throw Err.of("bad-stringref",
+                "boring: the stringref pointer for " + idx + " names offset " + off
+                + ", which holds major " + major + ", not a string",
+                "index", idx, "offset", off);
+        long save = pos;
+        Object made;
+        try {
+            pos = off + 1;
+            long n = arg(h & 0x1F);
+            if (n < 0)
+                throw Err.of("bad-stringref",
+                    "boring: the stringref pointer for " + idx
+                    + " names an indefinite-length string, which cannot take a slot",
+                    "index", idx, "offset", off);
+            // Bounds are the reader's own: `stringAt` and the byte copy below
+            // both read through the checked path, so a pointer naming a length
+            // that runs past the buffer is a typed truncated-input.
+            if (n > limit - pos)
+                throw Err.of("bad-stringref",
+                    "boring: the stringref pointer for " + idx + " names a string of "
+                    + n + " bytes, which runs past the end of the input",
+                    "index", idx, "offset", off);
+            if (major == 3) {
+                made = stringAt(pos, (int) n, StandardCharsets.UTF_8);
+            } else {
+                byte[] bs = new byte[(int) n];
+                for (int i = 0; i < n; i++) bs[i] = (byte) b(pos + i);
+                made = bs;
+            }
+        } finally {
+            pos = save;
+        }
+        srPtrCache[slot] = made;
+        return made;
+    }
+
+    /** `srResolve`, for the callers that require TEXT — tag 39 and anything
+     *  interning an identifier. A byte string legally occupies a slot, so this
+     *  is a refusal by shape rather than an impossible case. */
+    private String srResolveText(long idx) {
+        Object o = srResolve(idx);
+        if (!(o instanceof String))
+            throw Err.of("bad-tag-content",
+                "boring: tag 39 references stringref " + idx
+                + ", which holds a byte string, not text", "tag", 39L);
+        return (String) o;
+    }
+
     private void srPut(Object s) {
         // Allocated on the first stringref rather than eagerly at 64 slots:
         // a document with no stringref namespace -- anything under the
@@ -1446,6 +1947,12 @@ public final class Reader {
             int idx = b(pos + 4);
             if (idx < 24) {                       // inline uint: byte IS the index
                 pos += 5;
+                // The shortcut is for the INCREMENTAL table, whose `srIdents`
+                // is indexed by stringref index. Offset mode has no such array
+                // -- its cache is keyed by pair slot, because the table is
+                // sparse -- so it takes the ordinary resolution path instead of
+                // a second, subtly different copy of it here.
+                if (srOffsetMode()) return internIdent(srResolveText(idx));
                 stringrefIndex(idx);              // may not be registered yet
                 Object cached = srIdents[idx];
                 return cached != null ? cached : internAt(idx);
@@ -2346,6 +2853,22 @@ public final class Reader {
                 // A fresh table, and the enclosing one restored on the way out.
                 // Nested namespaces SHADOW rather than extend, so an index can
                 // never leak across a boundary in either direction.
+                // TRANSPARENT IN OFFSET MODE, and it has to be: the ROOT
+                // namespace is a tag 256 at offset 0, so a blanket refusal here
+                // would reject every document this mode exists to read. The
+                // shadowing below is bookkeeping for the incremental table, and
+                // offset mode has no incremental table to shadow.
+                //
+                // A NESTED namespace therefore resolves against the frame's one
+                // table. For anything boring wrote that is exactly right --
+                // `write-root!` is the sole caller of
+                // `writeStringrefNamespace` and opens one namespace at the
+                // root, so there is no second table for it to be wrong about.
+                // Reaching here with real nesting means a damaged frame, where
+                // doc/INDEX.md already allows a wrong answer; what it does not
+                // allow is an untyped throw or a read outside the file, and
+                // `srResolve` refuses by shape and bounds-checks every byte.
+                if (srOffsetMode()) return read();
                 Object[] savedStrings = srStrings;
                 Object[] savedIdents  = srIdents;
                 int      savedCount   = srCount;
@@ -2359,6 +2882,7 @@ public final class Reader {
                 }
             }
             case 25:                                         // stringref
+                if (srOffsetMode()) return srResolve(stringrefArg());
                 return srStrings[stringrefIndex(stringrefArg())];
             case 39: {                                       // identifier
                 // Peek: a stringref here means we can reuse the interned ident.
@@ -2367,6 +2891,15 @@ public final class Reader {
                 if ((h >>> 5) == 6) {                        // nested tag => stringref
                     int inner = (int) arg(h & 0x1F);
                     if (inner == 25) {
+                        // OFFSET MODE INTERNS THROUGH THE SAME `internIdent`, so
+                        // a keyword read by jumping is the identical interned
+                        // object a keyword read incrementally would be. The
+                        // per-index `srIdents` cache is not available here --
+                        // the pointer table is sparse and keyed by slot -- but
+                        // `internIdent` has its own cache, which is what made
+                        // that array an optimisation rather than a requirement.
+                        if (srOffsetMode())
+                            return internIdent(srResolveText(stringrefArg()));
                         // stringrefArg + stringrefIndex, NOT a raw read. This
                         // path used to mask the major type and index srIdents
                         // directly, so `d8 27 d9 00 19 00` (an alternate-width
@@ -2632,7 +3165,18 @@ public final class Reader {
                         throw Err.of("bad-tag-content",
                             "boring: shaped array row must be an array", "tag", 39649L);
                     int vn = checkCount(arg(vh & 0x1F), 1);
-                    if (vn != n)
+                    // A ROW MAY BE SHORTER THAN THE SHAPE, and the keys it does
+                    // not reach are absent. Longer is still malformed: there is
+                    // no key for the extra value to land on.
+                    //
+                    // This used to demand exact equality, which made shapes
+                    // all-or-nothing -- one row with a different key set and the
+                    // writer declined to shape the table at all. Absence is now
+                    // spelled two ways, both of them here: a short row, and
+                    // `undefined` (0xf7) in an interior position. See
+                    // doc/SHAPES.md, and note that `null` (0xf6) remains a
+                    // PRESENT value, so `{:a nil}` and `{}` stay distinct.
+                    if (vn > n)
                         throw Err.of("bad-tag-content",
                             "boring: shaped array row has " + vn + " values but the shape has "
                             + n + " keys", "tag", 39649L);
@@ -2643,12 +3187,22 @@ public final class Reader {
                 // n whose `n * 2` overflows signed int on a source larger than
                 // 2 GiB, which was a raw NegativeArraySizeException. Even
                 // below that, the product may exceed any usable heap.
-                Object[] kvs = new Object[kvSlots(n)];
-                    for (int i = 0; i < n; i++) {
-                        kvs[i * 2] = keys[i];
-                        kvs[i * 2 + 1] = read();
+                Object[] kvs = new Object[kvSlots(vn)];
+                    // `p` counts PRESENT pairs, which is `vn` minus however many
+                    // came back `undefined`. Every value is still READ -- the
+                    // bytes have to be consumed either way -- it is only the
+                    // landing in `kvs` that is skipped.
+                    int p = 0;
+                    for (int i = 0; i < vn; i++) {
+                        Object v = read();
+                        if (v == Data.UNDEFINED) continue;   // absent, not nil
+                        kvs[p * 2] = keys[i];
+                        kvs[p * 2 + 1] = v;
+                        p++;
                     }
-                    tv = tv.conj(buildMap(kvs, n));
+                    // Trimmed only when something was absent, so the common
+                    // dense row pays no copy at all.
+                    tv = tv.conj(buildMap(p == vn ? kvs : java.util.Arrays.copyOf(kvs, p * 2), p));
                 }
                 return tv.persistent();
             }

@@ -95,13 +95,30 @@ class Record:
 def _shaped_array(payload):
     """Tag 39649: [keys, [row-values, ...]] -> [dict, ...].
 
-    An array whose elements are all maps sharing one key set is written with
-    the keys ONCE. This is boring's only non-registered tag; reconstructing it
-    needs no state beyond the tag's own contents, so this function is the
-    entire implementation.
+    An array of maps written with the keys ONCE. This is boring's only
+    non-registered tag; reconstructing it needs no state beyond the tag's own
+    contents, so this function is the entire implementation.
+
+    THE KEYS ARE THE UNION OF EVERY ROW'S, so a row need not carry all of
+    them, and absence has two spellings:
+
+      a SHORT row -- every key past its length is absent
+      `undefined` -- simple value 23, for a gap in the middle
+
+    `null` is NOT absence: it is a key that is present with a nil value, and
+    the two are different maps. CBOR spells them differently on purpose --
+    0xf6 is null, 0xf7 is undefined -- so this distinction survives the wire
+    and must survive the reconstruction.
+
+    A plain `dict(zip(keys, row))` gets the short-row case right by accident,
+    since zip stops at the shorter sequence, and the mid-row case WRONG: it
+    produces a phantom key holding `undefined`. That is what this used to do.
     """
     keys, rows = payload
-    return [dict(zip(keys, row)) for row in rows]
+    return [
+        {k: v for k, v in zip(keys, row) if v is not cbor2.undefined}
+        for row in rows
+    ]
 
 
 def _tag_hook(*args):

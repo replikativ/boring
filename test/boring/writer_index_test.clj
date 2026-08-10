@@ -25,8 +25,9 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [clojure.set]
-            [boring.core :as boring])
-  (:import (org.replikativ.boring Writer)))
+            [boring.core :as boring]
+            [boring.nav :as nav])
+  (:import (org.replikativ.boring Writer Reader)))
 
 (defn- norm
   "An index as a comparable value: nodes sorted by container offset."
@@ -73,18 +74,32 @@
   (gen/one-of [gen/large-integer gen/string-ascii gen/boolean
                (gen/return nil) gen/keyword]))
 
+;; SCALED, and the cap is the point rather than a tuning knob. Five recursive
+;; branches each drawing up to 25 children, at test.check's default max size of
+;; 200, make a rose tree whose SHRINK path is what exhausts the heap -- not the
+;; generated value. Measured before the cap: `OutOfMemoryError: Java heap space`
+;; out of `rose-tree/remove` on roughly one run in thirteen, red CI with no
+;; diagnostic, and -- worse -- a real failing case would present the same way,
+;; since the OOM destroys the shrink output that would have named it.
+;;
+;; A flake that is indistinguishable from a genuine failure is the failure mode
+;; this suite can least afford. Depth is what these tests are about -- a
+;; container nested inside a container, and whether the walk and the writer
+;; agree about it -- and that is reached at size 30 as surely as at 200.
 (def gen-container
-  (gen/recursive-gen
-   (fn [inner]
-     (gen/one-of
-      [(gen/fmap (fn [vs] (into {} (map-indexed (fn [i v] [(format "k%03d" i) v]) vs)))
-                 (gen/vector inner 0 25))
-       (gen/vector inner 0 25)
-       (gen/fmap set (gen/vector gen/large-integer 0 25))
-       (gen/fmap #(into (sorted-map) (map-indexed (fn [i v] [(format "s%03d" i) v]) %))
-                 (gen/vector inner 0 20))
-       (gen/fmap #(apply list %) (gen/vector inner 0 20))]))
-   gen-leaf))
+  (gen/scale
+   #(min % 30)
+   (gen/recursive-gen
+    (fn [inner]
+      (gen/one-of
+       [(gen/fmap (fn [vs] (into {} (map-indexed (fn [i v] [(format "k%03d" i) v]) vs)))
+                  (gen/vector inner 0 25))
+        (gen/vector inner 0 25)
+        (gen/fmap set (gen/vector gen/large-integer 0 25))
+        (gen/fmap #(into (sorted-map) (map-indexed (fn [i v] [(format "s%03d" i) v]) %))
+                  (gen/vector inner 0 20))
+        (gen/fmap #(apply list %) (gen/vector inner 0 20))]))
+    gen-leaf)))
 
 (def profiles
   [{:stringref false}
@@ -190,7 +205,13 @@
   (testing "a writer that was never given setIndex records nothing, and encodes
             byte-identically to one that does -- the index must not change the
             document"
-    (let [v (into {} (for [i (range 40)] [(format "k%03d" i) i]))
+    ;; A 200-ELEMENT VECTOR, not a 40-entry map. This test needs the indexed
+    ;; writer to actually RECORD something, and the old fixture records
+    ;; nothing twice over: 40 scalar pairs are crossed in 39 items on average,
+    ;; below the threshold, and an UNSORTED map earns no node above stride 1
+    ;; at any walk, because the reader would refuse it. An array is gated on
+    ;; walk alone, and 200 elements walk 99.
+    (let [v (vec (range 200))
           ^Writer plain (boring/writer 65536 {:stringref false})
           ^Writer idxed (boring/writer 65536 {:stringref false})]
       (.setIndex idxed (int 16) (int 8) 0)
@@ -210,3 +231,93 @@
              (hooked v {:profile :canonical} 16 2))
           "canonical encoding with nested containers inside KEYS-adjacent
            positions must still agree"))))
+
+(deftest an-index-can-be-rooted-at-an-offset
+  (testing "`build-index` folded `base` into the CONTAINER offset and not into
+            the entry offsets, so a non-zero base produced a node pointing at
+            the right container and the wrong entries. The slot-rebasing branch
+            had been deleted as dead code on the grounds that base is always 0.
+
+            It is not always 0. An item embedded behind a prefix -- which is
+            what `nav/source-at` exists for, and what konserve-lmdb's split blob
+            is -- needs its index expressed in the ENCLOSING buffer's
+            coordinates. Without that, `source-at` reads a frame whose every
+            offset is wrong by the prefix, and silently gets no index at all.
+
+            Asserted as: the embedded form answers identically to the standalone
+            one and does the same amount of work."
+    (let [o {:stringref false :trust-index :trusted}
+          doc (into {:tree (vec (repeatedly 200 #(hash-map :a 1 :b 2)))}
+                    (map (fn [i] [(keyword (str "k" i)) i])) (range 12))
+          item (boring/encode doc {:stringref false})
+          prefix 5
+          idx-opts {:index 1 :index-min 13}
+          blob (let [idx (boring/build-index item idx-opts prefix)
+                     bos (java.io.ByteArrayOutputStream.)]
+                 (.write bos (byte-array prefix))
+                 (.write bos ^bytes item)
+                 (boring/seal-index! (boring/writer) bos idx
+                                     (+ prefix (alength ^bytes item))
+                                     {:stringref false})
+                 (.toByteArray bos))
+          ;; The index is forced before counting: opening one walks the frame
+          ;; positionally to find each node's slot, and those are `skipFrom`
+          ;; calls too. What is being compared here is lookup work.
+          probe (fn [^bytes bs ^long off]
+                  (let [c (nav/cursor bs off o)
+                        nv (.nav ^boring.nav.Cursor c)
+                        ^Reader r (.rdr ^boring.nav.Nav nv)
+                        _ (#'nav/nav-idx nv)
+                        before (.skips r)
+                        v (nav/value (nav/walk c [:k11]))]
+                    {:value v :skips (- (.skips r) before)}))
+          embedded (probe blob prefix)
+          ;; `:stringref false` HERE TOO. Everything else in this fixture says
+          ;; it explicitly -- `item`, `blob`'s frame, and `o` -- and this one
+          ;; call inherited the profile default instead, so once stringref and
+          ;; indexing composed the standalone form was a DIFFERENT document
+          ;; from the embedded one and did a different amount of work. The
+          ;; comparison is about where the index is rooted, not about stringref.
+          standalone (probe (boring/encode-indexed
+                             doc (assoc idx-opts :stringref false)) 0)
+          unindexed (probe item 0)]
+      (is (= 11 (:value embedded) (:value standalone) (:value unindexed))
+          "every form gives the same answer")
+      (is (= (:skips embedded) (:skips standalone))
+          "and the embedded index does exactly the work the standalone one does")
+      (is (< (:skips embedded) (:skips unindexed))
+          "which is less than no index at all -- if these were equal the index
+           would be present but unconsulted, which is the state this fixes")
+      (testing "every container offset lands inside the blob, not the item"
+        (let [idx (boring/build-index item idx-opts prefix)
+              ^longs cs (:containers idx)]
+          (is (pos? (alength cs)))
+          (is (every? #(>= % prefix) (seq cs))
+              "a container offset below the prefix is an un-rebased one"))))))
+
+(deftest reserved-name-frames-are-indexed-the-same-by-both-builders
+  (testing "`clojure/sorted-set` and `clojure/queue` route through
+            `writeSeqAsArray`, and #40 flagged that they do so OUTSIDE any
+            `idxSuspend` -- so the writer captures a node for their element
+            array while `Reader.recordDescendable` refuses every reserved name,
+            which means `nav` realises those frames opaquely and can never
+            reach an offset inside one.
+
+            The open question was whether the BYTE-WALK builder keeps that node
+            too. It does. The node is unreachable either way, so it is waste
+            rather than a defect -- but the two builders writing DIFFERENT
+            files would have been a defect, and that is what this pins.
+
+            Left as agreement rather than suppressed on both sides: suppressing
+            is a wire change for a handful of bytes, and every past attempt to
+            make one builder skip a node the other kept is exactly how #30 and
+            #34 happened."
+    (let [o {:stringref false}]
+      (doseq [[label v] [["sorted-set" (into (sorted-set) (range 200))]
+                         ["queue" (into clojure.lang.PersistentQueue/EMPTY
+                                        (range 200))]
+                         ["sorted-set beside a plain vector"
+                          {:s (into (sorted-set) (range 200))
+                           :t (vec (range 200))}]]]
+        (testing label
+          (is (= (walked v o 4 4) (hooked v o 4 4))))))))

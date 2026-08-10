@@ -80,15 +80,25 @@
             (str hex " re-encoded as " (:ok ours)
                  " decodes to " (pr-str (or (:ok back) (:err back)))))))))
 
-(deftest rfc8949-forbidden-encodings-are-refused
-  (testing "vectors that RFC 8949 forbids an encoder from producing must be
-            refused, not silently emitted — they remain decodable"
-    (doseq [{:keys [hex value encode-forbidden encode-forbidden-reason]} v/appendix-a
-            :when encode-forbidden]
-      (let [r (try-encode (c/->expected value) interop-opts)]
-        (is (contains? r :err)
-            (str hex " should be refused on encode (" encode-forbidden-reason
-                 ") but produced " (pr-str (:ok r))))))))
+;; DELETED: `rfc8949-forbidden-encodings-are-refused`.
+;;
+;; It filtered `v/appendix-a` on `:when encode-forbidden`, and no row in
+;; `vectors.cljc` carries that key -- `grep -c encode-forbidden` is 0. The
+;; doseq therefore had an empty body and the deftest asserted NOTHING, while
+;; reporting green and reading like coverage of a real RFC 8949 rule.
+;;
+;; It is deleted rather than repointed. The obvious candidate, `:decode-only`
+;; (17 rows), is a DIFFERENT property: those are f32/f64 Infinity and NaN,
+;; which boring encodes perfectly well, just not at the width they arrived in.
+;; "Cannot round-trip byte-identically" is not "an encoder must refuse to
+;; produce this", and conflating them would replace a test that asserts nothing
+;; with one that asserts the wrong thing.
+;;
+;; THE COVERAGE IS GENUINELY MISSING and is tracked -- the corpus has no
+;; encode-forbidden rows to test against, so restoring the test means first
+;; deciding which Appendix A vectors RFC 8949 forbids an encoder from
+;; producing, and marking them. A green test asserting nothing is worse than an
+;; absent one, because only the absent one is visible.
 
 (deftest preserve-width-differs-on-narrow-floats
   (testing ":preserve-width must NOT reproduce f16/f32 vectors — it widens by
@@ -347,7 +357,7 @@
    "BOM in the middle"    "a﻿b"
    "two BOMs"             "﻿﻿"
    "empty"                ""
-   "nul"                  " "
+   "nul"                  "\u0000"
    "astral pair"          "💩"
    "combining mark"       "é"
    "lone ascii"           "A"})
@@ -2687,14 +2697,24 @@
             thing that is still JVM-only"
     (let [v (vec (for [i (range 40)] {:e i :a :n/x :v (str "value-" i)}))
           plain (boring/encode v {:stringref false})
-          idx (boring/encode-indexed v {:index 4 :index-min 4})]
+          idx (boring/encode-indexed v {:index 4 :index-min 4 :stringref false})]
       (testing "the result is still a CBOR sequence whose first item is the value"
         (is (= v (first (boring/decode-seq idx)))))
       (testing "and the frame is metadata, not an item"
         (is (= 1 (count (boring/decode-seq idx)))))
-      (testing "the index costs something but not much"
+      (testing "the index costs something but not much. LIKE FOR LIKE on
+                `:stringref`, which this pair did not used to have to say:
+                `encode-indexed` forced it off, so its output could only be
+                compared against a non-stringref `encode`. Now that the two
+                compose, leaving it out of one side measures the compression
+                rather than the index -- and gets the sign wrong, because
+                stringref saves more than the frame costs."
         (is (> (count-bytes idx) (count-bytes plain)))
         (is (< (count-bytes idx) (* 1.1 (count-bytes plain)))))
+      (testing "and with stringref on, the indexed file is SMALLER than the
+                plain unreferenced one -- frame included"
+        (is (< (count-bytes (boring/encode-indexed v {:index 4 :index-min 4}))
+               (count-bytes plain))))
       (testing "nothing worth indexing means no frame, so the result still decodes"
         (is (= [1 2] (first (boring/decode-seq
                              (boring/encode-indexed [1 2] {:index-min 16}))))))))
@@ -2716,23 +2736,59 @@
             konserve is portable and content-addressed: two platforms must not
             disagree about the bytes.
 
-            These two cases differ in ONE byte -- f5 vs f4, the flag itself --
+            These two cases differ in ONE byte -- 01 vs 00, the flag itself --
             which is what makes them a discriminator rather than a smoke test.
             Without the fix the ascending case fails on ClojureScript and
-            passes on the JVM."
+            passes on the JVM.
+
+            The flag used to be a CBOR boolean in an array (`81f5`/`81f4`) and
+            is now a bit in a byte string (`4101`/`4100`). `slots` went from an
+            array of typed arrays (`814301030381`) to one byte string, and now
+            carries a start table as well: `49 02 00 0600 0900 010303` is a
+            9-byte string holding the layout byte (version 2, 2-byte table
+            entries), the 2-bit width table (node 0 is width 0 = u8), one start entry per node plus a
+            final total -- 6, where node 0's deltas begin, and 9, which must
+            equal the string's own length and is the structural gate -- and then the deltas 1, 3, 3.
+
+            The discriminating byte is still one, and still the sorted flag."
     (let [opts {:index 1 :index-min 3 :shapes false :stringref false}
-          asc  (array-map "a" 1 "b" 2 "c" 3)
-          desc (array-map "c" 1 "b" 2 "a" 3)]
-      (is (= (str "81a3616101616202616303d81b826c626f72696e672f696e646578"
-                  "8601d84e4401000000d84e4403000000814301030381f5"
-                  "48000000000000000b")
+          ;; THE VALUES ARE LARGE BECAUSE THE MAP MUST EARN A NODE. Three
+          ;; entries of scalars are crossed in two items on average, and the
+          ;; writer no longer writes a node for a container that cheap -- so
+          ;; the earlier fixture, `{"a" 1 "b" 2 "c" 3}`, produced no frame at
+          ;; all and there was no `sorted` bit left to compare. A 70-element
+          ;; vector per entry puts the walk at 72.
+          ;;
+          ;; Nothing else about the fixture changed: the subject is still the
+          ;; KEY ORDER, "a" "b" "c" against "c" "b" "a", and the values are
+          ;; identical between the two so the only difference the bytes can
+          ;; show is the flag.
+          big  (vec (range 70))
+          asc  (array-map "a" big "b" big "c" big)
+          desc (array-map "c" big "b" big "a" big)
+          ;; The 70-element vector, once, rather than three times inside each
+          ;; of two 830-character literals.
+          v-hex (str "9846000102030405060708090a0b0c0d0e0f101112131415161718"
+                     "181819181a181b181c181d181e181f18201821182218231824182518"
+                     "26182718281829182a182b182c182d182e182f18301831183218331834"
+                     "18351836183718381839183a183b183c183d183e183f184018411842"
+                     "184318441845")
+          ;; The frame, whose ONLY difference between the two is the `sorted`
+          ;; bitset: `4101` (bit set) against `4100` (bit clear).
+          ;; `41` is the one-byte string head; the byte after it is the
+          ;; bitset. Split on the BYTE boundary -- splitting mid-byte silently
+          ;; shortens the literal by a nibble and the mismatch then reads as a
+          ;; frame layout change rather than a typo.
+          frame (fn [sorted-bit]
+                  (str "d81b826c626f72696e672f696e6465788601d84e4401000000"
+                       "d84e440300000049020006000900017878" "41" sorted-bit
+                       "48000000000000016a"))]
+      (is (= (str "81a3" "6161" v-hex "6162" v-hex "6163" v-hex (frame "01"))
              (c/bytes->hex (boring/encode-indexed [asc] opts)))
-          "ascending keys -> sorted true (f5)")
-      (is (= (str "81a3616301616202616103d81b826c626f72696e672f696e646578"
-                  "8601d84e4401000000d84e4403000000814301030381f4"
-                  "48000000000000000b")
+          "ascending keys -> sorted true (bit set)")
+      (is (= (str "81a3" "6163" v-hex "6162" v-hex "6161" v-hex (frame "00"))
              (c/bytes->hex (boring/encode-indexed [desc] opts)))
-          "descending keys -> sorted false (f4)")
+          "descending keys -> sorted false (bit clear)")
       (testing "the flag is what separates them: same keys, same values, same
                 length, and the frame differs"
         (let [a (c/bytes->hex (boring/encode-indexed [asc] opts))
@@ -2750,12 +2806,16 @@
             output. The JVM located the frame by its bytes and never decoded
             it; ClojureScript decoded it and judged afterwards."
     (let [v (vec (for [i (range 40)] {:e i :a "x" :v (str "v" i)}))
-          idx (boring/encode-indexed v {:index 4 :index-min 4})]
+          ;; `:stringref false` EXPLICITLY, and it is now load-bearing rather
+          ;; than incidental. `encode-indexed` used to force it, so this
+          ;; document was three levels deep whatever the caller asked for. Now
+          ;; that the two options compose, the default wraps everything in a
+          ;; tag-256 namespace -- a fourth level that belongs to the DATA and
+          ;; is properly charged to `:max-depth`. Leaving it on here would turn
+          ;; a test about the frame's nesting into a test about the tag's.
+          idx (boring/encode-indexed v {:index 4 :index-min 4 :stringref false})]
       (testing "the control: this data really does fit in three levels, so a
-                failure below is the FRAME's nesting and not the data's.
-                `:stringref false` because `encode-indexed` forces it -- with
-                stringref on, the wrapping tag is a fourth level and the
-                comparison would be against a different document"
+                failure below is the FRAME's nesting and not the data's"
         (is (= v (boring/decode (boring/encode v {:stringref false}) {:max-depth 3}))))
       (testing "so every reader gets it back at that budget"
         (is (= [v] (vec (boring/decode-seq idx {:max-depth 3}))))
@@ -2802,9 +2862,17 @@
     (testing "the control: well-formed input of the SAME shapes still walks, so
               the assertions above are about the damage and not about the
               shapes being rejected wholesale"
+      ;; `:ok`, not `some?`. These are three- and two-element containers, and
+      ;; the writer no longer emits a node for a container a scan crosses in
+      ;; one or two items -- so `build-index` correctly returns nil and
+      ;; `some?` stopped meaning "the walk completed". What this control
+      ;; asserts is that the walk RUNS on well-formed bytes of these shapes,
+      ;; which is exactly "it did not throw".
       (doseq [hex ["83010203" "a201020304"]]
         (is (= 1 (count (boring/decode-seq (c/hex->bytes hex)))) hex)
-        (is (some? (boring/build-index (c/hex->bytes hex) {:index 1 :index-min 1})) hex)))))
+        (is (= :ok (first (err-type #(boring/build-index (c/hex->bytes hex)
+                                                         {:index 1 :index-min 1}))))
+            hex)))))
 
 (deftest a-declared-count-cannot-size-an-array-before-it-is-checked
   (testing "`build-index` sizes an anchor array from a count it reads off the
@@ -2823,8 +2891,12 @@
                                                       {:index 1 :index-min 1}))))))
     (testing "the control: a container whose count IS backed by bytes still
               indexes, so the guard rejects the lie and not the shape"
+      ;; See the control in `the-skip-walk-terminates-on-hostile-bytes`: nil
+      ;; is now the right answer for a container this cheap to cross, so the
+      ;; assertion is that the guard does not REJECT it.
       (doseq [hex ["83010203" "a201020304"]]
-        (is (some? (boring/build-index (c/hex->bytes hex) {:index 1 :index-min 1}))
+        (is (= :ok (first (err-type #(boring/build-index (c/hex->bytes hex)
+                                                         {:index 1 :index-min 1}))))
             hex)))))
 
 (deftest a-nil-input-is-a-typed-error-on-every-read-path
@@ -3191,3 +3263,91 @@
                   (str s " must re-encode to the bytes it came from"))))
         (is (= :boring/bad-tag-content (:err r))
             (str s " must be refused as :boring/bad-tag-content"))))))
+
+;; ## The three divergences #38 left open
+;;
+;; Each was found by MAPPING the two writers against each other rather than by
+;; a failing test, which is the point: the shared suite reached none of them.
+;; They live here, in the file that runs identically on both platforms, so the
+;; next one has to be introduced past a test rather than into a gap.
+
+(defrecord ConfWide [f01 f02 f03 f04 f05 f06 f07 f08 f09 f10])
+
+(deftest a-record-keeps-declaration-order-past-eight-fields
+  (testing "D3. `Writer.writeRecordFields` iterates in DECLARATION order;
+            ClojureScript wrote `(into {} x)`, which keeps insertion order only
+            while the result is a PersistentArrayMap. At NINE entries it
+            promotes to a PersistentHashMap and the fields come out in hash
+            order -- so the two platforms wrote different bytes for the same
+            record, and only for records wide enough that no fixture in this
+            suite had one. Every record here had three fields or fewer.
+
+            Field order IS byte order for a CBOR map, so this is a wire
+            divergence, not a cosmetic one. `:canonical` sorts and would have
+            hidden it a second time, which is why this asserts on the DEFAULT
+            profile."
+    (let [r (->ConfWide 1 2 3 4 5 6 7 8 9 10)
+          ;; ASSERTED ON THE BYTES, because the wire order cannot be recovered
+          ;; from a decoded value: a ten-entry map comes back as a hash map on
+          ;; both platforms, in ITS order rather than the file's. The oracle is
+          ;; the same fields as an `array-map`, which keeps insertion order at
+          ;; any size and goes down the identical `write-map-entries!` path.
+          oracle (data/unknown-record
+                  (data/record-type-name r)
+                  (array-map :f01 1 :f02 2 :f03 3 :f04 4 :f05 5
+                             :f06 6 :f07 7 :f08 8 :f09 9 :f10 10))]
+      (is (= (vec (boring/encode oracle {:stringref false}))
+             (vec (boring/encode r {:stringref false})))
+          "the wire order is the declaration order, on both platforms")
+      (testing "and it still round-trips as itself"
+        (let [reg (boring/register-record (boring/tag-registry)
+                                          (data/record-type-name r) map->ConfWide)]
+          (is (= r (boring/decode (boring/encode r) {:registry reg}))))))))
+
+(deftest two-byte-string-keys-with-the-same-content-are-refused-on-encode
+  (testing "D2. A CBOR map key is compared by CONTENT (RFC 8949 5.6), so two
+            byte strings holding the same bytes are ONE key -- while to a host
+            map they are two, because both platforms hash them by identity. The
+            JVM refused this on encode; ClojureScript happily wrote a map with
+            a duplicate key that boring's OWN reader then rejects.
+
+            A successful encode must never produce bytes the paired decoder
+            refuses, which is the rule this restores."
+    (let [mk (fn [v] #?(:clj (byte-array (map unchecked-byte v))
+                        :cljs (js/Uint8Array. (clj->js v))))
+          ;; Two SEPARATE bindings, and the map built with `assoc` rather than
+          ;; written as a literal: the ClojureScript reader rejects a literal
+          ;; whose key FORMS are identical, before either one is evaluated.
+          k1 (mk [1 2 3])
+          k2 (mk [1 2 3])
+          m (assoc {} k1 "a" k2 "b")]
+      (is (= 2 (count m)) "the control: two keys to the host")
+      (is (= :boring/duplicate-map-key
+             (err-type #(boring/encode m {:stringref false}))))
+      (testing "and byte-string keys that DIFFER are still perfectly legal"
+        (is (= 2 (count (boring/decode
+                         (boring/encode (assoc {} (mk [1 2 3]) "a" (mk [4 5 6]) "b")
+                                        {:stringref false})))))))))
+
+(deftest cljs-writes-the-typed-arrays-rfc-8746-has-tags-for
+  (testing "D8. A `js/Uint16Array` fell through to `:boring/unsupported-type`
+            although RFC 8746 has a tag for it, both readers accept that tag,
+            and the JVM decodes it to a value. Java has no unsigned array
+            types, so it can never WRITE these -- which is why this is a gap in
+            what ClojureScript covers rather than a disagreement about a shared
+            value, and why the assertion below is a decode on whichever
+            platform is running rather than a byte comparison across the two.
+
+            `Uint8Array` is deliberately not in the table: it is boring's
+            byte-string type and is written as major 2."
+    #?(:cljs
+       (doseq [[ctor tag] [[js/Uint8ClampedArray 68] [js/Int8Array 72]
+                           [js/Uint16Array 69] [js/Uint32Array 70]]]
+         (let [a (new ctor (clj->js [1 2 3]))
+               bs (boring/encode a {:stringref false})]
+           (is (not= :boring/unsupported-type (err-type #(boring/encode a)))
+               (str (.-name ctor) " must encode"))
+           (is (= tag (:tag (boring/decode bs)))
+               (str (.-name ctor) " must carry its RFC 8746 tag"))))
+       :clj
+       (is true "JVM has no unsigned array types; see reader.cljs on the read side"))))

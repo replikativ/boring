@@ -212,7 +212,7 @@
 
 (defn run-cursor []
   (let [^bytes bs (boring/encode customers opts)
-        c (nav/source bs opts)
+        c (nav/root bs opts)
         rdr (Reader. bs)
         path ["customer-137" "name"]]
 
@@ -221,25 +221,25 @@
     (println (format "%-44s %10s %10s %8s" "" "nav" "decode" "ratio"))
 
     (let [[a b] (ab-us #(nav/value (get-in c path))
-                    #(get-in (do (.reset rdr bs) (.read rdr)) path)
-                    200 30)]
+                       #(get-in (do (.reset rdr bs) (.read rdr)) path)
+                       200 30)]
       (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                        "get-in one leaf (heap)" a b (/ b a))))
 
     ;; count is read from the head, so it should not depend on size at all
     (let [[a b] (ab-us #(count c)
-                    #(count (do (.reset rdr bs) (.read rdr)))
-                    200 30)]
+                       #(count (do (.reset rdr bs) (.read rdr)))
+                       200 30)]
       (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                        "count the top-level map" a b (/ b a))))
 
     ;; Scanning every customer's :name -- the reducers case. Still beats a full
     ;; decode because the other five fields per record are never materialised.
     (let [[a b] (ab-us #(reduce (fn [acc e] (+ acc (count (nav/value (get (val e) "name")))))
-                             0 c)
-                    #(reduce-kv (fn [acc _ v] (+ acc (count (get v "name")))) 0
-                                (do (.reset rdr bs) (.read rdr)))
-                    50 20)]
+                                0 c)
+                       #(reduce-kv (fn [acc _ v] (+ acc (count (get v "name")))) 0
+                                   (do (.reset rdr bs) (.read rdr)))
+                       50 20)]
       (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                        "reduce over all 200, one field each" a b (/ b a))))
 
@@ -248,8 +248,8 @@
           [mc arena] (mmap/mmap-source f opts)
           ^java.lang.foreign.Arena arena arena]
       (let [[a b] (ab-us #(nav/value (get-in mc path))
-                      #(get-in (do (.reset rdr bs) (.read rdr)) path)
-                      200 30)]
+                         #(get-in (do (.reset rdr bs) (.read rdr)) path)
+                         200 30)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                          "get-in one leaf (mmap'ed file)" a b (/ b a))))
       (.close arena))
@@ -258,18 +258,18 @@
     (let [payload (byte-array (* 1024 1024))
           blob-doc {"meta" {"id" 7} "data" payload}
           ^bytes bbs (boring/encode blob-doc opts)
-          bc (nav/source bbs opts)
+          bc (nav/root bbs opts)
           brdr (Reader. bbs)]
       (println (format "\nblob: one 1 MiB bytestring beside a small map\n"))
       (println (format "%-44s %10s %10s %8s" "" "nav" "decode" "ratio"))
       (let [[a b] (ab-us #(nav/byte-span (get bc "data"))
-                      #(count ^bytes (get (do (.reset brdr bbs) (.read brdr)) "data"))
-                      50 20)]
+                         #(count ^bytes (get (do (.reset brdr bbs) (.read brdr)) "data"))
+                         50 20)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.0fx"
                          "locate the blob vs materialise it" a b (/ b a))))
       (let [[a b] (ab-us #(nav/value (get-in bc ["meta" "id"]))
-                      #(get-in (do (.reset brdr bbs) (.read brdr)) ["meta" "id"])
-                      50 20)]
+                         #(get-in (do (.reset brdr bbs) (.read brdr)) ["meta" "id"])
+                         50 20)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.0fx"
                          "read a field PAST the blob" a b (/ b a)))))
 
@@ -295,17 +295,17 @@
                        (count events) (/ (alength log-bs) 1024.0)))
       (println (format "%-44s %10s %10s %8s" "" "nav" "decode" "ratio"))
       (let [[a b] (ab-us #(into [] xf (nav/items log-bs opts))
-                      #(into [] (comp (filter (fn [e] (= "error" (get e "lvl"))))
-                                      (map (fn [e] (get e "n"))))
-                             (boring/decode-seq log-bs opts))
-                      5 20)]
+                         #(into [] (comp (filter (fn [e] (= "error" (get e "lvl"))))
+                                         (map (fn [e] (get e "n"))))
+                                (boring/decode-seq log-bs opts))
+                         5 20)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                          "scan a log for matching events" a b (/ b a))))
       (let [[a b] (ab-us #(reduce (fn [_ c] (reduced (nav/value (get c "n")))) nil
-                               (nav/items log-bs opts))
-                      #(reduce (fn [_ e] (reduced (get e "n"))) nil
-                               (boring/decode-seq log-bs opts))
-                      50 20)]
+                                  (nav/items log-bs opts))
+                         #(reduce (fn [_ e] (reduced (get e "n"))) nil
+                                  (boring/decode-seq log-bs opts))
+                         50 20)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                          "first event only (early exit)" a b (/ b a)))))
 
@@ -355,8 +355,8 @@
           plain (boring/encode m idx-opts)
           bs (boring/encode-indexed m (assoc idx-opts :index 16 :index-min 16))
           ks (mapv #(format "k%06d" %) (range 0 n (max 1 (quot n 100))))
-          a (timed (lookup-sweep (nav/source plain idx-opts) ks) 5 8)
-          b (timed (lookup-sweep (nav/source bs idx-opts) ks) 20 8)]
+          a (timed (lookup-sweep (nav/root plain idx-opts) ks) 5 8)
+          b (timed (lookup-sweep (nav/root bs idx-opts) ks) 20 8)]
       (println (format "  %-8d %10.1f %11.1f %11.1f%% %12.2f %10.3f"
                        n (/ (alength ^bytes plain) 1024.0) (/ (alength ^bytes bs) 1024.0)
                        (* 100.0 (/ (- (alength ^bytes bs) (alength ^bytes plain))
@@ -371,7 +371,7 @@
           path (vec (concat (repeat d "zzz") ["v"]))
           plain (boring/encode m idx-opts)
           bs (boring/encode-indexed m (assoc idx-opts :index 16 :index-min 16))
-          cp (nav/source plain idx-opts) ci (nav/source bs idx-opts)
+          cp (nav/root plain idx-opts) ci (nav/root bs idx-opts)
           a (timed #(nav/value (get-in cp path)) 200 8)
           b (timed #(nav/value (get-in ci path)) 200 8)]
       (println (format "  %-8d %10.1f %11.1f%% %12.3f %12.3f"
@@ -391,7 +391,7 @@
         (println (format "  %-12d %-8d %10.1f%% %12.3f" mn st
                          (* 100.0 (/ (- (alength ^bytes bs) (alength ^bytes plain))
                                      (double (alength ^bytes plain))))
-                         (/ (timed (lookup-sweep (nav/source bs idx-opts) ks) 20 8)
+                         (/ (timed (lookup-sweep (nav/root bs idx-opts) ks) 20 8)
                             (count ks) 1000.0)))
         (flush))))
 
@@ -436,18 +436,30 @@
     (doseq [st [1 8 16 64 256]]
       (let [^bytes bs (build st)
             idx (- (alength bs) plain)
-            ;; the slot as it sits on the wire, BEFORE expansion -- its class is
-            ;; the width, since the CBOR element type is what declares it
             ;; Read the frame WHERE IT IS, not as a trailing item of
             ;; `decode-seq` -- which recognises it as metadata and does not
             ;; yield it. This line predates that and had been broken since.
-            slot (nth (nth (boring.data/frame-payload
-                            (.readFrom (Reader. ^bytes bs)
-                                       (long (#'boring.frame/footer-start bs)))) 3) 0)
-            width (condp instance? slot
-                    (Class/forName "[B") "u8 bytes"
-                    (Class/forName "[S") "sint16"
-                    "sint32")
+            ;;
+            ;; SLOTS ARE ONE PACKED BYTE STRING, and this column used to report
+            ;; the CBOR element type of a per-node typed array -- the layout
+            ;; #17 replaced. Since then payload element 3 has been a byte[], so
+            ;; `(nth ... 0)` yielded a BYTE, `condp instance?` fell past both
+            ;; arms, and every row printed "sint32" whatever it actually was.
+            ;; The doc built on this column recorded a byte string at stride 1
+            ;; and sint16 elsewhere, which is the layout from before #17: the
+            ;; harness and the table it backs had drifted apart in two
+            ;; different directions.
+            ;;
+            ;; The width is now a 2-BIT CODE PER NODE inside that byte string --
+            ;; see `boring.core/pack-slots`. Node 0 is the sequence node, which
+            ;; is the only one these payloads have.
+            ^bytes slots (nth (boring.data/frame-payload
+                               (.readFrom (Reader. ^bytes bs)
+                                          (long (#'boring.frame/footer-start bs)))) 3)
+            width (if (< (alength slots) 2)
+                    "(empty)"
+                    (case (bit-and (bit-shift-right (aget slots 1) 0) 3)
+                      0 "u8" 1 "u16" 2 "i32" 3 "i64"))
             items (nav/items bs seq-opts)]
         (println (format "  %-8d %10d %12s %11.1f %10.2f%% %10.3f %12.3f"
                          st (quot 200000 st) width (/ idx 1024.0)
@@ -536,10 +548,48 @@
           (flush))))
     (println "  (file size" (.length f) "bytes)")))
 
+(defn run-index-min
+  "`:index-min` -- the dominant size knob, and the one whose FAILURE mode is a
+  slower lookup rather than a bigger file.
+
+  This table lived only in `boring.core/write-seq!`'s docstring, with no
+  harness anywhere, and had been copied verbatim into konserve-lmdb -- so a
+  figure nobody could regenerate spanned two repositories. #41.
+
+  The shape being measured: a node is only worth its cost if a lookup will
+  actually jump through it. A container narrow enough to walk cheaply still
+  gets a node when `:index-min` is below its width, and then every lookup pays
+  to find that node -- a binary search over the container list, per level --
+  before discovering the jump saves nothing."
+  []
+  (println)
+  (println "INDEX-MIN — a node nothing jumps through is not free")
+  (println (format "  %-22s %-14s %8s %12s" "payload" ":index-min" "nodes" "us/last"))
+  (doseq [[label v mins]
+          [["4096 x 4-key maps"
+            (vec (for [i (range 4096)] {:a i :b i :c i :d i})) [4 16]]
+           ["256 x 64-key maps"
+            (vec (for [i (range 256)]
+                   (into {} (for [j (range 64)] [(keyword (format "k%02d" j)) (+ i j)]))))
+            [16 65]]]
+          mn mins]
+    (let [bs (boring/encode-indexed v {:index 16 :index-min mn :stringref false})
+          n (dec (count v))
+          o {:trust-index :trusted}
+          nodes (count (:containers (boring/build-index
+                                     (boring/encode v {:stringref false})
+                                     {:index 16 :index-min mn})))
+          root (nav/root bs o)]
+      (println (format "  %-22s %-14d %8d %12.2f"
+                       label mn nodes
+                       (/ (timed #(nav/value (nth root n)) 200 8) 1000.0)))
+      (flush))))
+
 (defn -main [& args]
   (let [only (set args)
         run? (fn [k] (or (empty? only) (contains? only (name k))))]
     (when (run? :skip) (run-skip))
     (when (run? :cursor) (run-cursor))
     (when (run? :index) (run-index))
+    (when (run? :index-min) (run-index-min))
     (when (run? :write) (run-write))))

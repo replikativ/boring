@@ -55,7 +55,7 @@ EXPECTED = {
     "keyword-bare": Keyword(":simple"),
     "symbol":       Symbol("my.ns/sym"),
     "map":          {Keyword(":a"): 1, Keyword(":b"): "two"},
-    "record":       Record("gen_interop_fixture.Point",
+    "record":       Record("gen-interop-fixture/Point",
                            {Keyword(":x"): 3, Keyword(":y"): 4}),
 
     # Stringref at the exact threshold: a 3-byte string IS table-eligible.
@@ -66,6 +66,22 @@ EXPECTED = {
     # --- boring's one extension: tag 39649, shaped array ----------------
     "shaped": [{Keyword(":e"): 1, Keyword(":a"): Keyword(":x")},
                {Keyword(":e"): 2, Keyword(":a"): Keyword(":y")}],
+
+    # RAGGED ROWS. The shape's keys are the UNION of every row's, so a row can
+    # lack one: `undefined` (0xf7) marks a gap in the middle, and a SHORT ROW
+    # marks a missing tail. Neither key appears in the reconstructed map.
+    #
+    # `:a` in the first row is PRESENT with the value None -- `null` (0xf6) is
+    # a value, not absence -- so a reader that filters on falsiness rather than
+    # on `cbor2.undefined` fails right here.
+    #
+    # This case exists because the reader reconstructed rows with
+    # `dict(zip(...))`, which is right for a short row by accident and wrong
+    # for a gap: it produced a phantom key holding `undefined`. CI was green,
+    # because nothing in the fixture had a ragged row.
+    "ragged": [{Keyword(":a"): None, Keyword(":b"): 1, Keyword(":c"): 2},
+               {Keyword(":a"): 3, Keyword(":c"): 4},
+               {Keyword(":a"): 5}],
 }
 
 

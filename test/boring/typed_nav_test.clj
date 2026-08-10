@@ -38,7 +38,7 @@
     (testing (str label " of " n)
       (let [a (mk n)
             bs (boring/encode a opts)
-            c (nav/source bs opts)
+            c (nav/root bs opts)
             realised (boring/decode bs opts)]
         (is (= (seq a) (seq realised)) "the fixture must round-trip at all")
         (is (= n (count c))
@@ -75,7 +75,7 @@
             form, the ANSWERS must not change."
     (let [a (byte-array (map byte [1 2 3 -4]))
           bs (boring/encode a opts)
-          c (nav/source bs opts)
+          c (nav/root bs opts)
           realised (boring/decode bs opts)]
       (is (= (seq a) (seq realised)))
       ;; whether this navigates or realises is an implementation choice; that
@@ -87,7 +87,7 @@
    [xs (gen/vector gen/large-integer 0 40)]
    (let [a (long-array xs)
          bs (boring/encode a opts)
-         c (nav/source bs opts)
+         c (nav/root bs opts)
          realised (boring/decode bs opts)]
      (and (= (count xs) (count c))
           (every? (fn [i]

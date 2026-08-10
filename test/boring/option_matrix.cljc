@@ -33,8 +33,19 @@
 
 (def specimen
   "A value with a map, a vector, strings and integers — enough that every
-  option under test has something to act on."
-  {:rows [{:e 1 :a "x" :v "alpha"} {:e 2 :a "y" :v "beta"}]
+  option under test has something to act on.
+
+  BIG ENOUGH TO EARN AN INDEX NODE, which two rows quietly depend on. The
+  writer now refuses a node for any container a scan crosses cheaply, and with
+  two rows this specimen earned none -- so `build-index` returned nil,
+  `seal-index!` short-circuited on nil before it validated anything, and nine
+  `seal-index!` rows recorded `:ok` for options that must be refused. The
+  matrix went green on calls that had stopped doing the work.
+
+  Sixty rows puts `:rows` well past the threshold. Nothing else about the
+  specimen matters to the options under test."
+  {:rows (vec (for [i (range 60)]
+                {:e i :a (str "a" i) :v (str "value-" i)}))
    :n 42 :s "hello"})
 
 (defn- encoded ^"[B" []
@@ -61,6 +72,12 @@
 
 (def decode-side
   [["decode"          (fn [o] (boring/decode (encoded) o))]
+   ;; `decode-at` is JVM-only and was not in this matrix at all, while
+   ;; konserve-lmdb's split-blob read path depends on it entirely -- eight call
+   ;; sites there against one in this whole repo. An entry point that only a
+   ;; downstream consumer exercises is exactly the one whose option handling
+   ;; drifts unnoticed.
+   #?@(:clj [["decode-at" (fn [o] (boring/decode-at (encoded) 0 o))]])
    ;; `reader` is here because it was the ONE decode entry point the option
    ;; unification missed on ClojureScript, and the matrix could not see it.
    ["reader"          (fn [o] (boring/decode-with (boring/reader (encoded) o) (encoded)))]
@@ -97,6 +114,37 @@
   [["build-index"     (fn [o] (some? (boring/build-index (encoded) o)))]])
 
 (defn sides [] {:decode decode-side :encode encode-side :index index-side})
+
+;; --------------------------------------------- what the matrix CLAIMS to cover
+;;
+;; DECLARED IDENTICALLY ON BOTH PLATFORMS, and that is the whole point. The
+;; tables above splice three encode rows behind `#?@(:clj ...)`, directly under
+;; a comment promising that a row is "marked rather than omitted -- a row that
+;; silently is not there on one platform is how a gap hides". It was omitted,
+;; and the gap hid: `the-matrix-covers-what-it-claims-to` counts CASE LABELS,
+;; not entry points, so dropping a row could not fail it. `write-seq!` then
+;; diverged across the platforms on `:stringref` -- three different-byte cells
+;; -- with nothing to notice.
+;;
+;; So the claim is written down once, here, and the platform's shortfall is
+;; NAMED rather than inferred from an absence.
+
+(def declared-entry-points
+  "Every entry point the matrix means to exercise, per side, on any platform."
+  {:decode #{"decode" "decode-at" "reader" "decode-with" "decode-seq" "decode-seq-from"}
+   :encode #{"encode" "encode-buffered" "encode-indexed"
+             "write-seq!" "write-indexed!" "seal-index!"}
+   :index  #{"build-index"}})
+
+(def unavailable-entry-points
+  "Declared above but absent HERE, with the reason. Empty on the JVM.
+
+  ClojureScript has no streaming writer and no `seal-index!` opts arity, so
+  these three cannot be exercised. That is a fact about the platform; what it
+  must not be is invisible."
+  #?(:clj  {}
+     :cljs {:decode #{"decode-at"}
+            :encode #{"write-seq!" "write-indexed!" "seal-index!"}}))
 
 ;; --------------------------------------------------------------- the matrix
 ;;

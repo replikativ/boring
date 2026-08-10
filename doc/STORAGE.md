@@ -38,7 +38,7 @@ from being built — so `nav/value` at the end:
                           [(str "customer-" i) {"name" (str "name-" i)}])))
 
 (def bs (boring/encode customers {:stringref false}))   ; at WRITE time
-(def c (nav/source bs))
+(def c (nav/root bs))
 (nav/value (get-in c ["customer-137" "name"]))          ; => "name-137"
 ```
 
@@ -96,19 +96,98 @@ everything in a small value, `decode` is the cheaper call.
 
 ### Constraints, enforced rather than documented
 
-- **`:stringref false` is required.** A stringref is an index into a table
-  built from every preceding string, so a cursor holding only an offset cannot
-  resolve one. Navigating a stringref document is refused, not silently wrong.
-  boring writes stringref *by default*, so this is a decision at write time.
+- **A stringref document needs an INDEX to be navigable**, not `:stringref
+  false`. A stringref is an index into a table built from every preceding
+  string, so a cursor holding only an offset cannot resolve one by itself — the
+  index frame therefore carries a *pointer table* mapping each referenced index
+  to the offset where that string was defined. `encode-indexed` writes it.
+  A stringref document with **no** index is refused, not silently wrong; so is
+  one read under `{:trust-index :ignore}`, since ignoring the index ignores the
+  table. (This used to say `:stringref false` was required, and it was, until
+  the pointer table existed.)
 - **Indefinite-length containers cannot be descended.** Their count is not on
   the wire, so `count` could not be O(1) and `Counted` would be lying. boring
   never emits them; only a foreign streaming encoder will.
-- **Tags are opaque.** `get` on a tagged value realises it through the ordinary
-  reader and continues with `clojure.core/get`. A tag's reader is an arbitrary
-  function, so structure does not imply semantics — the slow path *is* the
-  reference implementation, which is what makes the fast path safe to trust.
-  A consequence: positional records (a tag 27 wrapping a vector, as datahike's
-  `Datom` uses) can be reached but not descended into.
+- **Tags are opaque *by default*.** `get` on a tagged value realises it through
+  the ordinary reader and continues with `clojure.core/get`. A tag's reader is
+  an arbitrary function, so structure does not imply semantics — the slow path
+  *is* the reference implementation, which is what makes the fast path safe to
+  trust. A consequence: positional records (a tag 27 wrapping a vector, as
+  datahike's `Datom` uses) can be reached but not descended into.
+
+  **Three tags do have structural descent**, because boring wrote them and
+  knows they preserve structure: shaped arrays (39649), records (27) and RFC
+  8746 typed arrays. A cursor on one presents its contents without realising
+  it — a shaped row answers `get` as a map while its bytes are an array. See
+  [PERFORMANCE.md](PERFORMANCE.md). `boring.core/declare-navigable-record` is
+  the extension point for adding your own.
+
+### The index frame's format, and what is frozen about it
+
+These are cheap to state now and impossible to retrofit, so they are stated.
+
+**The payload is six or seven elements, and readers accept six through
+fifteen.** Six without a stringref namespace, seven with one — the extra
+element is the stringref pointer table, and it sits between `sorted` and
+`data-end`:
+
+```
+[stride, containers, counts, slots, sorted, data-end]                six
+[stride, containers, counts, slots, sorted, stringrefs, data-end]    seven
+```
+
+**`data-end` is always last, whatever the count**, which is what lets a reader
+find it without knowing the width: the trailing back-pointer already *is* it.
+Everything else is positional, so a reader takes the element count off the
+array head and uses it to decide whether element 5 is `data-end` or the pointer
+table.
+
+`boring.frame/prefix-bytes` is 17 exact bytes ending in `0x86`; readers compare
+the first 16 and then accept any array head from `0x86` to `0x8f`, so a future
+widening is *recognised* rather than mistaken for data. (This section said six
+was "what this library writes", and it was until the pointer table.)
+
+That distinction is the whole point, and it is worth stating why. A reader that
+does not recognise a frame never learns `data-end`, so the frame is republished
+as a trailing **data** item and a file of N records reads back as N+1 —
+silently, in both directions. Refusing to *use* an index is safe; refusing to
+*see* one is not.
+
+A widened payload must insert its new elements **before** the trailing
+back-pointer, which stays last: the trailer the whole scheme is located by is
+the file's final 9 bytes. Changing an element's *type* remains safe in the
+older way — the frame is still recognised, the index is refused, and the caller
+scans.
+
+**`data-end` is frozen in type as well as position.** `footer-start` requires
+the byte at `n-9` to be literally `0x48`, and the payload check requires a byte
+string of length 8. Five of the six elements have a free type; that one has
+none.
+
+**The `slots` layout byte has no spare bits.** Its low nibble is the version and
+its high nibble is the start-table entry width — and the reader consults the
+*whole* high nibble, so setting any of bits 5–7 makes a current reader compute a
+4-byte width, fail the final-entry gate, and refuse the index. The extension
+point is the **version nibble**, which has 14 unused values. That layout byte
+versions the whole frame: any semantic change to any of the six elements bumps
+it.
+
+**Sealed files are terminal.** `footer-start` requires the frame to end exactly
+at EOF — the check that stops a concatenated pair of sealed batches from having
+the second file's back-pointer land inside the first. So two sealed files can
+never simply be concatenated and keep an index, and `write-seq!`'s back-pointers
+are chunk-relative. The supported way to re-seal is `build-index`'s `base`
+arity, which roots an index at an offset.
+
+**There is deliberately no integrity check.** The frame is a trust boundary (see
+[SHAPES.md](SHAPES.md)), and adding a checksum would not change that, because
+whoever can rewrite the index can rewrite the checksum and the data. If one is
+ever wanted for *accident* detection it belongs in a `slots` v3 section, not in
+a seventh payload element.
+
+**`sorted` must never grow.** Its length is checked as an *equality* —
+`(quot (+ n 7) 8)` — not a bound, so it cannot carry a second bit per node.
+Future per-node flags go in `slots`, which is versioned and can.
 
 ## Memory-mapped files
 
@@ -201,10 +280,16 @@ there instead.
 
 Four things follow from the default:
 
-- **`:stringref false` is forced** whenever a stride is set, and passing
-  `:stringref true` alongside `:index` throws rather than one silently winning.
-  On a sequence this costs nothing — the stringref table resets per top-level
-  item, so short records never amortise it and dropping it is a ~1.5% *saving*.
+- **`:stringref false` is forced on a SEQUENCE**, and `write-seq!` throws on an
+  explicit `:stringref true` rather than dropping it silently. It costs nothing
+  there — the stringref table resets per top-level item, so short records never
+  amortise it and dropping it is a ~1.5% *saving*.
+
+  It is **not** forced for a single document: `encode-indexed` and
+  `write-indexed!` keep stringref and are smaller for it, because one document
+  is one namespace and one index frame can carry its pointer table. (This
+  paragraph said the force applied "whenever a stride is set", which was true of
+  all three entry points once and is now true of one.)
 - **A sequence too small to benefit gets no frame at all.** `:index-min`
   (default 16) gates it, so 15 small items cost no more than they did before.
 - **`decode-seq` hides the frame.** You get your items, not your items plus a
@@ -216,8 +301,9 @@ Four things follow from the default:
 
 The frame is one extra CBOR item holding the offsets of every Nth item, and
 `nav/items` then jumps rather than skips — on 200 000 records, reaching the last
-one takes **10.6 ms** unindexed against **1–2 µs** indexed, for 0.34% of the
-file. Those are the stride-16 numbers, which is what the paragraph above says
+one takes about **12 ms** unindexed against **1 µs** indexed, for 0.34% of the
+file. Those figures come from the stride-16 row of `doc/SHAPES.md`'s table,
+which is their one home; do not restate them from here. Those are the stride-16 numbers, which is what the paragraph above says
 the default is; an earlier version of this sentence quoted the **stride-8** row
 of `doc/SHAPES.md`'s table (0.6 µs, 0.68%) under the stride-16 heading, so it
 promised a seek twice as fast at twice the cost. The
@@ -225,12 +311,14 @@ offsets are stored as deltas in the narrowest type that holds them, so even a
 stride of 1 — no scan at all — costs 2.7% rather than the 10.9% absolute
 offsets would. `doc/SHAPES.md` has the format and the full stride table.
 
-The index is not load-bearing: a stale or missing one, or damage that leaves it
-structurally inconsistent, is detected and falls back to scanning. That stops at
-damage which leaves the payload *consistent* — including ordinary bit rot, which
-returns a wrong answer about 2% of the time. Verifying every anchor would cost
-the scan the index exists to avoid, so the index frame is a trust boundary and
-wants a checksum if the medium is not trusted. `doc/SHAPES.md` has the detail. It does **not** survive appending, though
+The index is not load-bearing: a stale or missing one, or damage the frame
+checks catch at open, falls back to scanning. Damage that gets past those is a
+different matter — the index frame is a **trust boundary**, so a damaged one may
+return a wrong answer, and damage inside a node's slot segment raises a typed
+`:boring/bad-index` at the lookup that touches it rather than at open. What is
+still guaranteed is that nothing fails *untyped* and nothing reads outside the
+file. Verifying every anchor would cost the scan the index exists to avoid, so
+put a checksum around it if the medium is not trusted. `doc/SHAPES.md` has the detail. It does **not** survive appending, though
 — re-seal rather than append to a sealed file.
 
 ## Compression
@@ -333,10 +421,12 @@ reason is exactly the one stringref runs into below.
 [zstd-seekable]: https://github.com/facebook/zstd/tree/dev/contrib/seekable_format
 [bgzf]: https://samtools.github.io/hts-specs/SAMv1.pdf
 
-### Why stringref and the index are mutually exclusive
+### Why stringref needed a pointer table, and now composes with the index
 
-`boring.nav` refuses a stringref document, and indexing therefore forces
-`:stringref false`. This is not a limitation of the implementation.
+`boring.nav` used to refuse a stringref document outright, and indexing forced
+`:stringref false`. This section argued that was inherent rather than an
+implementation limit. The argument was right about the problem and wrong about
+the conclusion, so it is kept here with the resolution attached.
 
 A stringref (tag 25) is an index into a table built *incrementally, in
 occurrence order, while decoding*. To resolve one at offset X you must already
@@ -348,11 +438,23 @@ The schemes that DO permit random access all use a **static** dictionary
 available up front — Parquet's dictionary pages, [FSST][fsst]'s symbol table, a
 trained zstd dictionary. Given the table, any single value decodes alone.
 
-That is the whole distinction, and it is why the answer is to layer rather than
-fuse. It is also why the cost of giving stringref up is small: stringref is
+That is the whole distinction — and it is also the way out. The scheme has to
+become STATIC at read time, and the index frame is where a static table can
+live: it carries the defining offset of every slot something actually
+references, so a cursor resolves by JUMPING rather than by remembering. The
+dictionary is still built incrementally by the WRITER; the reader no longer has
+to rebuild it.
+
+So `:stringref` and `:index` compose. `encode-indexed` and `write-indexed!`
+honour the profile default; only `write-seq!` still refuses, because each
+top-level item restarts the namespace at index 0 and one frame carries one
+table. Measured on 200 konserve-shaped records: 5323 bytes against 6505, an 18%
+saving, navigable, with the pointer table itself about 1.3% of the blob.
+
+The layering argument still stands for what it was actually about: stringref is
 2.09x on record-shaped data where whole-file zstd is 36.7x, and stringref *plus*
-zstd is only 10% better than zstd alone. Give it up and let a real compressor
-work.
+zstd is only 10% better than zstd alone. Under a compressor stringref is close
+to noise. What changed is that you no longer have to give it up to navigate.
 
 [fsst]: https://www.vldb.org/pvldb/vol13/p2649-boncz.pdf
 

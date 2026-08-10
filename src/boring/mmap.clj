@@ -124,9 +124,11 @@
   loudly. A shared arena is used rather than a confined one: it is 8% faster
   per access and does not pin the mapping to one thread.
 
-  The file must have been written with `{:stringref false}` -- see
-  `boring.nav`, which refuses a stringref document rather than resolving
-  references wrongly.
+  A stringref file is fine PROVIDED IT WAS INDEXED: the frame carries the
+  offsets a reference resolves by jumping to. What `boring.nav` refuses is a
+  document that opens a namespace and carries no such table -- one that was
+  `encode`d rather than `encode-indexed`. This used to say `{:stringref false}`
+  was required, which it no longer is.
 
   `:offset` and `:length` narrow the mapping to PART of the file, for a
   document that is not the whole of it. konserve stores a blob as a 20-byte
@@ -145,7 +147,7 @@
    (let [arena (Arena/ofShared)]
      (try
        (let [seg (sub-segment (mmap-segment file arena) opts)]
-         [(nav/source (segment-source seg) opts) arena])
+         [(nav/root (segment-source seg) opts) arena])
        (catch Throwable t
          (.close ^java.lang.AutoCloseable arena)
          (throw t))))))
@@ -161,8 +163,16 @@
   heap -- which is the combination this whole feature is for: seek into a large
   file without faulting in the pages you skipped.
 
-  Same rules as `mmap-source`: the caller closes the arena, nothing derived from
-  it may escape, and the file must have been written `{:stringref false}`."
+  Same rules as `mmap-source`: the caller closes the arena and nothing derived
+  from it may escape.
+
+  A SEQUENCE still needs `{:stringref false}`, which is not the same claim
+  `mmap-source` makes and is why this no longer says \"same rules\" about it.
+  `write-seq!` resets the namespace per top-level item, so one index frame
+  cannot carry a pointer table for all of them and it forces the option off.
+  A single mapped DOCUMENT keeps stringref and resolves references through the
+  frame -- see `mmap-source`, which used to carry this restriction and no
+  longer does."
   ([file] (mmap-items file nil))
   ([file opts]
    ;; The arena is CLOSED if anything after it throws. It owns the mapping, and

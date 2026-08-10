@@ -35,6 +35,32 @@ indexes on both heap and memory-mapped sources. And the attacker wrote every
 byte already, so a value they misdirect you to is one they could have sent
 directly.
 
+**The index now carries a second thing, and it is the same class.** A document
+that opens a stringref namespace stores a *pointer table* in the index frame —
+`(reference index → the offset where that string was defined)` — because a
+cursor holding only an offset has not decoded the strings before it and cannot
+resolve a reference any other way. That table is attacker-chosen too, so a
+chosen index can redirect what a *string* resolves to, not only which position
+a lookup lands on. It is bounded the same way: offsets are range-checked
+against the data section, so the worst case remains a wrong answer inside the
+document rather than a read outside it.
+
+**That table is read in both directions.** A key repeated inside a document is
+written as a reference, and a binary search over such keys compares against
+references — so `nav` compiles the *probe* into reference form by scanning the
+table for the literal it matches. A chosen table therefore also steers which
+key a probe becomes, and so which entry a lookup lands on. That is the same
+class again and the same bound — the probe either matches a table entry or the
+lookup falls back to scanning the container — but position misdirection no
+longer comes from the anchors alone, and this page said it did.
+
+The reverse pass is **linear in the pointer table**, whose size the attacker
+chooses. It is named here because this file charges quadratic scans as a real
+defect class below, not because it is a regression: the path it replaced walked
+the whole container on every lookup, so the bound is no worse and the measured
+cost is 1.7–5.4× lower. What it is not is free, and a document with a large
+table and few repeated keys is the shape that pays most.
+
 **It matters when an application verifies one part of a document and then acts
 on another.** Two `get`s can be made to resolve to overlapping regions, so you
 checked one thing and used a different one — the shape of Android's Master Key
@@ -47,19 +73,45 @@ is the reference implementation the indexed paths are checked against. Lookups
 cost what they would on a file with no index — measured, 301 skips against 17
 for one key in a 200-key map — and the question does not arise.
 
+**`:ignore` does not work on a stringref document, and that is not a bug.**
+Ignoring the index means ignoring the pointer table, which is the only thing
+that can resolve a reference from an offset — so `nav/source` refuses with
+`:boring/stringref-not-navigable` rather than answering wrongly. Since
+`encode-indexed` no longer forces `:stringref false`, this is **every
+default-profile indexed document**, so the recipe above needs one of:
+
+| you want | do this |
+|---|---|
+| navigate untrusted bytes, no index trusted | encode with `{:stringref false}`, then `{:trust-index :ignore}` |
+| read untrusted bytes you did not encode | `boring/decode` — it builds the stringref table itself by decoding in order and consults no index at all |
+| navigate, accepting the index as trusted | the default |
+
+`boring/decode` is the honest answer for input you did not produce: it is the
+reference implementation, it never reads the frame, and it therefore has none
+of this section's exposure.
+
 Not yet built, and named here so the gap is visible rather than implied: a
 `:validate` setting that walks every anchor chain at load and refuses an index
 that does not hold together. It is measured at about one unindexed scan
 (12.2 ms on a 4.6 MB, 200 000-item file), after which lookups run at full
-speed — so it is never worse than having no index. Until it exists,
-`:trust-index` accepts only `:trusted` and `:ignore`.
+speed — so it is never worse than having no index.
 
-Two amplification paths on the `nav` side are also uncharged and unmeasured by
+Until it exists there is nothing to select. `:trust-index` accepts `:trusted`
+and `:ignore`; `:ignore` skips the index entirely and scans, and **`:trusted`
+is a documented no-op** — there is one read path, and the per-node validation
+the option used to disable no longer exists. The key is kept rather than
+removed because a removed option key silently no-ops rather than failing.
+
+One amplification path on the `nav` side is also uncharged and unmeasured by
 this page: cursor construction in `seq`/`reduce`/`items`/`count` is not charged
-to `:max-items` at all, and the index frame decodes with the budgets
-deliberately lifted. Both are bounded by the message size, so a transport cap
-bounds them — but the multiplier has not been measured and may exceed the
-decode figures below.
+to `:max-items` at all. It is bounded by the message size, so a transport cap
+bounds it — but the multiplier has not been measured and may exceed the decode
+figures below.
+
+The index frame used to be a second such path, decoding with the depth and item
+budgets lifted. It no longer lifts anything: each payload element is read at its
+own offset, so the frame's own nesting is never charged, and every element is a
+single item.
 
 ## Trust boundary
 

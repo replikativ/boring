@@ -41,7 +41,7 @@
   "Whether nav actually descended, observed from the outside: a descended record
    is Counted, an opaque tag is not."
   [bs o]
-  (= :ok (first (outcome #(count (nav/source bs o))))))
+  (= :ok (first (outcome #(count (nav/root bs o))))))
 
 ;; ------------------------------------------------- what the gate must decide
 
@@ -79,7 +79,7 @@
               [dk dv] (outcome #(boring/decode bs oo))]
           (doseq [k [:x :y :nope]]
             (let [want (if (= :ok dk) [:ok (get dv k ::nf)] [dk])
-                  got (outcome #(nav/value (get (nav/source bs oo) k ::nf)))]
+                  got (outcome #(nav/value (get (nav/root bs oo) k ::nf)))]
               (is (= want got) (str label " get " k)))))))))
 
 ;; ------------------------------------------------------------ reserved names
@@ -116,9 +116,9 @@
     (let [m (into (sorted-map) {:x 1 :y 2})
           bs (boring/encode m opts)]
       (is (not (descends? bs opts)) "refused")
-      (is (= m (nav/value (nav/source bs opts))) "value still realises correctly")
-      (is (= 1 (nav/value (get (nav/source bs opts) :x))) "and lookups still answer")
-      (is (= ::nf (nav/value (get (nav/source bs opts) :nope ::nf)))))))
+      (is (= m (nav/value (nav/root bs opts))) "value still realises correctly")
+      (is (= 1 (nav/value (get (nav/root bs opts) :x))) "and lookups still answer")
+      (is (= ::nf (nav/value (get (nav/root bs opts) :nope ::nf)))))))
 
 ;; ------------------------------------------------------------- descent works
 
@@ -126,7 +126,7 @@
   (testing "the case that survives: no constructor means UnknownRecord, whose
             valAt, count and seq delegate straight to the field map"
     (let [bs (boring/encode (->Pt 7 8) opts)
-          c (nav/source bs opts)
+          c (nav/root bs opts)
           realised (boring/decode bs opts)]
       (is (descends? bs opts))
       (is (= :tag (nav/value-type c)) "value-type still reports the tag")
@@ -142,7 +142,7 @@
                 (boring/declare-navigable-record pt-name))
         o (assoc opts :registry reg)
         bs (boring/encode (->Pt 1 2) o)
-        c (nav/source bs o)]
+        c (nav/root bs o)]
     (is (descends? bs o))
     (is (= (->Pt 1 2) (nav/value c)) "value realises the RECORD")
     (is (= 1 (nav/value (get c :x))))
@@ -185,7 +185,7 @@
    [xs (gen/vector gen/small-integer 0 6)]
    (let [v (->Pt (vec xs) (count xs))
          bs (boring/encode v opts)
-         c (nav/source bs opts)
+         c (nav/root bs opts)
          realised (boring/decode bs opts)]
      (and (= realised (nav/value c))
           (= 2 (count c))

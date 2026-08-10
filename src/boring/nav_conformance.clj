@@ -87,7 +87,7 @@
    (let [o (merge {:stringref false} opts)
          bs (boring/encode v o)
          realised (boring/decode bs o)
-         c (nav/source bs o)
+         c (nav/root bs o)
          fail (fn [what expected actual]
                 {:check what :expected expected :actual actual
                  :value v :opts o :bytes (alength ^bytes bs)})]

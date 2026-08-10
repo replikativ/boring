@@ -84,6 +84,78 @@ One caveat, measured after the fact and worth stating here rather than only in
 a general-purpose compressor is best at. Turn `:shapes` on when you are not
 compressing, or when decode latency matters more than ~10% of compressed size.
 
+Under **deflate** — which is what `permessage-deflate` uses over a WebSocket —
+the four profiles land within 4% of each other (plain 1 404, stringref 1 388,
+shapes 1 399, shapes+stringref 1 342), and shapes+stringref is marginally the
+smallest. So the inversion above is a zstd result, not a general one, and one
+profile can serve both storage and a deflating wire.
+
+### Ragged rows: the key set is a UNION
+
+The rule above — "all maps sharing one key set" — was once literal, and the
+writer declined the moment any row differed. That made shapes all-or-nothing:
+one ragged row in a thousand cost the whole table its density, and data
+arriving at a system boundary is exactly the ragged case (optional fields,
+schema drift, mixed event types).
+
+The keys are now the **union** of every row's, in first-seen order, and a row
+that lacks one says so in one of two ways:
+
+```
+value   [{:a nil :b 1} {:b 2}]
+
+shaped  d9 9ae1               tag 39649
+          82
+            82                  keys :a :b
+              d827 62 3a61
+              d827 62 3a62
+            82                  rows
+              82 f6 01            :a PRESENT with value null
+              82 f7 02            :a ABSENT
+```
+
+- **`undefined`** (simple value 23, `0xf7`) in a value position means that key
+  is absent from this map.
+- **A short row** means every key past its length is absent. Trailing
+  absences are truncated rather than padded, so a row that stops early costs
+  nothing for the keys it never reaches.
+
+`null` (`0xf6`) is untouched and still means a key that is **present** with a
+nil value. `{:a nil}` and `{}` are different maps and stay different bytes —
+that distinction is the whole reason absence needed its own spelling rather
+than reusing null.
+
+A row that carries `undefined` as an actual value cannot be shaped, since the
+two would be indistinguishable coming back; the writer declines such a table.
+
+This is [draft-ietf-cbor-packed][packed]'s idea — its tag-114 `record` function
+uses `undefined` for the same purpose. Only the semantics are borrowed, not the
+packing framework, and not its tag numbers, which are unassigned. See
+[IANA-REGISTRATION.md](IANA-REGISTRATION.md).
+
+### The density bound
+
+The union has a pathological case: **disjoint key sets**. Keys are numbered in
+first-seen order, so a row introducing all-new keys sits at high positions and
+must be padded past everything before it. The padding is then O(rows²) and
+shaping makes the document dramatically *bigger*. Measured, 200 rows of 5 keys
+each, shaped size ÷ plain size:
+
+| distinct key sets | 1 | 5 | 10 | 20 | 40 | 200 |
+|---|---:|---:|---:|---:|---:|---:|
+| ratio | 0.21 | 0.43 | 0.71 | **1.19** | 2.17 | **9.65** |
+
+So the writer measures rather than hopes. Hoisting the keys saves writing
+`total-entries − union` key occurrences; the padding costs one byte per empty
+slot. Both are accumulated during the pass the shape needs anyway, and shaping
+is declined when the padding would exceed the saving — which puts break-even
+between 10 and 20 distinct key sets, with no tuned constant.
+
+The guard's guarantee is narrow and worth stating exactly: **shaped output is
+never larger than the same value written without shapes.**
+
+[packed]: https://datatracker.ietf.org/doc/draft-ietf-cbor-packed/
+
 ---
 
 ## Proposed: tag 39650, shaped map
@@ -258,309 +330,13 @@ and reviewable. Ship it once the vertical is proven.
 
 ---
 
-## `boring/index`: the sequence offset index
-
-A CBOR sequence (RFC 8742) has no way to reach item *n* except by skipping the
-*n-1* before it. For a log that is fine while tailing and useless while seeking:
-reaching the last of 200 000 items measured 10.6 ms by skipping and 0.2 µs
-through an index — see the stride table below, and reproduce it with
-`clojure -M:bench -m nav index`.
-
-`boring/write-seq!` with `:index N` seals a sequence with one extra item:
-
-```
-<item> <item> ... <item>              the data section, untouched
-d8 1b  82                             tag 27, array(2)
-   6c 626f72696e672f696e646578        "boring/index"
-   86 ...                             [stride, containers, counts,
-                                       slots, sorted, 48 <8 bytes>]
-```
-
-`slots` are **deltas, not absolute offsets** — see "Slots are deltas" below
-before implementing a reader.
-
-### Why the index is at the END
-
-Offsets are only known once the items are written, so a leading index would
-mean buffering the whole sequence in memory before emitting a byte — fatal for
-a log. ZIP's central directory and Parquet's footer sit at the end for exactly
-this reason. It also means a foreign reader sees every real item first and the
-metadata last, so one that stops early never encounters it.
-
-### How it is found, without leaving CBOR
-
-CBOR cannot be parsed backwards. The last element is therefore a byte string of
-exactly 8 bytes, which always encodes as `0x48` plus 8 — so a sealed file ends
-with 9 predictable bytes however large the offsets array is. Read them, take
-the pointer, seek.
-
-**Those 9 bytes are not a magic trailer.** They are the ordinary encoding of an
-ordinary byte string. The file remains a valid CBOR sequence end to end, and
-`cbor2` or `ciborium` reading it gets every data item plus one tagged value
-they can ignore.
-
-### The pointer verifies as well as locates
-
-It is both where the index begins and how long the data section is. A reader
-seeks there and checks for the `boring/index` frame; if it is not there the
-index is stale —
-the file was truncated, or appended to after sealing — and the reader scans
-instead. Three checks guard against a file that merely happens to end in the
-right shape: the tail must look like an 8-byte byte string, the pointer must be
-in range, and the target must actually carry the `boring/index` name.
-
-**The index is never load-bearing for correctness.** It is rebuildable by a
-full scan, discardable at any time, and a missing or damaged one changes only
-the speed. That is deliberate, and it is what the test suite pins: a corrupt
-pointer, a truncated file, an appended-to file, a file that merely ends in the
-right 9-byte shape, and a frame that passes every detection check but holds an
-unusable payload all fall back to scanning rather than throwing.
-
-**The limit of that claim, stated rather than implied.** It holds for an index
-that is **missing, stale, truncated, or damaged in a way that leaves it
-structurally inconsistent** — each is detected and costs only a scan. It does
-**not** hold for damage that leaves the payload structurally *consistent*, and
-that is not only a crafted-attack case: exhaustive single-byte mutation of a
-real index frame returns a **silently wrong answer 2.1% of the time**, and a
-**one-bit** flip of the `sorted` byte loses 15 of 20 keys with no error at all.
-Ordinary bit rot lands on the wrong side of this line.
-
-The reader checks that a node's parts agree — the container really is at that
-offset with the count it claims, its first anchor is that container's first
-entry, anchors ascend and stay inside the data section. What it cannot check
-without doing the very work the index exists to avoid is that **every** anchor
-is a real entry boundary (O(n) per container), or that `sorted` is truthful
-(which means reading every key). An index built to lie about either will
-misdirect a lookup to a neighbouring value, silently and without error.
-
-So the index frame is a **trust boundary**: integrity of the index is integrity
-of the document. That is the same exposure the data section already has — CBOR
-carries no checksum, and anyone able to rewrite the index can rewrite the data —
-but it is a real qualification of the sentence above, which was previously
-written without one.
-
-### Slots are deltas, in the narrowest type that holds them
-
-Offsets inside a container ascend, so consecutive differences are small and
-nearly uniform while the absolutes are large and unbounded. Each slot therefore
-goes out as differences from the previous entry, in the narrowest of a **byte
-string**, **sint16** (tag 77) or **sint32** (tag 78), and the first difference
-is measured from the container's own offset — 0 for the sequence node, whose
-sentinel −1 is not a position.
-
-The CBOR element type *is* the width declaration, so there is no per-entry flag
-of the kind PostgreSQL needs for its `JEntry` array. Postgres reads offsets in
-place out of a TOAST'd datum and pays a prefix sum per probe; boring
-materialises the index once when it loads, expands there, and every lookup path
-then reads a plain `int[]` exactly as it did before. Delta encoding costs
-nothing at lookup time here.
-
-A reader must therefore treat an int32 slot as deltas too — absolutes and deltas
-are indistinguishable on the wire. That is why this landed before the format was
-published rather than after.
-
-### Stride is a parameter, not a constant
-
-A lookup scans up to *N*-1 items, so stride trades size against seek. On 200 000
-items of ~36.8 bytes (7.36 MB of data) — reproduce with
-`clojure -M:bench -m nav index`:
-
-| stride | anchors | slot type | index | overhead | µs/seek |
-|---:|---:|---|---:|---:|---:|
-| — | — | *no index* | — | — | **10 600** |
-| 1 | 200 000 | byte string | 195.4 KB | 2.72% | 0.2 |
-| 8 | 25 000 | sint16 | 48.9 KB | 0.68% | 0.6 |
-| 16 | 12 500 | sint16 | 24.5 KB | 0.34% | 1–2.5 |
-| 64 | 3 125 | sint16 | 6.2 KB | 0.09% | ~4.2 |
-| 256 | 781 | sint16 | 1.6 KB | 0.02% | ~4.3 |
-
-The first row is the same seek with no index: 10.6 **milliseconds**, because
-reaching item 199 999 means skipping 199 999 items. That is the number the
-whole feature exists to remove — roughly 18 000× at stride 8 — and against it
-every other row is within a rounding error of the same answer.
-
-Sizes are exact; **seek times are not**, and the last three rows are quoted
-loosely on purpose. Run to run, stride 16 moved between 1.1 and 2.4 µs and
-64/256 swapped order — the index competes for cache with the data, so a
-smaller index sometimes wins back what a longer scan costs. Read the column
-for its shape, not its digits.
-
-Seek is separated from decode because only the seek is the index's doing:
-materialising the item is a ~0.3–0.5 µs floor at any stride, which dominates at
-stride 1 and disappears into the noise by stride 64.
-
-**Narrowing breaks the proportionality.** Doubling the stride halves the anchor
-count but can double the element width, so size falls in steps rather than
-smoothly and there are bands where a denser index is nearly free. Absolute
-int32 offsets would have cost 781 KB at stride 1 (10.9% of this file); deltas
-cost 195 KB, and that 4× is what makes a stride-1 index — one with no scan
-component at all — a defensible choice rather than a curiosity.
-
-The sweet spot still moves with item size — the scan cost is per item, the index
-cost per entry — so there is no default worth baking in.
-
-### Reaching into an item
-
-The offsets above locate top-level items. The same trailing item also carries a
-node per **container**, which is what reaches inside one — see "part two"
-below. That was written as future work in an earlier draft of this document and
-has since shipped; the sequence offsets are simply the node at the sentinel
-offset −1, so both live in one uniform list.
-
-
----
-
-## `boring/index`, part two: container nodes
-
-The sequence index above reaches item *n*. The same item also carries a node
-per **container**, which reaches *into* an item.
-
-A node is the byte offsets of a container's entries. With them, an array
-indexes positionally in O(1) and a map with sorted keys binary-searches in
-O(log n), comparing **encoded key bytes** — no key is ever decoded and no value
-is ever touched.
-
-```
-tag 27 [ "boring/index",
-         [ stride, containers, counts, slots, sorted, <8-byte data-len> ] ]
-```
-
-### A name, not a number
-
-The index is a **tag-27 name**, not a tag of its own. It began as tag 39651 and
-was moved once the cost was measured: the index appears exactly **once per
-file**, so a name costs 14 bytes — 0.05% of a 28 KB file. Against that it
-removes a registration obligation entirely, is self-describing (`cbor2` sees
-the string rather than an unregistered number), and narrows false-positive
-detection, since a stray file must now end in the right shape **and** point at
-tag 27 **and** carry this exact name.
-
-**Tag 39649 keeps its own number for the opposite reason**, and this is the
-rationale that was missing from this document. Shaped arrays occur **per
-array**, not once per file, and `:shapes` exists precisely to shrink documents:
-
-| payload | shaped arrays | cost as a tag-27 name |
-|---|---:|---:|
-| datom-maps-200 | 1 | +0.4% |
-| 100 small tables | 100 | **+19.6%** |
-| nested tables ×500 | 500 | **+35.2%** |
-
-Paying up to a third of the file back would defeat the feature on exactly the
-documents it exists for. A 3-byte tag is the right trade there; a 17-byte name
-is not. One number to register, not two.
-
-`containers` are sorted byte offsets, so a reader binary-searches them; the
-sequence itself is the node at the sentinel offset −1. `sorted` is recorded per
-node rather than inferred, because the encoding profile is not on the wire.
-
-### Sorted keys are what make it systematic
-
-Binary search needs ordering, so it requires `:canonical` or `:archival` — the
-profiles that sort map keys by encoded bytes, and which you would already be
-using for storage. Without them a lookup still jumps anchor to anchor rather
-than entry to entry, but it is O(n/stride), not O(log n).
-
-**Arrays need no profile.** Element *i* is the *i*-th recorded offset, so an
-indexed array is O(1) under any encoding.
-
-### Two knobs, and which one matters
-
-| | | |
-|---|---|---|
-| `:index` | stride | entries per recorded offset |
-| `:index-min` | threshold | smallest container worth a node |
-
-**`:index-min` dominates.** Real data is mostly small containers, and each one
-costs an offset, a count, a typed-array slot and a flag whether or not it is
-worth searching. On 2 000 records of two fields each, indexing every container
-cost **76%** of the file; indexing only containers of 8+ cost **1.3%** — and
-was *faster*, because the smaller index also fits in cache.
-
-Measured, one container, lookups spread across it:
-
-| keys | overhead | scan | indexed |
-|---:|---:|---:|---:|
-| 100 | 3.4% | 4.23 µs | 2.09 µs |
-| 1 000 | 1.4% | 26.1 µs | 0.79 µs |
-| 10 000 | 1.2% | 175.1 µs | **0.74 µs** |
-
-### Where it loses
-
-An index can be **slower**. Finding the node is itself a binary search over the
-container list, once per level. When a container is narrow *and* its entries are
-cheap to skip, walking it costs less than looking up how to jump:
-
-| nesting depth, 64-key levels | scan | indexed |
-|---:|---:|---:|
-| 4 | 0.395 µs | 0.856 µs |
-| 64 | 4.025 µs | **8.168 µs** |
-
-Raise `:index-min` above the width of such containers and they fall back to
-walking. This is the case where the default is wrong and the knob is the fix,
-which is why both are parameters and neither is implicit.
-
-### Building it
-
-### Two builders, and why
-
-**`write-seq!` captures the index as it encodes.** The writer already knows
-`pos` — the offset it is about to write to — and knows a container's entry
-count before emitting a byte of it, so the nodes fall out of encoding. Nothing
-in the index needs a subtree's *length*, only where its entries start, so there
-is nothing to back-patch. In a length-prefixed format this would need a second
-pass; CBOR's element counts make the write side free and the read side
-expensive, and this takes the good half of that trade.
-
-On 50 000 records through a `BufferedOutputStream`, against the same write with
-no index — reproduce with `clojure -M:bench -m nav write`:
-
-| stride | walked | captured |
-|---:|---:|---:|
-| 16 | +80% | **+3%** |
-| 8 | +85% | **+5%** |
-| 1 | +113% | +30% |
-
-Stride 1's remainder is not the capture — it is delta-encoding and emitting a
-50 000-entry slot at the end, which the walk paid too.
-
-**`build-index` walks encoded bytes instead**, and stays, because it is the only
-way to index a value that is already encoded — re-indexing after a compaction,
-or indexing a file somebody else wrote. It is also the reference implementation
-the captured index is tested against, generatively, in
-`boring.writer-index-test`.
-
-The walk returns each value's **end offset** rather than calling `skipFrom` per
-entry. That matters: `skipFrom` is O(subtree), so an entry-at-a-time walk
-re-walks everything beneath each level and is O(n²) in depth — measured at
-486 ns/byte against a skip's 1.3–2, and 27× slower on a 200-deep document. A
-single descent visits each byte once and the node falls out of it. Even so it
-cannot beat ~31% of encode time, because stepping over a subtree *is* walking
-it. That floor is what capturing avoids rather than optimises.
-
-### The two builders differ, deliberately
-
-The walk indexes containers **on the wire**, and boring puts several there that
-no user wrote: a sorted-map is tag 27 around a two-element `[name, map]`, a
-shaped array is `[keys, rows]`. On the wire those are indistinguishable from a
-user's own two-element vector, so the walk indexes them; the writer knows the
-difference and skips them.
-
-That is a **subset, not a disagreement**, and it is legitimate — the index is
-never load-bearing, and a node for `[name, map]` is pure overhead. The pinned
-contract:
-
-- every captured node is byte-identical to one the walk found — always;
-- the two agree completely once `:index-min` excludes frames.
-
-Every *structural* frame boring emits — a sorted map's `[name, map]`, a shaped
-array's `[keys, rows]` — has 3 entries or fewer. The `boring/index` frame's own
-payload has **6** (`[stride, containers, counts, slots, sorted, <8 bytes>]`, as
-:275 and :425 spell out), and a re-index over an already-sealed file — which
-`doc/STORAGE.md` presents as a real operation — walks that frame like any other
-container. At `:index-min` 4 or 6 the walk captures a node for it; at 7 it does
-not. So **7 is the boundary**, and the default of 16 clears it comfortably.
-
-Tags are **descended through**, not stepped over. A set is tag 258 around an
-array, a record tag 27 around `[name, map]`, a shaped array tag 39649 around
-`[keys, rows]` — skipping tags would leave exactly those uncovered, and
-descending is free because `skipFrom` walks the same bytes anyway.
+## The offset index lives in its own document now
+
+`boring/index` — the frame that records where things are so a reader can jump
+instead of walk — used to be documented here, below the shaped-array material,
+because the two were designed in the same week. They are independent features
+and that was a poor home for it.
+
+**See [INDEX.md](INDEX.md)**, which carries the frame layout, how a reader finds
+it without parsing CBOR backwards, **how `boring.nav` turns a node into a jump**,
+the stride and threshold economics, and the trust boundary.

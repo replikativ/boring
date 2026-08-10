@@ -210,9 +210,39 @@ probe that reproduces a withdrawn conclusion is worse than no probe: someone
 runs it, sees parity, and re-opens a settled question. What survived is written
 down here and in `SegmentSource`, which is where it is load-bearing.
 
-`ByteBuffer` is the JDK-9-compatible alternative and is worse: it ties `byte[]`
-on sequential scans but runs **2.29×** on the data-dependent walk a head parser
-actually performs, against `MemorySegment`'s 1.22×.
+`ByteBuffer` is the JDK-9-compatible alternative and is worse *for the Reader's
+own accessors*: it ties `byte[]` on sequential scans but runs **2.29×** on the
+data-dependent walk a head parser actually performs, against `MemorySegment`'s
+1.22×. That is why the Reader branches on `byte[]` and reaches
+`MemorySegment` through `SegmentSource` for a mapped file.
+
+**It did not stay rejected as a `ByteSource`, and the reason is reach rather
+than speed.** `BufferSource` wraps any `java.nio.ByteBuffer` — NIO channels,
+Netty, `MappedByteBuffer`, and log engines that hand out a read-only slice into
+an mmap they never copied. `SegmentSource` needs JDK 22; this runs on 9
+alongside the rest of `src/java`, so it is also the only off-heap source
+available to a caller who cannot move yet.
+
+One thing about it IS measured and worth keeping: reading through a
+`ByteBuffer` field goes **megamorphic** if one process meets more than two
+`ByteBuffer` implementation classes — `HeapByteBuffer`, `HeapByteBufferR`,
+`DirectByteBuffer`, `DirectByteBufferR` — and that costs about 8%. Any
+benchmark comparing buffer kinds must therefore use one shape per JVM, or it
+measures a megamorphic call site for everything after the second.
+
+**No numbers are quoted here for `BufferSource` against `SegmentSource`, and
+that is deliberate.** An earlier version of this section reported them at
+parity (38.1 µs against 40.3) and an mmap'd slice at parity with anonymous
+`allocateDirect` — all measured over files in `/tmp`, which on this machine is
+**tmpfs**. A mapping backed by tmpfs is memory; it never faults a page from
+storage, so a comparison against `allocateDirect` was memory against memory and
+could not have shown a difference even if one exists. The numbers were not
+wrong about what they measured, they were wrong about what they were *for*.
+
+Re-measuring properly needs mappings over real storage, which this repository
+has no harness for. Until it does, the honest statement is the narrow one:
+`BufferSource` exists for **reach** — it runs on JDK 9 and takes a buffer from
+any source — and whether the FFM path is faster over a real disk is untested.
 
 ### What shipped: one parser, two accessors
 
@@ -231,6 +261,64 @@ Off-heap decode costs **1.35×** heap decode, and only that path pays it
 (shared/global arena 1.35×, confined 1.46×). It also means: to realise a whole
 subtree from a mapping, stage its byte span into a scratch array and decode
 through the array path (67.5 µs) rather than in place (75.4 µs).
+
+### Reading a field without decoding the value it is in
+
+Every other table on this page compares codecs: how fast bytes become a value
+and back. On those, boring, hako and nippy sit within a factor of two or three
+and the winner depends on the payload. None of it says why you would pick one.
+
+This table is the reason. hako's read API is `decode`, `decode-into!` and
+`decode-many`; nippy's is `thaw`. There is no partial read, no cursor, no early
+stop — `decode-many` returns a vector, not a lazy seq. To see one field of one
+row, both must build every row. That is not a handicap imposed by the
+benchmark; it is the question a store asks, and the cost of answering it is
+what `boring.nav` exists to remove.
+
+A table of datom-shaped rows, `{:e :a :v :tx :added}`, written with the
+`:store` settings — `encode-indexed` with `{:shapes true :stringref true}`.
+(**Not a `:profile` value**; `:profile` takes `:clojure`, `:interop`,
+`:archival`, `:canonical` or `:canonical-rfc7049`, and `{:profile :store}`
+raises `:boring/bad-option`. It is shorthand used in this document and in
+`bench/capability.clj` for that combination of options.)
+`clojure -M:bench -m capability`:
+
+| 5 000 rows × 5 fields | boring | hako | nippy |
+|---|---:|---:|---:|
+| **size** | **134 465 B** | 138 766 B | 273 865 B |
+| one field of one row | **0.94 µs** | 236 µs | 1 005 µs |
+| sum one column | **110 µs** | 267 µs | 1 070 µs |
+| filter on one column, project another | **114 µs** | 267 µs | 1 070 µs |
+| heap allocated, one field of one row | **4 048 B** | 987 344 B | — |
+| heap allocated, sum one column | **121 120 B** | 1 107 320 B | 6 306 800 B |
+
+**The point read scales and the column scan does not**, and the difference is
+the whole design. Against hako it is 16.8× at 200 rows, 75× at 1 000 and 251×
+at 5 000, because boring is O(log n) in the index and hako is O(n) in the
+decode. The column scan is a flat ~2.4× at every size, because both sides visit
+every row; what boring saves there is the allocation, not the walk.
+
+**Most of the win is navigation, not the codec, and the harness says so.**
+boring's *own* full decode is the fourth column, and on a column scan it loses
+to hako — 231 µs against 267 at 5 000 rows only because stringref shrinks the
+input, and 2.1× slower than boring's navigating path on the same bytes. A table
+that omitted that row would be claiming a codec advantage boring does not have.
+
+Shapes and stringref **compose**; an earlier draft of the harness assumed they
+competed and left 24% on the floor. Shapes hoist the keys out of every row,
+stringref then dedupes the repeated values that remain, and only together do
+they land under hako:
+
+| 200-row table | bytes |
+|---|---:|
+| plain | 12 613 |
+| stringref only | 10 037 |
+| shapes only | 6 648 |
+| **shapes + stringref** | **5 063** |
+| hako | 5 165 |
+
+All four are navigable. Combining stringref with an index is what the pointer
+table in the index frame is for.
 
 ### Navigation
 
@@ -273,17 +361,32 @@ Write such a file with the options on the **writer**, not per call:
 
 `resolve-opts` merges the caller's map over the profile defaults on every
 encode, which costs ~250 heap bytes per event — and it bites hardest here,
-because a navigable file needs `:stringref false` and so cannot use the
-nil-opts fast path. Resolved once on the writer, a log event costs **301 → 15**
-bytes through `encode-buffered!` and **248 → 0** through `write-to!`.
+because a **sequence** needs `:stringref false` and so cannot use the nil-opts
+fast path. Resolved once on the writer, a log event costs **301 → 15** bytes
+through `encode-buffered!` and **248 → 0** through `write-to!`.
 
-Two constraints are enforced, not documented-and-hoped: `:stringref` documents
-are refused (a cursor holding only an offset cannot resolve an index into a
-table built from preceding strings), and indefinite-length containers cannot be
-descended (their count is not on the wire, so `Counted` would lie — boring
-never writes them). Tags are opaque: `get` realises through the ordinary reader
-and delegates, because a tag's reader is an arbitrary function and structure
-does not imply semantics.
+That restriction is specific to sequences and does not apply to a single
+document. `write-root!` resets the writer per top-level item, so every item
+opens its own namespace numbered from zero, while one index frame carries one
+pointer table and can describe at most one of them. `write-seq!` therefore
+forces `:stringref false` at every stride and refuses an explicit `true` rather
+than dropping it silently. A per-section pointer table would lift this; the
+economics are measured and it is not yet worth the format bump.
+
+Two constraints are enforced, not documented-and-hoped. **A stringref document
+is navigable only if its index carries a pointer table** — a cursor holding
+only an offset cannot resolve an index into a table built from the strings that
+precede it, so the table is written into the index frame and `encode-indexed`
+is what puts it there. A stringref document written *without* an index is
+refused, loudly, rather than answered wrongly. And indefinite-length containers
+cannot be descended: their count is not on the wire, so `Counted` would lie —
+boring never writes them.
+
+Tags are opaque *by default*: `get` realises through the ordinary reader and
+delegates, because a tag's reader is an arbitrary function and structure does
+not imply semantics. Three have descent because boring wrote them and knows
+they preserve structure — shaped arrays, records, and RFC 8746 typed arrays.
+The shaped-array case is the one above.
 
 ### mmap: good for reading, not for writing
 
@@ -312,9 +415,12 @@ Compression and mmap'ed selective access pull against each other: mmap pages at
 
 Lookup cost scales with chunk size; ratio saturates almost immediately. 4 KB
 reaches 77% of whole-file ratio and aligns with the page granularity mmap gives
-you anyway. This is the argument *against* filesystem compression here: btrfs
+you anyway. This is the argument *against* filesystem compression at its defaults: btrfs
 compresses 128 KiB extents and ZFS a 128 KiB recordsize, landing at the bottom
-of that table with no knob. Compression also forecloses zero-copy — a chunk
+of that table. **The knob exists, though** — `zfs create -o recordsize=16K` —
+and [STORAGE.md](STORAGE.md) has the worked version. An earlier draft of this
+sentence said there was none, which was wrong, and the correction had been made
+in one document and not the other. Compression also forecloses zero-copy — a chunk
 must be decompressed to the heap — so it and the blob win are alternatives for
 the same bytes.
 

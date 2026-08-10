@@ -17,7 +17,7 @@ here.
   reach item *n* without stepping over the *n-1* before it — 9.8 ms to 1.6 µs on
   a 200 000-item log, at 0.34% file overhead. The frame is ordinary CBOR (tag 27,
   `boring/index`), so a file carrying one stays readable by any CBOR
-  implementation; see [doc/SHAPES.md](doc/SHAPES.md) for the format.
+  implementation; see [doc/INDEX.md](doc/INDEX.md) for the format.
 - `encode-indexed`, `build-index` and `seal-index!` — index an already-encoded
   blob rather than capturing while writing. **Available on both platforms**, and
   byte-identical between them, so a browser and a server produce the same file.
@@ -105,7 +105,173 @@ here.
   interface naming no FFM type; only a caller who CONSTRUCTS a segment-backed
   source needs the newer JDK.
 
+- **`org.replikativ.boring.BufferSource`** — a `ByteSource` over any
+  `java.nio.ByteBuffer`, so a payload need not be copied to be read. NIO
+  channels, Netty, `MappedByteBuffer` and log engines that hand out a read-only
+  slice into an mmap all produce one.
+
+  `SegmentSource` needs JDK 22; this runs on 9 alongside the rest of
+  `src/java`, so it is also the only off-heap source available to a caller who
+  cannot move yet. Measured at parity with the FFM path on the same mapping —
+  38.1 µs against 40.3 on a column scan — so it is not a fallback.
+
+  Every read is absolute and goes through a duplicate, so decoding cannot
+  disturb a cursor the caller still holds, and one buffer can back two sources.
+  Byte order is forced to big-endian on that duplicate: it is a mutable
+  property of a `ByteBuffer`, and a caller who set `LITTLE_ENDIAN` for their
+  own framing would otherwise get every length and float silently byte-swapped.
+
+- **The offset layer of `boring.nav` can read a shaped array.** `shape`,
+  `shape-rows`, `shape-column`, `shape-count` and `shape-keys` expose the
+  key-to-column map that makes the encoding fast, so a scan resolves a key to a
+  column ONCE for the table rather than comparing keys per row:
+
+      (let [sh  (nav/shape s (nav/root-offset s))
+            col (nav/shape-column sh :amount)]
+        (nav/reduce-at s (nav/shape-rows sh)
+                       (fn [acc row]
+                         (+ acc (nav/long-at s (nav/nth-offset s row col))))
+                       0))
+
+  Summing one column over 5 000 rows: 110 µs and 16 bytes allocated for the
+  whole scan, against 267 µs for hako and 1 070 for nippy, both of which must
+  decode every row to reach one field. Reading one field of ONE row is 0.94 µs
+  against 236 and 1 005 — and that gap widens with the table, because it is
+  O(log n) against O(n). `clojure -M:bench -m capability`.
+
+- **`nav/root-offset`** — where the document's root value begins, without
+  building a cursor to throw away. Entering the offset layer previously
+  required `(nav/offset (nav/root bs))`.
+
 ### Changed
+
+- **FORMAT: a shaped array's key set is now the UNION of every row's keys.**
+  Shapes previously required every row to carry an identical key set and
+  declined otherwise, so one ragged row in a thousand cost a whole table its
+  density — and data arriving at a system boundary is exactly the ragged case.
+
+  A row that lacks a key says so in one of two ways: **`undefined`** (simple
+  value 23) in a value position, or a **short row**, whose trailing keys are
+  absent. `null` (simple value 22) is untouched and still means a key that is
+  PRESENT with a nil value — `{:a nil}` and `{}` are different maps and stay
+  different bytes.
+
+  Distinguishing 22 from 23 is therefore a **conformance requirement of tag
+  39649**, and RFC 8949 §3.3 already makes them distinct. Surveyed: `cbor2`,
+  `cbor-x`, `node-cbor` and `clj-cbor` all comply; `ciborium` collapses them at
+  its `Value` layer and Jackson does not surface tags at all. See
+  [doc/INTEROP.md](doc/INTEROP.md).
+
+  The idea is [draft-ietf-cbor-packed][packed]'s, whose tag-114 `record`
+  function spells absence the same way. Only the semantics are borrowed.
+
+  **The writer measures before it shapes.** Disjoint key sets are pathological
+  — first-seen numbering makes the padding O(rows²) — so hoisting is declined
+  when the padding would exceed the key occurrences saved. The guarantee is
+  exact: **shaped output is never larger than the same value written without
+  shapes.**
+
+  Documents written this way are not readable by earlier boring. Nothing
+  released produces them.
+
+  [packed]: https://datatracker.ietf.org/doc/draft-ietf-cbor-packed/
+
+- **`nav/field-offset` and `nav/nth-offset` return `-2` for a non-container**,
+  where `-1` continues to mean absent, and **`nav/container-count` throws**
+  `:boring/not-a-container` rather than joining that convention — a count has
+  no spare value, and every negative long is a plausible count downstream.
+
+  All three previously assumed the caller had checked the major type.
+  `container-count` on a shaped array returned **39649**, the tag number, as a
+  count; the other two walked off the end of the document and raised
+  `:boring/truncated-input`.
+
+- **BREAKING: `boring.nav/source` returns a *source*, not a root cursor.**
+  `(nav/root bs opts)` is what it used to be, and is what you want for `get`,
+  `seq`, `walk` and friends.
+
+  The split names a concept the namespace did not have. A **source** is the
+  document — the bytes, the reader over them, the index, the shape cache. A
+  **cursor** is a position inside one. Without that distinction an
+  allocation-free field lookup has to take a cursor and *ignore* its offset,
+  which is both meaningless and a trap.
+
+  The rule: **a cursor is a position you can hold; an offset is a position you
+  can only use.** Exploring, holding, printing, `get`-ing, `seq`-ing — cursors.
+  Inside a loop whose trip count is the size of your data — the source and its
+  offsets, where a million-row projection allocates 0.62 GB through cursors and
+  none at all through offsets.
+
+  A source implements no collection interface, and `get` on one *throws* rather
+  than answering nil — because `clojure.core/get` returns nil for anything that
+  is not `ILookup`, and a silently empty projection is exactly what this change
+  must not cause.
+
+  `source-at` and `end-at` are **removed** in favour of `cursor`, which is the
+  same function under a name that says what it returns. (They were briefly
+  deprecated-but-present; since this release is the first to carry any of it,
+  shipping a deprecation for something no released version had would be
+  advertising a migration nobody needs to make.) New: `root`, `cursor`,
+  `offset`, `source-of`, `root-offset`. The bridge is exact — `(cursor (source-of c) (offset c))` is
+  `c`, for everything except a shaped row, whose `shape` is cursor state an
+  offset cannot carry.
+
+- **`boring.nav/re-point!`** — point an existing source at different bytes and
+  get its root cursor back, reusing the reader, the nav, the probe cache and
+  the cursor. A scan over many blobs then allocates nothing per row. It is
+  sharp on purpose: cursors previously taken from that source now address the
+  new bytes, so it is for a loop that finishes with each document before
+  starting the next, and it must not be shared across threads even by the
+  standards of the rest of the namespace.
+
+- **BREAKING: the index frame is a trust boundary, and a corrupt one may now
+  change an answer.** boring previously promised that *a missing, stale,
+  truncated or randomly corrupt index may cost speed; it may not change an
+  answer and it may not throw at the caller*. That promise required re-deriving
+  at read time what the frame asserts — verifying each anchor against its
+  predecessor costs O(stride) *skips* per jump, and a skip is O(1) only for a
+  scalar, so stepping over 16 twenty-entry maps is ~640 sub-skips. Measured at
+  four times the cost of the lookup it guarded.
+
+  The promise is withdrawn rather than quietly falsified. Use the index where
+  you are willing to trust the bytes; corruption beneath boring is the storage
+  layer's job, and both known consumers have one.
+
+  **What is still promised, and is not negotiable**: no untyped exception ever,
+  from any damage to any byte — a wrong answer is inside the boundary, an
+  `ArrayIndexOutOfBoundsException` or `OutOfMemoryError` out of `get` is not;
+  no read outside the file; a reader that consults no index is never affected
+  by frame damage; and undamaged data always reads correctly. See
+  [doc/SHAPES.md](doc/SHAPES.md).
+
+- **`:trust-index :trusted` is accepted and does nothing.** There is one path
+  now, and it is faster than the old *trusted* one was — the checks it used to
+  skip are gone for everyone. The key is kept rather than removed because a
+  removed option key silently no-ops. `:trust-index :ignore` is unchanged and
+  still skips the index entirely.
+
+- **The index frame is recognised with six *through fifteen* payload
+  elements**, where it previously required exactly six. Six and **seven** are
+  written: seven when the document opens a stringref namespace, the extra
+  element being the pointer table. This is forward compatibility, and the
+  reason it matters is that
+  the failure mode of *not* recognising a frame is the worst one available: a
+  reader that does not recognise it never learns where the data section ends,
+  so the frame is republished as a trailing **data** item and a file of N
+  records reads back as N+1 — silently, and in both directions. Refusing to
+  *use* an index is safe; refusing to *see* one is not.
+
+  Readers from this version on therefore treat a widened frame as a frame. A
+  widened payload must insert its new elements **before** the trailing
+  back-pointer, which stays last: the trailer the whole scheme is located by is
+  the file's final 9 bytes.
+
+- **The index reader no longer materialises any of the frame.** `containers`,
+  `counts`, `slots` and `sorted` are read in place as byte offsets. Opening an
+  index on a 769-node document went from 17 840 to 1 664 bytes allocated, and
+  the open is now flat in both node count and anchor count — a 16 150-node
+  document opens in the same time as a 770-node one, and stride 1 costs no more
+  than stride 16. Neither the format nor any API changes.
 
 - **BREAKING, ClojureScript: a reserved tag-27 marker naming a type
   ClojureScript does not have now decodes to a frame-preserving carrier**
@@ -181,6 +347,25 @@ here.
   of the sequence rather than as an error. Pass `{:index 0}` for the old output.
 
 ### Fixed
+
+- **ClojureScript wrote index offsets past 2 GiB as negative numbers.**
+  `seal-index!` emitted a 32-bit typed array unconditionally, and
+  `Int32Array.from` wraps rather than refusing — so an offset at or above 2^31
+  went out negative, which is precisely the case 64-bit offsets exist for. The
+  JVM writer had always promoted to 64-bit; ClojureScript now does too.
+
+- **A damaged index could raise an untyped `OutOfMemoryError` out of `get`.**
+  The anchor array was allocated from an entry count read off the wire *before*
+  the bound check that refuses it, so one flipped bit reached 2^31−1 — and
+  `Error` walks through every catch between the frame parser and the caller.
+  Reachable from a single bit flip in a file boring itself wrote.
+
+- **A crafted index could raise an untyped `ArithmeticException` out of
+  `get`.** Anchors are a prefix sum, and a 64-bit delta near `Long/MAX_VALUE`
+  overflowed the sum before the range check that refuses it. Clojure's `+` on
+  primitive longs is checked; the sum is now unchecked, so the wrapped value
+  fails the range check that already existed.
+
 
 - Cross-platform: `encode-indexed` produced different bytes on ClojureScript
   than on the JVM, because the index's `sorted` flag was hardcoded rather than

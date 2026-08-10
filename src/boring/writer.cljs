@@ -1,4 +1,4 @@
-(ns boring.writer
+(ns ^:no-doc boring.writer
   "CBOR writer for ClojureScript.
 
   Design follows measurements taken on node before any of this
@@ -45,7 +45,6 @@
 ;; symmetric across our two platforms. There is no JS URI type, so tag 32
 ;; decodes to a plain string here -- lossless, since a URI IS its string form,
 ;; unlike a BigDecimal which is why that one needed a stand-in type.
-(def ^:const TAG-URI 32)
 (def ^:const TAG-REGEX 35)
 (def ^:const TAG-GENERIC-OBJ 27)
 ;; Reserved tag-27 names for Clojure collections CBOR cannot distinguish. See
@@ -61,9 +60,30 @@
 (def ^:const TAG-DECIMAL 4)
 (def ^:const TAG-RATIONAL 30)
 ;; RFC 8746 little-endian typed arrays, keyed by JS constructor name.
+;;
+;; THE UNSIGNED AND 8-BIT TYPES ARE HERE TOO, and used not to be: a
+;; `js/Uint16Array` handed to `encode` fell through to `:boring/unsupported-type`
+;; although RFC 8746 has a tag for it, the reader on BOTH platforms accepts that
+;; tag, and the JVM decodes it to a value. There was nothing to gain by
+;; refusing -- the caller's only recourse was to convert the array by hand into
+;; one of the five spellings that happened to be listed.
+;;
+;; It is not a JVM divergence in the usual sense, because Java has no unsigned
+;; array types and so can never write these; it is a JS type the format covers
+;; and this writer did not. `Uint8Array` is deliberately ABSENT -- it is
+;; boring's byte-string type and is written as major 2, which the branch above
+;; this one settles first.
+;;
+;; Round trip: the JVM reads all of these. This platform's reader decodes the
+;; five original tags to native typed arrays and PRESERVES the rest as
+;; TaggedValues that re-encode identically -- an asymmetry reader.cljs already
+;; documents as deliberate. So the bytes survive everywhere and the JS type
+;; survives on the JVM.
 (def typed-array-tags
   {"Int16Array" 77 "Int32Array" 78 "BigInt64Array" 79
-   "Float32Array" 85 "Float64Array" 86})
+   "Float32Array" 85 "Float64Array" 86
+   "Uint8ClampedArray" 68 "Int8Array" 72
+   "Uint16Array" 69 "Uint32Array" 70 "BigUint64Array" 71})
 
 ;; Above this length TextEncoder's fixed per-call cost is cheaper than looping.
 (def ^:const ASCII-LOOP-MAX 55)
@@ -571,7 +591,41 @@
       (.set (.-buf w) eb (.-pos w))
       (set! (.-pos w) (+ (.-pos w) (.-length eb))))))
 
+(defn- check-byte-string-keys!
+  "Refuse a map whose keys include two byte strings with the same CONTENT.
+
+  Mirrors `Writer.checkByteStringKeys`. Two distinct `js/Uint8Array` objects
+  are two keys to a ClojureScript map -- they hash by identity -- and ONE key
+  in CBOR, which is by content (RFC 8949 5.6). So the map encoded cleanly here
+  and boring's own reader then rejected the result as
+  `:boring/duplicate-map-key`: a successful encode must never produce bytes the
+  paired decoder refuses.
+
+  The canonical path already caught this from the other direction, by comparing
+  ENCODED key bytes -- which is why the defect only showed on the ordinary
+  path, the one most callers take. Checked here, above the branch, so both
+  paths are covered by the same rule the JVM uses.
+
+  O(k^2) in the number of byte-string keys and nothing else: maps with none
+  pay one `instance?` per key and never allocate."
+  [m]
+  (let [seen (array)]
+    (doseq [k (keys m)]
+      (when (instance? js/Uint8Array k)
+        (doseq [b seen]
+          (when (and (== (.-length b) (.-length k))
+                     (loop [i 0] (cond (== i (.-length b)) true
+                                       (== (aget b i) (aget k i)) (recur (inc i))
+                                       :else false)))
+            (throw (ex-info (str "boring: two map keys are byte strings with the same "
+                                 "content, which is ONE key in CBOR (RFC 8949 5.6). "
+                                 "This map cannot be encoded without producing a "
+                                 "duplicate key.")
+                            {:type :boring/duplicate-map-key}))))
+        (.push seen k)))))
+
 (defn- write-map-entries! [^Writer w m]
+  (check-byte-string-keys! m)
   (if-not (.-canonical w)
     (do (head! w MAP (count m))
         (doseq [[k v] m] (write-value! w k) (write-value! w v)))
@@ -625,30 +679,90 @@
 
 (def ^:private sentinel (js-obj))
 
-(defn- homogeneous-shape
-  "The shared key vector of `v`, or nil if its elements are not all plain maps
-  with the same keys. Membership is checked with `contains?` rather than by
-  comparing key order, since equal key sets need not iterate alike."
+(defn- estimated-key-bytes
+  "Roughly what `k` costs on the wire, for the density bound below.
+
+  An estimate on purpose: the exact figure needs the encoder, stringref state
+  and the profile, none of which exist yet when the shape is chosen. Being
+  wrong here changes only whether an optimisation fires. MIRRORS
+  `Writer.estimatedKeyBytes`."
+  [k]
+  (cond
+    ;; tag 39 (2) + text head (1) + ':' + name, plus "ns/" when present
+    (keyword? k) (+ 4 (count (name k)) (if-let [ns (namespace k)] (inc (count ns)) 0))
+    (string? k) (inc (count k))
+    (symbol? k) (+ 3 (count (name k)) (if-let [ns (namespace k)] (inc (count ns)) 0))
+    :else 8))
+
+(defn- worth-shaping?
+  "Whether the union is dense enough to pay for itself.
+
+  THE PATHOLOGICAL CASE IS DISJOINT KEY SETS. Keys are numbered in first-seen
+  order, so a row introducing all-new keys sits at high positions and must be
+  padded past everything before it -- making the padding O(rows^2) and the
+  document dramatically BIGGER. Measured, 200 rows of 5 keys, shaped/plain:
+
+    distinct key sets    1     5    10     20     40    200
+    ratio             0.21  0.43  0.71   1.19   2.17   9.65
+
+  Hoisting the keys saves writing `total-entries - union` key occurrences; the
+  padding costs one byte per empty slot. Comparing the two directly puts
+  break-even between 10 and 20 key sets with no tuned constant. MIRRORS
+  `Writer.worthShaping`."
+  [union total-entries total-padding]
+  (let [n (count union)
+        avg (max 1 (quot (reduce + (map estimated-key-bytes union)) n))]
+    (< total-padding (* (- total-entries n) avg))))
+
+(defn- union-shape
+  "The UNION of every row's keys, in first-seen order, or nil to decline.
+
+  MIRRORS `Writer.unionShape`, and the two must agree byte for byte -- shapes
+  are per-array, so a divergence here is not a corner case, it is every
+  document. See that method for why the union replaced the old
+  all-keys-identical rule and for the density measurements.
+
+  Declines for: fewer than two rows, any element that is not a `plain-map?`, an
+  empty union, and a row carrying `undefined` AS A VALUE -- absence is spelled
+  that way, so the two would be indistinguishable coming back."
   [v]
   (let [rows (count v)]
     (when (>= rows 2)
-      (let [m0 (nth v 0)]
-        (when (and (plain-map? m0) (pos? (count m0)))
-          (let [ks (vec (keys m0))
-                n (count ks)]
-            (loop [i 1]
-              (cond
-                (= i rows) ks
-                :else (let [m (nth v i)]
-                        (if (and (plain-map? m) (== n (count m))
-                                 ;; get-with-sentinel: one lookup, where
-                                 ;; contains? does a lookup and a test
-                                 (loop [j 0]
-                                   (cond (== j n) true
-                                         (identical? sentinel (get m (nth ks j) sentinel)) false
-                                         :else (recur (inc j)))))
-                          (recur (inc i))
-                          nil))))))))))
+      (loop [i 0 order (transient []) seen (transient {}) n-order 0
+             total-entries 0 total-padding 0]
+        (if (== i rows)
+          (let [o (persistent! order)]
+            (when (and (pos? (count o))
+                       (worth-shaping? o total-entries total-padding))
+              o))
+          (let [m (nth v i)]
+            (when (plain-map? m)
+              ;; [order seen n-order max-pos size ok]. A row spans from position
+              ;; 0 to its highest-numbered key, and the slots between that it
+              ;; does not fill cost one `undefined` byte each; trailing slots
+              ;; cost nothing because the row is truncated.
+              (let [st (reduce-kv
+                        (fn [[o s n mx sz _] k val]
+                          ;; BY VALUE, not by identity. `data/undefined` is one
+                          ;; singleton, but `(data/simple-value 23)` constructs
+                          ;; an equal-but-distinct record, and identity would
+                          ;; have shaped that row and silently turned the value
+                          ;; into an absent key. The instance check keeps it
+                          ;; cheap: false for every ordinary value, so the field
+                          ;; read almost never runs.
+                          (if (and (data/simple-value? val) (== 23 (:n val)))
+                            (reduced [o s n mx sz false])
+                            (let [at (get s k)]
+                              (if at
+                                [o s n (if (> at mx) at mx) (inc sz) true]
+                                [(conj! o k) (assoc! s k n) (inc n)
+                                 (if (> n mx) n mx) (inc sz) true]))))
+                        [order seen n-order -1 0 true] m)
+                    [order seen n-order mx sz ok] st]
+                (when ok
+                  (recur (inc i) order seen n-order
+                         (+ total-entries sz)
+                         (+ total-padding (- (inc mx) sz))))))))))))
 
 (defn- write-shaped-array! [^Writer w v ks]
   (head! w TAG TAG-SHAPED-ARRAY)
@@ -656,9 +770,26 @@
   (head! w ARRAY (count ks))
   (doseq [k ks] (write-value! w k))
   (head! w ARRAY (count v))
-  (doseq [m v]
-    (head! w ARRAY (count ks))
-    (doseq [k ks] (write-value! w (get m k)))))
+  (let [nk (count ks)]
+    (doseq [m v]
+      ;; TRAILING ABSENCES ARE TRUNCATED, interior ones written as `undefined`.
+      ;; The JVM does the same, in the same order, for the same reason -- see
+      ;; `Writer.writeShapedArray`.
+      (let [nv (loop [n nk]
+                 (if (and (pos? n)
+                          (identical? sentinel (get m (nth ks (dec n)) sentinel)))
+                   (recur (dec n))
+                   n))]
+        (head! w ARRAY nv)
+        (dotimes [i nv]
+          ;; sentinel lookup, not `(get m k)`: a key present with a nil value is
+          ;; NOT absent, and CBOR spells the two differently -- `null` is a
+          ;; value, `undefined` is absence. Collapsing them loses `{:a nil}`
+          ;; against `{}`.
+          (let [val (get m (nth ks i) sentinel)]
+            (if (identical? sentinel val)
+              (u8! w (bit-or SIMPLE 23))
+              (write-value! w val))))))))
 
 (defn- write-bigint! [^Writer w ^js/BigInt v]
   (let [neg (neg? v)
@@ -876,7 +1007,19 @@
     (do (head! w TAG TAG-GENERIC-OBJ)
         (head! w ARRAY 2)
         (write-string! w (data/record-type-name x))
-        (write-map-entries! w (into {} x)))
+        ;; THE RECORD ITSELF, not `(into {} x)`. `Writer.writeRecordFields`
+        ;; iterates in DECLARATION order, and a record seqs in declaration
+        ;; order here too -- but `into {}` does not preserve it. Up to eight
+        ;; fields the result is a PersistentArrayMap, which keeps insertion
+        ;; order and so agreed with the JVM by accident; at nine it promotes to
+        ;; a PersistentHashMap and the fields come out in hash order. Every
+        ;; record fixture in the shared suite has three fields or fewer, so the
+        ;; suite could not see it.
+        ;;
+        ;; Field ORDER is not merely cosmetic: it is the byte order of the map,
+        ;; so the two platforms wrote different files for the same record, and
+        ;; `:canonical` -- which sorts -- hid it again by normalising both.
+        (write-map-entries! w x))
 
     ;; Before map?/set?/sequential?, which would flatten these.
     ;; A custom comparator is refused rather than dropped: it is code, and
@@ -915,7 +1058,7 @@
 
     (or (vector? x) (seq? x) (list? x))
     (let [v (if (and (counted? x) (vector? x)) x (vec x))
-          ks (when (and (.-shapes w) (not (.-canonical w))) (homogeneous-shape v))]
+          ks (when (and (.-shapes w) (not (.-canonical w))) (union-shape v))]
       (if ks
         (write-shaped-array! w v ks)
         (do (head! w ARRAY (count v))

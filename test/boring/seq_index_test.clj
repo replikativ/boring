@@ -166,27 +166,37 @@
 
 ;; ----------------------------------------------------------- delta encoding
 ;;
-;; Slots go on the wire as differences from the previous entry, in the narrowest
-;; of a byte string / sint16 / sint32, and are expanded once when the index
-;; loads. The element type IS the width declaration, so these tests check the
-;; type that came back rather than a flag, and check that every width still
-;; answers identically -- narrowing is a size decision and nothing else.
+;; Slots go on the wire as differences from the previous entry, PER NODE, in the
+;; narrowest of u8 / u16 / i32 / i64 -- all of it inside one byte string whose
+;; head is a 2-bit width code per node (`boring.core/pack-slots`). The width is
+;; a declaration in that table rather than a CBOR element type, so these read
+;; the code back rather than a class, and check that every width still answers
+;; identically: narrowing is a size decision and nothing else.
 
 (defn- index-slots
-  "The slot arrays as they actually sit on the wire, before expansion."
-  [^bytes bs o]
+  "The packed slots byte string as it actually sits on the wire."
+  ^bytes [^bytes bs o]
   (let [item (last (foreign-items bs))
         [_ _ _ slots _ _] (boring.data/frame-payload item)]
-    (vec slots)))
+    slots))
+
+(defn- width-code
+  "Node `i`'s 2-bit width code, out of the table that follows the LAYOUT BYTE."
+  [^bytes packed i]
+  (bit-and 3 (bit-shift-right (aget packed (+ 1 (quot i 4))) (* 2 (rem i 4)))))
 
 (deftest slots-narrow-to-the-width-the-data-needs
-  (testing "small, uniform deltas take a byte string -- no tag at all"
-    (let [slots (index-slots (build 1) opts)]
-      (is (= 1 (count slots)) "one node: the sequence")
-      (is (bytes? (first slots))
-          (str "expected a byte string for ~60-byte deltas, got "
-               (.getName (class (first slots)))))))
-  (testing "wider deltas step up to sint16, and wider still to sint32"
+  (testing "small, uniform deltas take the u8 tier"
+    (let [packed (index-slots (build 1) opts)]
+      (is (bytes? packed) "slots are ONE byte string, not an array per node")
+      (is (= 0 (width-code packed 0))
+          "expected the u8 tier for ~60-byte deltas")
+      ;; One node -- the sequence -- so: a layout byte, one width byte, a
+      ;; start table of two 2-byte entries (the block start and the total,
+      ;; which is the structural gate), then 500 one-byte deltas.
+      (is (= (+ 1 1 4 500) (alength packed))
+          "the byte string is exactly the header plus the deltas")))
+  (testing "wider deltas step up to u16, and wider still to i32"
     (let [w (boring/writer 262144 opts)
           mk (fn [len]
                (let [o (ByteArrayOutputStream.)
@@ -194,10 +204,42 @@
                                {"n" i "pad" (apply str (repeat len \x))}))]
                  (boring/write-seq! w vs o (assoc opts :index 1))
                  (.toByteArray o)))]
-      (is (instance? (class (short-array 0)) (first (index-slots (mk 2000) opts)))
-          "~2 KB deltas exceed a byte and fit sint16")
-      (is (instance? (class (int-array 0)) (first (index-slots (mk 40000) opts)))
-          "~40 KB deltas exceed signed 16 bits and fall back to sint32"))))
+      (is (= 1 (width-code (index-slots (mk 2000) opts) 0))
+          "~2 KB deltas exceed a byte and fit u16")
+      ;; 40 KB exceeded the OLD second tier, which was sint16 and so capped at
+      ;; 0x7FFF because tag 77 is signed. Nothing here is a CBOR typed array,
+      ;; so the full 16 bits are usable and this band stays two bytes wide.
+      (is (= 1 (width-code (index-slots (mk 40000) opts) 0))
+          "~40 KB deltas still fit u16, which sint16 could not hold")
+      (is (= 2 (width-code (index-slots (mk 70000) opts) 0))
+          "~70 KB deltas exceed 16 bits and fall back to i32"))))
+
+(deftest each-node-keeps-its-own-width
+  (testing "ONE flat array at a single width was the alternative, and it is why
+            the width table exists: a single container with wide deltas would
+            promote every other node with it. Measured on 767 nodes, that was
+            166% LARGER than the per-node shape when one node was wide. Here a
+            small map beside a large blob must leave the small node at u8."
+    (let [o (ByteArrayOutputStream.)
+          w (boring/writer 262144 opts)
+          ;; VALUES ARE ITEM-RICH, and have to be. An unsorted map earns a
+          ;; node on how many CBOR items each value costs to skip, not on how
+          ;; many bytes -- so the original fixture, whose values were an
+          ;; integer and a 3000-char string, earned no node at all once that
+          ;; rule was corrected and this test failed with "not a tag-27 frame".
+          ;; Both maps still differ the way the test is about: small deltas
+          ;; against large ones.
+          vs [(zipmap (map #(str "k" %) (range 40))
+                      (repeat (vec (range 8))))
+              (zipmap (map #(str "b" %) (range 40))
+                      (repeat (vec (repeat 30 (apply str (repeat 100 \x))))))]]
+      (boring/write-seq! w vs o (assoc opts :index 1 :index-min 4))
+      (let [packed (index-slots (.toByteArray o) opts)
+            codes (map #(width-code packed %) (range 3))]
+        (is (some #{0} codes)
+            (str "the small-value node must stay u8; got widths " (vec codes)))
+        (is (some #{1} codes)
+            (str "the 3 KB-value node must widen on its own; got " (vec codes)))))))
 
 (deftest every-width-resolves-identically
   (testing "the fallback to a wider element type is a size decision only"
@@ -303,7 +345,7 @@
           m (into {} (for [i (range 40)]
                        [(format "k%03d" i)
                         (if (= i 20) (apply str (repeat 50000 \z)) i)]))
-          c (nav/source (boring/encode-indexed m (assoc o :index 4 :index-min 8)) o)]
+          c (nav/root (boring/encode-indexed m (assoc o :index 4 :index-min 8)) o)]
       (doseq [k (keys m)]
         (is (= (get m k) (nav/value (get c k))) (str "key " k))))))
 
@@ -316,10 +358,14 @@
 
 (def sorted-opts {:profile :archival})          ; sorts map keys, drops stringref
 
+;; ENTRIES ARE ITEM-RICH. An unsorted map earns a node on the ITEMS a lookup
+;; skips per entry, not the bytes, so a 3-item value left `wide-map` with no
+;; node and `indexed-descent-agrees-with-scanning` asserting nothing.
 (def wide-map
-  (into {} (for [i (range 300)] [(format "k%04d" i) {"v" i "w" (str "x" i)}])))
+  (into {} (for [i (range 300)]
+             [(format "k%04d" i) {"v" i "w" (str "x" i) "z" (vec (range 8))}])))
 
-(def wide-vec (vec (for [i (range 300)] {"n" i "s" (str "s" i)})))
+(def wide-vec (vec (for [i (range 300)] {"n" i "s" (str "s" i) "z" (vec (range 8))})))
 
 (deftest indexed-descent-agrees-with-scanning
   (testing "every key of a wide map resolves identically with and without an
@@ -328,8 +374,18 @@
     (doseq [o [sorted-opts opts]]
       (let [plain (boring/encode wide-map o)
             idxed (boring/encode-indexed wide-map (assoc o :index 16 :index-min 8))
-            cp (nav/source plain o)
-            ci (nav/source idxed o)]
+            cp (nav/root plain o)
+            ci (nav/root idxed o)]
+        ;; BOTH PROFILES EARN A NODE, by different routes, and that is the
+        ;; point of per-node stride. Under `sorted-opts` the outer map is
+        ;; binary-searchable and takes the file's stride of 16. Unsorted, it
+        ;; cannot be binary-searched at all -- so it takes stride 1, where
+        ;; moving anchor to anchor jumps OVER each value instead of walking it.
+        ;; One file, two strides, neither of them written down: the reader
+        ;; derives which is which from the anchor count.
+        ;;
+        ;; This assertion read `(= plain idxed)` for the unsorted case for one
+        ;; commit, when such a map earned nothing at all above stride 1.
         (is (< (alength ^bytes plain) (alength ^bytes idxed)) "index costs something")
         (doseq [k (keys wide-map)]
           (is (= (nav/value (get-in cp [k "v"]))
@@ -345,8 +401,8 @@
             it is only maps that need canonical order for binary search"
     (let [plain (boring/encode wide-vec opts)
           idxed (boring/encode-indexed wide-vec (assoc opts :index 16 :index-min 8))
-          cp (nav/source plain opts)
-          ci (nav/source idxed opts)]
+          cp (nav/root plain opts)
+          ci (nav/root idxed opts)]
       (doseq [i [0 1 15 16 17 150 298 299]]
         (is (= (nav/value (nth cp i)) (nav/value (nth ci i)) (wide-vec i))
             (str "index " i)))
@@ -370,7 +426,7 @@
             falls back to walking -- slower, identical answers"
     (let [bs (boring/encode-indexed wide-map (assoc sorted-opts :index 16 :index-min 8))
           broken (corrupt-at bs (- (alength bs) 6) 0x7F)
-          c (nav/source broken sorted-opts)]
+          c (nav/root broken sorted-opts)]
       (doseq [k (take 50 (keys wide-map))]
         (is (= (get-in wide-map [k "v"]) (nav/value (get-in c [k "v"])))
             (str "key " k))))))
@@ -398,16 +454,21 @@
     (let [sizes (vec (for [mn [2 8 64]]
                        [mn (alength ^bytes (boring/encode-indexed
                                             wide-map (assoc sorted-opts :index 16 :index-min mn)))]))]
-      ;; Non-increasing, not strictly decreasing: 8 and 64 both exclude the
-      ;; 2-entry inner maps and index only the outer one, so they tie. The
-      ;; claim is that raising the threshold never GROWS the index.
+      ;; NON-INCREASING, and now FLAT. `:index-min` used to be what excluded
+      ;; the 2-entry inner maps, so 2 cost more than 64. `walk` excludes them
+      ;; first and at every setting -- a 2-entry map of scalars is crossed in
+      ;; two items, whatever the threshold says -- so all three tie.
+      ;;
+      ;; That is the knob being SUBSUMED, not broken: `:index-min` counts
+      ;; entries and the metric measures the scan, and where they disagree the
+      ;; metric is the one that describes the cost. What survives is the claim
+      ;; this test is named for -- raising the threshold never grows the index,
+      ;; and never changes an answer.
       (is (apply >= (map second sizes)) (str "size must not rise with threshold: " sizes))
-      (is (> (second (first sizes)) (second (last sizes)))
-          (str "and 2 must cost more than 64: " sizes))
       (doseq [mn [2 8 64]]
-        (let [c (nav/source (boring/encode-indexed
-                             wide-map (assoc sorted-opts :index 16 :index-min mn))
-                            sorted-opts)]
+        (let [c (nav/root (boring/encode-indexed
+                           wide-map (assoc sorted-opts :index 16 :index-min mn))
+                          sorted-opts)]
           (is (= 42 (nav/value (get-in c ["k0042" "v"]))) (str "min " mn)))))))
 
 (deftest seal-index-accepts-the-nil-build-index-returns
@@ -428,8 +489,11 @@
             "sealing nothing writes nothing")
         (is (= 0 (.size out)))))
     (testing "and a real index still seals"
+      ;; 200, not 40: 40 scalars are crossed in 19 items on average and no
+      ;; longer earn a node, so "a real index still seals" was sealing nil --
+      ;; the very case the first half of this test covers.
       (let [o {:stringref false}
-            v (vec (range 40))
+            v (vec (range 200))
             bs (boring/encode v o)
             w (boring/writer 4096 o)
             out (ByteArrayOutputStream.)]
@@ -438,30 +502,117 @@
                                       (alength ^bytes bs) o)))
         (is (= v (first (boring/decode-seq (.toByteArray out) o))))))))
 
-(deftest stringref-and-an-index-are-refused-by-every-writer
-  (testing "An index exists to be navigated, and `boring.nav` refuses a
+(deftest stringref-and-an-index-compose-for-a-value-and-not-for-a-sequence
+  (testing "An index exists to be navigated, and `boring.nav` used to refuse a
             stringref document outright -- a stringref is an index into a table
             built from every preceding string, which a cursor holding only an
-            offset cannot resolve. `write-seq!` and `write-indexed!` have
-            raised on that combination all along; `encode-indexed` honoured it
-            and produced a file whose index nothing can use. Three functions,
-            one rule, and one of them did not follow it."
-    (let [v (vec (range 40))
+            offset cannot resolve. The frame's pointer table gives it the
+            defining offset of every slot something references, so the two
+            SINGLE-VALUE writers now honour the combination.
+
+            A SEQUENCE STILL REFUSES IT, and that asymmetry is the point:
+            `write-root!` resets the writer per top-level item, so each item
+            opens its own namespace numbered from zero, and one frame carries
+            one table. Item 1's references would resolve against item N's
+            literals -- silently."
+    (let [v (vec (repeat 40 {:city "amsterdam" :n 1}))
           opts {:index 4 :index-min 2 :stringref true}]
-      (is (= :boring/incompatible-options
-             (try (do (boring/encode-indexed v opts) nil)
-                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
-      (is (= :boring/incompatible-options
-             (try (let [out (ByteArrayOutputStream.)]
-                    (boring/write-indexed! (boring/writer 4096) v out opts) nil)
-                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+      (is (= v (nav/value (nav/root (boring/encode-indexed v opts))))
+          "encode-indexed honours it, and what it writes is navigable")
+      (is (= v (nav/value
+                (nav/root (let [out (ByteArrayOutputStream.)]
+                            (boring/write-indexed! (boring/writer 4096) v out opts)
+                            (.toByteArray out)))))
+          "and so does write-indexed!, which is where the pointers come from")
       (is (= :boring/incompatible-options
              (try (let [out (ByteArrayOutputStream.)]
                     (boring/write-seq! (boring/writer 4096) [v] out opts) nil)
-                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+          "write-seq! refuses, at every stride"))
     (testing "the control: without `:stringref true` all three still write, and
               what they write is navigable"
       (let [v (vec (range 40))
             opts {:index 4 :index-min 2}]
         (is (pos? (alength ^bytes (boring/encode-indexed v opts))))
-        (is (= v (nav/value (nav/source (boring/encode-indexed v opts)))))))))
+        (is (= v (nav/value (nav/root (boring/encode-indexed v opts)))))))))
+
+(deftest write-seq-forces-stringref-off-at-every-stride-including-zero
+  (testing "D1, pinned. The rule used to be `:index` forces `:stringref false`,
+            on the grounds that indexing declares navigational intent. That
+            made `{:index 0}` -- the documented OFF switch -- the one spelling
+            that kept stringref ON, and ClojureScript cannot index at all, so
+            it forced unconditionally. The SAME portable call therefore wrote
+            different bytes on the two platforms, and only the JVM's were
+            unnavigable.
+
+            The cause is not the index. It is that `write-root!` resets the
+            writer per top-level item, so each item opens its own namespace
+            numbered from zero; one frame carries one pointer table and can
+            describe at most one of them. That is true at stride 0 too -- only
+            `nav`'s categorical refusal of a stringref document was hiding it."
+    (let [v ["repeated-text" "repeated-text"]
+          bytes-for (fn [opts]
+                      (let [out (ByteArrayOutputStream.)]
+                        (if opts
+                          (boring/write-seq! (boring/writer 4096) [v v] out opts)
+                          (boring/write-seq! (boring/writer 4096) [v v] out))
+                        (.toByteArray out)))
+          ;; d9 0100 is tag 256, the namespace opener. Its absence is the whole
+          ;; navigability claim, so this asserts on the WIRE rather than on a
+          ;; byte count that could match for unrelated reasons.
+          opens-namespace? (fn [^bytes b] (= [0xd9 0x01 0x00] (mapv #(bit-and % 0xff)
+                                                                    (take 3 b))))]
+      (is (not (opens-namespace? (bytes-for nil)))
+          "the default arity, which indexes")
+      (is (not (opens-namespace? (bytes-for {:index 0})))
+          "and stride zero, which does not -- this is the one that regressed")
+      (testing "an explicit :stringref true throws at stride 0 as well, rather
+                than being overridden in silence"
+        (is (= :boring/incompatible-options
+               (try (do (bytes-for {:stringref true :index 0}) nil)
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+      (testing "and :stringref false, the way to say it out loud, still writes"
+        (is (pos? (alength ^bytes (bytes-for {:stringref false :index 0}))))))))
+
+(deftest nth-through-the-sequence-index-does-far-less-walking
+  (testing "THE INDEX IS A PURE OPTIMISATION, so no assertion about the VALUE
+            `nth` returns can tell a live index from a dead one -- the scan
+            returns the same item. `bin/index-mutants` measures that directly by
+            replacing each index branch with its scan and asking which tests
+            notice, and this path had NOBODY: `Items.nth`'s `.offsets` branch
+            could be deleted with the whole suite still green.
+
+            That is the same hole the same tool found in `lookup-map` and
+            `nth-item`, both of which then turned out to carry real defects. The
+            observable that distinguishes them is the WALKING, which
+            `nav/skips` counts.
+
+            `nav/skips` takes a cursor rather than an `Items`, and every item
+            `nth` returns IS one over the same Reader -- so the counter is read
+            through an item, and it counts what the sequence walk did."
+    ;; `(build 0)`, NOT `(build nil)`. `write-seq!` INDEXES BY DEFAULT -- this
+    ;; file says so at the top -- so `(build nil)` is a SEALED sequence and the
+    ;; first version of this test compared an index against itself, which is
+    ;; how it failed. `:index 0` is the documented off switch.
+    (let [indexed (nav/items (build 16) opts)
+          plain (nav/items (build 0) opts)
+          walked (fn [its i]
+                   (let [c0 (nth its 0)]
+                     (nav/skips c0 0)
+                     (nav/value (nth its i))
+                     (nav/skips c0)))]
+      (testing "both reach the same item -- the index changes the work, not the
+                answer, which is why this cannot be a value assertion"
+        (is (= (nth items 400) (nav/value (nth indexed 400))))
+        (is (= (nth items 400) (nav/value (nth plain 400)))))
+      (let [with (walked indexed 400)
+            without (walked plain 400)]
+        (is (< (* 4 with) without)
+            (str "reaching item 400 through the index must walk far less: "
+                 with " against " without))
+        ;; A CEILING as well as a ratio. At stride 16 the walk from an anchor is
+        ;; bounded by the stride, so this cannot quietly degrade into "slightly
+        ;; better than scanning" while still passing the ratio.
+        (is (< with 40)
+            (str "and it must be bounded by the stride, not by the sequence: "
+                 with))))))

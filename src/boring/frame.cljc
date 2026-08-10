@@ -68,7 +68,10 @@
 
 (def prefix-bytes
   "The exact bytes every sealed frame starts with: tag 27, a two-element array,
-  the text string `boring/index`, and the six-element payload array.
+  the text string `boring/index`, and a payload array head. Six or
+  SEVEN elements are written -- seven when the document opens a stringref
+  namespace -- and `payload-count-bytes` below accepts six through fifteen, so
+  only the first 16 bytes are compared as a constant.
 
   A CONSTANT, compared before anything is decoded. That is the whole point:
   the gates that preceded it judged the frame only AFTER materialising it, and
@@ -78,19 +81,43 @@
 
 (def ^:const prefix-length 17)
 
-#?(:clj
-   (def ^:no-doc prefix-array
-     "The same constant as a `byte[]`, for callers that reach bytes through a
-     `Reader` rather than an array -- `boring.nav`, which must also work over a
-     memory-mapped `ByteSource`.
+(def ^:const prefix-head-length
+  "The prefix bytes that are FIXED: everything but the payload's array head."
+  16)
 
-     One constant, two access paths, so the rule cannot differ between them.
-     It differed before: `nav` checked tag 27, then that the payload was an
-     array, then the name -- but never the array's ELEMENT COUNT. Widen a
-     genuine frame's payload from six elements to seven and `nav` used it as an
-     index while `decode-seq` published it as a phantom trailing data item. One
-     file, two logical contents. The 0x86 in these bytes is that count."
-     (byte-array (map unchecked-byte prefix-bytes))))
+(def payload-count-bytes
+  "Array heads a frame's payload may carry: 6 through 15 elements.
+
+  SIX OR SEVEN IS WHAT THIS LIBRARY WRITES: six without a stringref namespace,
+  seven with one, the extra element being the pointer table that lets a cursor
+  resolve a reference by jumping. This used to say six was all this library
+  wrote, and that was true until the two composed. `data-end` is LAST in both
+  shapes, which is what keeps the trailer findable -- readers must take it as
+  the last element, never as element five.
+
+  Accepting more is forward compatibility, and the reason it matters is
+  that the failure mode of NOT accepting it is the worst one available: a
+  reader that does not RECOGNISE a frame never learns `data-end`, so the frame
+  is republished as a trailing DATA item and a file of N records reads back as
+  N+1 -- silently, and in both directions. Refusing to USE an index is safe;
+  refusing to SEE one is not.
+
+  So a reader from this version on treats a widened frame as a frame: bounded,
+  its index used or refused on its own merits, never mistaken for data. The
+  elements past the sixth are skipped, which costs nothing -- `payload-offsets`
+  chains `skipFrom` and never visits them, and the tile-to-EOF check walks the
+  whole array regardless.
+
+  Fifteen is where the CBOR array head stops being one byte. Past that the
+  prefix changes length and this stops being a constant comparison, which is
+  the property the gate exists for."
+  #{0x86 0x87 0x88 0x89 0x8a 0x8b 0x8c 0x8d 0x8e 0x8f})
+
+#?(:clj
+   (def ^:no-doc prefix-head-array
+     "The fixed 16 bytes as a `byte[]`, for `Reader.bytesEqualAt`. The
+     seventeenth is compared against `payload-count-bytes` separately."
+     (byte-array (map unchecked-byte (take prefix-head-length prefix-bytes)))))
 
 (defn- be64
   "The 8 big-endian bytes at `off` as a number.
@@ -117,11 +144,15 @@
                 :cljs (+ (* acc 256) (ubyte bs (+ off i))))))))
 
 (defn prefix-at?
-  "Whether `bs` carries the frame prefix at `off`."
+  "Whether `bs` carries the frame prefix at `off`.
+
+  Sixteen bytes exactly, then an array head of six THROUGH FIFTEEN elements --
+  see `payload-count-bytes` for why the count is a range and not a constant."
   [bs ^long off]
   (and (some? bs) (>= off 0) (<= (+ off prefix-length) (blen bs))
        (loop [i 0]
-         (cond (= i prefix-length) true
+         (cond (= i prefix-head-length)
+               (contains? payload-count-bytes (ubyte bs (+ off prefix-head-length)))
                (= (ubyte bs (+ off i)) (long (nth prefix-bytes i))) (recur (inc i))
                :else false))))
 
@@ -178,12 +209,23 @@
        (= index-name (data/frame-name v))
        (let [p (data/frame-payload v)]
          (and (sequential? p)
-              ;; SIX, checked. `boring.nav/index-payload` destructured six
-              ;; names off this without checking the count, so a seven-element
-              ;; payload was used as an index there and published as a phantom
-              ;; trailing data item here -- one file, two logical contents.
-              (= 6 (count p))
-              (let [ptr (nth (vec p) 5)]
+              ;; AT LEAST SIX, and no more than fifteen. `index-payload`
+              ;; destructured six names off this without checking the count at
+              ;; all, so a seven-element payload was used as an index there and
+              ;; published as a phantom trailing data item here -- one file,
+              ;; two logical contents. The bound is a RANGE rather than an
+              ;; equality so that a future widening is recognised by readers
+              ;; from this version on; see `payload-count-bytes`.
+              (<= 6 (count p) 15)
+              ;; THE POINTER IS LAST, not element 5, and that is forced rather
+              ;; than chosen: the trailer this whole scheme is found by is the
+              ;; file's final 9 bytes, so the element encoded last must be the
+              ;; 8-byte back-pointer. A widened payload therefore inserts its
+              ;; new elements BEFORE it. Reading `(nth p 5)` here would refuse
+              ;; exactly the frames `prefix-at?` now accepts, and the two gates
+              ;; disagreeing about what a frame is, is the defect this test
+              ;; family exists for.
+              (let [ptr (nth (vec p) (dec (count p)))]
                 (and #?(:clj (bytes? ptr) :cljs (instance? js/Uint8Array ptr))
                      (= 8 (blen ptr))
                      (or (neg? start)

@@ -60,11 +60,22 @@ echo "──▶ index-mutants"
 # The variable is `seq-ok?` since per-node validation landed -- `ok?` named a
 # whole-index verdict that no longer exists.
 check "index load"            "          (when seq-ok?" "          (when (and seq-ok? false)"
-check "Items.nth anchors"     "(if-not (anchor-sound? nav offsets stride anchor)" "(if-not true"
-# `(:slots idx)` became `slot-at`, which expands and memoizes per node rather
-# than eagerly for every node at load.
-check "lookup-map (map key)"  "    (if (or (neg? ns) (zero? (alength ^longs (slot-at idx ns))))" "    (if true"
-check "nth-item (array elem)" "        (if (neg? ns)" "        (if true"
+# THREE OF THESE FOUR PATTERNS WENT STALE ON THE stringref-index BRANCH, and
+# the script caught it by refusing to run rather than by reporting a pass --
+# which is the property it was written for. Re-derived against the code as it
+# now stands:
+#
+#   `anchor-sound?` is GONE. Per-anchor verification was removed when the index
+#   became a trust boundary outright (it cost O(stride) skips per jump), so
+#   `Items.nth` has no check left to disable. The index PATH is now the
+#   `if-let` on `.offsets`, and forcing it nil is what makes `nth` fall back to
+#   walking the sequence.
+#
+#   `lookup-map` and `nth-item` both grew a per-node stride and a nil-slot
+#   guard, so the shapes changed. Both are still one branch: take the scan.
+check "Items.nth offsets"     "      (if-let [^longs offsets (when idx (.offsets idx))]" "      (if-let [^longs offsets (when false (.offsets idx))]"
+check "lookup-map (map key)"  "    (if (or (nil? slot) (zero? m)" "    (if (or true (nil? slot) (zero? m)"
+check "nth-item (array elem)" "          (if (or (nil? slot) (zero? (alength slot)) (>= (long anchor) (alength slot)))" "          (if (or true (nil? slot) (zero? (alength slot)) (>= (long anchor) (alength slot)))"
 restore
 
 if [ ${#FAILED[@]} -ne 0 ]; then

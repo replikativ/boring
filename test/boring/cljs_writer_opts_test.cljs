@@ -24,6 +24,33 @@
         (boring/write-seq! w [v v] #(swap! chunks conj %))
         (is (every? #(bytes= (boring/encode v {:stringref false}) %) @chunks))))))
 
+(deftest write-seq-refuses-stringref-the-same-way-the-jvm-does
+  ;; D1, pinned. `write-root!` resets the writer per top-level item, so every
+  ;; item opens its own stringref namespace numbered from zero, and one index
+  ;; frame carries one pointer table -- it can describe at most one of them.
+  ;;
+  ;; The JVM used to force `:stringref false` only when indexing, on the
+  ;; grounds that indexing declares navigational intent. This platform cannot
+  ;; index at all, so it had no such trigger and forced unconditionally. That
+  ;; left `{:index 0}` -- the documented OFF switch -- as the one spelling
+  ;; where the two platforms wrote DIFFERENT BYTES for the same call, and only
+  ;; the JVM's were unnavigable. Both now force at every stride.
+  (let [v ["repeated-text" "repeated-text"]
+        w (boring/writer 64)]
+    (testing "an explicit :stringref true is refused, not silently dropped"
+      (is (= :boring/incompatible-options
+             (try (do (boring/write-seq! w [v v] (fn [_]) {:stringref true}) nil)
+                  (catch :default e (:type (ex-data e)))))))
+    (testing ":stringref false is how you say it out loud, and still works"
+      (let [chunks (atom [])]
+        (boring/write-seq! w [v v] #(swap! chunks conj %) {:stringref false})
+        (is (= 2 (count @chunks)))))
+    (testing "the default output opens no namespace, so nav can read it"
+      ;; d9 0100 is tag 256. Its absence is the whole navigability claim.
+      (let [chunks (atom [])]
+        (boring/write-seq! w [v v] #(swap! chunks conj %))
+        (is (every? #(not= [0xd9 0x01 0x00] (vec (.slice % 0 3))) @chunks))))))
+
 (deftest instant-type-can-be-a-constructor
   (testing "JavaScript has one time type, so the JVM's `:date`/`:instant`
             keyword choice has no counterpart -- and the option was accepted

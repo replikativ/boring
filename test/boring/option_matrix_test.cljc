@@ -12,7 +12,8 @@
 
   Both run on both platforms from one table, so a JVM-only fix fails on
   ClojureScript rather than passing quietly."
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require [clojure.set]
+            [clojure.test :refer [deftest testing is]]
             [boring.core :as boring]
             [boring.option-matrix :as m]))
 
@@ -97,6 +98,31 @@
     (let [got (m/run)]
       (is (= (count m/cases) (count (distinct (map (fn [[_ label _]] label) (keys got))))))
       (is (= (set (keys frozen)) (set (map (fn [[side label _]] [side label]) (keys got))))))))
+
+(deftest every-declared-entry-point-is-exercised-or-named-as-absent
+  (testing "the two assertions above count CASE LABELS, so an entry point could
+            be dropped from a side's table without either of them moving -- and
+            one was: three encode rows sit behind `#?@(:clj ...)` directly under
+            a comment promising that a row is marked rather than omitted. The
+            matrix then could not see that `write-seq!` handles `:stringref`
+            differently on the two platforms.
+
+            So the claim is checked against `declared-entry-points`, which is
+            written once for both platforms, and a shortfall has to be NAMED in
+            `unavailable-entry-points` rather than simply not being there."
+    (let [got (m/run)
+          exercised (reduce (fn [acc [side _ ep]] (update acc side (fnil conj #{}) ep))
+                            {} (keys got))]
+      (doseq [[side declared] m/declared-entry-points]
+        (let [absent (get m/unavailable-entry-points side #{})
+              ran (get exercised side #{})]
+          (is (empty? (clojure.set/intersection ran absent))
+              (str side ": " (pr-str (clojure.set/intersection ran absent))
+                   " is named unavailable but ran anyway"))
+          (is (= declared (clojure.set/union ran absent))
+              (str side ": declared " (pr-str declared)
+                   " but exercised " (pr-str ran)
+                   " and named absent " (pr-str absent))))))))
 
 (deftest ok-really-means-it-ran
   (testing "`:ok` is recorded when a call RETURNS, so a row could pass by doing

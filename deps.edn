@@ -1,4 +1,17 @@
-{:paths ["src" "target/classes"]
+;; `src-hasch` IS ON THE PATH, not only in the jar. `build.clj` adds it to
+;; `write-pom` and `copy-dir`, so a Maven consumer gets `boring.hasch` -- but a
+;; `:local/root` or `:git/url` consumer gets THIS `:paths` vector instead, and
+;; the comment below names four of them. The result was that
+;; `boring.core/hasch-integration?` answered TRUE for a Maven consumer and
+;; FALSE for konserve, kabel, konserve-sync and datahike on an otherwise
+;; identical classpath -- and the failure mode is exactly the one boring.hasch
+;; exists to prevent, since two record types and a plain map then
+;; content-address to the same uuid with nothing thrown.
+;;
+;; Safe for a consumer WITHOUT hasch: the `defonce` at the end of `boring.core`
+;; probes `hasch.benc` before `boring.hasch`, which is there so that shipping
+;; the namespace cannot break anyone. See the comment on it.
+{:paths ["src" "src-hasch" "target/classes"]
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}}
 
  ;; boring has a Java hot path, so `target/classes` on :paths above is BUILT,
@@ -29,6 +42,19 @@
    :extra-deps {io.github.cognitect-labs/test-runner
                 {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                 org.clojure/test.check {:mvn/version "1.1.1"}}
+   ;; A HEAP CEILING, because without one the suite MISREPORTS resource
+   ;; exhaustion as a codec defect. `generative-test/decode-outcome` catches
+   ;; Throwable and classifies OutOfMemoryError as `:untyped` -- the category
+   ;; that means "boring let a raw host exception escape" -- so a tight heap
+   ;; turns into a correctness failure, and it fires hardest during test.check
+   ;; SHRINKING, exactly when the diagnostic is needed. Seen twice: a green
+   ;; suite, then an OOM inside a rose-tree generator, on unchanged code.
+   ;;
+   ;; `:dev` and `:bench` both set -Xmx4g; this alias set nothing, so it took
+   ;; the JVM default -- 25% of a CI container is about 1 GB. 2g is comfortably
+   ;; above the real peak (`writer-streaming-test` holds five boxed copies of a
+   ;; generated value live at once) and low enough to stay honest.
+   :jvm-opts ["-Xmx2g"]
    :main-opts ["-m" "cognitect.test-runner"]}
 
   ;; boring measured against nippy's own reference stress data. Isolated in its
@@ -132,11 +158,11 @@
   ;; Same names as the rest of replikativ, so the shared CircleCI orb finds them.
   :format
   {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
-   :main-opts ["-m" "cljfmt.main" "check" "src" "test" "dev"]}
+   :main-opts ["-m" "cljfmt.main" "check" "src" "test" "dev" "bench"]}
 
   :ffix
   {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
-   :main-opts ["-m" "cljfmt.main" "fix" "src" "test" "dev"]}
+   :main-opts ["-m" "cljfmt.main" "fix" "src" "test" "dev" "bench"]}
 
   :lint
   {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}

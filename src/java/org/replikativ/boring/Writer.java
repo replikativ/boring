@@ -388,6 +388,93 @@ public final class Writer {
     private int[] idxCnts;
     private boolean[] idxSrt;
     private long[][] idxSlots;
+    /** Each node's `walk`: the mean number of CBOR items a scan crosses to
+     *  reach a random entry of that container. NEVER GOES ON THE WIRE -- it is
+     *  a writer-side decision input, read once to decide whether the node is
+     *  worth keeping and then discarded. Exposed only so the byte walk can be
+     *  held to the same number. */
+    private long[] idxWalk;
+
+    /**
+     * WHERE A BINARY SEARCH STARTS TO REPAY THE FRAME, in mean prefix items.
+     *
+     * Derived by measurement, not fitted: on `:archival` (sorted keys) the
+     * crossing sits around walk 60 -- walk 31 measured 0.95x, walk 63 1.21x,
+     * walk 255 3.51x. A round number off a flat curve. Being off by 2x costs
+     * ~10%; being off by the METRIC costs 2-3x, which is what choosing items
+     * over bytes and over subtree size was about.
+     */
+    private static final long WALK_THRESHOLD = 64;
+
+    /**
+     * Mean prefix items an unsorted map must cross per ENTRY to earn a node.
+     * `walk` is that mean over the whole container, so the test is
+     * {@code walk >= UNSORTED_WALK_PER_ENTRY * n}.
+     *
+     * THE AXIS IS ITEMS, NOT BYTES. This replaces a direct budget on the
+     * anchors' size -- "at most a tenth of the container" -- whose javadoc
+     * argued that `walk` could not express the trade. It had it backwards:
+     * BYTES cannot express it. An unsorted map is usable only at stride 1, so
+     * its node buys exactly one thing, skipping each VALUE instead of walking
+     * it, and what that is worth depends on how many CBOR items a value is --
+     * not on how many bytes.
+     *
+     * Measured, same n, near-identical bytes per entry, opposite verdicts:
+     *
+     *   values                    B/entry   n=20    n=64    n=200
+     *   400-char strings (1 item)     409  0.30x   0.64x    0.67x
+     *   100-int vectors (101 items)   184  0.78x   2.61x   14.21x
+     *
+     * The old rule admitted both. A big string is the exact shape it cannot
+     * help -- one cheap skip either way -- and konserve-shaped records are
+     * mostly that, which is why `:index-min 16` had to mask it.
+     *
+     * Swept over n in {8, 32, 128, 512} x items-per-entry in {1, 4, 16, 64,
+     * 256}. Every admitted node at 16 items per entry or more measured at
+     * least 1.84x, up to 18.13x; 4 items per entry straddled (0.77x at n=32,
+     * 2.62x at n=512), and 1 loses everywhere. 4 mean items per entry -- this
+     * constant, against `walk` which is a half-sum -- sits below the clear
+     * wins and above every measured loss.
+     */
+    private static final long UNSORTED_WALK_PER_ENTRY = 4;
+
+    /** Set when a node has been refused, cleared by {@link #compactNodes}. */
+    private boolean idxDirty;
+
+    /**
+     * Scratch space for a MAP's anchors, used as a stack.
+     *
+     * A map captures one anchor per ENTRY, because which stride it wants is
+     * not known until its last key has been compared. Allocating `long[n]` per
+     * map to find that out cost 3.9x to 16.4x more than the old
+     * `long[n/stride]`, measured -- and worst on the shape `write-indexed!`
+     * exists for: 500 rows of 20-entry maps allocated 88 KB of anchor arrays
+     * whose nodes were then all REFUSED, pure per-encode garbage.
+     *
+     * Containers nest, so this is a stack: each map claims a region, fills it,
+     * and pops it. `fillNodeScratch` copies out only the anchors it keeps, at
+     * the stride it chose, so the surviving array is right-sized and the
+     * speculative part is reused rather than collected.
+     *
+     * ARRAYS ARE NOT ROUTED THROUGH IT. They capture at the file's stride
+     * already -- they can never become unsorted maps -- so they were unchanged
+     * by the regression (1.00x measured) and would only pay an extra copy.
+     */
+    private long[] idxScratch;
+    private int idxScratchTop;
+
+    /** Claim `n` longs of scratch, returning the base. */
+    private int idxScratchClaim(int n) {
+        if (idxScratch == null) idxScratch = new long[Math.max(64, n)];
+        else if (idxScratchTop + n > idxScratch.length) {
+            int cap = idxScratch.length;
+            while (cap < idxScratchTop + n) cap <<= 1;
+            idxScratch = java.util.Arrays.copyOf(idxScratch, cap);
+        }
+        int base = idxScratchTop;
+        idxScratchTop += n;
+        return base;
+    }
 
     private static final long[] NO_LONGS = new long[0];
     private static final int[] NO_INTS = new int[0];
@@ -417,7 +504,6 @@ public final class Writer {
     }
 
     /** Move the offset base without disturbing what has been captured. */
-    public void idxBase(long base) { this.idxBase = base; }
 
     // ---- sequence offsets -------------------------------------------------
     //
@@ -435,6 +521,25 @@ public final class Writer {
     // A plain Java field needs neither. The writer is already the mutable thing
     // in this picture and is not thread-safe anyway, so there is nothing for a
     // barrier to protect.
+
+    /**
+     * CBOR items emitted so far, ONE PER HEAD. The input to the `walk` metric.
+     *
+     * NOT `idxItems` below, which counts top-level SEQUENCE items and is
+     * refused at Integer.MAX_VALUE because the frame stores it as an int32.
+     * This one counts every head at every depth, is never written to the wire,
+     * and is only ever read as a DIFFERENCE between two points in one
+     * container -- so it may wrap without consequence and is not bounded.
+     *
+     * Counted at the emit sites (`head`, `headU64`, `u8`, the three float
+     * writers, and the two-byte simple form) rather than once per `writeValue`,
+     * because the number has to match what a STRUCTURAL WALK over the same
+     * bytes counts -- `Reader.skipCountingFrom` -- and a walker sees heads, not
+     * calls. A shaped array is the case that separates the two: its reader
+     * consumes the outer, keys, rows and row heads inline, so counting
+     * `writeValue` calls would miss four containers per row.
+     */
+    private long idxItemsWritten;
 
     /** Null until the first anchored item -- see the node arrays above. 8 KB
      *  on every Writer was the largest single piece of that regression. */
@@ -479,6 +584,11 @@ public final class Writer {
      *  {@code Integer.MAX_VALUE}: {@link #idxItem} refuses to go past it. */
     public long idxItemTotal() { return idxItems; }
 
+    /** CBOR items emitted so far, one per head. See {@link #idxItemsWritten}.
+     *  Exposed for the property test that holds this count and
+     *  {@code Reader.skipCountingFrom} in agreement. */
+    public long itemsWritten() { return idxItemsWritten; }
+
     /** Offsets of every `stride`th top-level item. */
     public long[] idxItemOffsets() {
         return idxSeq == null ? NO_LONGS : java.util.Arrays.copyOf(idxSeq, idxSeqN);
@@ -493,25 +603,96 @@ public final class Writer {
         if (idxSlots != null && idxN > 0)
             java.util.Arrays.fill(idxSlots, 0, idxN, null);
         idxN = 0;
+        idxDirty = false;
+        // The stack unwinds with the containers, but an exception mid-document
+        // leaves it wherever it stopped. Both entry points reset on the throw
+        // path, so this is where it is put right.
+        idxScratchTop = 0;
+        idxSuspend = 0;
         idxSeqN = 0;
         idxItems = 0;
         idxItemCountdown = 1;
     }
-    public int idxCount() { return idxN; }
+    // ---- node accessors -----------------------------------------------
+    //
+    // THESE ARE NOT PURE READS. Each one compacts first, and compaction
+    // RENUMBERS slots -- so calling any of them while a container is still
+    // being written would renumber under the `int slot` locals that in-flight
+    // `writeMapValue`/`writeArrayOf`/`writeRecordFields` frames are holding,
+    // and those frames would then fill the wrong node.
+    //
+    // Safe today because nothing calls them mid-document: both seal paths
+    // (`core/write-seq-resolved!`, `core/write-indexed-resolved!`) read them
+    // after the value has been written, and a custom tag writer never receives
+    // the Writer. Written down because "getter" stopped being an accurate
+    // description of them and nothing said so.
+    public int idxCount() { compactNodes(); return idxN; }
     // Null-safe because the backing arrays are lazy now: a writer that never
     // indexed has none, and `idxN` is 0, so an empty result is the right
     // answer rather than an NPE.
     public long[] idxContainers() {
+        compactNodes();
         return idxOffs == null ? NO_LONGS : java.util.Arrays.copyOf(idxOffs, idxN);
     }
     public int[] idxCounts() {
+        compactNodes();
         return idxCnts == null ? NO_INTS : java.util.Arrays.copyOf(idxCnts, idxN);
     }
     public Object[] idxSlots() {
+        compactNodes();
         return idxSlots == null ? NO_OBJS : java.util.Arrays.copyOf(idxSlots, idxN);
     }
     public boolean[] idxSorted() {
+        compactNodes();
         return idxSrt == null ? NO_BOOLS : java.util.Arrays.copyOf(idxSrt, idxN);
+    }
+    /** Each node's `walk`. Not written to the wire -- see {@link #idxWalk}. */
+    public long[] idxWalks() {
+        compactNodes();
+        return idxWalk == null ? NO_LONGS : java.util.Arrays.copyOf(idxWalk, idxN);
+    }
+
+    /**
+     * The referenced stringref slots as interleaved `(index, offset)` pairs,
+     * ascending by index; empty when nothing was referenced.
+     *
+     * Ascending because the reader binary-searches it. Sorting here rather than
+     * on the reader is the same trade the rest of the frame makes: the writer
+     * sees each document once, a reader may open it a million times.
+     *
+     * Interleaved in one `long[]` rather than two arrays or a list of pairs,
+     * because this crosses into Clojure and every wrapper on that boundary is
+     * an allocation the sealer would have to unpick again.
+     */
+    public long[] stringrefPointers() {
+        if (srOffs == null || srCount == 0) return NO_LONGS;
+        int n = 0;
+        for (int i = 0; i <= srMask; i++) if (srKeys[i] != null && srUsed[i]) n++;
+        if (n == 0) return NO_LONGS;
+        long[] out = new long[n << 1];
+        int j = 0;
+        for (int i = 0; i <= srMask; i++) {
+            if (srKeys[i] != null && srUsed[i]) {
+                out[j++] = srVals[i];
+                out[j++] = srOffs[i];
+            }
+        }
+        // Insertion sort on pairs. The table is walked in hash order, so this
+        // arrives shuffled; `n` is the number of DISTINCT REFERENCED strings,
+        // measured at 3-56 on konserve-shaped data, where insertion sort beats
+        // boxing the pairs to hand them to a comparator sort.
+        for (int a = 2; a < out.length; a += 2) {
+            long ki = out[a], ko = out[a + 1];
+            int b = a - 2;
+            while (b >= 0 && out[b] > ki) {
+                out[b + 2] = out[b];
+                out[b + 3] = out[b + 1];
+                b -= 2;
+            }
+            out[b + 2] = ki;
+            out[b + 3] = ko;
+        }
+        return out;
     }
 
     /** Anchors an indexed container of `n` entries needs at the current stride. */
@@ -526,8 +707,30 @@ public final class Writer {
         return idxStride == 1 ? n : ((n - 1) / idxStride) + 1;
     }
 
+    /**
+     * Capture is SUSPENDED inside a map key and inside a set element.
+     *
+     * `boring.nav` cannot reach either. A map entry is handed out as
+     * `MapEntry(realize(key), cursor(value))` -- the key is realised, never a
+     * cursor -- and a set is realised whole, so `(get set-cursor 0)` is nil. A
+     * node on a container inside one is therefore unusable by construction,
+     * exactly like the tag-27 frame's own `[name, args]` array that
+     * `frame-payload-array?` drops for the same reason.
+     *
+     * It also removes a divergence between the two index builders. Canonical
+     * maps and sets stage their keys and elements through a scratch writer
+     * that never indexes, so the writer already emitted no node there -- while
+     * the byte walk descended and emitted one. Same value, two files. Plain
+     * maps had the mirror problem: both builders agreed, and both were
+     * emitting nodes nothing could use.
+     *
+     * A counter rather than a flag, because these nest, and it covers the
+     * whole subtree for free since `writeValue` recurses beneath it.
+     */
+    private int idxSuspend;
+
     private boolean indexing(int n) {
-        return idxStride > 0 && n >= idxMinEntries;
+        return idxStride > 0 && idxSuspend == 0 && n >= idxMinEntries;
     }
 
     /**
@@ -548,31 +751,27 @@ public final class Writer {
             idxCnts = new int[32];
             idxSrt = new boolean[32];
             idxSlots = new long[32][];
+            idxWalk = new long[32];
         } else if (idxN == idxOffs.length) {
             int m = idxN * 2;
             idxOffs = java.util.Arrays.copyOf(idxOffs, m);
             idxCnts = java.util.Arrays.copyOf(idxCnts, m);
             idxSrt = java.util.Arrays.copyOf(idxSrt, m);
             idxSlots = java.util.Arrays.copyOf(idxSlots, m);
+            idxWalk = java.util.Arrays.copyOf(idxWalk, m);
         }
+        // MARKED DEAD UNTIL FILLED. `-1` in `idxCnts` means refused, and a
+        // slot claimed but never filled -- an exception between here and
+        // `fillNode` -- would otherwise inherit the previous document's count
+        // and survive compaction as a live node describing nothing. Both
+        // library entry points reset on the throw path; an interop caller
+        // driving `setIndex` and `encode-buffered!` by hand is not so lucky.
+        idxCnts[idxN] = -1;
+        idxDirty = true;
         return idxN++;
     }
 
     /**
-     * An index offset, checked to fit the int the format stores it in.
-     *
-     * The index carries offsets as int32 -- `containers` and every slot are
-     * int arrays on the wire. Past 2 GiB the cast silently produced NEGATIVE
-     * offsets, which is the worst of all outcomes: `node-slot` binary-searches
-     * `containers` and they stop ascending, sequence `nth` seeks to a negative
-     * position, and past 4 GiB offsets collide outright. Nothing warned. The
-     * back-pointer is 8 bytes and `nav` is long-clean throughout, so 2 GiB is a
-     * limit of the index alone -- and `write-seq!` is explicitly for
-     * long-running files, so it is reachable rather than theoretical.
-     *
-     * Refusing is right until the format carries wider offsets: an unindexed
-     * file is correct and a wrongly-indexed one is not.
-     */
     /**
      * ABSOLUTE offsets are 64-bit. They used to be capped at 2 GiB because the
      * index stored them as int32, which made a mapping larger than that
@@ -614,11 +813,184 @@ public final class Writer {
 
     /** `off` is a FILE offset, captured by `absOffset()` when the container
      *  started -- not a buffer position to be resolved now. See absOffset(). */
-    private void fillNode(int slot, long off, int n, long[] anchors, boolean sorted) {
+    /**
+     * Every `stride`th element of `all`, which holds one entry per anchor at
+     * stride 1.
+     *
+     * A map is CAPTURED AT STRIDE 1 and narrowed here, because which stride it
+     * wants is not known until its last key has been compared -- an unsorted
+     * map is usable only at stride 1, a sorted one is better served by the
+     * file's stride. Capturing at the finer of the two and dropping what is not
+     * needed is the only order that works.
+     */
+
+    /**
+     * A MAP's node, with its anchors still in the scratch stack at `base`.
+     *
+     * Chooses the node's stride and copies out only what it keeps, so the
+     * speculative capture never becomes garbage. See {@link #idxScratch}.
+     */
+    private void fillNodeScratch(int slot, long off, int n, int base, boolean sorted,
+                                 long walkAcc) {
+        long walk = n > 0 ? walkAcc / n : 0;
+        if (!keepNode(n, sorted, walk, true)) { cancelNode(slot); return; }
+        // An unsorted map is only usable at stride 1; a sorted one takes the
+        // file's. The reader derives which from the anchor count alone.
+        int stride = sorted ? idxStride : 1;
+        int m = stride == 1 ? n : ((n - 1) / stride) + 1;
+        long[] anchors = new long[m];
+        for (int a = 0; a < m; a++) anchors[a] = idxScratch[base + a * stride];
         idxOffs[slot] = checkedOffset(off);
         idxCnts[slot] = n;
         idxSlots[slot] = anchors;
         idxSrt[slot] = sorted;
+        idxWalk[slot] = walk;
+    }
+
+    /**
+     * AN ARRAY's node. Every call site passes an array, so this cannot be a map
+     * and cannot be sorted -- it carried `sorted` and `isMap` parameters that
+     * were `false` at all eight, and a `downsample` call behind
+     * `if (isMap && sorted)` that no caller could reach. A map's node is built
+     * by {@link #fillNodeScratch}, which selects its own stride.
+     */
+    private void fillNode(int slot, long off, int n, long[] anchors, long walkAcc) {
+        // FLOOR DIVISION, and the byte walk must divide the same way. `walkAcc`
+        // is the SUM of per-entry prefixes; `walk` is their mean. An empty
+        // container has no entries to average over and no scan to shorten.
+        long walk = n > 0 ? walkAcc / n : 0;
+        if (!keepNode(n, false, walk, false)) { cancelNode(slot); return; }
+        idxOffs[slot] = checkedOffset(off);
+        idxCnts[slot] = n;
+        idxSlots[slot] = anchors;
+        idxSrt[slot] = false;
+        idxWalk[slot] = walk;
+    }
+
+    /**
+     * Whether this container is worth a node.
+     *
+     * TWO RULES, because they answer different questions.
+     *
+     * <p>An ARRAY or a SORTED MAP is reached by a binary search over the
+     * anchors, and that repays the frame from about {@link #WALK_THRESHOLD}
+     * mean prefix items -- so among the containers that reach here, `walk`
+     * decides and the entry count does not.
+     *
+     * <p>THE ENTRY COUNT STILL GATES WHAT REACHES HERE. `indexing(n)` refuses
+     * anything below `:index-min` before a slot is claimed, so a five-entry map
+     * beside a large sibling -- walk in the hundreds, entry count 5 -- is still
+     * excluded, and that is exactly the container whose scan is expensive. The
+     * floor is a capture guard (it avoids sizing an anchor array for a tiny
+     * container) that doubles as a policy it should not be making. Lowering it
+     * is a separate decision with its own measurements, because it also admits
+     * a flood of unsorted stride-1 nodes; it is not made here.
+     *
+     * <p>An UNSORTED MAP cannot be binary-searched, so at a stride above 1 the
+     * reader REFUSES the node outright -- `boring.nav` checks precisely this,
+     * because an anchor loop over an unordered map visits every entry exactly
+     * as a plain scan does. Writing one is pure cost: measured at 0.43x-0.81x,
+     * the frame's open cost buying nothing. So it is not written. At stride 1
+     * the node IS usable and today's behaviour is kept unchanged; gating that
+     * on `walk` too is a separate change, because it needs a per-node stride
+     * to be worth having and that costs a format version.
+     *
+     * <p>Not applied to the SEQUENCE node, which is synthesised outside this
+     * class: that one answers an explicit `:index N` request on `write-seq!`,
+     * and a metric must not silently switch off a feature asked for by name.
+     */
+    private boolean keepNode(int n, boolean sorted, long walk, boolean isMap) {
+        // ONE ANCHOR CANNOT ACCELERATE ANYTHING, whatever the walk says.
+        //
+        // A container of n <= stride entries gets a single anchor, and that
+        // anchor is its own first entry -- which the reader already has from
+        // `headEndAt`. The binary search lands on it and then scans the whole
+        // container: exactly the plain scan, plus the frame's open cost.
+        //
+        // This is the `stride < n` clause of the measured rule, and it is
+        // PROVABLE rather than economic -- the same class as the two rules the
+        // reader already enforces. It was nearly dropped as vacuous, which it
+        // is only under a per-node stride; under one global stride it is the
+        // clause that catches small-n containers whose entries are large. A
+        // 16-entry map of 16-element vectors walks 135, clears the threshold
+        // comfortably, and measured 0.74x -- a loss, because 16 entries at
+        // stride 16 is one anchor.
+        // AT THE STRIDE THIS NODE WILL ACTUALLY USE, not the file's. An
+        // unsorted map is written at stride 1 and therefore has `n` anchors --
+        // asking `anchorCount` at a file stride of 16 said "one anchor" about a
+        // node that will have sixteen, and refused every unsorted map of 16
+        // entries or fewer. That is the ordinary Clojure map, so the rule
+        // silently cancelled the per-node stride it sits beside.
+        int nodeStride = (isMap && !sorted) ? 1 : idxStride;
+        int m = n <= 0 ? 0 : (nodeStride == 1 ? n : ((n - 1) / nodeStride) + 1);
+        if (m < 2) return false;
+        if (!isMap || sorted) return walk >= WALK_THRESHOLD;
+        // An unsorted map is written at STRIDE 1 whatever the file's stride --
+        // it is the only stride that helps one -- so the file's stride does not
+        // enter into the decision. What decides is how many ITEMS the node
+        // lets each lookup skip, which is what `walk` measures. See
+        // UNSORTED_WALK_PER_ENTRY, and note that `bytes` is no longer read:
+        // the rule it fed admitted big strings, the one shape a stride-1
+        // anchor cannot help.
+        return walk >= UNSORTED_WALK_PER_ENTRY * n;
+    }
+
+    /**
+     * Give up the slot this container claimed.
+     *
+     * It cannot simply be dropped: `reserveNode` claims BEFORE the entries are
+     * written, so a refused parent's slot sits in the middle of the arrays with
+     * its own children already filled in behind it. Marked dead here and
+     * squeezed out in one pass by {@link #compactNodes}, which preserves
+     * relative order -- and relative order IS ascending container offset, which
+     * `read-index` binary-searches.
+     *
+     * `-1` in `idxCnts` cannot collide with a real value: `fillNode` writes
+     * only counts >= 0. (The `-1` that appears in CONTAINER offsets is the
+     * sequence node's sentinel, added on the Clojure side, and never reaches
+     * these arrays.)
+     */
+    private void cancelNode(int slot) {
+        idxCnts[slot] = -1;
+        idxSlots[slot] = null;      // release it now rather than at compaction
+        idxDirty = true;
+    }
+
+    /**
+     * Squeeze out refused nodes, once, in place.
+     *
+     * O(N) with a write pointer rather than a sort: the array is already in
+     * ascending container order because slots are claimed at the container's
+     * head, and removing elements cannot disturb the order of what remains.
+     * (The byte walk sorts instead, because it appends on COMPLETION and is
+     * therefore post-order. Two orders, one invariant.)
+     *
+     * Idempotent, and called from every accessor rather than left to the caller
+     * -- there are five of them and forgetting one would report dead nodes as
+     * live, which `pack-slots` would then refuse for a reason that names the
+     * wrong thing.
+     */
+    private void compactNodes() {
+        if (!idxDirty) return;
+        int w = 0;
+        for (int i = 0; i < idxN; i++) {
+            if (idxCnts[i] < 0) continue;
+            if (w != i) {
+                idxOffs[w] = idxOffs[i];
+                idxCnts[w] = idxCnts[i];
+                idxSrt[w] = idxSrt[i];
+                idxSlots[w] = idxSlots[i];
+                idxWalk[w] = idxWalk[i];
+            }
+            w++;
+        }
+        // NULL THE TAIL. Each slot is its own long[], so leaving references
+        // above the new count pins one array per refused container for the life
+        // of the writer -- and a writer is meant to be long-lived and reused.
+        // Same reasoning, and the same fix, as `idxReset`.
+        java.util.Arrays.fill(idxSlots, w, idxN, null);
+        idxN = w;
+        idxDirty = false;
     }
 
     private static final clojure.lang.Keyword K_N =
@@ -655,11 +1027,17 @@ public final class Writer {
          *  type/fields must be read through accessors, not keyword lookup. */
         static final clojure.lang.IFn RECORD_TYPE;
         static final clojure.lang.IFn RECORD_FIELDS;
+        /** CBOR `undefined`, simple value 23 -- which a shaped row uses to mean
+         *  "this key is absent", and which therefore may not also appear as a
+         *  row's VALUE. Identity-compared, so this must be the same singleton
+         *  `boring.data/undefined` holds and the Reader returns. */
+        static final Object UNDEFINED;
 
         static {
             try {
                 clojure.lang.RT.var("clojure.core", "require")
                     .invoke(clojure.lang.Symbol.intern("boring.data"));
+                UNDEFINED = clojure.lang.RT.var("boring.data", "undefined").deref();
                 SIMPLE_VALUE = clojure.lang.RT.classForName("boring.data.SimpleValue");
                 TAGGED_VALUE = clojure.lang.RT.classForName("boring.data.TaggedValue");
                 UNKNOWN_RECORD = clojure.lang.RT.classForName("boring.data.UnknownRecord");
@@ -677,6 +1055,30 @@ public final class Writer {
     private int srMask;
     private int srCount;
     private int srNextIndex;
+
+    /**
+     * Where each table entry's DEFINING LITERAL starts, and whether anything
+     * ever referenced it. Parallel to `srKeys`/`srVals`, so `rehash` carries
+     * them and `reset` clears them with the rest of the namespace.
+     *
+     * This is what lets an index and a stringref namespace coexist. A reference
+     * is only resolvable by a reader that has decoded every preceding string --
+     * which is exactly what an index exists to avoid -- so the frame carries
+     * (index -> defining offset) for the referenced entries and the reader
+     * resolves by jumping instead of by remembering.
+     *
+     * ONLY THE REFERENCED ONES ARE EMITTED, which is why `srUsed` exists at all
+     * rather than the offsets being written densely: a slot nothing points at
+     * costs a reader nothing to be missing. On 200 records of konserve shape
+     * that is ~56 pairs against ~256 dense offsets.
+     *
+     * ALLOCATED ONLY WHEN INDEXING (`idxStride > 0`). A stringref-only writer --
+     * every `:clojure` encode -- must not pay a long[] and a boolean[] plus a
+     * store per literal for a frame it will never seal. Both arrays stay null
+     * and every use below is guarded.
+     */
+    private long[] srOffs;
+    private boolean[] srUsed;
 
     /** What {@link #trim()} goes back to. */
     private final int initialSize;
@@ -700,6 +1102,25 @@ public final class Writer {
         srMask = cap - 1;
         srCount = 0;
         srNextIndex = 0;
+        srOffs = null;
+        srUsed = null;
+    }
+
+    /**
+     * Whether stringref pointers are being captured, allocating the two arrays
+     * on the first qualifying literal.
+     *
+     * Lazy for the reason the symbol table itself is: `setIndex` can be called
+     * on a writer that then encodes something with no strings in it at all, and
+     * an unconditional allocation here would be paid by every such writer.
+     */
+    private boolean srTracking() {
+        if (idxStride <= 0) return false;
+        if (srOffs == null) {
+            srOffs = new long[srKeys.length];
+            srUsed = new boolean[srKeys.length];
+        }
+        return true;
     }
 
     /** Reset for reuse. Keeps the buffer; clears the stringref namespace. */
@@ -735,8 +1156,9 @@ public final class Writer {
      * bytes of buffer released.
      *
      * A Writer is meant to be long-lived and reused, and every growth it has is
-     * one-way: the byte buffer, the stringref symbol table, and the index
-     * capture arrays all keep their PEAK size for the life of the writer. That
+     * one-way: the byte buffer, the stringref symbol table, the index capture
+     * arrays, the map anchor stack and the canonical staging writer all keep
+     * their PEAK size for the life of the writer. That
      * is the right default -- it is what makes reuse allocation-free -- but a
      * pooled writer that once encoded a 200 MB value then pins a 256 MB buffer
      * forever while it goes back to encoding 200-byte datoms.
@@ -766,6 +1188,12 @@ public final class Writer {
         long freed = buf.length - initialSize;
         if (freed > 0) { buf = new byte[initialSize]; pos = 0; }
         if (srKeys.length > 16) initSymtab(16);
+        // Released even when the symbol table was already at its floor, which
+        // `initSymtab` above would not have reached: these two are allocated on
+        // the first indexed literal, not with the table, so a small table can
+        // still be holding them.
+        srOffs = null;
+        srUsed = null;
         idxReset();
         // RELEASED, not reallocated to the default size. `trim()` exists to
         // give memory back, and the arrays are lazy now, so dropping them
@@ -776,8 +1204,32 @@ public final class Writer {
             idxCnts = null;
             idxSrt = null;
             idxSlots = null;
+            // AND idxWalk, which was added later and missed here: 262 KB
+            // measured, pinned for the life of the writer by the one method
+            // whose whole job is to hand memory back. The five arrays grow
+            // together in `reserveNode` and must be released together.
+            idxWalk = null;
         }
         if (idxSeq != null && idxSeq.length > 1024) idxSeq = null;
+        // THE MAP ANCHOR STACK, which this method's own docstring promised and
+        // did not deliver. `idxScratch` grows to the deepest nesting-sum of map
+        // entry counts and NEVER shrank: `idxReset` only zeroes the top
+        // pointer. Measured on one 200 000-entry indexed map -- buffer 4 MiB ->
+        // 256 B, and 1.6 MB of scratch still held afterwards, by the one method
+        // whose whole job is to hand memory back.
+        //
+        // Third time in this method: `idxWalk` above records the second.
+        if (idxScratch != null && idxScratch.length > 64) {
+            idxScratch = null;
+            idxScratchTop = 0;
+        }
+        // THE CANONICAL STAGING WRITER, for the same reason and with a wider
+        // reach: it is a whole Writer, with its own buffer, its own symbol
+        // table, and -- because a canonical map can appear inside a canonical
+        // map's key -- its own `canonicalScratch`. Dropping the head of that
+        // chain drops all of it. It is rebuilt lazily on the next canonical
+        // encode, exactly as the index arrays are.
+        canonicalScratch = null;
         return Math.max(0, freed);
     }
 
@@ -954,12 +1406,14 @@ public final class Writer {
     // ---- primitive emission -------------------------------------------------
 
     private void u8(int b) {
+        idxItemsWritten++;
         ensure(1);
         buf[pos++] = (byte) b;
     }
 
     /** Header byte for `major` carrying unsigned `val`, shortest form. */
     private void head(int major, long val) {
+        idxItemsWritten++;
         // EVERY byte string on the wire consumes a stringref index, wherever it
         // appears -- a bignum magnitude, a UUID's 16 bytes and a typed-array
         // payload all count, which was verified against cbor2. Accounted here
@@ -996,7 +1450,7 @@ public final class Writer {
         }
     }
 
-    public void writeLong(long n) {
+    void writeLong(long n) {
         if (n >= 0) head(UINT, n);
         else head(NINT, -1L - n);
     }
@@ -1004,6 +1458,7 @@ public final class Writer {
     /** 8-byte argument form, treating `bits` as UNSIGNED. Needed for the top of
      *  the uint64 range, which does not fit a signed long. */
     private void headU64(int major, long bits) {
+        idxItemsWritten++;
         ensure(9);
         buf[pos] = (byte) (major | 27);
         LONG_BE.set(buf, pos + 1, bits);
@@ -1021,7 +1476,7 @@ public final class Writer {
      * bignum tags (2/3) beyond it — so 2^64-1 is `1bffffffffffffffff`, not a
      * tagged bignum, while 2^64 is `c249010000000000000000`.
      */
-    public void writeBigInteger(java.math.BigInteger v) {
+    void writeBigInteger(java.math.BigInteger v) {
         // Same tension as floats: RFC-preferred encoding is the most compact
         // form, but that erases the distinction between a BigInt and a Long on
         // the way back. Under :preserve-width we always tag, so the type
@@ -1080,7 +1535,7 @@ public final class Writer {
      * encode differently and both survive the round trip — datahike's dump requirements
      * §2 needs this, since 1.50M is not equal to 1.5M for their purposes.
      */
-    public void writeBigDecimal(java.math.BigDecimal v) {
+    void writeBigDecimal(java.math.BigDecimal v) {
         head(TAG, TAG_DECIMAL);
         head(ARRAY, 2);
         writeLong(-v.scale());
@@ -1097,24 +1552,26 @@ public final class Writer {
         }
     }
 
-    public void writeDouble(double d) {
+    void writeDouble(double d) {
         if (!preserveWidth) { writeShortestFloat(d); return; }
         writeF64(d);
     }
 
     private void writeF64(double d) {
+        idxItemsWritten++;
         ensure(9);
         buf[pos] = (byte) (SIMPLE | 27);
         LONG_BE.set(buf, pos + 1, Double.doubleToRawLongBits(d));
         pos += 9;
     }
 
-    public void writeFloat(float f) {
+    void writeFloat(float f) {
         if (!preserveWidth) { writeShortestFloat(f); return; }
         writeF32(f);
     }
 
     private void writeF32(float f) {
+        idxItemsWritten++;
         ensure(5);
         buf[pos] = (byte) (SIMPLE | 26);
         INT_BE.set(buf, pos + 1, Float.floatToRawIntBits(f));
@@ -1122,6 +1579,7 @@ public final class Writer {
     }
 
     private void writeF16(short bits) {
+        idxItemsWritten++;
         ensure(3);
         buf[pos] = (byte) (SIMPLE | 25);
         SHORT_BE.set(buf, pos + 1, bits);
@@ -1205,7 +1663,7 @@ public final class Writer {
     }
 
     /** Simple value (major 7). Codes 0-23 inline, 32-255 in the following byte. */
-    public void writeSimpleValue(int n) {
+    void writeSimpleValue(int n) {
         // head()'s `val < 24` test is true for negatives, so a negative simple
         // value became a malformed header — (simple-value -1) emitted 0xFF, the
         // break code, producing a document this library then rejects.
@@ -1229,13 +1687,14 @@ public final class Writer {
             + " (0xf8 followed by a byte < 0x20), and makes such sequences not "
             + "well-formed, so boring will not read the result back; set "
             + ":permit-reserved-simple-values to emit it anyway", "value", (long) n);
+        idxItemsWritten++;
         ensure(2);
         buf[pos] = (byte) (SIMPLE | 24);
         buf[pos + 1] = (byte) n;
         pos += 2;
     }
 
-    public void writeTag(long tag) {
+    void writeTag(long tag) {
         if (tag < 0)
             throw Err.of("bad-tag",
                 "boring: tag must be non-negative, got " + tag, "tag", tag);
@@ -1310,47 +1769,273 @@ public final class Writer {
                || ((clojure.lang.IObj) o).meta() == null;
     }
 
-    private Object[] homogeneousShape(List l) {
-        int rows = l.size();
-        if (rows < 2) return null;               // one row cannot amortise the keys
-        Object first = l.get(0);
-        if (!plainMap(first)) return null;
-        Map m0 = (Map) first;
-        int n = m0.size();
-        if (n == 0) return null;
-        Object[] keys = m0.keySet().toArray();
-        for (int i = 1; i < rows; i++) {
-            Object o = l.get(i);
-            if (!plainMap(o)) return null;
-            Map m = (Map) o;
-            if (m.size() != n) return null;
-            // `containsKey` on a SORTED map runs its comparator, and the key it
-            // is handed comes from a different map -- so
-            // `[{false nil} (sorted-map "0" nil)]` threw a raw
-            // ClassCastException out of `encode`. A map that cannot be probed
-            // is not part of a homogeneous shape; that is an answer, not an
-            // error.
-            try {
-                for (int k = 0; k < n; k++) if (!m.containsKey(keys[k])) return null;
-            } catch (ClassCastException e) {
-                return null;
-            }
-        }
-        return keys;
+    /**
+     * The UNION of every row's keys, in first-seen order, or null to decline.
+     *
+     * THIS USED TO REQUIRE EVERY ROW TO CARRY THE SAME KEYS and returned null
+     * the moment one did not, which made shapes all-or-nothing: one ragged row
+     * in a thousand cost the whole table its density, and data arriving at a
+     * system boundary is exactly the ragged case -- optional fields, schema
+     * drift, mixed event types. A row that lacks a key now writes `undefined`
+     * in that position instead, and the encoding survives.
+     *
+     * The idea is draft-ietf-cbor-packed's, whose tag-114 `record` function
+     * uses `undefined` for the same purpose. Only the SEMANTICS are borrowed --
+     * not the packing framework, and not its tag numbers, which are
+     * unassigned. See doc/SHAPES.md.
+     *
+     * MEASURED, 200 rows, against the same data written plain:
+     *
+     *   uniform, every row identical         0.50x   (unchanged by this)
+     *   90% share a core, 10% carry one more 0.52x   (was 1.00x -- no shape)
+     *   5 core keys and 3 optional ones      0.51x   (was 1.00x)
+     *   5 event types with disjoint keys     0.90x   (was 1.00x)
+     *
+     * The last row is the case that argues against a union, and it still WINS:
+     * hoisting 25 keys out of 200 rows saves more than one `undefined` byte per
+     * absent slot costs. There is no density cliff, so there is no
+     * abandon-if-too-sparse guard here.
+     */
+    /**
+     * `m.containsKey(k)` treating a comparison failure as absent.
+     *
+     * `unionShape` has already declined any map whose keys threw while being
+     * traversed, so this should not fire -- but the probe here is a key from a
+     * DIFFERENT row, which is the case that threw a raw ClassCastException out
+     * of `encode` before. Being wrong here writes `undefined` for a key that is
+     * present, which is a lost entry, so it is worth saying plainly that the
+     * guard is defensive and not a design.
+     */
+    /** Whether `v` is CBOR `undefined` -- simple value 23 -- by value. */
+    private static boolean isUndefined(Object v) {
+        if (v == Data.UNDEFINED) return true;
+        if (!Data.SIMPLE_VALUE.isInstance(v)) return false;
+        Object n = clojure.lang.RT.get(v, clojure.lang.Keyword.intern(null, "n"));
+        return n instanceof Number && ((Number) n).intValue() == 23;
     }
 
     @SuppressWarnings("rawtypes")
-    private void writeShapedArray(List l, Object[] keys) {
-        head(TAG, TAG_SHAPED_ARRAY);
-        head(ARRAY, 2);
-        head(ARRAY, keys.length);
-        for (int i = 0; i < keys.length; i++) writeValue(keys[i]);
-        head(ARRAY, l.size());
-        for (int r = 0; r < l.size(); r++) {
-            Map m = (Map) l.get(r);
-            head(ARRAY, keys.length);
-            for (int i = 0; i < keys.length; i++) writeValue(m.get(keys[i]));
+    private static boolean containsKeyQuietly(Map m, Object k) {
+        try { return m.containsKey(k); } catch (ClassCastException e) { return false; }
+    }
+
+    private Object[] unionShape(List l) {
+        int rows = l.size();
+        if (rows < 2) return null;               // one row cannot amortise the keys
+        java.util.ArrayList<Object> order = new java.util.ArrayList<>();
+        java.util.HashMap<Object, Integer> seen = new java.util.HashMap<>();
+        long totalEntries = 0;   // key occurrences across all rows
+        long totalPadding = 0;   // `undefined` bytes the rows would cost
+        for (int i = 0; i < rows; i++) {
+            Object o = l.get(i);
+            if (!plainMap(o)) return null;
+            Map m = (Map) o;
+            int maxPos = -1, size = 0;
+            // entrySet, not keySet: the VALUES have to be looked at anyway --
+            // see the `undefined` check below -- and one traversal answers both
+            // questions. This is also strictly less work per row than the
+            // containsKey probing it replaces, which was O(keys) lookups
+            // against a foreign map.
+            try {
+                for (Object e : m.entrySet()) {
+                    Map.Entry en = (Map.Entry) e;
+                    // A ROW THAT ALREADY CONTAINS `undefined` AS A VALUE cannot
+                    // go in a shape, because absence is spelled the same way and
+                    // the two would be indistinguishable coming back. Declining
+                    // is the only honest answer: `:shapes` is an optimisation,
+                    // and an optimisation that silently changes the value is not
+                    // one.
+                    //
+                    // BY VALUE, not by identity: `boring.data/undefined` is one
+                    // singleton, but `(simple-value 23)` builds an equal-but-
+                    // distinct record, and identity would have shaped that row
+                    // and silently turned the value into an absent key. The
+                    // instance test is what keeps it cheap -- false for every
+                    // ordinary value, so the field read almost never runs.
+                    if (isUndefined(en.getValue())) return null;
+                    Object k = en.getKey();
+                    Integer at = seen.get(k);
+                    if (at == null) { at = order.size(); seen.put(k, at); order.add(k); }
+                    if (at > maxPos) maxPos = at;
+                    size++;
+                }
+            } catch (ClassCastException e) {
+                // `containsKey`/`hashCode` on a map whose keys are not mutually
+                // comparable threw a raw ClassCastException out of `encode`
+                // once. A map that cannot be probed is not part of a shape;
+                // that is an answer, not an error.
+                return null;
+            }
+            // A row spans from position 0 to its highest-numbered key; the slots
+            // in between that it does not fill cost one `undefined` byte each.
+            // Trailing slots cost nothing, because the row is truncated -- which
+            // is why this is `maxPos + 1` and not the union size.
+            totalPadding += (maxPos + 1) - size;
+            totalEntries += size;
         }
+        if (order.isEmpty()) return null;
+        return worthShaping(order, totalEntries, totalPadding) ? order.toArray() : null;
+    }
+
+    /**
+     * Whether the union is dense enough to pay for itself.
+     *
+     * THE PATHOLOGICAL CASE IS DISJOINT KEY SETS. Keys are numbered in
+     * first-seen order, so if row `i` introduces all-new keys it sits at
+     * positions `i*M` upward and must be padded past everything before it. The
+     * padding is then O(rows^2), and shaping makes the document dramatically
+     * BIGGER rather than smaller. Measured, 200 rows of 5 keys each, against
+     * the same data written plain:
+     *
+     *   distinct key sets    1     5    10     20     40    200
+     *   shaped / plain    0.21  0.43  0.71   1.19   2.17   9.65
+     *
+     * An earlier version of this comment claimed there was no cliff. That was
+     * measured on schemas that CYCLED, which caps the union at `schemas * M`
+     * and hides the quadratic term entirely. Fully disjoint rows are 9.65x
+     * WORSE than plain.
+     *
+     * The bound compares the two quantities directly rather than guessing at a
+     * ratio: hoisting the keys saves writing `totalEntries - union` key
+     * occurrences, and the padding costs one byte per empty slot. Both are
+     * accumulated during the pass the shape needs anyway, so the check is O(1)
+     * at the end.
+     *
+     * Break-even lands between 10 and 20 distinct key sets above, and this rule
+     * puts it there without a tuned constant in sight.
+     */
+    private static boolean worthShaping(java.util.List<Object> union,
+                                        long totalEntries, long totalPadding) {
+        long unionKeyBytes = 0;
+        for (Object k : union) unionKeyBytes += estimatedKeyBytes(k);
+        // Average, because the saving is per OCCURRENCE and occurrences are
+        // spread across the union's keys in proportions this does not know.
+        long avg = Math.max(1, unionKeyBytes / union.size());
+        return totalPadding < (totalEntries - union.size()) * avg;
+    }
+
+    /**
+     * Roughly what key `k` costs on the wire, for the density bound above.
+     *
+     * An estimate on purpose: the exact figure needs the encoder, stringref
+     * state and the profile, none of which exist yet when the shape is chosen.
+     * Being wrong here changes only whether an optimisation fires.
+     */
+    private static long estimatedKeyBytes(Object k) {
+        if (k instanceof clojure.lang.Keyword) {
+            clojure.lang.Keyword kw = (clojure.lang.Keyword) k;
+            String ns = kw.getNamespace();
+            // tag 39 (2) + text head (1) + ':' + name, plus "ns/" when present
+            return 4 + kw.getName().length() + (ns == null ? 0 : ns.length() + 1);
+        }
+        if (k instanceof String) return 1 + ((String) k).length();
+        if (k instanceof clojure.lang.Symbol) {
+            clojure.lang.Symbol s = (clojure.lang.Symbol) k;
+            String ns = s.getNamespace();
+            return 3 + s.getName().length() + (ns == null ? 0 : ns.length() + 1);
+        }
+        return 8;
+    }
+
+    /**
+     * A shaped array, and THE FOUR ARRAYS INSIDE IT ARE INDEXED LIKE ANY OTHER.
+     *
+     * This method used to emit its arrays through bare `head()` and capture
+     * nothing, while the byte walk descended the tag and noded them -- so the
+     * two index builders produced different files for the same value. Measured
+     * on a 30-row shaped array at the defaults: `write-indexed!` gave 157 bytes
+     * and NO FRAME, `encode-indexed` gave 209 and one node. That is the format
+     * having two readings, which is the one thing the builders may not do.
+     *
+     * The walk was right and this side was wrong, which is worth saying because
+     * the opposite call was made for the tag-27 frame's own `[name, args]`
+     * array (see `frame-payload-array?`): there the node is DROPPED, because
+     * `boring.nav` realises a tag-27 payload opaquely and could never use it.
+     * A shaped array is different -- `nav` descends it structurally through
+     * `shaped-view`, presenting each row as a map -- so a node on the ROWS
+     * array is reachable and is exactly the one worth having. Measured on 5000
+     * rows, reading the last one: 190.66 us unindexed against 35.80 indexed,
+     * 5.3x, for 365 bytes of frame on a 48 KB document.
+     *
+     * The nodes are reserved in encounter order -- outer, keys, rows, then each
+     * row -- which is ascending by container offset, as `reserveNode` requires.
+     */
+    @SuppressWarnings("rawtypes")
+    private void writeShapedArray(List l, Object[] keys) {
+        int nk = keys.length, nr = l.size();
+        head(TAG, TAG_SHAPED_ARRAY);
+
+        // The outer [keys, rows] pair. Two entries, so only reachable at
+        // `:index-min` <= 2 -- but the walk emits it there and this must too.
+        long outerStart = absOffset();
+        head(ARRAY, 2);
+        long[] outer = indexing(2) ? new long[anchorCount(2)] : null;
+        int outerSlot = outer != null ? reserveNode() : -1;
+        int oa = 0, oc = 1;
+        long outerAtStart = idxItemsWritten, outerWalk = 0;
+
+        if (outer != null && --oc == 0) { outer[oa++] = idxOffset(pos); oc = idxStride; }
+        outerWalk += idxItemsWritten - outerAtStart;
+        long keysStart = absOffset();
+        head(ARRAY, nk);
+        long[] ka = indexing(nk) ? new long[anchorCount(nk)] : null;
+        int keysSlot = ka != null ? reserveNode() : -1;
+        int kai = 0, kc = 1;
+        long keysAtStart = idxItemsWritten, keysWalk = 0;
+        for (int i = 0; i < nk; i++) {
+            if (ka != null && --kc == 0) { ka[kai++] = idxOffset(pos); kc = idxStride; }
+            keysWalk += idxItemsWritten - keysAtStart;
+            writeValue(keys[i]);
+        }
+        if (ka != null) fillNode(keysSlot, keysStart, nk, ka, keysWalk);
+
+        if (outer != null && --oc == 0) { outer[oa++] = idxOffset(pos); oc = idxStride; }
+        outerWalk += idxItemsWritten - outerAtStart;
+        long rowsStart = absOffset();
+        head(ARRAY, nr);
+        long[] ra = indexing(nr) ? new long[anchorCount(nr)] : null;
+        int rowsSlot = ra != null ? reserveNode() : -1;
+        int rai = 0, rc = 1;
+        long rowsAtStart = idxItemsWritten, rowsWalk = 0;
+        for (int r = 0; r < nr; r++) {
+            if (ra != null && --rc == 0) { ra[rai++] = idxOffset(pos); rc = idxStride; }
+            rowsWalk += idxItemsWritten - rowsAtStart;
+            Map m = (Map) l.get(r);
+            // TRAILING ABSENCES ARE TRUNCATED, not padded: a row is `nv <= nk`
+            // values, and keys nv..nk-1 are absent by virtue of not being there.
+            // Interior gaps still need a placeholder, since position is what
+            // binds a value to its key.
+            //
+            // Worth more than it looks. The union is in FIRST-SEEN order, so a
+            // row belonging to the first schema encountered tends to fill a
+            // prefix and stop, while padding would make every row as long as
+            // the widest. It is also what would make a single-pass writer
+            // possible later: a row written while the shape had three keys
+            // stays a three-element array and still reads correctly once the
+            // shape grows, with no back-patching.
+            int nv = nk;
+            while (nv > 0 && !containsKeyQuietly(m, keys[nv - 1])) nv--;
+            long rowStart = absOffset();
+            head(ARRAY, nv);
+            long[] row = indexing(nv) ? new long[anchorCount(nv)] : null;
+            int rowSlot = row != null ? reserveNode() : -1;
+            int ri = 0, rcd = 1;
+            long rowAtStart = idxItemsWritten, rowWalk = 0;
+            for (int i = 0; i < nv; i++) {
+                if (row != null && --rcd == 0) { row[ri++] = idxOffset(pos); rcd = idxStride; }
+                rowWalk += idxItemsWritten - rowAtStart;
+                // containsKey, not `get() != null`: a key present with a nil
+                // value is NOT absent, and CBOR spells the two differently --
+                // `null` (0xf6) is a value, `undefined` (0xf7) is absence.
+                // Collapsing them would lose `{:a nil}` versus `{}`.
+                if (containsKeyQuietly(m, keys[i])) writeValue(m.get(keys[i]));
+                else writeSimpleValue(23);
+            }
+            if (row != null) fillNode(rowSlot, rowStart, nv, row, rowWalk);
+        }
+        if (ra != null) fillNode(rowsSlot, rowsStart, nr, ra, rowsWalk);
+
+        if (outer != null) fillNode(outerSlot, outerStart, 2, outer, outerWalk);
     }
 
     /**
@@ -1426,16 +2111,20 @@ public final class Writer {
         head(ARRAY, n);
         long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
+        // AFTER the head: `walk` is the scan INSIDE the container, so the
+        // container's own head is not part of any entry's prefix.
+        long itemsAtStart = idxItemsWritten, walkAcc = 0;
         int a = 0, countdown = 1, seen = 0;
         for (; s != null; s = s.next()) {
             if (++seen > n) countMismatch(n, seen);
             if (anchors != null && --countdown == 0) {
                 anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
+            walkAcc += idxItemsWritten - itemsAtStart;
             writeValue(s.first());
         }
         if (seen != n) countMismatch(n, seen);
-        if (anchors != null) fillNode(slot, start, n, anchors, false);
+        if (anchors != null) fillNode(slot, start, n, anchors, walkAcc);
     }
 
     /** An array of `n` elements from any Iterable, indexed if it is big enough. */
@@ -1445,16 +2134,18 @@ public final class Writer {
         head(ARRAY, n);
         long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
         int slot = anchors != null ? reserveNode() : -1;
+        long itemsAtStart = idxItemsWritten, walkAcc = 0;
         int a = 0, countdown = 1, seen = 0;
         for (Object o : it) {
             if (++seen > n) countMismatch(n, seen);
             if (anchors != null && --countdown == 0) {
                 anchors[a++] = idxOffset(pos); countdown = idxStride;
             }
+            walkAcc += idxItemsWritten - itemsAtStart;
             writeValue(o);
         }
         if (seen != n) countMismatch(n, seen);
-        if (anchors != null) fillNode(slot, start, n, anchors, false);
+        if (anchors != null) fillNode(slot, start, n, anchors, walkAcc);
     }
 
     @SuppressWarnings("rawtypes")
@@ -1466,26 +2157,32 @@ public final class Writer {
         head(MAP, n);
         // Iterated as a SEQ rather than an entrySet, so this cannot delegate to
         // writeMapValue without changing field order on some record types.
-        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
-        int slot = anchors != null ? reserveNode() : -1;
+        // ONE ANCHOR PER ENTRY, always, for a map -- into the scratch stack,
+        // not a fresh array. See `idxScratch`.
+        boolean cap = indexing(n);
+        int base = cap ? idxScratchClaim(n) : -1;
+        int slot = cap ? reserveNode() : -1;
         boolean sorted = true;
         int prevK0 = -1, prevK1 = -1;
         KeyOrder ko = null;
-        int a = 0, countdown = 1;
+        int a = 0;
+        // A MAP ENTRY IS KEY AND VALUE TOGETHER: a scan reaching entry j
+        // crosses both halves of every earlier entry, so the prefix is taken
+        // once per PAIR, before the key.
+        long itemsAtStart = idxItemsWritten, walkAcc = 0;
         // Every adjacent pair, for the reason spelled out in writeMapValue: an
         // anchor sample does not establish that the container is ordered.
         int seen = 0;
         for (clojure.lang.ISeq s = clojure.lang.RT.seq(fields); s != null; s = s.next()) {
             Map.Entry e = (Map.Entry) s.first();
             if (++seen > n) countMismatch(n, seen);
-            if (anchors != null && --countdown == 0) {
-                anchors[a++] = idxOffset(pos); countdown = idxStride;
-            }
+            if (cap) idxScratch[base + a++] = idxOffset(pos);
+            walkAcc += idxItemsWritten - itemsAtStart;
             int k0 = pos;
             long flushedAtKey = flushed;
-            pinDepth++;
-            try { writeValue(e.getKey()); } finally { pinDepth--; }
-            if (anchors != null) {
+            pinDepth++; idxSuspend++;
+            try { writeValue(e.getKey()); } finally { pinDepth--; idxSuspend--; }
+            if (cap) {
                 if (sink == null) {
                     if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
                         sorted = false;
@@ -1498,7 +2195,8 @@ public final class Writer {
             writeValue(e.getValue());
         }
         if (seen != n) countMismatch(n, seen);
-        if (anchors != null) fillNode(slot, start, n, anchors, sorted);
+        if (cap) { fillNodeScratch(slot, start, n, base, sorted, walkAcc);
+                   idxScratchTop = base; }
     }
 
     /**
@@ -1589,14 +2287,21 @@ public final class Writer {
             for (Object o : m.entrySet()) {
                 Map.Entry e = (Map.Entry) o;
                 if (++seen > n) countMismatch(n, seen);
-                writeValue(e.getKey());
+                // SUSPENDED HERE TOO. This map is not itself indexed, but its
+                // KEYS can still hold containers that are -- and a container
+                // inside a key is unreachable whether or not its parent earned
+                // a node. Missing it here left the writer emitting nodes the
+                // byte walk (correctly) did not.
+                idxSuspend++;
+                try { writeValue(e.getKey()); } finally { idxSuspend--; }
                 writeValue(e.getValue());
             }
             if (seen != n) countMismatch(n, seen);
             return;
         }
 
-        long[] anchors = new long[anchorCount(n)];
+        // See writeRecordFields: one anchor per entry, into the scratch stack.
+        int base = idxScratchClaim(n);
         int slot = reserveNode();
         // EVERY adjacent key pair, not just the anchors.
         //
@@ -1614,16 +2319,19 @@ public final class Writer {
         boolean sorted = true;
         int prevK0 = -1, prevK1 = -1;
         KeyOrder ko = null;
-        int a = 0, countdown = 1, seen = 0;
+        int a = 0, seen = 0;
+        // See writeRecordFields: one prefix per key/value PAIR.
+        long itemsAtStart = idxItemsWritten, walkAcc = 0;
 
         for (Object o : m.entrySet()) {
             Map.Entry e = (Map.Entry) o;
             if (++seen > n) countMismatch(n, seen);
-            if (--countdown == 0) { anchors[a++] = idxOffset(pos); countdown = idxStride; }
+            idxScratch[base + a++] = idxOffset(pos);
+            walkAcc += idxItemsWritten - itemsAtStart;
             int k0 = pos;
             long flushedAtKey = flushed;
-            pinDepth++;
-            try { writeValue(e.getKey()); } finally { pinDepth--; }
+            pinDepth++; idxSuspend++;
+            try { writeValue(e.getKey()); } finally { pinDepth--; idxSuspend--; }
             if (sink == null) {
                 if (prevK0 >= 0 && sorted && cmpInBuf(prevK0, prevK1, k0, pos) >= 0)
                     sorted = false;
@@ -1635,7 +2343,8 @@ public final class Writer {
             writeValue(e.getValue());
         }
         if (seen != n) countMismatch(n, seen);
-        fillNode(slot, start, n, anchors, sorted);
+        fillNodeScratch(slot, start, n, base, sorted, walkAcc);
+        idxScratchTop = base;
     }
 
     // ---- time, uuid, rational ----------------------------------------------
@@ -1677,14 +2386,14 @@ public final class Writer {
         return s;
     }
 
-    public void writeInstant(java.time.Instant t) {
+    void writeInstant(java.time.Instant t) {
         String s = rfc3339(java.time.format.DateTimeFormatter.ISO_INSTANT.format(t),
                            TAG_DATETIME);
         head(TAG, TAG_DATETIME);
         writeString(s);
     }
 
-    public void writeUUID(java.util.UUID u) {
+    void writeUUID(java.util.UUID u) {
         head(TAG, TAG_UUID);
         head(BYTES, 16);
         ensure(16);
@@ -1694,7 +2403,7 @@ public final class Writer {
     }
 
     /** Tag 30, rational number: [numerator, denominator]. */
-    public void writeRatio(clojure.lang.Ratio r) {
+    void writeRatio(clojure.lang.Ratio r) {
         head(TAG, TAG_RATIONAL);
         head(ARRAY, 2);
         writeBigIntegerCompact(r.numerator);
@@ -1725,19 +2434,19 @@ public final class Writer {
         ensure((int) byteLen);
     }
 
-    public void writeLongArray(long[] a) {
+    void writeLongArray(long[] a) {
         typedArrayHeader(TAG_ARR_S64_LE, (long) a.length * 8);
         for (int i = 0; i < a.length; i++) LONG_LE.set(buf, pos + (i << 3), a[i]);
         pos += a.length << 3;
     }
 
-    public void writeIntArray(int[] a) {
+    void writeIntArray(int[] a) {
         typedArrayHeader(TAG_ARR_S32_LE, (long) a.length * 4);
         for (int i = 0; i < a.length; i++) INT_LE.set(buf, pos + (i << 2), a[i]);
         pos += a.length << 2;
     }
 
-    public void writeShortArray(short[] a) {
+    void writeShortArray(short[] a) {
         typedArrayHeader(TAG_ARR_S16_LE, (long) a.length * 2);
         for (int i = 0; i < a.length; i++) SHORT_LE.set(buf, pos + (i << 1), a[i]);
         pos += a.length << 1;
@@ -1756,7 +2465,7 @@ public final class Writer {
      * unacceptable state: the same API worked or did not depending only on
      * which class you named, and nothing said which.
      */
-    public static boolean isRegisterableClass(Class<?> c) {
+    static boolean isRegisterableClass(Class<?> c) {
         return !(c == String.class || c == Long.class || c == Integer.class
                  || c == Short.class || c == Byte.class
                  || c == Double.class || c == Float.class
@@ -1865,14 +2574,14 @@ public final class Writer {
         }
     }
 
-    public void writeDoubleArray(double[] a) {
+    void writeDoubleArray(double[] a) {
         typedArrayHeader(TAG_ARR_F64_LE, (long) a.length * 8);
         for (int i = 0; i < a.length; i++)
             LONG_LE.set(buf, pos + (i << 3), Double.doubleToRawLongBits(a[i]));
         pos += a.length << 3;
     }
 
-    public void writeFloatArray(float[] a) {
+    void writeFloatArray(float[] a) {
         typedArrayHeader(TAG_ARR_F32_LE, (long) a.length * 4);
         for (int i = 0; i < a.length; i++)
             INT_LE.set(buf, pos + (i << 2), Float.floatToRawIntBits(a[i]));
@@ -1919,13 +2628,19 @@ public final class Writer {
         int n = s.size();
         final byte[][] encoded = new byte[n][];
         Object[] items = new Object[n];
+        // What the scratch writer counted for each staged element. `reset()`
+        // does not clear the tally -- it is a running counter, not per-value --
+        // so the count for one element is the DIFFERENCE across its encode.
+        final long[] encodedItems = new long[n];
 
         Writer scratch = canonicalSubWriter();
         int i = 0;
         for (Object o : s) {
             if (i >= n) countMismatch(n, i + 1);    // staging arrays are size()d
             scratch.reset();
+            long before = scratch.idxItemsWritten;
             scratch.writeValue(o);
+            encodedItems[i] = scratch.idxItemsWritten - before;
             encoded[i] = scratch.toByteArray();
             items[i] = o;
             i++;
@@ -1951,15 +2666,14 @@ public final class Writer {
                     + items[order[j - 1]] + " and " + items[order[j]] + ")");
 
         head(TAG, TAG_SET);
-        long start = absOffset();                       // the array, not the tag
         head(ARRAY, n);
-        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
-        int slot = anchors != null ? reserveNode() : -1;
-        int a = 0, countdown = 1;
+        // NO INDEX CAPTURE HERE, and none is reachable. This method's only
+        // caller raises idxSuspend around the call (see writeValueInner's
+        // "A SET IS INDEXED NOWHERE"), and `indexing(n)` requires
+        // idxSuspend == 0 -- so the anchor array, the reserved node and the
+        // fillNode that used to sit in this loop were inert on every path.
+        // Twenty-eight lines that read live and could not run.
         for (int j = 0; j < n; j++) {
-            if (anchors != null && --countdown == 0) {
-                anchors[a++] = idxOffset(pos); countdown = idxStride;
-            }
             // The STAGED bytes, not a second `writeValue`. Re-encoding asked a
             // registered handler for the value twice, and a handler may be
             // stateful or read the clock -- so the bytes that decided the sort
@@ -1968,11 +2682,16 @@ public final class Writer {
             // this is the same fix, and it also restores one handler call per
             // value.
             byte[] eb = encoded[order[j]];
+            // THE STAGED BYTES CARRY NO EMIT SITE, so nothing has counted the
+            // items inside them -- the scratch writer counted them into ITS
+            // own tally and this one never saw them. Carried over explicitly;
+            // a per-emit counter alone reads zero items for a whole canonical
+            // set, which is unbounded error rather than an off-by-one.
+            idxItemsWritten += encodedItems[order[j]];
             ensure(eb.length);
             System.arraycopy(eb, 0, buf, pos, eb.length);
             pos += eb.length;
         }
-        if (anchors != null) fillNode(slot, start, n, anchors, false);
     }
 
     /**
@@ -2036,6 +2755,8 @@ public final class Writer {
     private void writeMapCanonical(Map m) {
         int n = m.size();
         final byte[][] encodedKeys = new byte[n][];
+        // See writeSetCanonical: the scratch writer's tally, per staged key.
+        final long[] encodedKeyItems = new long[n];
         Object[] keys = new Object[n];
         Object[] vals = new Object[n];
 
@@ -2050,7 +2771,9 @@ public final class Writer {
             // error the other container paths give.
             if (i >= n) countMismatch(n, i + 1);
             scratch.reset();
+            long before = scratch.idxItemsWritten;
             scratch.writeValue(e.getKey());
+            encodedKeyItems[i] = scratch.idxItemsWritten - before;
             encodedKeys[i] = scratch.toByteArray();
             keys[i] = e.getKey();
             vals[i] = e.getValue();
@@ -2100,26 +2823,31 @@ public final class Writer {
 
         long start = absOffset();
         head(MAP, n);
-        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
-        int slot = anchors != null ? reserveNode() : -1;
-        int a = 0, countdown = 1;
+        // See writeRecordFields: one anchor per entry, into the scratch stack.
+        boolean cap = indexing(n);
+        int base = cap ? idxScratchClaim(n) : -1;
+        int slot = cap ? reserveNode() : -1;
+        long itemsAtStart = idxItemsWritten, walkAcc = 0;
+        int a = 0;
         for (int j = 0; j < n; j++) {
             int k = order[j];
-            if (anchors != null && --countdown == 0) {
-                anchors[a++] = idxOffset(pos); countdown = idxStride;
-            }
+            if (cap) idxScratch[base + a++] = idxOffset(pos);
+            walkAcc += idxItemsWritten - itemsAtStart;
+            // See writeSetCanonical: staged bytes bypass every emit site.
+            idxItemsWritten += encodedKeyItems[k];
             ensure(encodedKeys[k].length);
             System.arraycopy(encodedKeys[k], 0, buf, pos, encodedKeys[k].length);
             pos += encodedKeys[k].length;
             writeValue(vals[k]);
         }
-        if (anchors != null) fillNode(slot, start, n, anchors, sorted);
+        if (cap) { fillNodeScratch(slot, start, n, base, sorted, walkAcc);
+                   idxScratchTop = base; }
     }
 
-    public void writeBoolean(boolean b) { u8(SIMPLE | (b ? 21 : 20)); }
-    public void writeNull()             { u8(SIMPLE | 22); }
+    void writeBoolean(boolean b) { u8(SIMPLE | (b ? 21 : 20)); }
+    void writeNull()             { u8(SIMPLE | 22); }
 
-    public void writeBytes(byte[] bs) {
+    void writeBytes(byte[] bs) {
         head(BYTES, bs.length);
         writePayload(bs, 0, bs.length);
     }
@@ -2167,7 +2895,7 @@ public final class Writer {
      * just keywords — the decoder registers on every literal it reads, so the
      * encoder must register on every literal it writes or the two diverge.
      */
-    public void writeString(String s) {
+    void writeString(String s) {
         if (!stringref) { writeStringLiteral(s, -1); return; }
 
         // Single probe for lookup-or-insert. The previous version probed twice
@@ -2183,6 +2911,10 @@ public final class Writer {
             if (cur == s || cur.equals(s)) {
                 head(TAG, TAG_STRINGREF);
                 head(UINT, srVals[i]);
+                // THE ONLY PLACE A REFERENCE IS EMITTED, so it is the only place
+                // that can mark a slot worth a pointer. Slots that are merely
+                // registered are not emitted: nothing will ever ask for them.
+                if (srTracking()) srUsed[i] = true;
                 return;
             }
             i = (i + 1) & srMask;
@@ -2191,20 +2923,31 @@ public final class Writer {
     }
 
     /** Insert `s` at the slot a miss landed on, if it earns an index. */
-    private void srInsertAt(int slot, String s, int byteLen) {
+    private void srInsertAt(int slot, String s, int byteLen, long off) {
         if (byteLen < minLenForIndex(srNextIndex)) return;
         if (srCount + 1 > (srMask + 1) * 3 / 4) {
             rehash();                          // slot is stale after a rehash
-            srRegister(s, byteLen);
+            srRegister(s, byteLen, off);
             return;
         }
         srKeys[slot] = s;
         srVals[slot] = srNextIndex++;
+        // `srUsed` is cleared HERE rather than in `reset`, because `reset` nulls
+        // `srKeys` and leaves these two arrays alone -- so a slot reused by the
+        // next document would otherwise inherit the previous one's "referenced"
+        // bit and emit a pointer nothing points at.
+        if (srTracking()) { srOffs[slot] = off; srUsed[slot] = false; }
         srCount++;
     }
 
     private void writeStringLiteral(String s, int slot) {
         int n = s.length();
+        // CAPTURED BEFORE `ensure`, and that is safe rather than lucky:
+        // `absOffset` is `pos + flushed + idxBase`, so a flush inside `ensure`
+        // moves both halves by the same amount and leaves the sum alone. This
+        // is the offset a reader will jump to, so it must name the HEAD of the
+        // literal, not its payload.
+        long off = absOffset();
         // A string that cannot fit the buffer skips the speculative path
         // entirely. Speculating means reserving the whole payload up front so
         // the loop can bail out to writeStringSlow on the first non-ASCII
@@ -2212,7 +2955,7 @@ public final class Writer {
         // and cannot be retracted once part of it has gone to the sink.
         // writeStringSlow streams the payload after its head.
         if (sink != null && pinDepth == 0 && (long) n + 5 > buf.length) {
-            writeStringSlow(s, slot);
+            writeStringSlow(s, slot, off);
             return;
         }
         // Speculate ASCII: reserve worst-case-for-ASCII and bail out if wrong.
@@ -2222,14 +2965,14 @@ public final class Writer {
         int p = hdrStart + hdrLen;
         for (int i = 0; i < n; i++) {
             char c = s.charAt(i);
-            if (c >= 0x80) { writeStringSlow(s, slot); return; }
+            if (c >= 0x80) { writeStringSlow(s, slot, off); return; }
             buf[p++] = (byte) c;
         }
         // ASCII: byte length == char length, so the reserved header size is right.
         pos = hdrStart;
         head(TEXT, n);
         pos = p;
-        if (slot >= 0) srInsertAt(slot, s, n);
+        if (slot >= 0) srInsertAt(slot, s, n, off);
     }
 
     private static int headLen(long v) {
@@ -2270,7 +3013,7 @@ public final class Writer {
         }
     }
 
-    private void writeStringSlow(String s, int slot) {
+    private void writeStringSlow(String s, int slot, long off) {
         checkWellFormedUtf16(s);
         byte[] utf = s.getBytes(StandardCharsets.UTF_8);
         head(TEXT, utf.length);
@@ -2282,7 +3025,7 @@ public final class Writer {
         writePayload(utf, 0, utf.length);
         // Byte length differs from char length here, so the slot from the
         // char-length probe is still valid but the threshold uses utf.length.
-        if (slot >= 0) srInsertAt(slot, s, utf.length);
+        if (slot >= 0) srInsertAt(slot, s, utf.length, off);
     }
 
     // ---- stringref ----------------------------------------------------------
@@ -2293,7 +3036,7 @@ public final class Writer {
      * octets, 24-255 needs >=4, and so on. The decoder applies the identical
      * rule, so the two index spaces stay in lockstep.
      */
-    private void srRegister(String s, int byteLen) {
+    private void srRegister(String s, int byteLen, long off) {
         if (!stringref) return;
         if (byteLen < minLenForIndex(srNextIndex)) return;
         if (srCount + 1 > (srMask + 1) * 3 / 4) rehash();
@@ -2306,6 +3049,7 @@ public final class Writer {
         }
         srKeys[i] = s;
         srVals[i] = srNextIndex++;
+        if (srTracking()) { srOffs[i] = off; srUsed[i] = false; }
         srCount++;
     }
 
@@ -2343,8 +3087,20 @@ public final class Writer {
         // 48.0 KB on a reused one -- so the reasoning is recorded as wrong
         // rather than repeated.
         int newCap = (srMask + 1) << 1;
+        // CARRIED, NOT DROPPED. `srOffs`/`srUsed` are indexed by table slot, and
+        // a rehash moves every entry -- so rebuilding the table without them
+        // would silently lose the defining offset of every string registered so
+        // far, and the frame would then omit pointers for references it really
+        // emits. That is a document a reader cannot resolve, produced only for
+        // documents big enough to rehash.
+        long[] oo = srOffs;
+        boolean[] ou = srUsed;
         srKeys = new Object[newCap];
         srVals = new int[newCap];
+        if (oo != null) {
+            srOffs = new long[newCap];
+            srUsed = new boolean[newCap];
+        }
         srMask = newCap - 1;
         srCount = 0;
         for (int j = 0; j < ok.length; j++) {
@@ -2355,6 +3111,7 @@ public final class Writer {
                 while (srKeys[i] != null) i = (i + 1) & srMask;
                 srKeys[i] = ok[j];
                 srVals[i] = ov[j];
+                if (oo != null) { srOffs[i] = oo[j]; srUsed[i] = ou[j]; }
                 srCount++;
             }
         }
@@ -2555,7 +3312,7 @@ public final class Writer {
             boolean exInfo = x instanceof clojure.lang.ExceptionInfo;
             head(TAG, TAG_GENERIC_OBJ); head(ARRAY, 2);
             writeString(exInfo ? NAME_EX_INFO : NAME_THROWABLE);
-            head(ARRAY, exInfo ? 3 : 3);
+            head(ARRAY, 3);
             if (exInfo) {
                 writeString(t.getMessage() == null ? "" : t.getMessage());
                 writeValue(((clojure.lang.ExceptionInfo) t).getData());
@@ -2711,19 +3468,27 @@ public final class Writer {
         if (x instanceof Map) { writeMapValue((Map) x); return; }
         if (x instanceof Set) {
             Set s = (Set) x;
-            if (canonical) { writeSetCanonical(s); return; }
-            head(TAG, TAG_SET);
-            // The node describes the ARRAY, not the tag: the byte walk descends
-            // tags and indexes the container beneath, so `start` is taken after
-            // the tag head or the two would disagree about this container's
-            // offset.
-            writeArrayOf(s, s.size());
+            // A SET IS INDEXED NOWHERE, not even its own array. `boring.nav`
+            // realises a set whole -- `(get set-cursor 0)` is nil -- so no
+            // offset inside one is reachable, and a node there is bytes that
+            // nothing can read. Same argument, and the same conclusion, as the
+            // tag-27 frame's `[name, args]` array.
+            //
+            // It also settles a divergence: a CANONICAL set stages its
+            // elements through a scratch writer that never indexes, so the two
+            // builders disagreed about every container inside one.
+            idxSuspend++;
+            try {
+                if (canonical) { writeSetCanonical(s); return; }
+                head(TAG, TAG_SET);
+                writeArrayOf(s, s.size());
+            } finally { idxSuspend--; }
             return;
         }
         if (x instanceof List) {
             List l = (List) x;
             if (shapes && !canonical) {
-                Object[] shape = homogeneousShape(l);
+                Object[] shape = unionShape(l);
                 if (shape != null) { writeShapedArray(l, shape); return; }
             }
             int n = l.size();
@@ -2732,12 +3497,14 @@ public final class Writer {
             long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
             int slot = anchors != null ? reserveNode() : -1;
             int a = 0, countdown = 1, seen = 0;
+            long itemsAtStart = idxItemsWritten, walkAcc = 0;
             if (x instanceof java.util.RandomAccess) {
                 // Indexed by position, so it cannot yield more or fewer than n.
                 for (int i = 0; i < n; i++) {
                     if (anchors != null && --countdown == 0) {
                         anchors[a++] = idxOffset(pos); countdown = idxStride;
                     }
+                    walkAcc += idxItemsWritten - itemsAtStart;
                     writeValue(l.get(i));
                 }
             } else {
@@ -2746,11 +3513,12 @@ public final class Writer {
                     if (anchors != null && --countdown == 0) {
                         anchors[a++] = idxOffset(pos); countdown = idxStride;
                     }
+                    walkAcc += idxItemsWritten - itemsAtStart;
                     writeValue(o);
                 }
                 if (seen != n) countMismatch(n, seen);
             }
-            if (anchors != null) fillNode(slot, start, n, anchors, false);
+            if (anchors != null) fillNode(slot, start, n, anchors, walkAcc);
             return;
         }
         if (x instanceof java.util.Collection) {

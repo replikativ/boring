@@ -96,8 +96,11 @@
   to passing the same map on every call: `resolve-opts` merges the caller's map
   over the profile defaults, which allocates ~230-300 B per call. On a log
   event that is the difference between 452 and 220 heap bytes, and it bites
-  hardest exactly where it is least wanted -- a navigable file needs
-  `:stringref false`, so it cannot use the nil-opts fast path.
+  hardest exactly where it is least wanted -- a SEQUENCE needs
+  `:stringref false`, so it cannot use the nil-opts fast path. (A single
+  indexed document keeps stringref and is smaller for it; the restriction is
+  specific to `write-seq!`, which resets the namespace per top-level item so
+  one frame cannot describe them all.)
 
   Passing opts explicitly to a 3-arity call still wins, and REPLACES these
   rather than merging with them -- one place to look for what a call used."
@@ -368,11 +371,20 @@
   return value IS -- one item becomes a sequence, `application/cbor` becomes
   `application/cbor-seq` -- which is a change of kind, not of setting.
 
-  Note the size trade, which runs the other way: indexing forces
-  `:stringref false`, because `boring.nav` cannot resolve a string reference
-  from an offset. On a value holding many similar records that costs about 2x.
-  Under a compressor it is noise -- zstd reaches 37x where stringref reaches
-  2.09x -- so see doc/STORAGE.md before optimising this by hand."
+  INDEXING NO LONGER COSTS YOU STRINGREF. It used to force `:stringref false`,
+  because `boring.nav` cannot rebuild a reference table from an offset, and on
+  a value holding many similar records that cost about 2x. The index frame now
+  carries a pointer table -- each referenced index to the offset where that
+  string was defined -- so a cursor resolves a reference by jumping to the
+  literal. `encode-indexed` therefore KEEPS stringref and is smaller for it:
+  measured on 200 records, 5063 bytes with both against 6648 with shapes
+  alone.
+
+  The consequence runs the other way now. A stringref document is navigable
+  ONLY if it carries an index, so plain `encode` output -- stringref on by
+  default, no frame -- is refused by `nav/source` rather than answered wrongly.
+  Decoding it is unaffected: `decode` builds the table as it reads and consults
+  no frame."
   (^bytes [v] (encode v nil))
   (^bytes [v opts]
    (let [o (resolve-opts opts)]
@@ -696,6 +708,24 @@
    (with-decode-errors (.read (configure-reader! (reader-of src "decode")
                                                  (opt/check-opts opts))))))
 
+(defn decode-at
+  "Decode the CBOR item starting at byte offset `off` in `src`.
+
+  `decode` is this with `off` 0. The companion of `boring.nav/cursor`, for
+  the same reason: a format that puts a header, a length or another item in
+  front of the one you want should not have to nest it in a container purely so
+  it can be found. See `boring.nav/cursor` for the case that motivated both.
+
+  `off` is TRUSTED. A wrong offset lands mid-item and decodes whatever the
+  bytes there happen to encode -- bounded by the source, so it cannot read past
+  the end, but perfectly capable of returning a plausible wrong value. Derive
+  offsets from your format, not from input."
+  ([src off] (decode-at src off nil))
+  ([src off opts]
+   (with-decode-errors
+     (.readFrom (configure-reader! (reader-of src "decode-at") (opt/check-opts opts))
+                (long off)))))
+
 (defn decode-with
   "Decode using a reusable Reader.
 
@@ -722,7 +752,15 @@
 ;; cannot be split. Not implemented; chunk size is the knob for that tradeoff.
 
 (declare seal-index! seal-index-with! scan-index scan-into! nodes->index
-         build-index write-seq-resolved!)
+         build-index write-seq-resolved! write-indexed-resolved!
+         derive-stringref-pointers default-index-stride)
+
+(def ^:private ^:const small-enough-to-encode-twice
+  "Below this many bytes, `encode-indexed` encodes both ways and keeps the
+  shorter. See its docstring: the index frame is a rounding error on a large
+  value and most of the file on a small one, and only the buffering entry
+  point can look at both."
+  4096)
 
 (defn encode-indexed
   "Encode `v` and seal an index onto it, returning a byte[].
@@ -751,39 +789,103 @@
   `encode` -- silently returning an unindexed single item would change what the
   return value IS, from a two-item sequence to one item. Call `encode` instead.
 
-  `:stringref false` IS FORCED, because the sentence above would otherwise be
-  false by default. The default profile writes stringref, and `boring.nav`
-  categorically refuses a stringref document -- a stringref is an index into a
-  table built from every preceding string, which a cursor holding only an offset
-  cannot resolve. So `(nav/source (encode-indexed v))` threw
-  `:boring/stringref-not-navigable` on the very shape this function's docstring
-  recommends. Every test passed `{:stringref false}` or a sorting profile, so the
-  advertised default was the one path never exercised.
+  `:stringref` AND `:index` NOW COMPOSE, and the profile's default is honoured
+  rather than forced off. They were mutually exclusive because a stringref is
+  an index into a table built by decoding every preceding string, so a cursor
+  holding nothing but an offset could not resolve one and `boring.nav` refused
+  such a document outright. The index frame now carries ONE MORE PAYLOAD
+  ELEMENT -- seven rather than six, the extra one sitting between `sorted` and
+  `data-end` -- holding the offset of the defining literal for each slot
+  something actually references, so a reference resolves by JUMPING to that
+  offset instead of by having decoded everything before it. `data-end` stays
+  last whatever the width, which is what lets a reader take the count off the
+  array head and know which element is which. See doc/INDEX.md.
 
-  An index exists to be navigated; producing one that cannot be is not a
-  trade-off worth offering -- so an EXPLICIT `:stringref true` is now REFUSED
-  with `:boring/incompatible-options` rather than honoured. It used to be
-  honoured, producing a file whose index `boring.nav` refuses outright, which
-  is the same silent-useless-output this function's siblings already reject:
-  `write-seq!` and `write-indexed!` have raised on that combination all along.
-  Three functions, one rule, and this was the one that did not follow it."
+  So `(nav/root (encode-indexed v))` works on the default profile, which is the
+  shape this docstring recommends and used to be the one path never exercised.
+  Measured on 200 konserve-shaped records: 9115 bytes against 13129 without
+  stringref, a 31% saving, with the pointer table itself 1.26% of the blob.
+
+  A SEQUENCE STILL REFUSES the combination -- see `write-seq!`. Each top-level
+  item restarts the namespace at index 0 and one frame carries one table, so no
+  frame can describe them all. A single value is the shape the table describes."
   (^bytes [v] (encode-indexed v nil))
   (^bytes [v opts]
-   (when (true? (:stringref opts))
-     (throw (ex-info (str "boring: :stringref true cannot be combined with an index -- "
-                          "boring.nav cannot resolve string references from an offset, "
-                          "so the index would be unusable. Drop one of the two.")
-                     {:type :boring/incompatible-options :stringref true})))
-   (let [opts (if (contains? opts :stringref) opts (assoc opts :stringref false))
-         ^bytes body (encode v opts)
-         idx (build-index body opts)]
-     (if-not idx
-       body
-       (let [w (writer (max 1024 (alength body)) opts)
-             out (java.io.ByteArrayOutputStream. (+ (alength body) 256))]
-         (.write out body)
-         (seal-index! w out idx (alength body) (resolve-opts opts))
-         (.toByteArray out))))))
+   ;; THIS IS `write-indexed!` INTO A BYTE ARRAY, and it used to be its own
+   ;; implementation: encode the whole value, then WALK the finished bytes to
+   ;; derive the index. That is two full passes and two copies of the document,
+   ;; where the streaming writer already captures every node as it encodes --
+   ;; it knows a container's offset and entry count before it emits the head,
+   ;; so the nodes fall out of encoding for free.
+   ;;
+   ;; Measured, byte-identical output either way: 200 konserve-shaped records
+   ;; 3.214 ms -> 0.584 ms, a flat 2000 records 2.973 ms -> 0.717 ms. Four to
+   ;; five and a half times faster for strictly less code.
+   ;;
+   ;; AND IT REMOVES A SECOND BUILDER FROM THIS PATH, which matters more than
+   ;; the speed. Two implementations of "where do the index nodes go" have
+   ;; disagreed before -- see #30 and #34 -- and each divergence was found by a
+   ;; test comparing them rather than by either one being obviously wrong.
+   ;; There is now one builder for every value boring encodes itself.
+   ;;
+   ;; `build-index` KEEPS the byte walk, because it has a job this does not: it
+   ;; indexes bytes somebody else wrote, or re-indexes after a compaction, and
+   ;; there is no writer in either story.
+   (let [o (resolve-opts opts)
+         stride (long (get o :index default-index-stride))
+         ;; `:index 0` IS REFUSED HERE, not treated as "off". It means off
+         ;; everywhere else, but sealing an index with no index is not a thing
+         ;; this function can do, and silently substituting the default made the
+         ;; documented off switch produce a LARGER file than omitting the
+         ;; option. The refusal used to come from `build-index`; delegating to
+         ;; the streaming writer, which legitimately reads 0 as off, would have
+         ;; dropped it -- so it moves here rather than disappearing.
+         _ (when (zero? stride)
+             (throw (ex-info (str "boring: :index 0 turns indexing off, which "
+                                  "encode-indexed cannot do; use `encode` instead")
+                             {:type :boring/bad-option :option :index :value 0})))
+         ;; `:stringref` IS NO LONGER FORCED OFF. This used to be
+         ;; `(cond-> o (pos? stride) (assoc :stringref false))`, because a
+         ;; cursor holding an offset could not resolve a reference and the
+         ;; index would have been unreachable. The frame's pointer table closed
+         ;; that: `write-indexed-resolved!` takes the pointers from the writer's
+         ;; own symbol table, and `build-index` re-derives the same numbering
+         ;; from the byte order for documents it did not write, so both
+         ;; builders still produce the same file.
+         w (writer 1024 o)
+         out (java.io.ByteArrayOutputStream. 1024)
+         _ (write-indexed-resolved! w v out o stride (long (get o :index-min 16)))
+         bs (.toByteArray out)]
+     ;; SMALL VALUES TAKE WHICHEVER NAVIGABLE ENCODING IS SMALLER, which
+     ;; restores the promise two paragraphs of this docstring make and one
+     ;; change broke.
+     ;;
+     ;; An indexed write seals a frame whenever it opens a stringref namespace,
+     ;; because "namespace with no pointer table" has to keep meaning exactly
+     ;; one thing for `boring.nav` -- see `write-indexed-resolved!`. On a large
+     ;; value the frame is noise. On a small one it is most of the file:
+     ;; `{:a 1}` came out at 50 bytes against 7, and `(vec (range 40))` at 101
+     ;; against 58, because #22's placement rule quite correctly declines to
+     ;; index anything that small and the frame is then pure overhead.
+     ;;
+     ;; So below a bound, encode the other way too and keep the shorter. Both
+     ;; candidates are ordinary `encode-indexed` output and both are navigable
+     ;; -- this picks between them, it does not invent a third shape.
+     ;;
+     ;; ONLY `encode-indexed` CAN DO THIS, and that is not an oversight:
+     ;; `write-indexed!` streams to a sink and cannot revisit what it has
+     ;; already flushed. So the two differ in SIZE on small values, never in
+     ;; meaning, and the streaming one is the conservative side.
+     ;;
+     ;; THE BOUND IS WHAT KEEPS IT FREE. A second encode of something already
+     ;; known to be under a few kilobytes is cheap; above that the frame is a
+     ;; rounding error and the comparison would be the expensive half of the
+     ;; call. Skipped entirely when the caller already asked for
+     ;; `:stringref false`, which is the candidate being compared against.
+     (if (and (:stringref o) (< (alength bs) small-enough-to-encode-twice))
+       (let [alt (encode-indexed v (assoc opts :stringref false))]
+         (if (< (alength ^bytes alt) (alength bs)) alt bs))
+       bs))))
 
 (def ^:const default-index-stride
   "Stride `write-seq!` indexes at unless told otherwise. See its docstring for
@@ -828,8 +930,11 @@
   at stride 16. Since offsets are only knowable after the fact, a file written
   without an index can never gain one without a rewrite, so the default has to
   be the useful one or the feature is unreachable for anyone who did not plan
-  ahead. It is close to free: +4.3% write time, +0.06% size on 50k ~200-byte
-  records, and -1.5% from the `:stringref false` it forces, netting SMALLER.
+  ahead. It is close to free: +3% write time at stride 16, +0.06% size on 50k
+  ~200-byte records, and -1.5% from the `:stringref false` it forces, netting
+  SMALLER. The write-cost figure is doc/INDEX.md's, from
+  `clojure -M:bench -m nav write`, and lives there rather than here -- this
+  docstring used to say +4.3% for the same corpus and the same stride.
 
   Unlike `encode`, this changes nothing about what the bytes ARE. A sequence is
   already `application/cbor-seq` (RFC 8742), where extra items are expected;
@@ -864,28 +969,39 @@
   only the containers on ONE path. So a node is a certain cost against a
   possible saving, and lowering the bar buys nodes that are never visited.
 
-  Measured, reaching the last element with `:trust-index :trusted`:
+  Measured, reaching the last element with `:trust-index :trusted` --
+  reproduce with `clojure -M:bench -m nav index-min`:
 
-    4096 x 4-key maps   :index-min 4    4097 nodes   105.14 us    1.7x
-    4096 x 4-key maps   :index-min 16      1 node      3.03 us   54.9x
-     256 x 64-key maps  :index-min 16    257 nodes    19.71 us    7.4x
-     256 x 64-key maps  :index-min 65      1 node     13.72 us   10.6x
+    4096 x 4-key maps   :index-min 4     1 node    11.93 us
+    4096 x 4-key maps   :index-min 16    1 node    12.54 us
+     256 x 64-key maps  :index-min 16    3 nodes   35.61 us
+     256 x 64-key maps  :index-min 65    1 node    30.54 us
 
-  The per-node figure held to within 10% across all three shapes. So the
-  failure mode of a LOW `:index-min` is not a slightly bigger file, it is a
-  35x slower lookup -- and the default of 16 is not conservative, it is
-  roughly where store-shaped data stops adding nodes it will not use.
+  THIS TABLE REPLACES ONE THAT DESCRIBED A FAILURE MODE THE CODE NO LONGER
+  HAS. It used to report 4097 nodes at `:index-min 4` against 1 at 16, and
+  concluded that a low setting costs a 35x slower lookup. Both node counts
+  are now 1: #22's placement rule decides where nodes go -- `walk >= 64` for
+  arrays and sorted maps, a byte budget for unsorted ones -- and it declines a
+  4-key map at any `:index-min`. The old numbers had no harness, and had been
+  copied verbatim into konserve-lmdb, so a figure nobody could regenerate
+  outlived the behaviour it described in two repositories. See #41.
 
-  Raising it further is safe and sometimes better: 16, 32, 64, 128 and 512 were
-  within noise of each other on 2000 record-shaped documents (~30-33x), because
-  none of them changed the node count for that data.
+  What is still true: `:index-min` gates nodes, and raising it past a
+  container's width removes them (65 excludes the 64-key maps above, 16 does
+  not). What is no longer true is that a low value floods the index -- #22 is
+  the deciding rule now and `:index-min` is a floor under it. The default of 16
+  is a reasonable floor rather than a load-bearing safety limit.
 
-  `:index` FORCES `:stringref false`. `boring.nav` cannot resolve a string
-  reference from an offset alone -- a stringref indexes a table built from every
-  preceding string -- so the two options describe incompatible documents, and
-  honouring both produced an index that nothing could read. Passing
-  `:stringref true` alongside `:index` throws `:boring/incompatible-options`
-  rather than silently dropping one. This costs nothing on a sequence: the
+  `write-seq!` FORCES `:stringref false`, at EVERY stride including zero.
+  `boring.nav` cannot resolve a string reference from an offset alone -- a
+  stringref indexes a table built from every preceding string -- and the index
+  frame's pointer table, which is what lets a single value carry both, cannot
+  describe a sequence: the namespace restarts at each top-level item and one
+  frame holds one table, so item 1's references would resolve against item N's
+  literals. Passing `:stringref true` throws `:boring/incompatible-options`
+  rather than silently dropping it. `{:index 0}` used to be the one spelling
+  that kept stringref on, which made it the one spelling ClojureScript could
+  not match. This costs nothing on a sequence: the
   stringref table resets per top-level item, so on 50k ~200-byte records
   stringref is a 1.5% size LOSS, where on the same data as one large value it is
   a 2.1x win. Sequences are the shape that wants an index and the shape that
@@ -910,54 +1026,106 @@
   ;; public entry point. `encode-into!` passes `(writer-opts w)` straight to
   ;; `write-root!` without re-resolving; this now follows that model rather than
   ;; merely citing it.
-  ;; INDEXING FORCES `:stringref false`, for the reason spelled out on
-  ;; `encode-indexed`: `boring.nav` categorically refuses a stringref document,
-  ;; because a stringref is an index into a table built from every preceding
-  ;; string and a cursor holding only an offset cannot resolve it.
+  ;; `write-seq!` FORCES `:stringref false`, at EVERY stride including zero.
   ;;
-  ;; Without this, `(write-seq! w items out {:index 16})` under the default
-  ;; profile built the index, wrote the frame, charged for both -- and produced
-  ;; a file `nav/items` then rejected with `:boring/stringref-not-navigable`.
-  ;; The index was unreachable by construction. `encode-indexed` had already
-  ;; been fixed for exactly this; this entry point had not.
+  ;; It used to force it only when indexing, on the grounds that indexing is
+  ;; what declares navigational intent. That left `{:index 0}` writing a
+  ;; namespace per item on the JVM while ClojureScript -- which cannot index at
+  ;; all, and so never had that trigger -- forced it off unconditionally. The
+  ;; SAME portable call produced different bytes on the two platforms, and only
+  ;; the JVM's were unnavigable.
   ;;
-  ;; An EXPLICIT `:stringref true` alongside `:index` throws rather than being
-  ;; overridden in silence -- the two options cannot both be honoured, so the
-  ;; caller has to choose. The 3-arity cannot distinguish an explicit `true`
-  ;; from the profile default (it sees already-resolved options), so there it
-  ;; is forced; that is why the 4-arity is the one that can complain.
+  ;; Sequences are the half of the format the pointer table cannot reach.
+  ;; `write-root!` resets the writer per item, so every top-level item opens its
+  ;; own namespace numbered from zero and one frame carries one table -- see
+  ;; `write-seq-resolved!` for what that silently did to item 1's keys. A single
+  ;; value is the shape the table describes, which is why `write-indexed!` and
+  ;; `encode-indexed` are where stringref is honoured.
+  ;;
+  ;; So `write-seq!` means "a sequence `boring.nav` can read", on both
+  ;; platforms, at every stride. For compression without navigation, call
+  ;; `encode-into!` in a loop -- which both docstrings already pointed at.
+  ;;
+  ;; An EXPLICIT `:stringref true` throws rather than being overridden in
+  ;; silence. The 4-arity is the only one that can tell an explicit `true` from
+  ;; the profile default, because it alone still holds the RAW map:
+  ;; `resolve-opts` merges `:stringref true` into every `:clojure`-profile call,
+  ;; so testing the resolved map would refuse every default write. The 3-arity
+  ;; sees options `writer-opts` already resolved, cannot draw that distinction,
+  ;; and forces.
   (^long [^Writer w values ^java.io.OutputStream out]
-   (let [o (writer-opts w)
-         stride (long (get o :index default-index-stride))]
-     (write-seq-resolved! w values out
-                          (cond-> o (pos? (long stride)) (assoc :stringref false))
-                          stride (long (get o :index-min 16)))))
+   (let [o (writer-opts w)]
+     (write-seq-resolved! w values out (assoc o :stringref false)
+                          (long (get o :index default-index-stride))
+                          (long (get o :index-min 16)))))
   (^long [^Writer w values ^java.io.OutputStream out opts]
    ;; RESOLVED FIRST, because resolution is what validates. `:index` was read
    ;; and coerced with `long` off the RAW map here, so `{:index "x"}` was a raw
    ;; ClassCastException out of this line -- the exact defect the option
    ;; validator says it closed, reintroduced by reading the option before the
-   ;; gate rather than after it.
-   ;;
-   ;; The `:stringref` test below still reads the raw map, and must: a resolved
-   ;; map carries the profile's `:stringref true`, so testing the resolved one
-   ;; would refuse every default indexed write.
-   (let [o (resolve-opts opts)
-         stride (long (get o :index default-index-stride))]
-     (when (and (pos? (long stride)) (true? (:stringref opts)))
-       (throw (ex-info (str "boring: :stringref true cannot be combined with :index -- "
-                            "boring.nav cannot resolve string references from an offset, "
-                            "so the index would be unusable. Drop one of the two.")
+   ;; gate rather than after it. The `:stringref` test below still reads the raw
+   ;; map, and must, for the reason above; it runs after resolution so a call
+   ;; that is wrong in both ways still reports the option error first.
+   (let [o (resolve-opts opts)]
+     (when (true? (:stringref opts))
+       (throw (ex-info (str "boring: :stringref true is not supported by write-seq! -- "
+                            "each top-level item restarts the stringref namespace at "
+                            "index 0, so one index frame cannot describe them all and "
+                            "boring.nav could not resolve a reference from an offset. "
+                            "Use write-indexed! or encode-indexed for a single value, "
+                            "or encode-into! in a loop for compression without "
+                            "navigation.")
                        {:type :boring/incompatible-options
-                        :stringref true :index stride})))
-     (write-seq-resolved! w values out
-                          (cond-> o
-                            (pos? (long stride)) (assoc :stringref false))
-                          stride (long (get o :index-min 16))))))
+                        :stringref true
+                        :index (long (get o :index default-index-stride))})))
+     (write-seq-resolved! w values out (assoc o :stringref false)
+                          (long (get o :index default-index-stride))
+                          (long (get o :index-min 16))))))
 
 (defn- write-seq-resolved!
   "`write-seq!` with options already resolved. See the note on its 3-arity."
   [^Writer w values ^java.io.OutputStream out o stride min-entries]
+  ;; A SEQUENCE CANNOT CARRY STRINGREF POINTERS, and this is a property of the
+  ;; format rather than a gap in the implementation.
+  ;;
+  ;; `write-root!` resets the writer per item, so EVERY top-level item opens its
+  ;; own namespace numbered from zero. The frame carries ONE table keyed by
+  ;; stringref index, so it can describe at most one of them -- and it described
+  ;; the last, because the symbol table only still holds that item's strings
+  ;; when the frame is sealed. Item 1's references then resolved against item
+  ;; N's literals: `{:alpha 1 :beta 2 :gamma {:alpha 3 :beta 4}}` read back as
+  ;; `{:alpha 1 :beta 2 :gamma {:zulu 3 :yankee 4}}`, silently.
+  ;;
+  ;; REFUSED HERE, not only at the public arity, because the public guard is
+  ;; going to be lifted for the single-value writers once their builder can
+  ;; emit pointers -- and a lift that reached this path would reintroduce
+  ;; exactly that wrong answer. Single values are what the pointer table is for
+  ;; and what a document store needs: a konserve blob is one top-level item.
+  ;;
+  ;; Supporting sequences would mean an item dimension in the element and a
+  ;; two-level lookup. That shape is designed and its economics are measured --
+  ;; a sectioned table keyed by item start offset, section per item, ~0.4-2.9%
+  ;; of the file against a 22-28% stringref saving -- but it is a FORMAT
+  ;; VERSION, not a patch: the layout byte's low nibble would go to v2, and the
+  ;; reader gates on `stringref-layout-v1`, so today's `nav` refuses a v2 table
+  ;; with a typed error rather than misreading it. That refusal is what makes
+  ;; this safe to leave until a workload asks for it.
+  ;;
+  ;; AT EVERY STRIDE, not only when indexing. Both public arities force
+  ;; `:stringref false` now, so nothing reaches here with it set -- but the
+  ;; wrong answer above does not need an index to happen. It is the per-item
+  ;; namespace reset that causes it, and that happens at stride 0 too; only
+  ;; `nav`'s categorical refusal of a stringref document was hiding it. Guarding
+  ;; on `(pos? stride)` here would have let a future lift through the one door
+  ;; that must stay shut.
+  (when (:stringref o)
+    (throw (ex-info (str "boring: :stringref cannot be used in write-seq! -- each "
+                         "top-level item restarts the stringref namespace at index "
+                         "0, so one index frame cannot describe them all. Use "
+                         "write-indexed! or encode-indexed for a single value, or "
+                         "pass :stringref false.")
+                    {:type :boring/incompatible-options
+                     :stringref true :index stride})))
   (let [stride (long stride)
         min-entries (long min-entries)
         indexing? (pos? stride)
@@ -1042,7 +1210,19 @@
         (aset counts 0 (int (.idxItemTotal ^Writer w)))
         (System/arraycopy cs 0 containers 1 m)
         (System/arraycopy ns 0 counts 1 m)
-        (let [items (.idxItemOffsets ^Writer w)]
+        (let [items (.idxItemOffsets ^Writer w)
+              ;; READ BEFORE `seal-index!`, which calls `write-root!` and so
+              ;; `.reset` -- and reset clears the stringref namespace. Read
+              ;; afterwards this is always empty, and silently so.
+              ;;
+              ;; ALWAYS NIL ON THIS PATH, because `write-seq!` forces
+              ;; `:stringref false` at every stride -- see its comment. Kept as
+              ;; a gate rather than deleted so that a sequence which one day
+              ;; CAN carry pointers (the sectioned v2 table) starts from the
+              ;; same shape the single-value path uses, instead of from an
+              ;; unconditional call that would emit an empty element on every
+              ;; existing sequence file.
+              srp (when (:stringref o) (.stringrefPointers ^Writer w))]
           (.setIndex ^Writer w (int 0) (int 0) 0)   ; capture off again
           (+ total
              (long (seal-index!
@@ -1051,7 +1231,8 @@
                      :containers containers
                      :counts counts
                      :slots (into [items] sl)
-                     :sorted (into [false] so)}
+                     :sorted (into [false] so)
+                     :stringrefs srp}
                     total
                     o)))))
       ;; Capture must go off on THIS path too. It is switched on above whenever
@@ -1079,23 +1260,77 @@
                   (.abortStream ^Writer w)
                   (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
                   (throw t)))]
-    (if (and indexing? (pos? (alength ^longs (.idxContainers ^Writer w))))
+    ;; READ BEFORE THE GATE, and before `seal-index!` -- sealing calls
+    ;; `write-root!` and so `.reset`, which clears the stringref namespace, so
+    ;; read afterwards this is always empty and silently so.
+    ;;
+    ;; GATED ON `:stringref`, not on whether pointers came back.
+    ;; `stringrefPointers` answers the empty array to both "this document
+    ;; opened no namespace" and "it opened one and referenced nothing", and
+    ;; those need different frames: no element for the first, an EMPTY element
+    ;; for the second. Without the gate every `{:stringref false}` file would
+    ;; gain a two-byte element it has no use for and stop being byte-identical.
+    ;;
+    ;; THE NESTING IS LOAD-BEARING and clj-kondo cannot see why, so it is
+    ;; ignored rather than merged. This `let` has no bindings between it and
+    ;; the one above, which is exactly the shape `:redundant-let` flags -- but
+    ;; merging it moves the read EARLIER, to before the value has been written,
+    ;; and a `delay` moves it LATER, to after `seal-index!` has reset the
+    ;; writer. Either way `stringrefPointers` answers empty and the frame omits
+    ;; a table for references it really emitted, which is a document nothing
+    ;; can read. The nesting is what places the read between the two.
+    #_{:clj-kondo/ignore [:redundant-let]}
+    (let [srp (when (and indexing? (:stringref o)) (.stringrefPointers ^Writer w))]
+      ;; A FRAME IS SEALED WHENEVER A REFERENCE WAS EMITTED, even with no
+      ;; container node to describe. The gate used to be the node count alone,
+      ;; and that wrote a document nothing could read: the writer emits a tag-25
+      ;; reference as soon as a string repeats, but #22's walk threshold
+      ;; declines to index a small container, so
+      ;; `(encode-indexed [{:city "amsterdam"} {:city "amsterdam"}])` came out
+      ;; 49 bytes carrying references and no table -- and `nav/root` refused its
+      ;; own library's output. Small values with repeated keys are the common
+      ;; shape, not an edge case.
+      ;;
+      ;; The invariant this restores is that A REFERENCE IS ONLY EVER WRITTEN
+      ;; WHEN A TABLE EXISTS TO RESOLVE IT. The streaming writer cannot go back
+      ;; and re-encode, so sealing the frame is the only enforcement available
+      ;; -- and it is proportionate, because the frame now has a second job.
+      ;; Carrying the pointer table is reason enough to write one.
+      ;;
+      ;; ON `:stringref`, NOT on whether a reference was actually emitted. The
+      ;; narrower gate saves a frame on documents that open a namespace and
+      ;; never use it -- `(vec (range 40))` is 61 bytes rather than 101 -- but
+      ;; it buys that by making `nav` unable to tell "opened a namespace and
+      ;; referenced nothing" from "references something I cannot resolve", so
+      ;; the only way to accept the first is to stop refusing the second at
+      ;; open. That moves the failure for an UNINDEXED stringref document --
+      ;; the genuine error condition -- from `nav/source` to somewhere deep in
+      ;; a walk, which for `mmap-source` over millions of rows is the wrong
+      ;; place to learn the file cannot be navigated.
+      ;;
+      ;; So the frame is sealed whenever a namespace is opened, and "namespace
+      ;; with no table" goes back to meaning exactly one thing. The cost falls
+      ;; only on values too small to warrant an index in the first place.
+      ;;
       ;; NO SENTINEL NODE HERE, unlike `write-seq!`. That node stands for the
       ;; sequence itself so `nav/items` can seek between top-level items; this
       ;; writes ONE value, which `nav/source` navigates into. Adding a node for
       ;; a sequence of one would claim a shape the file does not have.
-      (let [containers (.idxContainers ^Writer w)
-            counts (.idxCounts ^Writer w)
-            sl (.idxSlots ^Writer w)
-            so (.idxSorted ^Writer w)]
-        (.setIndex ^Writer w (int 0) (int 0) 0)
-        (+ total
-           (long (seal-index! w out
-                              {:stride stride :containers containers :counts counts
-                               :slots (vec sl) :sorted (vec so)}
-                              total o))))
-      (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
-          total))))
+      (if (and indexing? (or (pos? (alength ^longs (.idxContainers ^Writer w)))
+                             (some? srp)))
+        (let [containers (.idxContainers ^Writer w)
+              counts (.idxCounts ^Writer w)
+              sl (.idxSlots ^Writer w)
+              so (.idxSorted ^Writer w)]
+          (.setIndex ^Writer w (int 0) (int 0) 0)
+          (+ total
+             (long (seal-index! w out
+                                {:stride stride :containers containers :counts counts
+                                 :slots (vec sl) :sorted (vec so)
+                                 :stringrefs srp}
+                                total o))))
+        (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
+            total)))))
 
 (defn write-indexed!
   "Stream ONE value to `out` and seal it with a container index, in bounded
@@ -1119,46 +1354,39 @@
   reader consumes both. Hand it to `boring.nav/source` and lookups inside large
   containers become jumps.
 
-  Same rules as `write-seq!`: `:index` is the stride (default 16), `:index-min`
-  the smallest container worth a node (default 16), `:stringref false` is forced
-  because `boring.nav` cannot resolve a string reference from an offset, and an
-  explicit `:stringref true` alongside `:index` throws rather than one silently
-  winning. No frame is written when no container clears the threshold.
+  `:index` is the stride (default 16) and `:index-min` the smallest container
+  worth a node (default 16). No frame is written when no container clears the
+  threshold.
 
-  Note the size trade: on a value holding many similar records, giving up
-  stringref costs about 2x. See doc/STORAGE.md -- under a compressor it is
-  noise, but uncompressed it is not."
+  `:stringref` COMPOSES WITH `:index` here, unlike in `write-seq!`. It used to
+  be forced off, because `boring.nav` could not resolve a string reference from
+  an offset; the frame's pointer table gives it the defining offset of every
+  slot something references, and this writer takes those pointers from its own
+  symbol table as it encodes. A sequence still refuses the combination -- each
+  top-level item restarts the namespace at index 0, so one frame cannot
+  describe them all -- which is the asymmetry `write-seq!` documents.
+
+  That also reverses the size trade this docstring used to warn about: on a
+  value holding many similar records, giving up stringref cost about 2x. See
+  doc/STORAGE.md."
   (^long [^Writer w v ^java.io.OutputStream out]
-   (let [o (writer-opts w)
-         stride (long (get o :index default-index-stride))]
-     (write-indexed-resolved! w v out
-                              (cond-> o (pos? (long stride)) (assoc :stringref false))
-                              stride (long (get o :index-min 16)))))
+   (let [o (writer-opts w)]
+     (write-indexed-resolved! w v out o
+                              (long (get o :index default-index-stride))
+                              (long (get o :index-min 16)))))
   (^long [^Writer w v ^java.io.OutputStream out opts]
    ;; RESOLVED FIRST, because resolution is what validates. `:index` was read
    ;; and coerced with `long` off the RAW map here, so `{:index "x"}` was a raw
    ;; ClassCastException out of this line -- the exact defect the option
    ;; validator says it closed, reintroduced by reading the option before the
    ;; gate rather than after it.
-   ;;
-   ;; The `:stringref` test below still reads the raw map, and must: a resolved
-   ;; map carries the profile's `:stringref true`, so testing the resolved one
-   ;; would refuse every default indexed write.
-   (let [o (resolve-opts opts)
-         stride (long (get o :index default-index-stride))]
-     (when (and (pos? (long stride)) (true? (:stringref opts)))
-       (throw (ex-info (str "boring: :stringref true cannot be combined with :index -- "
-                            "boring.nav cannot resolve string references from an offset, "
-                            "so the index would be unusable. Drop one of the two.")
-                       {:type :boring/incompatible-options
-                        :stringref true :index stride})))
-     (write-indexed-resolved! w v out
-                              (cond-> o
-                                (pos? (long stride)) (assoc :stringref false))
-                              stride (long (get o :index-min 16))))))
+   (let [o (resolve-opts opts)]
+     (write-indexed-resolved! w v out o
+                              (long (get o :index default-index-stride))
+                              (long (get o :index-min 16))))))
 
 (def ^:const index-name
-  "Tag-27 type name for a sequence/container index. See doc/SHAPES.md.
+  "Tag-27 type name for a sequence/container index. See doc/INDEX.md.
 
   A NAME under tag 27, not a tag number of its own. Tag 27 is CBOR's registered
   extension point for exactly this -- \"serialised language-independent object
@@ -1200,7 +1428,94 @@
   tag's reader is an arbitrary function -- but the offsets describe the wire,
   and the wire is what they describe accurately either way."
   [^Reader r p stride min-entries base ^java.util.ArrayList acc]
-  (index-walk* r p stride min-entries base acc 0))
+  ;; THE RUNNING ITEM COUNT, in a one-slot array.
+  ;;
+  ;; `walk` needs, for each entry of a container, how many items precede it
+  ;; inside that container. Returning a per-entry count would mean every
+  ;; recursive call handing back two values, which in Clojure means allocating
+  ;; a tuple per ENTRY of the whole document -- on the walk whose entire design
+  ;; note is that it visits each byte once and allocates only for nodes it
+  ;; keeps.
+  ;;
+  ;; A monotone running total costs nothing and gives the same answer by
+  ;; subtraction: the items before entry j are (total now - total when the
+  ;; container started). It is exactly what `Writer.idxItemsWritten` does on
+  ;; the other side, which is also why the two agree by construction rather
+  ;; than by coincidence.
+  (index-walk* r p stride min-entries base acc 0 (long-array 1) false))
+
+(def ^:private ^:const walk-threshold
+  "Where a binary search starts to repay the frame, in mean prefix items.
+  MUST equal `Writer.WALK_THRESHOLD` -- the two index builders decide with it
+  independently and must decide the same way."
+  64)
+
+(def ^:private ^:const map-capture-span-guard
+  "Bytes per entry a map must plausibly have before the walk captures it at
+  stride 1, which costs `n` longs.
+
+  AN ALLOCATION BOUND, not the placement rule -- `keep-node?` decides that,
+  later, once `sorted` and `walk` are known. `build-index` is public and takes
+  bytes somebody else wrote: a minimal map pair is two bytes, so a well-formed
+  60 MB file declaring 30M pairs made the walk allocate 240 MB before
+  `keep-node?` refused the node.
+
+  It was the placement rule until the unsorted branch moved to `walk`, and
+  #43's divergence was the two builders computing that rule on byte spans that
+  differed by a head's width. As a bound it has no such hazard, because it only
+  has to be no STRICTER than what `keep-node?` will admit."
+  10)
+
+(def ^:private ^:const unsorted-walk-per-entry
+  "Mean prefix items an unsorted map must cross per ENTRY to earn a node.
+  MUST equal `Writer.UNSORTED_WALK_PER_ENTRY` -- see it for the measurements,
+  and for why this branch is gated on ITEMS where it used to be gated on
+  bytes: an unsorted map's node buys one thing, skipping each VALUE instead of
+  walking it, and what that is worth is how many CBOR items a value is."
+  4)
+
+(defn- keep-node?
+  "Whether a container is worth an index node. Mirrors `Writer.keepNode`.
+
+  An ARRAY or SORTED MAP is binary-searched, and that repays the frame from
+  `walk-threshold` mean prefix items, so among containers that reach here
+  `walk` decides and the entry count does not. `:index-min` gates what reaches
+  here, and since the unsorted rule below moved to items it is inert on every
+  realistic shape -- measured identical at 2, 4, 16 and 64 on konserve-shaped
+  records. It is a floor, not a tuning knob.
+
+  An UNSORTED MAP cannot be binary-searched, so at a stride above 1
+  `boring.nav` REFUSES the node -- an anchor loop over an unordered map visits
+  every entry exactly as a plain scan does. Writing one is pure cost, measured
+  at 0.43x-0.81x. At stride 1 it IS usable, and then costs one anchor per
+  entry, so it is gated on how many ITEMS each entry costs to skip -- see
+  `Writer.UNSORTED_WALK_PER_ENTRY`. That used to read a byte budget, and bytes
+  are the wrong axis: a 400-char string and a 100-int vector have the same
+  order of bytes per entry and opposite verdicts, because a stride-1 anchor
+  buys skipping the VALUE and a string is one item to skip either way."
+  ;; NO PRIMITIVE HINTS: a Clojure fn taking primitives is limited to four
+  ;; arguments, and this takes five. Boxing at one call per container is not on
+  ;; any hot path -- the walk it gates is.
+  [map? sorted walk stride n]
+  ;; ONE ANCHOR CANNOT ACCELERATE ANYTHING -- see `Writer.keepNode`. A
+  ;; container of n <= stride entries gets a single anchor, which is its own
+  ;; first entry, so the search lands where the reader already was.
+  ;; Inlined rather than calling `anchor-count`, which is defined further down
+  ;; -- and must stay in agreement with it and with `Writer.anchorCount`.
+  ;; AT THE NODE'S OWN STRIDE -- see `Writer.keepNode`. An unsorted map is
+  ;; written at stride 1 and has `n` anchors, so asking at the file's stride
+  ;; refused every unsorted map of `stride` entries or fewer.
+  (and (>= (long (let [ns (if (and map? (not sorted)) 1 (long stride))]
+                   (if (<= (long n) 0) 0
+                       (if (= ns 1) (long n)
+                           (inc (quot (dec (long n)) ns)))))) 2)
+       (if (or (not map?) sorted)
+         (>= (long walk) walk-threshold)
+         ;; An unsorted map is written at stride 1 whatever the file's
+         ;; stride, so the file's stride does not enter into it. What decides
+         ;; is how many ITEMS the node lets a lookup skip -- see
+         ;; `Writer.UNSORTED_WALK_PER_ENTRY`. `bytes` is no longer read.
+         (>= (long walk) (* unsorted-walk-per-entry (long n))))))
 
 (defn- frame-payload-array?
   "Is the container at `p` the 2-element `[name, args]` array of a TAG-27 FRAME?
@@ -1226,7 +1541,8 @@
                        t))))))
 
 (defn- index-walk*
-  [^Reader r p stride min-entries base ^java.util.ArrayList acc depth]
+  [^Reader r p stride min-entries base ^java.util.ArrayList acc depth ^longs items
+   suppress?]
   ;; CONTAINER nesting is bounded too, not only the tag chain. `build-index` is
   ;; public and documented for "a file somebody else wrote", and ~1.2 KB of
   ;; `81 81 81 ...` was a StackOverflowError where `decode` on the same bytes
@@ -1266,15 +1582,56 @@
         ;; Collapsing the chain is equivalent to recursing through it: a tag's
         ;; extent IS its payload's extent, so the payload's end is the value's.
         q0 (long p)
-        p (long (loop [q p]
+        ;; EACH TAG IS ITS OWN ITEM, so the chain is counted as it collapses.
+        ;; The writer emits one `head(TAG, ..)` per tag; counting the chain as
+        ;; one would make the two builders disagree on any tagged value, which
+        ;; is most of what boring emits -- a set is tag 258, a record tag 27, a
+        ;; shaped array tag 39649.
+        ;; PRIMITIVE LOCALS. This loop is walked for EVERY value, and most of
+        ;; what boring emits is tagged -- a set is 258, a record 27, a shaped
+        ;; array 39649 -- so an Object-typed `q` here boxed once per tagged
+        ;; value and cost +14.7% of the walk's allocation on a tag-heavy
+        ;; document (2000 sets: 657 KB against 754 KB).
+        ;;
+        ;; Two loops rather than one that returns both. Packing the count and
+        ;; the offset into a single long would save the second pass, and would
+        ;; silently corrupt any file past the packing width -- boring carries
+        ;; 64-bit offsets on purpose, and a walk that is right up to 1 TiB is
+        ;; not right.
+        ntags (long (loop [q (long p) t 0]
+                      (if (= 6 (.majorAt r q))
+                        (recur (long (.headEndAt r q)) (inc (long t)))
+                        t)))
+        ;; A SET IS INDEXED NOWHERE -- see `Writer.writeValue`'s Set branch.
+        ;; `boring.nav` realises a set whole, so no offset inside one is
+        ;; reachable, and the writer emits nothing there. Detected by walking
+        ;; the tag chain again, which costs nothing for the untagged container
+        ;; that nearly every container is.
+        set? (boolean (loop [q (long p)]
+                        (if (= 6 (.majorAt r q))
+                          (if (= 258 (long (.headArgAt r q)))
+                            true
+                            (recur (long (.headEndAt r q))))
+                          false)))
+        suppress? (boolean (or suppress? set?))
+        p (long (loop [q (long p)]
                   (if (= 6 (.majorAt r q)) (recur (long (.headEndAt r q))) q)))
         mj (.majorAt r p)]
     (if-not (or (= mj 4) (= mj 5))
-      (.skipFrom r p)
+      ;; `skipCountingFrom`, not `skipFrom`: the items inside a scalar or a
+      ;; string are part of the enclosing container's walk, and a byte string
+      ;; of any size is ONE of them.
+      (let [e (.skipCountingFrom r p)]
+        (aset items 0 (+ (aget items 0) ntags (.skipItemCount r)))
+        e)
       (let [n (.headArgAt r p)
             map? (= mj 5)]
         (if (neg? n)
-          (.skipFrom r p)                       ; indefinite length: not indexable
+          ;; Indefinite length: not indexable, but still walked and still
+          ;; counted -- its items are part of its PARENT's walk.
+          (let [e (.skipCountingFrom r p)]
+            (aset items 0 (+ (aget items 0) ntags (.skipItemCount r)))
+            e)
             ;; Only containers we will KEEP get an array, and it holds one entry
             ;; per ANCHOR rather than one per entry. The old version allocated
             ;; `(int-array n)` for every container before testing `min-entries`,
@@ -1298,23 +1655,67 @@
                 ;; pairs overflowed and threw a raw ArithmeticException out of
                 ;; the guard whose job is to make this input typed -- 37 of
                 ;; 60000 fuzz probes, and introduced by the guard itself.
-                _ (let [avail (- (.size r) (long (.headEndAt r p)))
-                        budget (if map? (quot avail 2) avail)]
+                avail (- (.size r) (long (.headEndAt r p)))
+                _ (let [budget (if map? (quot avail 2) avail)]
                     (when (> n budget)
                       (throw (ex-info (str "boring: container at " p " declares " n
                                            (if map? " pairs" " elements")
                                            " but only " avail " bytes remain")
                                       {:type :boring/bad-count :count n :offset p}))))
-                keep? (and (>= n min-entries)
+                keep? (and (not suppress?)
+                           (>= n min-entries)
                            (not (frame-payload-array? r q0 p mj n)))
+                ;; A MAP CAPTURES ONE ANCHOR PER ENTRY, whatever the file's
+                ;; stride, and is narrowed below once `sorted` is known -- an
+                ;; unsorted map is usable only at stride 1 and a sorted one is
+                ;; better served by the file's stride, and which it is cannot
+                ;; be known until the last key has been compared. Same order as
+                ;; `Writer.downsample`.
+                ;; STRIDE 1 ONLY WHERE IT COULD BE KEPT. Capturing a map at
+                ;; stride 1 costs `n` longs, and `build-index` is public and
+                ;; takes bytes somebody else wrote: a minimal map pair is two
+                ;; bytes, so a well-formed 60 MB file declared 30M pairs and
+                ;; the walk allocated 240 MB before `keep-node?` refused the
+                ;; node. `OutOfMemoryError` is an Error, so it escaped
+                ;; `build-index`'s catch entirely.
+                ;;
+                ;; `bytes` is not known until the container ends, but `avail`
+                ;; -- what is left in the file -- bounds it. So when the anchor
+                ;; budget already fails against `avail` it must fail against
+                ;; `bytes` too, the unsorted branch is refused whatever the
+                ;; keys turn out to be, and capturing finer than the file's
+                ;; stride cannot change a single decision.
+                ;; AGAINST THE SAME SPAN THE WRITER MEASURES. `avail` starts
+                ;; after this container's HEAD, because it exists to bound the
+                ;; payload for the allocation guard above. `Writer.keepNode`
+                ;; takes `absOffset() - off`, which INCLUDES the head -- so the
+                ;; two differed by the head's width, and at the exact boundary
+                ;; they chose different strides for the same container. A
+                ;; 9-entry unsorted map spanning exactly 90 bytes: the writer
+                ;; saw 90 <= 90 and captured at stride 1 (nine anchors), the
+                ;; walk saw 90 <= 89 and captured at the file's stride (one).
+                ;; Same node, same count, same `sorted`, different anchors --
+                ;; two builders writing different files, which is the one thing
+                ;; the differential test exists to prevent. Found by that test,
+                ;; intermittently, because only the exact boundary shows it.
+                ;; AN ALLOCATION BOUND, NOT THE PLACEMENT RULE, and the
+                ;; distinction is new. `sorted` is not known here -- it cannot
+                ;; be until the last key has been compared -- so this cannot
+                ;; ask `keep-node?`, which needs it. What it must do is capture
+                ;; at least as widely as `keep-node?` will later want, while
+                ;; refusing to allocate `n` longs for a hostile declared count.
+                span-bound (- (.size r) (long p))
+                cap-stride (if (and map? (<= (* map-capture-span-guard (long n))
+                                             (long span-bound)))
+                             1 stride)
                 m (if keep?
                       ;; An empty container needs no anchors. The `(max n 1)`
                       ;; this replaces yielded ONE for n=0, and the loop never
                       ;; wrote it, leaving a phantom offset pointing at the
                       ;; document's start. Same defect as Writer.anchorCount.
                     (cond (<= n 0) 0
-                          (= stride 1) n
-                          :else (inc (quot (dec n) stride)))
+                          (= cap-stride 1) n
+                          :else (inc (quot (dec n) cap-stride)))
                     0)
                 kept (when keep? (long-array m))
                   ;; EVERY adjacent key pair decides `sorted`, not the anchors.
@@ -1325,14 +1726,34 @@
                   ;; map has two anchors, so an unordered map was marked sorted
                   ;; about half the time and present keys came back nil.
                 srt (when (and keep? map?) (doto (boolean-array 1) (aset 0 true)))
+                ;; The tag chain and this container's OWN head, charged before
+                ;; any entry -- so `at-start` below is the count with the head
+                ;; already paid, and no entry's prefix includes it. The Java
+                ;; side captures `itemsAtStart` after `head(..)` for the same
+                ;; reason.
+                _ (aset items 0 (+ (aget items 0) ntags 1))
+                at-start (aget items 0)
+                walk-acc (long-array 1)
                 end (loop [i 0 q (long (.headEndAt r p)) prev -1]
                       (if (= i n)
                         q
-                        (do (when (and keep? (zero? (rem i stride)))
-                              (aset ^longs kept (quot i stride) (long q)))
+                        (do (when (and keep? (zero? (rem i cap-stride)))
+                              (aset ^longs kept (quot i cap-stride) (long q)))
                             (when (and srt (aget ^booleans srt 0) (>= (long prev) 0)
                                        (>= (.compareItemsAt r (long prev) q) 0))
                               (aset ^booleans srt 0 false))
+                            ;; BEFORE the entry is walked, not in the `recur`
+                            ;; form: `recur`'s arguments are evaluated left to
+                            ;; right and the position argument contains the
+                            ;; recursive calls, so a prefix computed there
+                            ;; would already include the entry it precedes.
+                            ;;
+                            ;; One prefix per ENTRY -- for a map that is the
+                            ;; key and value together, since a scan reaching
+                            ;; entry j crosses both halves of every earlier one.
+                            (when keep?
+                              (aset walk-acc 0 (+ (aget walk-acc 0)
+                                                  (- (aget items 0) at-start))))
                             ;; index-walk*, CARRYING THE DEPTH. Calling the
                             ;; 6-arg wrapper here reset it to 0 at every level,
                             ;; so the bound never fired and the only thing
@@ -1345,21 +1766,73 @@
                                    (long (index-walk*
                                           r
                                           (if map?
+                                            ;; THE KEY, WITH NODES SUPPRESSED.
+                                            ;; `boring.nav` realises a map key
+                                            ;; -- an entry is
+                                            ;; `MapEntry(realize(k), cursor(v))`
+                                            ;; -- so nothing inside one is
+                                            ;; reachable. The writer suspends
+                                            ;; capture over exactly this span.
                                             (long (index-walk* r q stride min-entries base acc
-                                                               (inc (long depth))))
+                                                               (inc (long depth)) items true))
                                             q)
-                                          stride min-entries base acc (inc (long depth))))
+                                          stride min-entries base acc (inc (long depth))
+                                          items suppress?))
                                    q))))]
             (when keep?
                 ;; Decided on RAW offsets, before `base` is folded in: the
                 ;; Reader is positioned over this item's own buffer.
-              (let [sorted (boolean (and srt (aget ^booleans srt 0)))]
-                ;; No `base` rebasing here. `scan-into!` is reached only from
-                ;; `scan-index`, always with base 0, and the branch that used to
-                ;; rebase carried an `^ints` hint that has been wrong since
-                ;; `kept` widened to a long[] -- so it was dead code that would
-                ;; have thrown a ClassCastException had anything reached it.
-                (.add acc [(int (+ base p)) (int n) kept sorted])))
+              (let [sorted (boolean (and srt (aget ^booleans srt 0)))
+                    walk (if (pos? n) (quot (aget walk-acc 0) n) 0)
+                    ;; NARROWED HERE, now that `sorted` is known. See
+                    ;; `Writer.downsample`.
+                    ;; `(pos? n)` because this runs BEFORE the keep decision,
+                    ;; and an empty container derives `mm` of 1 from a
+                    ;; zero-length capture -- `(quot -1 16)` truncates to 0.
+                    ;; It is refused a line later, but not before this reads
+                    ;; anchor 0 of nothing.
+                    ;; `(= cap-stride 1)` because narrowing reads
+                    ;; `kept[a*stride]`, which only exists if the capture was
+                    ;; at stride 1. When the anchor budget already failed
+                    ;; against `avail` the capture was taken at the file's
+                    ;; stride and is already the right shape.
+                    ^longs kept (if (and map? sorted (pos? n)
+                                         (= (long cap-stride) 1) (> (long stride) 1))
+                                  (let [mm (inc (quot (dec n) (long stride)))
+                                        out (long-array mm)]
+                                    (dotimes [a mm]
+                                      (aset out a (aget ^longs kept (* a (long stride)))))
+                                    out)
+                                  kept)
+                    ;; SLOTS ARE REBASED TOO, and the container offset alone was
+                    ;; not enough. A node is (container-offset, count, entry
+                    ;; offsets), and every one of those is a position in the
+                    ;; reader's buffer -- so folding `base` into the first and
+                    ;; not the rest produced a node pointing at the right
+                    ;; container and the wrong entries.
+                    ;;
+                    ;; This branch existed once, carried an `^ints` hint that
+                    ;; went stale when `kept` widened to a long[], and was
+                    ;; removed as dead code on the grounds that `base` is always
+                    ;; 0. It is no longer always 0: an item embedded at an
+                    ;; offset -- konserve-lmdb's split blob puts its value after
+                    ;; a five-byte header -- needs its index expressed in the
+                    ;; enclosing buffer's coordinates, or `nav/cursor` finds
+                    ;; a frame whose every offset is wrong by the prefix.
+                    ^longs kept (if (zero? base)
+                                  kept
+                                  (let [^longs k kept
+                                        out (long-array (alength k))]
+                                    (dotimes [i (alength k)]
+                                      (aset out i (+ base (aget k i))))
+                                    out))]
+                ;; FLOOR DIVISION, matching `Writer.fillNode`. `walk-acc` is
+                ;; the sum of per-entry prefixes; `walk` is their mean.
+                ;; `(- end p)` is the container's own byte span, in the
+                ;; reader's own coordinates -- `base` belongs to the node's
+                ;; OFFSET, not to its length.
+                (when (keep-node? map? sorted walk stride n)
+                  (.add acc [(int (+ base p)) (int n) kept sorted walk]))))
             end))))))
 
 (defn- scan-into!
@@ -1390,7 +1863,12 @@
     {:containers (long-array (map #(nth % 0) idx))
      :counts (int-array (map #(nth % 1) idx))
      :slots (mapv #(nth % 2) idx)
-     :sorted (mapv #(nth % 3) idx)}))
+     :sorted (mapv #(nth % 3) idx)
+     ;; `walk` NEVER REACHES THE WIRE. `seal-index-with!` writes the six frozen
+     ;; payload elements and this is not one of them; it is a decision input,
+     ;; carried here only so the writer's capture and this walk can be held to
+     ;; the same number before either is allowed to act on it.
+     :walk (mapv #(nth % 4) idx)}))
 
 (defn- scan-index
   "Index nodes for every container of at least `min-entries` entries in
@@ -1427,8 +1905,9 @@
   entries is already found in well under a microsecond by walking it.
 
   Returns a map ready for `seal-index!`, or nil if nothing was worth indexing."
-  ([^bytes bs] (build-index bs nil))
-  ([^bytes bs opts]
+  ([^bytes bs] (build-index bs nil 0))
+  ([^bytes bs opts] (build-index bs opts 0))
+  ([^bytes bs opts base]
    ;; RESOLVED, like every other public entry point, even though nothing here
    ;; encodes. It read `:index` its own way -- `(if (and i (pos? (long i))) i 16)`
    ;; -- so `:index 0`, the documented off switch, silently became stride 16;
@@ -1450,7 +1929,7 @@
                   i)
          min-entries (long (get opts :index-min 16))
          idx (try
-               (scan-index r 0 (alength bs) stride min-entries 0)
+               (scan-index r 0 (alength bs) stride min-entries (long base))
                (catch StackOverflowError _
                  ;; The depth bound above is deterministic, but it is calibrated
                  ;; against a default stack; a smaller -Xss can still reach the
@@ -1459,66 +1938,392 @@
                  (throw (ex-info "boring: index walk ran out of stack; this document is too deeply nested to index"
                                  {:type :boring/max-depth-exceeded}))))]
      (when (pos? (alength ^longs (:containers idx)))
-       (assoc idx :stride stride)))))
+       (cond-> (assoc idx :stride stride)
+         ;; ONLY FOR A DOCUMENT THAT OPENS A NAMESPACE, which is the test
+         ;; `derive-stringref-pointers` makes first -- three bytes, and it is
+         ;; false for every non-stringref document, so nothing that does not
+         ;; use the feature walks anything twice.
+         (.hasStringrefRoot r)
+         (assoc :stringrefs (derive-stringref-pointers r (alength bs))))))))
 
-(defn- delta-slot
-  "A slot's entry offsets, as deltas in the narrowest typed array that holds them.
+(def ^:no-doc ^:const slot-layout-v2
+  "Version nibble for a DENSE start table -- one entry per node.
 
-  Offsets inside a container ascend, so consecutive differences are small and
-  nearly uniform while the absolutes are large and unbounded. That is the whole
-  saving: on 50 000 ~66-byte log records the per-item deltas span 60..67, which
-  is a byte, against int32 absolutes reaching into the millions.
+  v1 was sparse, one entry every 16 nodes, on the reasoning that a bounded
+  block walk was the same win an order of magnitude cheaper in bytes. Measured
+  on a 770-node frame, that was wrong: a block-aligned node resolves in
+  0.073 us and one at the end of its block in 0.376 -- the walk costs ~0.30 us,
+  FIVE TIMES the base, and averages ~0.22 across a block. Every number that
+  made sparse look free had been taken on node 0, which is block-aligned, so
+  the walk never ran.
 
-  Widths, narrowest first -- a byte string (no tag at all), sint16 (tag 77),
-  sint32 (tag 78). Every one of these already round-trips through the codec, so
-  this adds NO format surface: the CBOR tag is the width declaration, which is
-  why there is no per-entry flag of the kind Postgres needs for its JEntry
-  array. Postgres reads offsets in place out of a TOAST'd datum; we materialise
-  the index once, so we can afford a representation that must be expanded.
+  Dense costs 1542 bytes against sparse's 98 on that frame -- but 1.85% of the
+  BLOB, which is the denominator that matters, against the +84%-of-`slots`
+  figure the sparse decision was anchored on. It is also simpler: `start_i` is
+  one read, there is no block loop, and `counts` stops being needed to locate a
+  node at all.
 
-  The 0x7FFF bound, rather than 0xFFFF: tag 77 is SIGNED, and taking the last
-  32 KiB of range back would mean masking on read for a band that only opens up
-  when anchors are 32 KiB apart. Deltas that large take int32, which is what
-  they would have cost anyway.
+  The layout byte is what makes this cost nothing to change, which is the
+  reason it exists."
+  2)
 
-  `base` is what the first delta is measured from: the container's own offset,
-  or 0 for the sequence node. So slot[0] is a header width rather than a file
-  position, which keeps the first entry as narrow as the rest.
+(defn- slot-width-code
+  "The narrowest of four widths that holds every delta in `d`: 0 = u8, 1 = u16,
+  2 = i32, 3 = i64.
 
-  Falls back to int32 on a negative delta. That cannot arise from a walk --
-  entries ascend and no CBOR item is zero bytes -- but the narrow encodings
-  cannot represent one, so the check is what makes that an assumption about the
-  walk rather than about the file."
-  [^longs offs ^long base]
-  (let [n (alength offs)
-        d (long-array n)]
-    (loop [i 0 prev base mn Long/MAX_VALUE mx Long/MIN_VALUE]
+  On 50 000 ~66-byte log records the per-item deltas span 60..67, which is a
+  byte, against int32 absolutes reaching into the millions -- so the width is
+  worth choosing, and worth choosing PER NODE. See `pack-slots`."
+  ^long [^longs d]
+  (let [n (alength d)]
+    (loop [i 0 mn Long/MAX_VALUE mx Long/MIN_VALUE]
       (if (= i n)
         (cond
-          (or (zero? n) (and (>= mn 0) (<= mx 0xFF)))
-          (let [b (byte-array n)]
-            (dotimes [k n] (aset-byte b k (unchecked-byte (aget d k))))
-            b)
+          (or (zero? n) (and (>= mn 0) (<= mx 0xFF))) 0
+          (and (>= mn 0) (<= mx 0xFFFF)) 1
+          (and (>= mn Integer/MIN_VALUE) (<= mx Integer/MAX_VALUE)) 2
+          ;; The fourth tier. Only reachable when two anchors are more than
+          ;; 2 GiB apart, which needs items that large -- but it costs nothing
+          ;; to have, because a narrower node is still emitted beside it.
+          :else 3)
+        (let [v (aget d i)]
+          (recur (inc i) (min mn v) (max mx v)))))))
 
-          (and (>= mn 0) (<= mx 0x7FFF))
-          (let [s (short-array n)]
-            (dotimes [k n] (aset-short s k (unchecked-short (aget d k))))
-            s)
+(defn- anchor-count
+  "How many anchors a container of `n` entries carries at `stride`.
 
-          (and (>= mn Integer/MIN_VALUE) (<= mx Integer/MAX_VALUE))
-          (let [a (int-array n)]
-            (dotimes [k n] (aset-int a k (unchecked-int (aget d k))))
-            a)
+  The reader derives every node's segment length from this rather than reading
+  it, which is what keeps `slots` a single flat byte string. It must agree
+  EXACTLY with `Writer.anchorCount` and with what the walk emits -- a
+  disagreement would silently shift every subsequent node's anchors. Both index
+  builders were checked against it across strides 1/4/16 and five document
+  shapes before the derivation replaced the stored lengths.
 
-          ;; sint64 (tag 79), the fourth tier. Only reachable when two anchors
-          ;; are more than 2 GiB apart, which needs items that large -- but the
-          ;; tier costs nothing to have, because the CBOR tag declares the width
-          ;; and a narrower slot is still emitted whenever one fits.
-          :else d)
-        (let [v (aget offs i)
-              delta (- v prev)]
-          (aset d i delta)
-          (recur (inc i) v (min mn delta) (max mx delta)))))))
+  An EMPTY container needs no anchors: `((0 - 1) / stride) + 1` is 1 under
+  truncating division, which would claim a phantom anchor at offset 0."
+  ^long [^long n ^long stride]
+  (if (<= n 0) 0 (if (= stride 1) n (inc (quot (dec n) stride)))))
+
+(defn- pack-slots
+  "Every node's anchor deltas, as ONE byte string.
+
+      [ layout byte | 2-bit width code per node | dense start table |
+        node 0's deltas | node 1's deltas | ... ]
+
+  The width codes come first, `(quot (+ n 3) 4)` bytes of them, node `i` at bit
+  `(* 2 (rem i 4))` of byte `(+ 1 (quot i 4))` -- the layout byte is byte 0: 0 = u8, 1 = u16, 2 = i32, 3 = i64,
+  little-endian. Then each node's deltas back to back at its own width. A node's
+  segment LENGTH is not stored -- it is `anchor-count` of that node's entry
+  count, which the frame already carries.
+
+  This replaced one typed array PER NODE. That shape cost three ways and this
+  costs none of them: every small array carried its own CBOR head (a byte a
+  node, 33% of the slots on small deltas), decoding them all materialised a Java
+  array per container to serve a lookup that visits one or two, and locating
+  them positionally instead meant a head-read and a jump per node before any
+  lookup could start. Measured on a 767-node frame, the two together were 53.5
+  of the 92 ns per node it cost to open an index; this is 5.3.
+
+  A SINGLE FLAT TYPED ARRAY was the obvious alternative and is the wrong one.
+  It is faster still -- 0.53 ns/node, since it needs no width dispatch -- but
+  one array has one width, so a single container with 32 KiB between anchors
+  promotes every other node to int32. Measured: 33% SMALLER than the old shape
+  when all deltas are small, 166% LARGER when one node among 767 is wide. That
+  is not a corner: a map of small values beside one large blob is the ordinary
+  shape of scraped data. Per-node widths keep the narrow case narrow and make
+  the wide case cost only the node that is wide.
+
+  Unsigned u8 and u16 rather than the byte-string/sint16 pair the typed arrays
+  forced. The old second tier was SIGNED and so capped at 0x7FFF, sending
+  32 KiB..64 KiB deltas to int32; nothing here is a CBOR typed array, so the
+  full 16 bits are usable and that band stays two bytes wide."
+  ^bytes [slots ^longs containers ^ints counts ^long stride]
+  (let [n (count slots)
+        ds (object-array n)
+        ws (byte-array n)]
+    (dotimes [i n]
+      (let [^longs offs (nth slots i)
+            m (alength offs)
+            d (long-array m)]
+        ;; THE INVARIANT THE WHOLE LAYOUT RESTS ON, checked where it is
+        ;; established rather than assumed where it is used. No segment length
+        ;; goes on the wire: the reader slices `packed` by `anchor-count` of
+        ;; each node's entry count, so a walk that ever emitted a different
+        ;; number of anchors would not corrupt one node, it would shift every
+        ;; node after it -- silently, into other nodes' deltas. Cheap: one
+        ;; integer per node, on the writing side, which is the expensive side.
+        ;; EITHER OF THE TWO LEGAL STRIDES. Stride is per node now: an unsorted
+        ;; map is only usable at 1, everything else takes the file's. So a
+        ;; node's anchor count must match `anchor-count` at ONE of them, and
+        ;; which one is not stored -- the reader derives it, because a node
+        ;; whose anchors equal its entries can only have been written at 1.
+        ;;
+        ;; Still the invariant the layout rests on, just widened by one case:
+        ;; no segment length goes on the wire, so a walk that emitted some
+        ;; other number would shift every node after it.
+        (when-not (or (= m (anchor-count (aget counts i) stride))
+                      (= m (anchor-count (aget counts i) 1)))
+          (throw (ex-info (str "boring: index node " i " has " m " anchors but "
+                               (aget counts i) " entries implies "
+                               (anchor-count (aget counts i) stride) " at stride "
+                               stride " or " (anchor-count (aget counts i) 1)
+                               " at stride 1."
+                               " The index walk and `anchor-count` disagree.")
+                          {:type :boring/bad-index :node i :anchors m
+                           :entries (aget counts i) :stride stride})))
+        ;; Offsets inside a container ascend, so consecutive differences are
+        ;; small and nearly uniform while the absolutes are large and
+        ;; unbounded. That is the whole saving. `base` is the container's own
+        ;; offset, or 0 for the sequence node, whose sentinel offset is -1 --
+        ;; so slot[0] is a header width rather than a file position, which
+        ;; keeps the first delta as narrow as the rest.
+        (loop [k 0 prev (max 0 (aget containers i))]
+          (when (< k m)
+            (let [v (aget offs k)]
+              (aset d k (- v prev))
+              (recur (inc k) v))))
+        (aset ds i d)
+        ;; A negative delta cannot arise from a walk -- entries ascend and no
+        ;; CBOR item is zero bytes -- but u8 and u16 cannot represent one, so
+        ;; `slot-width-code` promotes to a signed tier rather than wrapping.
+        ;; That makes it an assumption about the walk, not about the file.
+        (aset-byte ws i (byte (slot-width-code d)))))
+    (let [wbytes (quot (+ n 3) 4)
+          seg (fn ^long [^long i] (* (alength ^longs (aget ds i))
+                                     (bit-shift-left 1 (aget ws i))))
+          deltas (loop [i 0 t 0] (if (= i n) t (recur (inc i) (+ (long t) (long (seg i))))))
+          entries (inc n)          ; DENSE: start_0 .. start_n
+          ;; W depends on the total, and the total depends on W. Two iterations
+          ;; settle it: widening the table can only push the total up by
+          ;; `entries * 2`, never back down.
+          w-start (loop [sw 2]
+                    (let [tot (+ 1 wbytes (* entries sw) deltas)]
+                      (if (or (= sw 4) (< tot 0x10000)) sw (recur 4))))
+          header (+ 1 wbytes (* entries w-start))
+          total (+ header deltas)
+          out (byte-array total)
+          put! (fn [^long o ^long v ^long sz]
+                 (dotimes [j sz]
+                   (aset-byte out (+ o j) (unchecked-byte (bit-shift-right v (* 8 j))))))]
+      ;; The layout byte: version in the low nibble, the start table's entry
+      ;; width in the high nibble. It is what makes a frame in the PREVIOUS
+      ;; shape refusable exactly rather than probabilistically -- a reader that
+      ;; expects this layout and meets the old one reads a width code where a
+      ;; version should be, and says so, instead of computing nonsense offsets
+      ;; and hoping the length check catches them.
+      (aset-byte out 0 (unchecked-byte (bit-or slot-layout-v2
+                                               (bit-shift-left (if (= w-start 4) 1 0) 4))))
+      (dotimes [i n]
+        (let [b (+ 1 (quot i 4))]
+          (aset-byte out b (unchecked-byte
+                            (bit-or (bit-and 0xFF (aget out b))
+                                    (bit-shift-left (aget ws i) (* 2 (rem i 4))))))))
+      ;; THE DENSE START TABLE, one entry per node plus a final entry holding
+      ;; the total. Node i's deltas begin at entry i -- ONE READ, where this
+      ;; was a prefix sum over every earlier node, which is what let the reader
+      ;; stop materialising `slot-starts` at all.
+      ;;
+      ;; The final entry is also the structural gate: it must equal the byte
+      ;; string's own length, which is one read instead of a sum over N.
+      (let [tbase (+ 1 wbytes)]
+        (loop [i 0 p (long header)]
+          (put! (+ tbase (* i w-start)) p w-start)
+          (when (< i n) (recur (inc i) (+ (long p) (long (seg i)))))))
+      (loop [i 0 p (long header)]
+        (if (= i n)
+          out
+          (let [^longs d (aget ds i)
+                sz (bit-shift-left 1 (aget ws i))
+                m (alength d)]
+            (dotimes [k m] (put! (+ p (* k sz)) (aget d k) sz))
+            (recur (inc i) (+ p (* m sz)))))))))
+
+(defn- pack-sorted
+  "One bit per node -- does this container's keys ascend -- as a byte string,
+  node `i` at bit `(rem i 8)` of byte `(quot i 8)`.
+
+  This was an array of CBOR booleans, one item each. Measured on a 767-node
+  frame: 770 bytes and 8.1 us to decode, against 98 bytes and 0.04 us here.
+  Two hundred times faster and eight times smaller, for a bit vector that CBOR
+  had no compact form for. The byte length is exact -- `(quot (+ n 7) 8)` --
+  which is also what lets the reader check it against the node count."
+  ^bytes [sorted]
+  (let [v (vec sorted)
+        n (count v)
+        out (byte-array (quot (+ n 7) 8))]
+    (dotimes [i n]
+      (when (nth v i)
+        (let [b (quot i 8)]
+          (aset-byte out b (unchecked-byte
+                            (bit-or (bit-and 0xFF (aget out b))
+                                    (bit-shift-left 1 (rem i 8))))))))
+    out))
+
+(def ^:no-doc ^:const stringref-layout-v1
+  "Version nibble for the stringref pointer table -- payload element 6.
+
+  Its own version rather than the frame's, for the reason every other element
+  carries one: elements are optional and independently extensible, so a reader
+  that meets a shape it does not know must be able to say which element it
+  failed on."
+  1)
+
+(defn- unsigned-width-code
+  "The narrowest unsigned width holding `mx`: 0 = u8, 1 = u16, 2 = u32, 3 = u64.
+
+  UNSIGNED, unlike `slot-width-code`, whose upper two tiers are signed because
+  a delta can in principle be negative. Neither a stringref index nor a file
+  offset can be, so the sign bit is a byte-eighth this can spend on range --
+  and it is the difference between a 64 KiB and a 4 GiB document keeping
+  two-byte offsets."
+  ^long [^long mx]
+  (cond (< mx 0x100)        0
+        (< mx 0x10000)      1
+        (< mx 0x100000000)  2
+        :else               3))
+
+(defn- pack-stringrefs
+  "The referenced stringref slots, as ONE byte string.
+
+      [ layout byte | (index, offset) | (index, offset) | ... ]
+
+  The layout byte is version in the low nibble, the index width code in bits
+  4-5 and the offset width code in bits 6-7. Pairs follow back to back,
+  ascending by index, each field little-endian at its own width. THE COUNT IS
+  NOT STORED: it is `(quot (dec len) (+ iw ow))`, and the structural gate is
+  that the division is exact -- one modulo, no sum over N, exactly as the slot
+  table's final entry gates that layout.
+
+  WHY THIS EXISTS. A stringref is an index into a table built by decoding every
+  preceding string, so a reader holding nothing but an offset cannot resolve
+  one -- which is why `:stringref` and `:index` were mutually exclusive. Given
+  (index -> defining offset) for the entries something actually references, the
+  reader resolves by jumping instead of by remembering, and the two compose.
+
+  ONLY REFERENCED ENTRIES. A registered-but-unreferenced slot is one nothing
+  will ever ask for, and on konserve-shaped data most slots are exactly that:
+  200 records carry ~256 registered strings and ~56 referenced ones. Dense
+  offsets would be 768 bytes where these are 224.
+
+  TWO WIDTHS, NOT ONE. Indices are small and dense from zero while offsets span
+  the document, so a single width would promote every index to the offset's
+  tier -- the same mistake `pack-slots` records for a single flat typed array,
+  in miniature.
+
+  EMPTY IS STILL AN ELEMENT -- one layout byte and no pairs. It would be
+  cheaper to omit it, and that is what this did, but the two states are not the
+  same to a reader: \"the frame carries no table\" is a document nothing can
+  navigate, while \"the frame carries an empty table\" is a document that opens
+  a namespace and references nothing, which is perfectly navigable. Collapsing
+  them made `(nav/root (encode-indexed (vec (range 40))))` refuse a file with
+  no strings in it at all, because the default profile opens a namespace
+  whatever the content turns out to be.
+
+  `pairs` is the interleaved `long[]` from `Writer.stringrefPointers`, already
+  ascending. nil in means nil out, and the element is then omitted entirely --
+  which is every document that opens no namespace."
+  ^bytes [^longs pairs]
+  (when pairs
+    (let [n (quot (alength pairs) 2)
+          mx-i (loop [k 0 m 0] (if (= k n) m (recur (inc k) (max m (aget pairs (* 2 k))))))
+          mx-o (loop [k 0 m 0] (if (= k n) m (recur (inc k) (max m (aget pairs (inc (* 2 k)))))))
+          ic (unsigned-width-code mx-i)
+          oc (unsigned-width-code mx-o)
+          iw (bit-shift-left 1 ic)
+          ow (bit-shift-left 1 oc)
+          out (byte-array (+ 1 (* n (+ iw ow))))
+          put! (fn [^long o ^long v ^long sz]
+                 (dotimes [j sz]
+                   (aset-byte out (+ o j) (unchecked-byte (bit-shift-right v (* 8 j))))))]
+      (aset-byte out 0 (unchecked-byte (bit-or stringref-layout-v1
+                                               (bit-shift-left ic 4)
+                                               (bit-shift-left oc 6))))
+      (dotimes [k n]
+        (let [p (+ 1 (* k (+ iw ow)))]
+          (put! p (aget pairs (* 2 k)) iw)
+          (put! (+ p iw) (aget pairs (inc (* 2 k))) ow)))
+      out)))
+
+(defn- min-len-for-index
+  "The shortest encoded length that earns stringref index `idx`.
+
+  Must agree EXACTLY with `Writer.minLenForIndex` and `Reader.minLenForIndex`:
+  all three decide independently whether a given string took an index at all,
+  and a disagreement shifts every later index rather than one."
+  ^long [^long idx]
+  (cond (< idx 24)    3
+        (< idx 256)   4
+        (< idx 65536) 5
+        :else         7))
+
+(defn- derive-stringref-pointers
+  "The pointer table for an already-encoded document, or nil.
+
+  The counterpart of `Writer.stringrefPointers` for the byte-walk builder, and
+  it exists because the two builders must write the SAME FILE. `write-indexed!`
+  streams through the Writer and takes the pointers from its symbol table;
+  `encode-indexed` and `build-index` walk finished bytes and have no symbol
+  table, so they re-derive the numbering from the only thing that defines it --
+  the order literals appear in.
+
+  A FLAT LOOP OVER ITEM HEADS, with no recursion and no structure. CBOR is
+  prefix-encoded, so a container's elements follow its head IMMEDIATELY in the
+  byte stream: stepping past each head in turn therefore visits every item in
+  exactly the order a decoder reads them, which is exactly the order the
+  stringref index space is defined by. Only a string's PAYLOAD has to be
+  stepped over, because payload bytes are not items.
+
+  That is also why this needs no depth bound and cannot overflow a stack, where
+  the container walk in `index-walk*` needs both -- it has to know the shape,
+  and this does not.
+
+  nil for anything that cannot reproduce the decoder's numbering: a document
+  that opens no namespace, an indefinite-length item, or a NESTED tag 256,
+  which resets the table so that one index space no longer describes the
+  document. nil means no pointer table, and such a document is then refused as
+  unnavigable -- the honest outcome, never a table that is subtly wrong."
+  ^longs [^Reader r ^long end]
+  (when (.hasStringrefRoot r)
+    (let [offs (java.util.ArrayList.)
+          refs (java.util.HashSet.)
+          ok (loop [p (long (.headEndAt r 0))]
+               (if (>= p end)
+                 true
+                 (let [info (.infoAt r p)]
+                   (if (= info 31)
+                     false                        ; indefinite: not reproduced
+                     (let [major (.majorAt r p)
+                           after (long (.headEndAt r p))]
+                       (case major
+                         (2 3) (let [n (long (.headArgAt r p))]
+                                 ;; THE HEAD IS RECORDED, not the payload: that
+                                 ;; is what a reader jumps to and reads from.
+                                 (when (>= n (min-len-for-index (.size offs)))
+                                   (.add offs (Long/valueOf p)))
+                                 (recur (+ after n)))
+                         6 (let [tag (long (.headArgAt r p))]
+                             (cond
+                               ;; A nested namespace shadows the outer one, so
+                               ;; every index below it means something else.
+                               (= 256 tag) false
+                               (= 25 tag) (if (zero? (.majorAt r after))
+                                            (do (.add refs (Long/valueOf (.headArgAt r after)))
+                                                (recur after))
+                                            false)
+                               :else (recur after)))
+                         ;; Containers advance past the head only -- their
+                         ;; elements are the next items. Scalars are their head.
+                         (recur after)))))))]
+      (when ok
+        (let [ks (sort (filter #(< (long %) (.size offs)) refs))
+              out (long-array (* 2 (count ks)))]
+          (loop [i 0 ks ks]
+            (when (seq ks)
+              (let [k (long (first ks))]
+                (aset out i k)
+                (aset out (inc i) (long (.get offs (int k))))
+                (recur (+ i 2) (next ks)))))
+          out)))))
 
 (defn- long->8-bytes* ^bytes [^long v]
   (let [b (byte-array 8)]
@@ -1532,18 +2337,42 @@
   item, which is also where it begins. The item is:
 
       tag 27 [ `boring/index`,
-               [ stride, containers, counts, slots, sorted, <8-byte data-len> ] ]
+               [ stride, containers, counts, slots, sorted,
+                 (stringrefs,) <8-byte data-len> ] ]
 
   `containers` are the byte offsets of every indexed container, sorted, so a
   reader binary-searches them. `slots` holds each container's entry offsets and
   `sorted` says whether that container's keys ascend -- recorded rather than
   inferred, because the encoding profile is not on the wire.
 
-  Slots go out as DELTAS, in the narrowest typed array that holds them (see
-  `delta-slot`), and a reader expands them back to absolutes once when it loads
-  the index. An int32 slot is therefore deltas too, not absolutes -- the two are
-  indistinguishable on the wire, which is why this had to land before the format
-  was published rather than after.
+  BOTH ARE BYTE STRINGS, not CBOR arrays. `slots` is every node's anchor deltas
+  concatenated, each node at its own width, behind a packed table of 2-bit width
+  codes (`pack-slots`); `sorted` is a bit per node (`pack-sorted`). Neither
+  carries per-node framing, and a node's segment length is DERIVED from the
+  entry count already in `counts`.
+
+  Measured on 768 nodes of 20 entries at stride 1, the same document through
+  both layouts: opening the index went from 91.6 ns per node to 22.2, a little
+  over fourfold. The frame shrank by 1.0% -- 124312 bytes to 123061 -- which is
+  the part NOT to generalise from: the saving is one CBOR head per node plus
+  seven eighths of `sorted`, so it is proportional to the node count and not to
+  the document, and it is worth most exactly where the old shape was worst.
+  Speed is the reason to do this; size is a rebate.
+
+  Slots go out as DELTAS and a reader expands them back to absolutes on first
+  use. Deltas and absolutes are indistinguishable on the wire, which is why this
+  had to land before the format was published rather than after.
+
+  THE PAYLOAD IS SIX ELEMENTS, OR SEVEN when the document opens a stringref
+  namespace -- the seventh is the pointer table, and it goes BETWEEN `sorted`
+  and `data-end` so that `data-end` stays last. Readers accept six THROUGH
+  FIFTEEN -- see `boring.frame/payload-count-bytes` -- so that a future
+  widening is RECOGNISED rather than republished as a trailing data item. That
+  forward compatibility is what made adding the seventh element a non-event. A reader too old for this shape
+  finds a byte string where it expects an array, fails its own structure check
+  and scans, which is the documented answer for an index it cannot use. A reader
+  new enough finds an array where it expects a byte string and does the same.
+  Neither direction can answer WRONGLY; both lose the index and keep the file.
 
   The trailing element is a byte string of exactly 8 bytes, so it always encodes
   as `0x48` plus 8: a sealed file ends with 9 predictable bytes however large
@@ -1584,10 +2413,25 @@
             ;; and write-to!'s 3-arity resolves again -- which throws for every
             ;; profile that locks a key, the same double-resolution trap as
             ;; `write-seq!`'s 3-arity.
-            (let [n (long (.position ^Writer (write-root! w item opts)))]
+            ;;
+            ;; THE FRAME IS NEVER WRITTEN INSIDE A STRINGREF NAMESPACE, whatever
+            ;; the data's options are. `write-root!` opens one whenever
+            ;; `:stringref` is set, and that prepends `d9 01 00` to the frame --
+            ;; which shifts the whole 17-byte prefix `read-index` compares
+            ;; against, so the frame stops being recognised and the index is
+            ;; SILENTLY DEAD. The comment below records this happening once
+            ;; before, when the frame picked up the writer's options instead of
+            ;; the caller's; now that `:stringref` and `:index` can be combined
+            ;; it would happen to every indexed document rather than to a
+            ;; mismatched few.
+            ;;
+            ;; Nothing is lost: a frame's only text is `boring/index`, which
+            ;; occurs once, and the namespace resets per top-level item anyway,
+            ;; so the data's own references are unaffected by this.
+            (let [n (long (.position ^Writer (write-root! w item (assoc opts :stringref false))))]
               (.write out (.buffer w) 0 (int n))
               n))]
-    (let [{:keys [stride ^longs containers counts slots sorted]} index
+    (let [{:keys [stride ^longs containers counts slots sorted stringrefs]} index
           ;; NARROWEST TYPE THAT HOLDS THEM, exactly as the slot deltas do. A
           ;; file whose offsets fit in int32 emits int32 and is byte-identical
           ;; to what it was before offsets became 64-bit; one that does not
@@ -1604,16 +2448,36 @@
                               (dotimes [i (alength containers)]
                                 (aset-int a i (unchecked-int (aget containers i))))
                               a))
-          packed (vec (map-indexed
-                       (fn [i s]
-                       ;; The sequence node's sentinel offset is -1, and a file
-                       ;; position is never negative: its deltas start from 0.
-                         (delta-slot s (max 0 (long (aget containers (int i))))))
-                       slots))
+          ;; OMITTED WHEN THERE IS NOTHING TO POINT AT, which is every document
+          ;; written without a stringref namespace and every one whose strings
+          ;; never repeat. Existing files stay byte-identical rather than
+          ;; gaining an empty element.
+          srp (when stringrefs (pack-stringrefs stringrefs))
+          ;; `data-end` IS LAST, AND THAT IS LOAD-BEARING -- it is not merely
+          ;; the sixth thing in a list. `nav/read-index` finds the whole frame
+          ;; by reading the FINAL NINE BYTES of the file: an 8-byte byte string
+          ;; always encodes as 0x48 plus its eight bytes, so those nine are a
+          ;; recognisable trailer holding a back-pointer to the frame's start.
+          ;; CBOR cannot be parsed backwards; this is the only way in.
+          ;;
+          ;; So a new element APPENDED after it is not the harmless extra that
+          ;; #20's 6-15 prefix widening makes it look like. Tried, and the file
+          ;; then ended in pointer-table bytes: the trailer no longer sits at
+          ;; the end, `read-index` finds nothing, and every indexed document
+          ;; silently falls back to scanning.
+          ;;
+          ;; Optional elements therefore go BETWEEN `sorted` and `data-end`,
+          ;; and the rule for readers is "data-end is the LAST element", never
+          ;; "data-end is element 5". nav does not read it positionally at all
+          ;; -- `payload-offsets` stops at `sorted` and the back-pointer IS the
+          ;; data end -- so shifting it costs existing readers nothing.
           item (data/unknown-record
                 index-name
-                [(long stride) wire-containers counts packed (vec sorted)
-                 (long->8-bytes* (long data-len))])]
+                (-> [(long stride) wire-containers counts
+                     (pack-slots slots containers counts (long stride))
+                     (pack-sorted sorted)]
+                    (cond-> srp (conj srp))
+                    (conj (long->8-bytes* (long data-len)))))]
     ;; The frame goes out under the SAME options as the data it describes.
     ;; `write-to!`'s 2-arity resolves the WRITER's options instead, so
     ;; `write-seq!`'s 4-arity wrote the data with the caller's opts and the
@@ -1646,24 +2510,28 @@
   memory to be a Clojure value at all, so streaming can only ever mean a
   sequence of items -- which is exactly what a datahike dump is.
 
-  The CONSTANT on that bound is several, not one, and this used to say \"plus
-  the chunk size\" as though it were one. `refill!` ends with
-  `(.reset r (Arrays/copyOf buf new-limit))`: `Reader.reset` has no
-  `(byte[], off, len)` form, so every refill allocates a full second copy of a
-  buffer `grow` has already doubled to hold the largest item. Measured as
-  bytes allocated per byte of file, over 32 MiB of byte-string items, with
-  `decode-seq` on the same bytes in the same run as the control:
+  The CONSTANT on that bound is more than one, and it rises with item size.
+  Measured as bytes allocated per byte of file, over 32 MiB of byte-string
+  items, against `decode-seq` on the same bytes in the same run:
 
       item size    decode-seq-from     decode-seq (control)
-      1 MiB              3.2x                 1.00x
-      4 MiB              3.6x                 1.00x
-     16 MiB              5.5x                 1.00x
+      1 MiB              1.13x                1.00x
+      4 MiB              1.50x                1.00x
+     16 MiB              3.00x                1.00x
 
   Linear in the file, not quadratic -- I looked for that specifically -- but
-  rising with item size, because the copied buffer tracks the largest item
-  rather than the chunk. ClojureScript's refill hands its reader
-  `(.subarray buf 0 new-limit)` -- a view over the same storage, not a copy --
-  so it pays the buffer's growth and nothing on top of it.
+  tracking the LARGEST ITEM rather than the chunk, because that is what `grow`
+  sizes the buffer for.
+
+  `refill!` used to end with `(.reset r (Arrays/copyOf buf new-limit))`,
+  allocating a full second copy of that already-doubled buffer on EVERY refill,
+  purely because `Reader.reset` had no length form and an array's own length
+  was the only limit it could take. `Reader.reset(byte[], int)` removes the
+  copy -- the reader is pointed at the first `new-limit` bytes of the buffer it
+  already has. That is what ClojureScript's refill always did with
+  `(.subarray buf 0 new-limit)`, so the two now agree in shape as well as in
+  result. (The figures above are after the change; the ones this docstring
+  carried before it were 3.2x, 3.6x and 5.5x, from a separate run.)
 
   The reader's hot path is untouched. Refilling happens between items, not
   inside `u8()`, so this costs nothing when decoding from a byte array.
@@ -1715,7 +2583,11 @@
                  (vreset! state {:buf buf :limit new-limit :last-good 0
                                  :base (+ base last-good)
                                  :eof? (or eof? (neg? n))})
-                 (.reset r (java.util.Arrays/copyOf buf (int new-limit)))
+                 ;; The buffer itself, bounded -- not a copy of it. Anything
+                 ;; past `new-limit` is the previous refill's leftovers, and
+                 ;; the length argument is what keeps the reader from reading
+                 ;; them as though they were data.
+                 (.reset r buf (int new-limit))
                  (pos? n)))
              (step []
                (lazy-seq

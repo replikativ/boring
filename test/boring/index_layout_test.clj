@@ -1,0 +1,265 @@
+(ns boring.index-layout-test
+  "The index frame's `slots` and `sorted` are BYTE STRINGS, and used to be a
+  CBOR array of typed arrays and a CBOR array of booleans.
+
+  That change is safe only because of two properties, and neither is implied by
+  the round-trip tests: a frame in the OTHER shape must be REFUSED rather than
+  misread, and the derived per-node segment lengths must be checked against the
+  byte string's actual length rather than assumed. Both are tested here by
+  building frames by hand, since no writer in the tree emits them any more."
+  (:require [clojure.test :refer [deftest testing is]]
+            [boring.core :as boring]
+            [boring.data :as data]
+            [boring.nav :as nav])
+  (:import (java.io ByteArrayOutputStream)))
+
+(def ^:private opts {:stringref false :shapes false})
+
+(def ^:private doc
+  "A SORTED MAP OF 130 ENTRIES, because the frame has to exist to be tested.
+
+  Forty entries earn no index node: a map of scalar pairs is crossed in
+  `n - 1` items on average, and the writer refuses a node below 64. So every
+  assertion here read a frame that was no longer written, and `footer-start`
+  returned -1 into `decode-at`.
+
+  130 walks 129, comfortably clear, and nothing else about the fixture matters
+  -- these tests are about the SHAPE of `slots` and `sorted`, not about how
+  many entries produced them. `k%03d` keeps the keys equal-length so they sort
+  the same way bytewise and numerically."
+  (into (sorted-map) (for [i (range 130)] [(format "k%03d" i) i])))
+
+(defn- wire-payload
+  "The frame's six payload elements, as they sit ON THE WIRE.
+
+  These assertions used to reach them through `(:slots (index-of bs))`, back
+  when opening an index materialised every element into a PER-NODE Java array.
+  `slots` and `sorted` are single packed byte strings now, so the old route
+  reports a different shape and the assertion reads as a layout failure when
+  nothing about the layout changed.
+
+  It is also where the reader is going: once `slots` and `sorted` are read in
+  place as byte OFFSETS rather than copied, `(:slots ix)` stops being a byte
+  array at all. Anything asserting on the reader's internals has to move before
+  then, and moving it early is free.
+
+  Reading the frame directly is what these tests meant all along; the reader's
+  internals were a shortcut that happened to agree. `seq_index_test` made the
+  same move for the same reason."
+  [^bytes bs]
+  (data/frame-payload (boring/decode-at bs (#'boring.frame/footer-start bs) opts)))
+
+(defn- packed-slots ^bytes [^bytes bs] (nth (wire-payload bs) 3))
+(defn- packed-sorted ^bytes [^bytes bs] (nth (wire-payload bs) 4))
+
+(defn- ptr-bytes ^bytes [^long v]
+  (let [b (byte-array 8)]
+    (dotimes [i 8] (aset-byte b i (unchecked-byte (bit-shift-right v (* 8 (- 7 i))))))
+    b))
+
+(defn- seal-with
+  "`body` with a hand-built frame appended carrying `slots` and `sorted` in
+  whatever shape the caller supplies."
+  ^bytes [^bytes body index slots sorted]
+  (let [{:keys [stride ^longs containers counts]} index
+        wire-containers (let [a (int-array (alength containers))]
+                          (dotimes [i (alength containers)]
+                            (aset-int a i (unchecked-int (aget containers i))))
+                          a)
+        frame (boring/encode
+               (data/unknown-record boring/index-name
+                                    [(long stride) wire-containers counts slots sorted
+                                     (ptr-bytes (alength body))])
+               opts)
+        out (ByteArrayOutputStream.)]
+    (.write out body)
+    (.write out ^bytes frame)
+    (.toByteArray out)))
+
+(defn- old-shape-slots
+  "`slots` the way every writer before this layout emitted them: one typed
+  array of deltas PER NODE, narrowest of byte string / sint16 / sint32."
+  [index]
+  (let [{:keys [slots ^longs containers]} index]
+    (vec (map-indexed
+          (fn [i ^longs offs]
+            (let [n (alength offs)
+                  d (long-array n)]
+              (loop [k 0 prev (max 0 (aget containers i))]
+                (when (< k n)
+                  (let [v (aget offs k)]
+                    (aset d k (- v prev))
+                    (recur (inc k) v))))
+              (let [mx (areduce d k m Long/MIN_VALUE (max m (aget d k)))]
+                (if (and (pos? n) (> mx 0xFF))
+                  (let [a (int-array n)]
+                    (dotimes [k n] (aset-int a k (unchecked-int (aget d k))))
+                    a)
+                  (let [b (byte-array n)]
+                    (dotimes [k n] (aset-byte b k (unchecked-byte (aget d k))))
+                    b)))))
+          slots))))
+
+(defn- index-of [^bytes bs]
+  (#'boring.nav/read-index (#'boring.nav/nav-of bs opts)))
+
+(defn- usable-index?
+  "Whether the frame was ACCEPTED. A refused one is not nil: `read-index` still
+  returns `{:data-end ..}`, because where the data section ends is known from
+  the back-pointer alone and is needed whether or not the index is usable."
+  [^bytes bs]
+  (some? (:containers (index-of bs))))
+
+(defn- answers-everything? [^bytes bs]
+  (let [src (nav/root bs opts)]
+    (every? (fn [i] (= i (some-> (get src (format "k%03d" i)) nav/value)))
+            (range 130))))
+
+;; ---------------------------------------------------------------- old shape
+
+(deftest a-frame-in-the-previous-shape-is-refused-not-misread
+  (testing "This is the whole compatibility argument for changing the layout
+            without changing the frame name or its 17-byte prefix. A reader
+            that meets the shape it does not expect must lose the INDEX and
+            keep the FILE -- answering by scanning, which is the documented
+            behaviour for any index it cannot use. Answering WRONGLY, or
+            throwing, would both make the change unshippable."
+    (let [body (boring/encode doc opts)
+          index (boring/build-index body (assoc opts :index 1 :index-min 4))
+          old (seal-with body index
+                         (old-shape-slots index)
+                         (vec (:sorted index)))]
+      (is (not (usable-index? old))
+          "the old shape must not be accepted as an index")
+      (is (answers-everything? old)
+          "and every key must still read back correctly, by scanning")))
+
+  (testing "the control: the SAME body sealed by the current writer is accepted,
+            so the refusal above is about the shape and not about the fixture"
+    (let [bs (boring/encode-indexed doc (assoc opts :index 1 :index-min 4))]
+      (is (usable-index? bs))
+      (is (bytes? (packed-slots bs)) "slots arrive as one byte string")
+      (is (bytes? (packed-sorted bs)) "sorted arrives as a bitset")
+      (is (answers-everything? bs)))))
+
+;; -------------------------------------------------- the derived-length check
+
+(deftest packed-slots-must-describe-their-own-length
+  (testing "No per-node segment length is stored -- it is derived from the entry
+            count in `counts` and the stride. The prefix sum over those lengths
+            must therefore land EXACTLY on the byte string's length, and that
+            equality is the structural check the layout gets in place of the
+            per-slot type check it replaced. A frame whose parts disagree is
+            refused WHOLE, rather than at whichever node a lookup visits."
+    (let [body (boring/encode doc opts)
+          index (boring/build-index body (assoc opts :index 1 :index-min 4))
+          good (boring/encode-indexed doc (assoc opts :index 1 :index-min 4))
+          packed (packed-slots good)]
+      (is (some? packed))
+      (doseq [[label mangled]
+              [["one byte short" (java.util.Arrays/copyOf ^bytes packed
+                                                          (dec (alength ^bytes packed)))]
+               ["one byte long" (java.util.Arrays/copyOf ^bytes packed
+                                                         (inc (alength ^bytes packed)))]
+               ;; BYTE 0 IS THE LAYOUT BYTE, not a width code. This case was
+               ;; labelled "a width code raised" and did `(bit-or (aget c 0)
+               ;; 0x03)`, which raises the VERSION NIBBLE from 2 to 3 -- so it
+               ;; asserted version refusal under a name that promised width
+               ;; coverage, and no width fault was ever tested. Renamed to what
+               ;; it does; the width fault has its own test below, because it
+               ;; behaves differently and the difference is the point.
+               ;;
+               ;; Version refusal is load-bearing beyond this test: the nibble
+               ;; is how a future layout stays refusable-not-misread, and #22
+               ;; Part B would spend it.
+               ["the version nibble raised"
+                (let [c (aclone ^bytes packed)]
+                  (aset-byte c 0 (unchecked-byte (bit-or (aget c 0) 0x03)))
+                  c)]]]
+        (let [bs (seal-with body index mangled (packed-sorted good))]
+          (is (not (usable-index? bs)) (str label ": must be refused"))
+          (is (answers-everything? bs) (str label ": and still answer by scanning"))))))
+
+  (testing "`sorted` is one bit per node, so its byte length is an EQUALITY --
+            `(quot (+ n 7) 8)` -- not a bound. A bitset sized for a different
+            node count is a frame whose parts disagree."
+    (let [body (boring/encode doc opts)
+          index (boring/build-index body (assoc opts :index 1 :index-min 4))
+          good (boring/encode-indexed doc (assoc opts :index 1 :index-min 4))]
+      (doseq [[label n] [["too short" 0] ["too long" 9]]]
+        ;; `(packed-slots good)`, not `(:slots (index-of good))`. Reaching into
+        ;; the reader for the GOOD half of a frame that is meant to be bad in
+        ;; exactly one way is how this stops testing what it says: the moment
+        ;; `slots` becomes a byte offset, `(:slots ix)` is a Long, `seal-with`
+        ;; encodes a uint where a byte string belongs, and the frame is refused
+        ;; for the WRONG reason -- with both assertions still passing.
+        (let [bs (seal-with body index (packed-slots good) (byte-array n))]
+          (is (not (usable-index? bs)) (str label ": must be refused"))
+          (is (answers-everything? bs) (str label ": and still answer by scanning")))))))
+
+;; ------------------------------------- the width code is NOT structurally gated
+
+(deftest a-corrupt-width-code-costs-speed-not-correctness
+  (testing "The per-node width code is the one part of the layout the O(1)
+            structural gate does NOT cover, and that is deliberate.
+
+            The gate is `the last start-table entry equals the byte string's
+            length`. Node starts are STORED in the dense table, so a raised
+            width code does not move them and the gate still passes -- unlike
+            every fault above, which shifts the total. Catching it would mean a
+            per-node cross-check that `start[i+1] - start[i]` equals
+            `anchors * 2^width`: O(nodes) work to re-derive what the index is
+            TRUSTED to have got right. That trust is the boundary this codebase
+            settled on, so the check stays out.
+
+            What is promised instead holds exactly, and is what this asserts:
+            no untyped failure, no read outside the file, and NO WRONG ANSWER.
+            Node 0's 40 deltas read at i64 rather than u8 want 320 bytes of a
+            46-byte string, so the node is abandoned and the lookup falls back
+            to an honest scan -- `confirm` re-derives every candidate, so a
+            damaged offset can only cost time.
+
+            The frame is therefore USABLE and CORRECT at once, which reads as a
+            contradiction until you see that `usable-index?` means `opened`,
+            not `trustworthy`."
+    (let [body (boring/encode doc opts)
+          index (boring/build-index body (assoc opts :index 1 :index-min 4))
+          good (boring/encode-indexed doc (assoc opts :index 1 :index-min 4))
+          ;; Node 0's code is at bits 0-1 of byte 1 -- `(+ 1 (quot i 4))`, see
+          ;; `pack-slots`. Raised to 3 = i64, the widest tier.
+          raised (let [c (aclone ^bytes (packed-slots good))]
+                   (aset-byte c 1 (unchecked-byte (bit-or (aget c 1) 0x03)))
+                   c)
+          bs (seal-with body index raised (packed-sorted good))]
+      (is (usable-index? bs)
+          "the O(1) gate cannot see this, and is not asked to")
+      (is (answers-everything? bs)
+          "and every key must still read back correctly, by scanning"))))
+
+;; ------------------------------------------------------------ width per node
+
+(deftest a-wide-node-does-not-widen-its-neighbours
+  (testing "The reason `slots` carries a width code per node rather than being
+            one flat typed array at a single width. Measured on 767 nodes, a
+            single width was 33% SMALLER than the per-node shape when every
+            delta was small and 166% LARGER when one node among them was wide
+            -- and a map of small values beside one large blob is the ordinary
+            shape of scraped data, not a corner case.
+
+            So: the same document, once with a large value and once without,
+            must differ in index size by about the one node that needed it."
+    (let [small (into (sorted-map)
+                      (for [i (range 40)] [(format "k%02d" i) (str "v" i)]))
+          wide (assoc small "zzz" (apply str (repeat 70000 \x)))
+          idx-bytes (fn [d]
+                      (let [sealed (boring/encode-indexed d (assoc opts :index 1 :index-min 4))
+                            plain (boring/encode d opts)]
+                        (- (alength ^bytes sealed) (alength ^bytes plain))))
+          a (idx-bytes small)
+          b (idx-bytes wide)]
+      ;; One extra entry at i32 costs at most a handful of bytes over the same
+      ;; entry at u8. If a wide node promoted the whole array, this would grow
+      ;; by ~3 bytes per EXISTING entry -- more than 100 on 41 of them.
+      (is (< (- b a) 40)
+          (str "a single wide value must not widen the other nodes: "
+               a " B -> " b " B")))))

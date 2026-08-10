@@ -2,20 +2,38 @@
   "Every test here is a bug that shipped on this branch and was found by review
   rather than by the suite.
 
-  They share a theme, and it is the claim the whole index rests on: **the index
-  is an optimisation and is never load-bearing for correctness.** A missing,
-  stale, truncated or randomly corrupt index may cost speed; it may not change
-  an answer and it may not throw at the caller. Six findings all violated that,
-  and none of them needed hostile input -- four fire on ordinary data at the
-  shipped defaults.
+  They shared a theme, and the theme has since been narrowed deliberately.
 
-  That claim is QUALIFIED, and the qualification belongs beside it: it does not
-  extend to a CRAFTED index. Checking that every anchor is a real entry boundary
-  is O(n) per container, and checking that `sorted` is truthful means reading
-  every key -- both exactly the work the index exists to avoid. A deliberately
-  lying index can therefore still misdirect a lookup, so the index frame is a
-  trust boundary: integrity of the index is integrity of the document. This
-  namespace's docstring previously asserted the unqualified version.
+  It used to be: **the index is an optimisation and is never load-bearing for
+  correctness** -- a missing, stale, truncated or randomly corrupt index may
+  cost speed, but may not change an answer and may not throw at the caller.
+  Six findings violated that, and none needed hostile input; four fired on
+  ordinary data at the shipped defaults.
+
+  THAT CLAIM IS NO LONGER MADE, and the tests here say so. Holding it up meant
+  re-deriving at read time what the frame asserts: verifying an anchor against
+  its predecessor costs O(stride) SKIPS per jump, and a skip is O(1) only for a
+  scalar -- stepping over 16 twenty-entry maps is ~640 sub-skips, measured at
+  four times the cost of the lookup it guards. The index is now a TRUST
+  BOUNDARY outright: we use it only where we are willing to trust it, and
+  integrity of the index is integrity of the document. Corruption beneath us is
+  the storage layer's job, and both real consumers have one.
+
+  WHAT IS STILL PROMISED, and what these tests now pin, is narrower and not
+  negotiable:
+
+    * No untyped exception, ever, from any damage to any byte. A wrong answer
+      is within the boundary; an `ArrayIndexOutOfBoundsException` out of `get`
+      is not.
+    * No read outside the file. This is why the O(1) frame-structure and
+      segment bounds stay while the per-node verification goes -- bounds are
+      not a matter of trust, because `Reader.skipFrom` does an unchecked array
+      access.
+    * A reader that consults no index is never affected by frame damage.
+    * Undamaged data always reads correctly, which is less trivial than it
+      sounds: `confirm` looks like a damage check and is not, and deleting it
+      breaks `sorted-map` lookups on perfectly good bytes.
+
   See doc/SHAPES.md.
 
   The suite missed them for reasons worth recording, because they are reasons a
@@ -53,7 +71,11 @@
 (defn- seal ^bytes [vs o]
   (let [w (boring/writer 65536 o)
         out (ByteArrayOutputStream.)]
-    (boring/write-seq! w vs out (merge o {:index 16}))
+    ;; `(merge {:index 16} o)`, not `(merge o {:index 16})`. The latter
+    ;; OVERRODE a stride the caller passed -- silently, so a test asking for
+    ;; `:index 1` got 16 and never knew. The default still applies when the
+    ;; caller says nothing, which is what every existing call does.
+    (boring/write-seq! w vs out (merge {:index 16} o))
     (.toByteArray out)))
 
 ;; ---------------------------------------------------------------- finding 1
@@ -73,8 +95,8 @@
             m (reduce (fn [^java.util.LinkedHashMap a k]
                         (doto a (.put k (subs k 1))))
                       (java.util.LinkedHashMap.) ks)
-            c (nav/source (boring/encode-indexed m (assoc opts :index 16 :index-min 16))
-                          opts)]
+            c (nav/root (boring/encode-indexed m (assoc opts :index 16 :index-min 16))
+                        opts)]
         (doseq [k ks]
           (is (= (subs k 1) (some-> (get c k) nav/value))
               (str "key " k " went missing in insertion order " (pr-str ks))))))))
@@ -184,10 +206,49 @@
                                                 0xFF))))
           (is (= 21 (count (into [] (nav/items broken opts))))
               "scans: 20 data items plus the unrecognised index frame")
-          (is (some? (nav/source broken opts))
+          (is (some? (nav/root broken opts))
               "and `source` returns rather than throwing"))))))
 
 ;; ---------------------------------------------------------------- finding 6
+
+(defn- parts
+  "The six payload elements, CONSISTENT by default, through the writer's own
+  packers.
+
+  The cases below used to build `slots` as a vector of byte arrays and `sorted`
+  as a vector of booleans -- the shapes both had before the v2 layout. Every one
+  of them was therefore refused at `(bytes? packed)`, a check that runs BEFORE
+  every length check the cases name, so all seven assertions passed against a
+  frame refused for a reason none of them was testing. The control asserted
+  `index accepted` over an index whose `:containers` was nil.
+
+  Packing through `pack-slots`/`pack-sorted` is what stops that recurring: a
+  case can only be inconsistent in the way it says it is. It also means the
+  writer's own node invariant runs here, which is why lying about `counts` or
+  `stride` needs `:pack-counts`/`:pack-stride` -- `pack-slots` refuses to build
+  an inconsistent node, so the lie has to go in the DECLARED value only.
+
+  Defaults describe the three 4-byte `{\"x\" n}` items `crafted` writes: one
+  sequence node at the sentinel offset -1, three entries, anchors at 0, 4, 8."
+  [& {:keys [stride containers counts slots sorted pack-counts pack-stride]
+      :or {stride 1 containers [-1] counts [3] slots [[0 4 8]] sorted [false]}}]
+  [stride
+   (int-array containers)
+   (int-array counts)
+   (#'boring/pack-slots (mapv long-array slots) (long-array containers)
+                        (int-array (or pack-counts counts))
+                        (long (or pack-stride stride)))
+   (#'boring/pack-sorted sorted)])
+
+(defn- accepted?
+  "Did the reader actually USE the index, as opposed to detecting the frame and
+  refusing it? Both keep `data-end`, so both stop `items` yielding the frame as
+  data -- which is why an item count alone cannot tell them apart, and why every
+  case here asserts this too."
+  [^bytes bs o]
+  (let [c (nav/root bs o)
+        ix (#'nav/nav-idx (.nav ^boring.nav.Cursor c))]
+    (some? (:containers ix))))
 
 (defn- crafted
   "A sealed sequence whose index frame is hand-built from `payload`."
@@ -213,25 +274,28 @@
             `get`, or a wrong subtree. All must now fall back to scanning, which
             sees 4 items -- the 3 data items and the index frame as data."
     (doseq [[label payload]
-            [["slots shorter than containers"
-              [1 (int-array [-1]) (int-array [3]) [] [false]]]
+            [["slots empty where a node is declared"
+              (assoc (parts) 3 (byte-array 0))]
              ["sorted shorter than containers"
-              [1 (int-array [-1]) (int-array [3])
-               [(byte-array (map unchecked-byte [0 4 4]))] []]]
+              (parts :sorted [])]
+             ;; `Integer/MAX_VALUE` AT STRIDE 1, not 1000000 at stride 16.
+             ;; The old case allocated 8 MB and passed; `slot-at` allocated
+             ;; `long[m]` from this count BEFORE the bound check that refuses
+             ;; it, so the size of the lie decided whether the test found
+             ;; anything. At stride 1 `anchor-count` returns the count verbatim
+             ;; and the allocation exceeds the VM's array limit on ANY heap --
+             ;; an OutOfMemoryError, which is an Error and so walked through
+             ;; every catch between here and `get`.
              ["count disagrees with the slot's length"
-              [1 (int-array [-1]) (int-array [1000000])
-               [(byte-array (map unchecked-byte [0 4 4]))] [false]]]
-             ["containers not ascending"
-              [1 (int-array [5 -1]) (int-array [3 3])
-               [(byte-array (map unchecked-byte [0 4 4]))
-                (byte-array (map unchecked-byte [0 4 4]))] [false false]]]
+              (parts :counts [Integer/MAX_VALUE] :pack-counts [3]
+                     :stride 1 :pack-stride 1)]
              ["an anchor beyond the data section"
-              [1 (int-array [-1]) (int-array [3])
-               [(byte-array (map unchecked-byte [0 100 100]))] [false]]]
+              (parts :slots [[0 100 200]])]
              ["a negative stride"
-              [-1 (int-array [-1]) (int-array [3])
-               [(byte-array (map unchecked-byte [0 4 4]))] [false]]]]]
+              (parts :stride -1 :pack-stride 1)]]]
       (let [bs (crafted payload)]
+        (is (not (accepted? bs opts))
+            (str label ": the index must be REFUSED, not merely survived"))
         ;; THREE, not four. The frame stays metadata even when its payload is
         ;; unusable: detection and usability are separate questions, and
         ;; detection has already succeeded here -- prefix, pointer, ends at
@@ -267,15 +331,15 @@
                                              [i {:k (str i)} [i i]]))  [89 1 :k]]
                ["empty array"         [[] [] []]                   [1]]]]
         (let [bs (boring/encode-indexed v (assoc opts :index 16 :index-min 4))
-              reach (fn [o] (nav/value (reduce #(get %1 %2) (nav/source bs o) path)))]
+              reach (fn [o] (nav/value (reduce #(get %1 %2) (nav/root bs o) path)))]
           (is (= (get-in v path) (reach opts)) (str label ": validated path"))
           (is (= (get-in v path) (reach trusted)) (str label ": trusted path"))
           ;; whole-document realisation too, not just the one path -- a skipped
           ;; check that corrupted `:total` or `:data-end` shows up here first
-          (is (= v (nav/value (nav/source bs trusted)))
+          (is (= v (nav/value (nav/root bs trusted)))
               (str label ": trusted realises the whole document unchanged"))
-          (is (= (nav/value (nav/source bs opts))
-                 (nav/value (nav/source bs trusted)))
+          (is (= (nav/value (nav/root bs opts))
+                 (nav/value (nav/root bs trusted)))
               (str label ": the two settings must not disagree")))))))
 
 (deftest a-tagged-container-is-realised-not-navigated
@@ -295,7 +359,7 @@
           "a sorted-map must encode as a tag")
       (doseq [[label bs] [["bare" bare] ["tagged" tagged]]
               trust [:trusted :ignore]]
-        (let [s (nav/source bs (assoc opts :trust-index trust))]
+        (let [s (nav/root bs (assoc opts :trust-index trust))]
           (is (= 0 (nav/value (get s "f000"))) (str label " " trust " first key"))
           (is (= 59 (nav/value (get s "f059"))) (str label " " trust " last key"))
           (is (nil? (get s "nope")) (str label " " trust " absent key")))))))
@@ -305,15 +369,117 @@
             cost O(1) to detect and would otherwise surface as a raw
             IndexOutOfBoundsException from inside `get` rather than as
             \"no usable index, scan instead\"."
-    (let [bs (crafted [1 (int-array [-1]) (int-array [3]) [] [false]])]
-      (is (= 3 (count (into [] (nav/items bs (assoc opts :trust-index :trusted)))))
+    (let [bs (crafted (assoc (parts) 3 (byte-array 0)))
+          trusted (assoc opts :trust-index :trusted)]
+      (is (not (accepted? bs trusted))
+          "trusted must still REFUSE this frame, not merely survive it")
+      (is (= 3 (count (into [] (nav/items bs trusted))))
           "trusted must still fall back to scanning, not index into nothing"))))
+
+(deftest containers-that-do-not-ascend-are-used-and-still-answer-correctly
+  (testing "this used to be refused, and the check that refused it is gone --
+            it was the last O(NODE COUNT) work at open and on a node-rich
+            document it WAS the open: 71.07 us against 4.08 on a 16150-node
+            frame, same probe.
+
+            What makes dropping it safe is that `node-slot` validates its own
+            answer. The binary search accepts a node only on `(= c off)`, so it
+            cannot return a node describing a DIFFERENT container. On a
+            mis-ordered array the search may fail to find a node that exists --
+            which yields -1, and -1 means walk, which is correct. So the cost
+            is a lookup that falls back to scanning, not a wrong answer.
+
+            Asserted here rather than deleted, because `accepted?` going from
+            false to true is exactly the kind of change that should be visible
+            in a test rather than only in a commit message."
+    (let [bs (crafted (parts :containers [5 -1] :counts [3 3]
+                             :slots [[5 9 13] [0 4 8]] :sorted [false false]))]
+      (is (accepted? bs opts)
+          "the frame is now ACCEPTED -- nothing re-derives that offsets ascend")
+      (is (= 3 (count (into [] (nav/items bs opts))))
+          "and it still sees three data items, not the frame as a fourth")
+      (is (= [1 2 3] (mapv #(get (nav/value %) "x") (into [] (nav/items bs opts))))
+          "and every record reads back correctly, because a search that cannot
+           find its node returns -1 and -1 means walk"))))
+
+(deftest an-absurd-delta-is-refused-rather-than-overflowing
+  (testing "anchors are a prefix sum, and at width code 3 the stored delta is
+            an unconstrained signed 64-bit value straight off the wire. The
+            segment bound says WHERE the delta bytes are, not what they say --
+            so a container base plus a delta near `Long/MAX_VALUE` overflowed
+            the sum BEFORE the range check that refuses it, and Clojure's `+`
+            on primitive longs THROWS on overflow.
+
+            Measured: `ArithmeticException: long overflow` out of `get`, on a
+            frame that passed every acceptance gate, while `decode` of the same
+            bytes returned the true value. Untyped, so outside the one promise
+            that survives trusting the index.
+
+            Not reachable by bit rot -- the eight delta bytes have to land in a
+            narrow window at the top of the long range -- so no damage sweep
+            will ever produce it, which is why it is built by hand here."
+    (let [;; one node, width code 3, one anchor, stored delta = Long/MAX_VALUE
+          slots (byte-array (map unchecked-byte
+                                 [0x02          ; layout: v2, start-entry width 2
+                                  0x03          ; width codes: node 0 -> i64
+                                  0x06 0x00     ; deltas begin at 6
+                                  0x0E 0x00     ; total length 14
+                                  0xFF 0xFF 0xFF 0xFF 0xFF 0xFF 0xFF 0x7F]))
+          ;; node 0 is the REAL container at offset 4 -- the second `{"x" n}` --
+          ;; so the prefix sum starts at 4 rather than 0 and the add overflows
+          bs (crafted [1 (int-array [4]) (int-array [1]) slots (byte-array 1)])
+          item (nth (into [] (nav/items bs opts)) 1)]
+      (is (accepted? bs opts)
+          "the frame is ACCEPTED -- this is not a case the gates refuse")
+      (is (= {"x" 2} (nav/value item))
+          "and the data underneath it is intact")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boring"
+                            (get item "x"))
+          "so the absurd anchor must raise a TYPED error, not overflow")
+      (is (= :boring/bad-index
+             (try (get item "x") nil
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+          "specifically :boring/bad-index"))))
+
+(deftest containers-are-read-at-either-declared-width
+  (testing "`containers` is emitted as tag 78 when every offset fits in int32
+            and tag 79 when one does not -- narrowest-that-fits, and the CBOR
+            tag IS the declaration. The reader sign-extends whichever it finds.
+
+            THE 64-BIT HALF IS UNREACHABLE FROM A REAL DOCUMENT: it needs an
+            offset past 2 GiB, so nothing in this suite has ever exercised it
+            and a regression there would be invisible. Hand-built here, at both
+            widths, over the same data.
+
+            Sign extension is the part that matters. The sequence node lives at
+            the sentinel offset -1, so a zero-extending read turns it into
+            4294967295 at width 4 and the node is never found at all."
+    (doseq [[label idx wire] [["containers tag 78, int32" 1 (int-array [-1])]
+                              ["containers tag 79, sint64" 1 (long-array [-1])]
+                              ;; counts too: nothing writes sint64 counts, but
+                              ;; the reader accepts them so a future writer
+                              ;; change costs no older reader its index. Only a
+                              ;; hand-built frame can exercise that.
+                              ["counts tag 78, int32" 2 (int-array [3])]
+                              ["counts tag 79, sint64" 2 (long-array [3])]]]
+      (let [bs (crafted (assoc (parts) idx wire))
+            src (nav/root bs opts)]
+        (is (accepted? bs opts) (str label ": the frame must be USED, not merely survived"))
+        (is (= 3 (count (into [] (nav/items bs opts))))
+            (str label ": three data items, the frame is not one of them"))
+        (is (= [1 2 3] (mapv #(get (nav/value %) "x") (into [] (nav/items bs opts))))
+            (str label ": and every record reads back through the index"))
+        (is (= {"x" 3} (nav/value (nth (nav/items bs opts) 2)))
+            (str label ": nth reaches the last record via the sentinel node"))
+        (is (some? src) (str label ": source opens"))))))
 
 (deftest a-consistent-crafted-payload-is-still-used
   (testing "the control: validation must reject inconsistency, not everything.
             Three 4-byte items at stride 1 means three anchors at 0, 4 and 8."
-    (let [bs (crafted [1 (int-array [-1]) (int-array [3])
-                       [(byte-array (map unchecked-byte [0 4 4]))] [false]])]
+    (let [bs (crafted (parts))]
+      (is (accepted? bs opts)
+          "the control's index must actually be USED -- this is the assertion
+           whose absence made all six cases above vacuous")
       (is (= 3 (count (into [] (nav/items bs opts))))
           "index accepted, so the frame is not yielded as data")
       (is (= 3 (get (nav/value (nth (nav/items bs opts) 2)) "x"))))))
@@ -346,8 +512,11 @@
             fresh start has to be declared somewhere else -- `setIndex` -- or a
             caller who enabled capture once accumulated nodes from documents
             that no longer exist."
+    ;; 200, not 40: this is about capture LIFECYCLE, and 40 scalars no longer
+    ;; earn a node (walk 19), so `after-one` was 0 and "not double" was true
+    ;; of nothing.
     (let [^org.replikativ.boring.Writer w (boring/writer 65536 opts)
-          v (vec (range 40))]
+          v (vec (range 200))]
       (.setIndex w (int 1) (int 4) 0)
       (boring/encode-buffered! w v)
       (let [after-one (.idxCount w)]
@@ -362,15 +531,34 @@
   (testing "each slot is its own int[], so forgetting the COUNT while leaving
             the references reachable pins one array per indexed container for
             the life of a long-lived writer. Same fix as the stringref table."
-    (let [^org.replikativ.boring.Writer w (boring/writer 65536 opts)]
+    ;; A FIXTURE THAT KEEPS MANY NODES, and the count read through reflection
+    ;; rather than through `.idxCount`.
+    ;;
+    ;; Both matter now. The old fixture -- 50 vectors of 10 -- kept ONE node
+    ;; once the writer began refusing containers a scan crosses cheaply, so
+    ;; "one array per indexed container" was being asserted about one array.
+    ;; And `.idxCount` COMPACTS, which nulls refused slots itself, so calling
+    ;; it first did the very thing the assertion then attributed to
+    ;; `idxReset`: the test passed whether or not `idxReset` released
+    ;; anything.
+    (let [^org.replikativ.boring.Writer w (boring/writer 65536 opts)
+          slots (doto (.getDeclaredField org.replikativ.boring.Writer "idxSlots")
+                  (.setAccessible true))
+          live (fn [] (count (remove nil? (seq ^objects (.get slots w)))))]
       (.setIndex w (int 1) (int 2) 0)
-      (boring/encode-buffered! w (vec (for [i (range 50)] (vec (range 10)))))
-      (is (pos? (.idxCount w)))
+      ;; ITEM-RICH VALUES, because an unsorted map earns a node on the items
+      ;; a lookup skips per entry, not on the bytes. With a bare string value
+      ;; these maps earn none, `(live)` is 1, and the assertion below asserts
+      ;; nothing -- which is what it says about itself.
+      (boring/encode-buffered! w (vec (for [i (range 40)]
+                                        (into {} (for [j (range 20)]
+                                                   [(format "k%02d" j)
+                                                    (vec (repeat 8 (format "v%03d-%03d" i j)))])))))
+      (is (< 1 (live))
+          "the fixture must keep MANY nodes, or this asserts nothing")
       (.idxReset w)
-      (let [f (doto (.getDeclaredField org.replikativ.boring.Writer "idxSlots")
-                (.setAccessible true))]
-        (is (every? nil? (seq ^objects (.get f w)))
-            "no anchor array may stay reachable after a reset")))))
+      (is (zero? (live))
+          "no anchor array may stay reachable after a reset"))))
 
 (deftest an-index-offset-past-2gb-is-carried-not-wrapped
   (testing "index offsets are 64-bit. They used to be int32, which capped an
@@ -386,7 +574,10 @@
     (let [^org.replikativ.boring.Writer w (boring/writer 65536 opts)
           base 3000000000]                       ; Integer/MAX_VALUE is 2147483647
       (.setIndex w (int 1) (int 4) base)
-      (is (pos? (boring/encode-buffered! w (vec (range 40))))
+      ;; 200, not 40: this test is about OFFSET WIDTH, and 40 scalars no
+      ;; longer earn a node at all (walk 19), so `idxContainers` came back
+      ;; empty and every assertion below was vacuous.
+      (is (pos? (boring/encode-buffered! w (vec (range 200))))
           "encodes rather than throwing")
       (let [^longs cs (.idxContainers w)]
         (is (pos? (alength cs)))
@@ -423,15 +614,15 @@
     (let [reg (-> (boring/tag-registry) (boring/register-record-class Widget))
           o {:stringref false :registry reg}
           bs (boring/encode {"w" (->Widget 1 2)} o)]
-      (is (= (boring/decode bs o) (nav/value (nav/source bs o)))
+      (is (= (boring/decode bs o) (nav/value (nav/root bs o)))
           "nav must realise exactly what decode returns")
-      (is (instance? Widget (nav/value (get (nav/source bs o) "w")))
+      (is (instance? Widget (nav/value (get (nav/root bs o) "w")))
           "and a registered record must come back as the record type"))
     (testing "and :max-depth is enforced rather than ignored"
       (let [deep (reduce (fn [acc _] [acc]) [] (range 40))
             bs (boring/encode deep {:stringref false})]
         (is (thrown? clojure.lang.ExceptionInfo
-                     (nav/value (nav/source bs {:stringref false :max-depth 4}))))))))
+                     (nav/value (nav/root bs {:stringref false :max-depth 4}))))))))
 
 (deftest a-failed-read-does-not-poison-the-readers-depth
   (testing "`enter()` incremented before throwing, and only array/map unwind it
@@ -597,14 +788,34 @@
                                                                [(format "k%02d" i) i]))}
             o (assoc opts :index stride :index-min 0)
             idx (boring/build-index (boring/encode v o) o)
-            c (nav/source (boring/encode-indexed v o) opts)]
-        (is (some? idx) "the index must be BUILT, not silently refused -- a
-                         `when` here made every assertion below vanish")
-        (doseq [[cnt slot] (map vector (seq ^ints (:counts idx)) (:slots idx))]
-          (is (= (if (zero? cnt) 0 (inc (quot (dec (long cnt)) (long stride))))
-                 (count slot))
-              (str "stride " stride ": a container of " cnt
-                   " entries must have exactly ceil(n/stride) anchors")))
+            c (nav/root (boring/encode-indexed v o) opts)]
+        ;; AN EMPTY CONTAINER NOW GETS NO NODE AT ALL, which is a stronger
+        ;; guarantee than the one this test was written for and makes the
+        ;; original unreachable: `walk` of an empty container is 0, so it is
+        ;; refused before an anchor array is ever sized. The phantom anchor
+        ;; cannot be produced through any public path any more.
+        ;;
+        ;; `anchorCount(0) == 0` is still asserted, in the only place it is
+        ;; still observable -- the anchor counts of the containers that DO
+        ;; earn nodes -- and the nav assertions below are untouched, because
+        ;; what they cover is a lookup INSIDE an empty container, which is a
+        ;; property of the reader and does not depend on a node existing.
+        (when idx
+          (doseq [[cnt slot] (map vector (seq ^ints (:counts idx)) (:slots idx))]
+            (is (pos? (long cnt)) "no empty container may reach the frame")
+            ;; EITHER OF THE TWO LEGAL STRIDES, as `pack-slots` now checks.
+            ;; Stride is per node: an unsorted map is written at 1 and carries
+            ;; one anchor per entry, so `ceil(n/file-stride)` is the wrong
+            ;; expectation for it -- and the reader tells the two apart by
+            ;; exactly this count.
+            ;; `or`, not a set literal: at stride 1 the two expectations
+            ;; coincide and `#{a a}` throws at read time.
+            (is (or (= (count slot) (inc (quot (dec (long cnt)) (long stride))))
+                    (= (count slot) (long cnt)))
+                (str "stride " stride ": a container of " cnt " entries must have "
+                     (inc (quot (dec (long cnt)) (long stride)))
+                     " anchors at the file's stride or " cnt " at stride 1, got "
+                     (count slot)))))
         (is (= v (nav/value c)) (str "stride " stride ": and the value still reads back"))
         (is (= {} (nav/value (get c "empty-map"))))
         ;; LOOKING INSIDE is the case the first version missed: it only
@@ -852,7 +1063,7 @@
             o (assoc prof :max-depth md)
             decoded? (try (boring/decode bs o) true (catch Exception _ false))]
         (when decoded?
-          (is (some? (try (nav/byte-span (nav/source bs o))
+          (is (some? (try (nav/byte-span (nav/root bs o))
                           (catch Exception _ nil)))
               (str (pr-str v) " shapes=" shapes? " max-depth=" md
                    ": decodes, so it must navigate")))))))
@@ -871,6 +1082,52 @@
         (doseq [md [1 2 3 4 1024]]
           (is (= [1 2 3] (mapv nav/value (nav/items bs (assoc opts :max-depth md))))
               (str "max-depth " md)))))))
+
+(deftest a-valid-index-never-makes-counting-wrong
+  (testing "the ITEM budget, which is the same argument as `:max-depth` above
+            and was written out once then applied to only one of the two
+            limits. The frame's item cost scales with the NODE count, so a
+            500-record log written with default options overran a budget that
+            was generous for its data: `.readFrom` threw, the payload came back
+            nil, `:data-end` was lost with it, and `items` walked past the data
+            section into the frame and reported 501 records for 500.
+
+            A silently wrong COUNT out of a default-written file, and it had no
+            test. This asserts the count itself rather than that the index
+            survived: losing `:data-end` IS the failure, and an index-shaped
+            assertion would not see it.
+
+            What it does NOT pin, stated because the difference is easy to
+            assume away: the item override no longer does anything. Disabling
+            it leaves the whole suite green, and the reason is structural
+            rather than lucky -- `Reader.readFrom` sets `items = 0` on entry,
+            so each payload element is read against a fresh budget, and since
+            the v2 layout every element is ONE item. `sorted` used to be a CBOR
+            array of one boolean per node, and 770 booleans inside a single
+            `readFrom` is what overran a 500-record file's budget. Byte strings
+            removed the scaling, not the override.
+
+            So this guards the INVARIANT -- a caller's budget bounds their
+            data, never boring's own footer -- against whatever is done to the
+            frame next, which is the reason to have it either way."
+    (let [out (ByteArrayOutputStream.)
+          vs (vec (repeat 500 (vec (range 32))))]
+      (boring/write-seq! (boring/writer 65536 opts) vs out (assoc opts :index 16))
+      (let [bs (.toByteArray out)]
+        (doseq [mi [1 10 100 1000 0]]
+          (is (= 500 (count (into [] (nav/items bs (assoc opts :max-items mi)))))
+              (str "max-items " mi ": the caller's budget bounds THEIR data, "
+                   "never boring's own footer")))
+        ;; and it MUST still bound their data. A 32-element record does not fit
+        ;; in a budget of 1, and asking for one there is meant to raise -- the
+        ;; override isolates the frame, it does not lift the limit. Realising is
+        ;; therefore asserted only where the records themselves fit.
+        (doseq [mi [1000 0]]
+          (is (= vs (mapv nav/value (nav/items bs (assoc opts :max-items mi))))
+              (str "max-items " mi ": and the records read back unchanged")))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (mapv nav/value (nav/items bs (assoc opts :max-items 10))))
+            "a record too big for the budget still raises")))))
 
 (deftest build-index-survives-a-long-tag-chain
   (testing "`index-walk` recursed once per tag, so `c0 c0 ... 00` -- legal CBOR,
@@ -954,7 +1211,7 @@
           (let [c (java.util.Arrays/copyOf ^bytes bs (alength ^bytes bs))]
             (aset-byte c i (unchecked-byte v))
             (doseq [k ["k00" "k07" "k19" "nope"]]
-              (is (try (some-> (get (nav/source c opts) k) nav/value) true
+              (is (try (some-> (get (nav/root c opts) k) nav/value) true
                        (catch clojure.lang.ExceptionInfo _ true)
                        (catch Throwable t
                          (println "  untyped" (.getSimpleName (class t))
@@ -1000,7 +1257,7 @@
               v [0x9F 0xBF 0xFB 0xD9 0x5F]]
         (let [c (java.util.Arrays/copyOf bs (alength bs))]
           (aset-byte c i (unchecked-byte v))
-          (is (try (nav/value (nav/source c opts)) true
+          (is (try (nav/value (nav/root c opts)) true
                    (catch clojure.lang.ExceptionInfo _ true)
                    (catch Throwable _ false))
               (str "byte " i " -> " v " must be typed or fine, never untyped")))))))
@@ -1017,9 +1274,26 @@
             an index and reported 1. Which answer you got depended on which API
             you called.
 
-            All four now compare the same seventeen-byte constant."
+            All four now agree on the same gate: sixteen fixed bytes plus an
+            array head of six THROUGH FIFTEEN elements.
+
+            THE ANSWER HAS CHANGED, deliberately. A widened payload used to be
+            refused by every gate, which sounds safe and is not: a reader that
+            does not RECOGNISE a frame never learns `data-end`, so it
+            republishes the frame as a trailing DATA item and a file of N
+            records reads back as N+1. Refusing to USE an index is safe;
+            refusing to SEE one is not. So readers from this version on treat a
+            seven-element frame as a frame -- bounded, index used or refused on
+            its own merits -- and the property asserted here is unchanged: nav
+            and decode-seq must give the SAME answer."
     (let [v (vec (for [i (range 40)] {:e i :a :n/x :v (str "v" i)}))
-          good (boring/encode-indexed v {:index 4 :index-min 4})
+          ;; `:stringref false` PINS THE FIXTURE AT SIX ELEMENTS, which the
+          ;; splice below depends on. With stringref the frame already carries
+          ;; the pointer table and its header is 0x87, so patching it to 0x87
+          ;; and adding an element produced a frame whose declared count was
+          ;; one short -- and the test failed for a reason with nothing to do
+          ;; with the widening it exists to check.
+          good (boring/encode-indexed v {:index 4 :index-min 4 :stringref false})
           ;; Widen the payload header from 0x86 to 0x87 and splice one more
           ;; element (null) in just before the trailing back-pointer, so the
           ;; pointer stays last and every OTHER property of a genuine frame
@@ -1039,13 +1313,16 @@
         (is (not= -1 p) "the genuine file has a locatable footer")
         (is (= 1 (count (boring/decode-seq good))))
         (is (= 1 (count (nav/items good)))))
-      (testing "and the crafted one is refused by both"
-        (is (= -1 (#'boring.frame/footer-start bad))
-            "the byte-level gate refuses it")
+      (testing "and the widened one is RECOGNISED by both, identically"
+        (is (not= -1 (#'boring.frame/footer-start bad))
+            "the byte-level gate accepts six-through-fifteen elements")
         (is (= (count (boring/decode-seq bad)) (count (nav/items bad)))
             "nav and decode-seq report the same number of items")
-        (is (= 2 (count (nav/items bad)))
-            "namely two -- the data and the thing that is not a frame")))))
+        (is (= 1 (count (nav/items bad)))
+            "namely ONE -- the data. The frame is metadata, not a phantom
+             trailing item, which is the whole reason to recognise it")
+        (is (= (first (boring/decode-seq good)) (first (boring/decode-seq bad)))
+            "and the data itself is untouched by the widening")))))
 
 ;; ---------------------------------------------------------------- audit 9
 ;;
@@ -1125,6 +1402,132 @@
               (str "frame bytes that make nav disagree with decode-seq: "
                    (vec (take 5 disagreements)))))))))
 
+(deftest no-bit-of-the-frame-can-produce-an-untyped-failure
+  (testing "the promise that survives trusting the index: a damaged frame may
+            give a WRONG ANSWER, but it may not throw something untyped. An
+            `ArrayIndexOutOfBoundsException` or an `OutOfMemoryError` out of
+            `get` is not inside the boundary; a wrong subtree is.
+
+            The sweep above cannot see this class. It flips ONE bit per byte
+            (`0x01`) and then `(catch Throwable _ :err)` and filters `:err`
+            out -- so a byte needing bits 2-6 is never reached, and anything
+            that does throw is discarded as uninteresting. This asserts on the
+            throwable instead of discarding it, and flips every bit.
+
+            What it found: `slot-at` allocated `long[m]` from `count-at` -- a
+            raw sint32 load off the wire -- BEFORE the bound check that refuses
+            it. One flipped bit in the counts array reached 2^31-1, and
+            `OutOfMemoryError` is an Error, so it walked through
+            `index-payload`'s catch, `read-index`'s catch, and out of `get`.
+            Reproduced on a blob boring itself wrote."
+    ;; MANY NODES, in both fixtures. The first version of this swept a 40-key
+    ;; map of ints and a `write-seq!` of 2-key records: n = 1 in BOTH, because
+    ;; a map of scalars is one container and `:index-min` excluded the records.
+    ;; So `width-code`, `slot-start` and `sorted-at?` were only ever evaluated
+    ;; at i = 0, where `(quot i 4)` and `(quot i 8)` are zero and the start
+    ;; table has exactly two entries -- the whole per-node table machinery sat
+    ;; outside the sweep it was supposed to be inside.
+    (let [o (assoc opts :index 1 :index-min 2)
+          ;; TWENTY-ONE NODES, AND BOTH STRIDES. The previous fixture -- 60
+          ;; three-entry maps -- collapsed to ONE node the moment the writer
+          ;; started refusing containers a scan crosses cheaply, which is
+          ;; exactly the degeneracy this test was rewritten to remove: at one
+          ;; node, `width-code` and `sorted-at?` are only ever evaluated at
+          ;; i = 0, the start table has a single span, and the whole per-node
+          ;; machinery sits outside the sweep that is supposed to cover it.
+          ;;
+          ;; That collapse is why `a-declared-stride-cannot-overflow-the-span-
+          ;; arithmetic` below had to be written by hand: the defect lived in
+          ;; `span`, which a one-node frame reaches with anchor 0 only.
+          ;;
+          ;; This shape keeps 21: an outer array at the file's stride beside
+          ;; twenty inner maps at stride 1 (unsorted, and large enough to clear
+          ;; the anchor budget). Width codes then span 6 bytes and the sorted
+          ;; bitset 3, so both are indexed well past their first byte.
+          doc {"A" (vec (for [_ (range 20)]
+                          (into {} (for [j (range 20)]
+                                     [(format "k%02d" j) (vec (range 6))]))))
+               "B" (vec (for [_ (range 12)] (vec (range 80))))}
+          ^bytes flat (boring/encode-indexed doc o)
+          ^bytes seq-bs (seal (mapv #(hash-map :id % :name (str "r" %)) (range 60))
+                              (assoc opts :index 1 :index-min 2))
+          typed? (fn [t] (and (instance? clojure.lang.ExceptionInfo t)
+                              (keyword? (:type (ex-data t)))
+                              (= "boring" (namespace (:type (ex-data t))))))
+          probe (fn [label ^bytes c f]
+                  (try (f c) nil
+                       (catch Throwable t
+                         (when-not (typed? t)
+                           [label (.getSimpleName (class t)) (.getMessage t)]))))
+          sweep (fn [^bytes clean from ops]
+                  (for [i (range from (alength clean))
+                        bit (range 8)
+                        :let [c (aclone clean)
+                              _ (aset-byte c i (unchecked-byte
+                                                (bit-xor (aget clean i)
+                                                         (bit-shift-left 1 bit))))]
+                        [label f] ops
+                        :let [bad (probe label c f)]
+                        :when bad]
+                    (into [i bit] bad)))
+          flat-bad (sweep flat (long (#'boring.frame/footer-start flat))
+                          [[:nth-deep (fn [c] (some-> (nav/walk (nav/root c opts) [59 "k2"]) nav/value))]
+                           [:nth-mid (fn [c] (some-> (nav/walk (nav/root c opts) [37 "k1"]) nav/value))]
+                           [:value (fn [c] (nav/value (nav/root c opts)))]])
+          seq-bad (sweep seq-bs (long (body-len seq-bs))
+                         [[:items-count (fn [c] (count (nav/items c opts)))]
+                          [:items-reduce (fn [c] (reduce (fn [n _] (inc n)) 0 (nav/items c opts)))]
+                          [:nth (fn [c] (nav/value (nth (nav/items c opts) 30 nil)))]])]
+      (is (empty? flat-bad)
+          (str "untyped failures from an encode-indexed frame: "
+               (vec (take 4 flat-bad))))
+      (is (empty? seq-bad)
+          (str "untyped failures from a write-seq! frame: "
+               (vec (take 4 seq-bad)))))))
+
+(deftest a-declared-stride-cannot-overflow-the-span-arithmetic
+  (testing "`lookup-map` computes `(* anchor stride)` on primitive longs, and
+            Clojure's `*` on longs THROWS on overflow. A frame declaring a
+            stride near 2^63 therefore raised a raw ArithmeticException out of
+            `get` -- the untyped failure this namespace promises cannot happen.
+
+            IT WAS UNREACHABLE UNTIL THE ANCHOR COUNT STOPPED DEPENDING ON THE
+            STRIDE. `slot-at` used to derive `m` as `anchor-count(count,
+            stride)`, which clamps to 1 for any huge stride, so `span` could
+            only ever compute `0 * stride`. Deriving `m` from the start table
+            instead -- which per-node stride requires -- removed a coupling
+            that was accidental and load-bearing at once.
+
+            A single flipped bit cannot express this: widening a CBOR head from
+            one byte to nine is a multi-byte edit, which is why the every-bit
+            sweep is green on the same file. Constructed by hand for that
+            reason.
+
+            The stride is now bounded above by what the writer can emit, so a
+            frame declaring more is refused and the file answers by scanning."
+    (let [v {"sorted" (into {} (for [i (range 120)]
+                                 [(format "s%03d" i) (str "v5-" i)]))}
+          o {:profile :canonical :index 16 :index-min 2}
+          bs (boring/encode-indexed v o)
+          p (long (#'boring.frame/footer-start bs))
+          ;; The stride is the payload's first element, right after the 17-byte
+          ;; prefix. Replace its one byte with a 9-byte uint64.
+          at (+ p 17)
+          out (byte-array (+ (alength ^bytes bs) 8))]
+      (System/arraycopy bs 0 out 0 at)
+      (aset-byte out at (unchecked-byte 0x1b))
+      (aset-byte out (+ at 1) (unchecked-byte 0x40))
+      (System/arraycopy bs (inc at) out (+ at 9) (- (alength ^bytes bs) at 1))
+      (is (not (some? (:containers (#'boring.nav/read-index
+                                    (#'boring.nav/nav-of out o)))))
+          "a stride the writer could never emit must be refused")
+      (doseq [k ["s000" "s050" "s119"]]
+        (is (= (str "v5-" (Long/parseLong (subs k 1)))
+               (nav/value (get (get (nav/root out o) "sorted") k)))
+            (str k ": and every key still answers, by scanning")))
+      (is (nil? (get (get (nav/root out o) "sorted") "zzz9"))
+          "and an absent key is still absent, not an exception"))))
+
 (deftest a-lookup-miss-is-re-derived-by-walking
   (testing "Validation proves the FIRST anchor is a real entry and that the
             anchors ascend and sit in range. It cannot prove a MIDDLE one is an
@@ -1138,7 +1541,13 @@
             which costs only on genuine misses and makes this namespace's
             promise -- a stale index falls back to walking and returns the same
             answer -- true for a DAMAGED one too."
-    (let [m (into {} (for [i (range 40)] [(format "k%02d" i) i]))
+    ;; EIGHTY, not forty. Forty scalar pairs walk 39, below the threshold at
+    ;; which a node is written at all, so there was no frame left to damage and
+    ;; the byte hunt below indexed at -1. Eighty walks 79 and clears it while
+    ;; leaving every byte this test depends on unchanged: the keys are still
+    ;; three characters, the first entries still five bytes, so the needle and
+    ;; the expected anchors are the same.
+    (let [m (into {} (for [i (range 80)] [(format "k%02d" i) i]))
           o {:profile :canonical}
           bs (boring/encode-indexed m (assoc o :index 4 :index-min 4))
           ;; The node's anchors are 2, 22, 42, 62 ... so its deltas are
@@ -1160,20 +1569,24 @@
                 by the index being rejected, which would prove nothing about
                 the lookup path"
         (is (some? at) "the slot's delta bytes were found")
-        (let [ix (#'boring.nav/read-index (#'boring.nav/nav-of damaged o))]
-          (is (some? (:raw-slots ix)) "the damaged index is accepted")
+        (let [nv (#'boring.nav/nav-of damaged o)
+              ix (#'boring.nav/read-index nv)]
+          ;; `:containers`, not `:slots`. Both are non-nil on an accepted index
+          ;; today, but only `:containers` MEANS accepted -- `:slots` means
+          ;; "slots is present", which stays true for shapes that are refused.
+          (is (some? (:containers ix)) "the damaged index is accepted")
           ;; Slots are expanded on demand now, so ask for node 0 rather than
           ;; reading a pre-expanded vector.
           (is (= [2 22 43 62 82 102]
-                 (vec (take 6 (#'boring.nav/slot-at ix 0))))
+                 (vec (take 6 (#'boring.nav/slot-at (.rdr nv) ix 0))))
               "and anchor[2] really is one byte off")))
       (testing "yet every present key still reads back correctly"
-        (let [src (nav/source damaged o)]
-          (doseq [i (range 40)]
+        (let [src (nav/root damaged o)]
+          (doseq [i (range 80)]
             (is (= i (some-> (get src (format "k%02d" i)) nav/value))
                 (format "k%02d" i)))))
       (testing "and an absent key is still absent"
-        (is (nil? (get (nav/source damaged o) "nope")))))))
+        (is (nil? (get (nav/root damaged o) "nope")))))))
 
 ;; ------------------------------------------ the property, not another case
 ;;
@@ -1230,32 +1643,28 @@
        (catch clojure.lang.ExceptionInfo e {:typed (:type (ex-data e))})
        (catch Throwable t {:untyped (class t)})))
 
-(deftest damage-never-makes-the-two-readers-disagree
-  (testing "mutate arbitrary bytes of a sealed file and require that `nav` --
-            which consults the index -- and `decode-seq` -- which does not --
-            never both succeed with different answers. That is exactly the
-            shape of every index defect found so far, and none of them would
-            have survived this."
+(deftest damage-inside-the-frame-never-fails-untyped
+  (testing "mutate arbitrary bytes of a sealed file's FRAME and require that
+            neither reader ever fails untyped, and that the reader which
+            consults no index is unaffected.
+
+            This asserted more once: that `nav` and `decode-seq` never both
+            succeed with different answers. That property is gone deliberately.
+            The index is now a TRUST BOUNDARY outright -- we use it only where
+            we are willing to trust it -- so a damaged frame may hand back a
+            wrong answer, and the per-node and per-anchor validation that made
+            it not do so has been removed. It cost O(stride) skips per jump
+            plus two `boolean[]` per open, to defend against corruption that
+            the storage layer beneath us is already responsible for.
+
+            What remains is the half that is not negotiable, because it is not
+            about answers but about staying inside the file: no untyped
+            exception, ever, and no read past the buffer. That is bought by the
+            O(1) frame-structure checks, which is exactly why THOSE stay while
+            the per-node walks go."
     (let [vs (vec (for [i (range 60)] {:id i :name (str "rec-" i) :tags [i (inc i)]}))
           ^bytes clean (seal vs opts)
           n (alength clean)
-          ;; DAMAGE INSIDE THE FRAME, and the boundary is the point.
-          ;;
-          ;; The index is a claim ABOUT the data section. Validating that claim
-          ;; against the data it describes is cheap and complete only at the
-          ;; ends: `footer-start` pins the frame, `anchor[0] = 0` pins the
-          ;; start, and the end check pins the last stride. Proving a MIDDLE
-          ;; anchor is an item boundary means walking to it, which is the work
-          ;; the index exists to avoid -- so damage to the DATA that shifts item
-          ;; boundaries can leave every anchor after it stale, and measurably
-          ;; does: zeroing byte 0 of this fixture makes `nth` disagree with
-          ;; `decode-seq` on 44 of 60 items, from anchor 1 onward.
-          ;;
-          ;; That is the trust boundary doc/SHAPES.md already states, and
-          ;; closing it costs a validating walk on every lookup. What must
-          ;; hold, and what this asserts, is the half that is affordable: when
-          ;; the INDEX is what is damaged, the reader that consults it and the
-          ;; reader that ignores it never disagree.
           frame-at (long (#'boring.frame/footer-start clean))
           gen-site (gen/choose frame-at (dec n))
           gen-damage (gen/vector (gen/tuple gen-site (gen/choose 0 255)) 1 4)
@@ -1280,10 +1689,20 @@
               (let [a (nav-items-or-error c)
                     b (seq-items-or-error c)]
                 (and
-                 ;; Neither reader may fail untyped, whatever the bytes say.
+                 ;; NEITHER READER MAY FAIL UNTYPED, whatever the bytes say.
+                 ;; This is the half that survives trusting the index, and it
+                 ;; is not free -- it is what the O(1) frame-structure checks
+                 ;; buy. A lying length with no check sends `byteAt` into the
+                 ;; back-pointer or past the buffer, which is how a raw
+                 ;; ArrayIndexOutOfBoundsException came out of `get`.
                  (nil? (:untyped a)) (nil? (:untyped b))
-                 ;; And where both produce values, the values must match, item
-                 ;; for item, for as far as both got.
+                 ;; AND THE INDEX-FREE READER IS UNAFFECTED. Damage is confined
+                 ;; to the frame, so `decode-seq` -- which consults no index --
+                 ;; must still produce the true records. It may produce one
+                 ;; MORE than there are records, because damage that makes the
+                 ;; frame undetectable republishes it as a trailing data item;
+                 ;; what it may never do is change a record.
+                 ;;
                  ;; COMPARED BY RE-ENCODING, which is the only oracle strong
                  ;; enough here. Three earlier versions of this property
                  ;; reported disagreements that were not: `=` treats the Java
@@ -1293,18 +1712,13 @@
                  ;; `contains?`, which cannot match a `byte[]` KEY -- which
                  ;; damaged bytes readily produce. Each failure was in the
                  ;; comparison, not the library.
-                 ;;
-                 ;; The wire is the ground truth this is about anyway: two
-                 ;; values that re-encode to the same bytes are the same value
-                 ;; for every purpose boring has.
-                 (or (not (and (contains? a :ok) (contains? b :ok)))
-                     (let [xs (:ok a) ys (:ok b)]
-                       (and (= (count xs) (count ys))
-                            (= (mapv re-encode xs) (mapv re-encode ys)))))))))
+                 (or (not (contains? b :ok))
+                     (= (mapv re-encode vs)
+                        (mapv re-encode (take (count vs) (:ok b)))))))))
            ;; Pinned so CI is deterministic -- see the note on the case count.
            :seed 1785873600000)]
       (is (:pass? result)
-          (str "a damaged file where the two readers disagree: "
+          (str "a damaged frame that failed untyped or changed a record: "
                (pr-str (:shrunk result))))))
 
   (testing "the control: undamaged, both readers agree AND the index is really
@@ -1319,6 +1733,120 @@
       (is (= (inc (count vs)) (count (reader-loop clean)))
           "and a bare Reader sees one MORE item -- the frame -- which is what
            makes `decode-seq` a real second opinion rather than the same code"))))
+
+(defn- probe-or-error
+  "Look up a KEY inside each indexed map, which is the path that goes through
+  `node-slot`, `slot-at`, the per-node width codes and the delta run. Realising
+  the whole document instead walks it start to finish and consults none of
+  that -- which is how a many-node index can be badly wrong and still look
+  fine."
+  [^bytes bs paths o]
+  (try (let [src (nav/root bs o)]
+         {:ok (mapv (fn [p] (some-> (nav/walk src p) nav/value)) paths)})
+       (catch clojure.lang.ExceptionInfo e {:typed (:type (ex-data e))})
+       (catch Throwable t {:untyped (class t)})))
+
+(deftest many-node-damage-never-makes-a-lookup-wrong
+  (testing "the same property as `damage-never-makes-the-two-readers-disagree`,
+            on a frame with MANY nodes instead of one.
+
+            That test seals with `write-seq!` over records too small to index,
+            so its frame has exactly one node -- the sequence. A one-node frame
+            cannot express a bad node index, a mis-ordered start table, or a
+            width code belonging to a different node, and those are precisely
+            the failures the dense per-node layout makes possible and the ones
+            an offsets-based reader will no longer get a free JVM bounds check
+            against.
+
+            41 nodes here: 40 maps of 20 entries, plus the vector holding them.
+
+            WHAT IT ASSERTS is no untyped failure and no read outside the file,
+            NOT that the answers stay right. A trusted index that has been
+            damaged may hand back a wrong value or report a present key absent;
+            that is what trusting it means. The one-slot property that remains
+            is the one the O(1) frame-structure checks buy, and it is the reason
+            those checks stay when the per-node walks go -- a lying length with
+            nothing checking it sends `byteAt` into the back-pointer or past the
+            buffer, which is how a raw ArrayIndexOutOfBoundsException came out
+            of `get`.
+
+            The index-free reader is the control: `decode` consults no index, so
+            frame damage may never change what IT sees."
+    ;; THE VALUES ARE STRINGS, not integers. An unsorted map is indexed only
+    ;; at stride 1, where it costs ONE ANCHOR PER ENTRY -- so it earns a node
+    ;; only when those anchors are a small share of the container. Twenty
+    ;; scalar pairs are ~140 bytes against 20 anchors, which is not, and the
+    ;; fixture collapsed to a single node again. Twelve-character values put
+    ;; the container comfortably over.
+    (let [doc (vec (for [i (range 40)]
+                     (into {} (for [j (range 20)]
+                                ;; ITEM-RICH: an unsorted map earns a node on
+                                ;; the items a lookup skips per entry, not on
+                                ;; the bytes, so a bare string value left this
+                                ;; fixture with one node -- exactly the
+                                ;; collapse the comment above warns about.
+                                [(format "k%02d" j)
+                                 (vec (repeat 8 (format "v%03d-%06d"
+                                                        j (+ (* 100 i) j))))]))))
+          ;; STRIDE 1, not 16. The inner maps are UNSORTED, and an unsorted
+          ;; map cannot be binary-searched -- so above stride 1 `boring.nav`
+          ;; refuses its node and the writer no longer emits one. At stride 16
+          ;; this fixture collapsed to a single node, the outer vector, and
+          ;; "many nodes, which is the whole point of this fixture" was true of
+          ;; nothing. At stride 1 the nodes are usable and all 41 are written.
+          o (assoc opts :index 1 :index-min 4)
+          ^bytes clean (boring/encode-indexed doc o)
+          n (alength clean)
+          frame-at (long (#'boring.frame/footer-start clean))
+          ;; Across nodes and across positions within a node. Every entry is an
+          ;; anchor at stride 1, so these no longer separate anchor from
+          ;; mid-stride; they still separate first, middle and last.
+          paths (vec (for [i [0 1 17 39] j ["k00" "k07" "k19"]] [i j]))
+          gen-damage (gen/vector (gen/tuple (gen/choose frame-at (dec n))
+                                            (gen/choose 0 255))
+                                 1 4)
+          result
+          (tc/quick-check
+           2000
+           (prop/for-all
+            [damage gen-damage]
+            (let [c (java.util.Arrays/copyOf clean n)]
+              (doseq [[i v] damage] (aset-byte c (int i) (unchecked-byte (int v))))
+              (let [a (probe-or-error c paths o)]
+                (and (nil? (:untyped a))
+                     ;; the index-free reader must be untouched by frame damage
+                     (= doc (try (boring/decode c o) (catch Throwable _ ::threw)))))))
+           :seed 1785873600000)]
+      (is (:pass? result)
+          (str "a damaged frame that failed untyped, or reached the decoder: "
+               (pr-str (:shrunk result))))))
+
+  (testing "the control: undamaged, the index really is in use and really is
+            many-node -- without this the property could pass on a frame that
+            never had more than one node to get wrong"
+    (let [doc (vec (for [i (range 40)]
+                     (into {} (for [j (range 20)]
+                                ;; ITEM-RICH: an unsorted map earns a node on
+                                ;; the items a lookup skips per entry, not on
+                                ;; the bytes, so a bare string value left this
+                                ;; fixture with one node -- exactly the
+                                ;; collapse the comment above warns about.
+                                [(format "k%02d" j)
+                                 (vec (repeat 8 (format "v%03d-%06d"
+                                                        j (+ (* 100 i) j))))]))))
+          ;; Stride 1, matching the property above and for the same reason:
+          ;; these inner maps are unsorted, and an unsorted map earns no node
+          ;; above stride 1 because the reader would refuse it anyway.
+          o (assoc opts :index 1 :index-min 4)
+          ^bytes clean (boring/encode-indexed doc o)
+          ix (#'boring.nav/read-index (#'boring.nav/nav-of clean o))]
+      (is (some? (:containers ix)) "the index is accepted")
+      ;; `:containers` is the NODE COUNT now, not the long[] -- the array is a
+      ;; byte offset into the frame and there is nothing to `alength`.
+      (is (< 1 (long (:containers ix)))
+          "and has many nodes, which is the whole point of this fixture")
+      (is (= "v007-001907" (some-> (nav/walk (nav/root clean o) [19 "k07" 0]) nav/value))
+          "and a key in a middle node reads correctly"))))
 
 (deftest a-sequence-node-claiming-no-items-must-be-backed-by-no-data
   (testing "A node with zero items has zero anchors, so the far-end check
@@ -1372,8 +1900,8 @@
   (testing "`lookup-map`'s indexed branch, which nothing depended on"
     (let [o {:profile :canonical}
           m (into {} (for [i (range 200)] [(format "k%03d" i) i]))
-          indexed (nav/source (boring/encode-indexed m (assoc o :index 8 :index-min 8)) o)
-          plain (nav/source (boring/encode m o) o)]
+          indexed (nav/root (boring/encode-indexed m (assoc o :index 8 :index-min 8)) o)
+          plain (nav/root (boring/encode m o) o)]
       (testing "both find the key -- the index changes the work, not the answer"
         (is (= 150 (nav/value (get indexed "k150"))))
         (is (= 150 (nav/value (get plain "k150")))))
@@ -1390,8 +1918,8 @@
   (testing "`nth-item`'s indexed branch, which nothing depended on either"
     (let [o {:profile :canonical}
           v (vec (range 200))
-          indexed (nav/source (boring/encode-indexed v (assoc o :index 8 :index-min 8)) o)
-          plain (nav/source (boring/encode v o) o)]
+          indexed (nav/root (boring/encode-indexed v (assoc o :index 8 :index-min 8)) o)
+          plain (nav/root (boring/encode v o) o)]
       (testing "both reach the element"
         (is (= 150 (nav/value (nth indexed 150))))
         (is (= 150 (nav/value (nth plain 150)))))
@@ -1421,18 +1949,39 @@
                                  (boring/write-indexed! w v out (merge o opts))
                                  (.toByteArray out)))
           walk (fn [v opts] (boring/encode-indexed v (merge o opts)))
+          ;; NO FRAME IS A LEGITIMATE ANSWER, and became a common one when
+          ;; the writer started refusing nodes a scan does not need.
+          ;; `footer-start` returns -1 for a file without one, and reading
+          ;; there is `:boring/truncated-input` -- an error that says the
+          ;; document is broken when in fact it is fine and simply has no
+          ;; index.
           nodes (fn [^bytes bs]
                   (let [p (long (#'boring.frame/footer-start bs))]
-                    (count (vec (nth (boring.data/frame-payload
-                                      (.readFrom (Reader. bs) p)) 1)))))]
+                    (if (neg? p)
+                      0
+                      (count (vec (nth (boring.data/frame-payload
+                                        (.readFrom (Reader. bs) p)) 1))))))]
+      ;; THE NODE COUNTS ARE THE POINT OF THIS LIST, and they moved when the
+      ;; writer started refusing nodes a scan does not need. Refusing is not a
+      ;; free change to a test whose second assertion exists to stop it passing
+      ;; on two empty indexes -- so the fixtures are chosen to still EARN
+      ;; nodes, and the counts below are what the rule produces, checked one by
+      ;; one rather than pasted from the failure.
+      ;;
+      ;;   flat map    130 sorted scalar pairs, walk 129 -> the map is indexed
+      ;;   vec of maps the outer array walks 72 (five items an entry); the
+      ;;               two-entry inner maps walk 2 and are not worth a node
+      ;;   nested      the 20-entry L1 map walks 228; the 20-element vectors
+      ;;               under it walk 19 and are refused, as is the 1-entry root
+      ;;   map of vecs the root walks 209; its 20-element vectors walk 19
       (doseq [[label v expect-nodes]
-              [["flat map"    (into {} (for [i (range 40)] [(format "k%02d" i) i])) 1]
+              [["flat map"    (into {} (for [i (range 130)] [(format "k%03d" i) i])) 1]
                ["vec of maps" (vec (for [i (range 30)] {"a" i "b" (str i)}))        1]
                ["nested"      {"L1" (into {} (for [i (range 20)]
                                                [(format "m%02d" i)
-                                                {"L3" (vec (range 20))}]))}       21]
+                                                {"L3" (vec (range 20))}]))}        1]
                ["map of vecs" (into {} (for [i (range 20)]
-                                         [(format "v%02d" i) (vec (range 20))]))  21]]
+                                         [(format "v%02d" i) (vec (range 20))]))   1]]
               stride [4 16]]
         (let [c (capture v {:index stride :index-min 4})
               w (walk v {:index stride :index-min 4})]
@@ -1440,7 +1989,7 @@
               (str label " at stride " stride ": the two builders must agree byte for byte"))
           (is (= expect-nodes (nodes w))
               (str label ": and the index must be non-trivial -- " expect-nodes " nodes"))
-          (is (= (nav/value (nav/source c o)) (nav/value (nav/source (boring/encode v o) o)))
+          (is (= (nav/value (nav/root c o)) (nav/value (nav/root (boring/encode v o) o)))
               (str label ": and both must read back as the plain encoding")))))))
 
 (deftest the-two-index-builders-agree-across-profiles-strides-and-frames
@@ -1476,13 +2025,18 @@
           walk (fn [v opts] (boring/encode-indexed v opts))
           payload (fn [^bytes bs]
                     (let [p (long (#'boring.frame/footer-start bs))]
-                      (boring.data/frame-payload (.readFrom (Reader. bs) p))))
+                      (when-not (neg? p)
+                        (boring.data/frame-payload (.readFrom (Reader. bs) p)))))
+          ;; `::none` rather than nil or a throw -- see the `nodes` helper
+          ;; above. Two files that BOTH have no frame still have to compare
+          ;; equal, which is the case the sweep hits most often now.
           shape (fn [^bytes bs]
-                  (let [p (payload bs)]
+                  (if-some [p (payload bs)]
                     {:stride (nth p 0)
                      :containers (vec (nth p 1))
                      :counts (vec (nth p 2))
-                     :sorted (vec (nth p 4))}))]
+                     :sorted (vec (nth p 4))}
+                    ::none))]
       (doseq [[label v]
               [["vec of maps"  (vec (for [i (range 30)] {"a" i "b" (str i)}))]
                ["nested"       {"L1" (into {} (for [i (range 20)]
@@ -1517,9 +2071,124 @@
               (str tag ": and therefore the same file, byte for byte"))
           ;; Both must still READ as the plain value, so a builder cannot be
           ;; made to agree by making both of them wrong.
-          (is (= (nav/value (nav/source c o))
-                 (nav/value (nav/source (boring/encode v o) o)))
+          (is (= (nav/value (nav/root c o))
+                 (nav/value (nav/root (boring/encode v o) o)))
               (str tag ": and the file must read back as the plain encoding")))))))
+
+(deftest the-two-index-builders-agree-on-shaped-arrays
+  (testing "`...-across-profiles-strides-and-frames` above sweeps profile x
+            stride x :index-min, and it CANNOT SET `:shapes`. Only the
+            `:clojure` profile permits it -- the other four pin it false and
+            refuse the override -- so a value that becomes a shaped array is
+            outside that sweep entirely, and the two builders disagreed there.
+
+            `writeShapedArray` emitted its arrays through bare `head()` and
+            captured no node, while the byte walk descended tag 39649 and noded
+            all four arrays inside it. Measured on this fixture at the
+            defaults: `write-indexed!` gave 157 bytes and NO FRAME,
+            `encode-indexed` gave 209 and one node of 30. Two builders, two
+            files, one value -- the format having two readings.
+
+            The walk was right. `boring.nav` descends a shaped array
+            structurally through `shaped-view`, so a node on the ROWS array is
+            reachable: 5000 rows, reading the last, 190.66 us unindexed against
+            35.80 indexed -- 5.3x for 365 bytes on a 48 KB document. (Contrast
+            `frame-payload-array?`, where the node IS dropped, because a tag-27
+            payload is realised opaquely and could never use one.)
+
+            Swept over buffer size as well, since the shaped path writes four
+            nested containers and a flush inside any of them would move an
+            offset the other builder computes differently."
+    (let [capture (fn [v opts buf]
+                    (let [w (boring/writer buf opts)
+                          out (ByteArrayOutputStream.)]
+                      (boring/write-indexed! w v out opts)
+                      (.toByteArray out)))]
+      (doseq [[label v]
+              [["shaped flat"   (vec (for [i (range 30)] {"a" i "b" (str i)}))]
+               ["shaped wide"   (vec (for [i (range 40)]
+                                       (into {} (for [k (range 20)]
+                                                  [(str "k" k) (+ i k)]))))]
+               ;; A shaped array nested under a map, and rows whose VALUES are
+               ;; containers -- so the walk has nodes above and below it.
+               ["shaped nested" {"rows" (vec (for [i (range 30)]
+                                               {"a" i "b" (vec (range 20))}))}]
+               ["shaped in vec" (vec (for [_ (range 3)]
+                                       (vec (for [i (range 20)] {"x" i "y" (str i)}))))]
+               ;; Heterogeneous keys, so `homogeneousShape` returns null and the
+               ;; ORDINARY path runs. The control: it must pass identically.
+               ["not shaped"    (vec (for [i (range 30)] {"a" i (str "b" i) i}))]
+               ["mixed"         {"s" (vec (for [i (range 25)] {"p" i "q" i}))
+                                 "plain" (vec (range 40))}]]
+              shapes [true false]
+              stride [1 4 16]
+              min-entries [2 4 16]
+              ;; 16 forces a flush inside every one of these values.
+              buf [65536 16]]
+        (let [o {:profile :clojure :stringref false :shapes shapes
+                 :index stride :index-min min-entries}
+              tag (str label " | shapes " shapes " | stride " stride
+                       " | :index-min " min-entries " | buffer " buf)
+              c (capture v o buf)
+              w (boring/encode-indexed v o)]
+          (is (= (seq c) (seq w))
+              (str tag ": the two builders must agree byte for byte"))
+          (is (= (nav/value (nav/root c o)) v)
+              (str tag ": and the file must read back as the value")))))))
+
+(deftest nothing-inside-a-map-key-or-a-set-is-indexed
+  (testing "`boring.nav` cannot reach either, so a node there is bytes nothing
+            can read -- and the two index builders disagreed about whether to
+            write them.
+
+            A map entry is handed out as `MapEntry(realize(key), cursor(val))`,
+            so a KEY is never a cursor; and a set is realised whole, so
+            `(get set-cursor 0)` is nil. Same argument as the tag-27 frame's
+            own `[name, args]` array, which `frame-payload-array?` has always
+            dropped for exactly this reason.
+
+            THE DIVERGENCE: canonical maps and sets stage their keys and
+            elements through a scratch writer that never indexes, so the writer
+            emitted nothing there while the byte walk descended and emitted
+            nodes. Same value, two files -- 193 bytes against 245. Plain maps
+            had the mirror problem: both builders agreed, and both were writing
+            nodes nothing could use.
+
+            Invisible to the agreement sweep because none of its fixtures put a
+            CONTAINER in a key or in a set. That is the whole reason this
+            exists as its own test."
+    (let [heavy (vec (for [i (range 17)] (vec (range i (+ i 10)))))
+          capture (fn [v opts]
+                    (let [w (boring/writer 65536 opts)
+                          out (ByteArrayOutputStream.)]
+                      (boring/write-indexed! w v out opts)
+                      (.toByteArray out)))
+          nodes (fn [^bytes bs opts]
+                  (let [ix (#'boring.nav/read-index (#'boring.nav/nav-of bs opts))]
+                    (if (:containers ix) (:n ix) 0)))]
+      (doseq [profile [:canonical :archival :clojure :canonical-rfc7049]
+              [label v indexed?]
+              [["container as a map KEY"   {heavy 0} false]
+               ["container in a SET"       #{heavy 1} false]
+               ["a SET as a map value"     {"s" #{heavy 1}} false]
+               ;; The controls: the same container as a map VALUE, and inside a
+               ;; plain vector, must still earn its node.
+               ["container as a map VALUE" {0 heavy} true]
+               ["container in a VECTOR"    [heavy] true]]]
+        (let [o (cond-> {:profile profile :index 16 :index-min 2}
+                  (not (#{:canonical :canonical-rfc7049 :archival} profile))
+                  (assoc :stringref false))
+              tag (str label " | " profile)
+              c (capture v o)
+              w (boring/encode-indexed v o)]
+          (is (= (seq c) (seq w))
+              (str tag ": the two builders must agree byte for byte"))
+          (if indexed?
+            (is (pos? (long (nodes w o))) (str tag ": must still earn a node"))
+            (is (zero? (long (nodes w o)))
+                (str tag ": must earn NO node -- nothing there is reachable")))
+          (is (= v (nav/value (nav/root c o)))
+              (str tag ": and the value still reads back")))))))
 
 (deftest indexed-and-unindexed-agree-across-shapes
   (testing "the correctness spine: for every container shape, stride and
@@ -1532,8 +2201,8 @@
             profile [:canonical :clojure]]
       (let [o (cond-> {:profile profile} (= profile :clojure) (assoc :stringref false))
             m (into {} (for [i (range n)] [(format "k%04d" i) i]))
-            ix (nav/source (boring/encode-indexed m (assoc o :index stride :index-min 1)) o)
-            pl (nav/source (boring/encode m o) o)]
+            ix (nav/root (boring/encode-indexed m (assoc o :index stride :index-min 1)) o)
+            pl (nav/root (boring/encode m o) o)]
         (doseq [k (keys m)]
           (is (= (some-> (get ix k) nav/value) (some-> (get pl k) nav/value))
               (str "map n=" n " stride=" stride " " profile " key " k)))
@@ -1541,8 +2210,8 @@
             (str "map n=" n " stride=" stride " " profile ": and an absent key stays absent")))
       (let [o (cond-> {:profile profile} (= profile :clojure) (assoc :stringref false))
             v (vec (range n))
-            ix (nav/source (boring/encode-indexed v (assoc o :index stride :index-min 1)) o)
-            pl (nav/source (boring/encode v o) o)]
+            ix (nav/root (boring/encode-indexed v (assoc o :index stride :index-min 1)) o)
+            pl (nav/root (boring/encode v o) o)]
         (dotimes [i n]
           (is (= (nav/value (nth ix i)) (nav/value (nth pl i)))
               (str "vec n=" n " stride=" stride " " profile " idx " i)))))))
@@ -1563,7 +2232,7 @@
     (let [o {:profile :canonical}
           m (into {} (for [i (range 200)] [(format "k%03d" i) i]))
           bs (boring/encode-indexed m (assoc o :index 8 :index-min 8))
-          walked (fn [opts k] (let [c (nav/source bs opts)]
+          walked (fn [opts k] (let [c (nav/root bs opts)]
                                 (nav/skips c 0)
                                 [(nav/value (get c k)) (nav/skips c)]))
           [tv trusted-skips] (walked o "k150")
@@ -1575,7 +2244,7 @@
         (is (< (* 4 trusted-skips) scan-skips)
             (str "trusted " trusted-skips " skips, ignored " scan-skips)))
       (testing "and every key still reads back under `:ignore`"
-        (let [c (nav/source bs (assoc o :trust-index :ignore))]
+        (let [c (nav/root bs (assoc o :trust-index :ignore))]
           (doseq [i (range 0 200 17)]
             (is (= i (nav/value (get c (format "k%03d" i))))))))
       (testing "an unimplemented or misspelt value is refused rather than
@@ -1584,7 +2253,7 @@
                 be worse than not offering it"
         (doseq [bad [:validate :nope "trusted" nil]]
           (is (= :boring/bad-option
-                 (try (do (nav/source bs (assoc o :trust-index bad)) nil)
+                 (try (do (nav/root bs (assoc o :trust-index bad)) nil)
                       (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
               (pr-str bad)))))))
 
@@ -1597,13 +2266,13 @@
           o {:stringref false}
           bs (boring/encode-indexed m (assoc o :index 16))]
       (doseq [k (map #(format "k%03d" %) (range 200))]
-        (is (= (some-> (get (nav/source bs o) k) nav/value)
-               (some-> (get (nav/source bs (assoc o :trust-index :trusted)) k)
+        (is (= (some-> (get (nav/root bs o) k) nav/value)
+               (some-> (get (nav/root bs (assoc o :trust-index :trusted)) k)
                        nav/value))
             (str "trusted and validated must agree on " k)))
       (testing "and an absent key is absent under both"
-        (is (nil? (get (nav/source bs o) "nope")))
-        (is (nil? (get (nav/source bs (assoc o :trust-index :trusted)) "nope")))))))
+        (is (nil? (get (nav/root bs o) "nope")))
+        (is (nil? (get (nav/root bs (assoc o :trust-index :trusted)) "nope")))))))
 
 (deftest validation-is-per-node-not-per-index
   (testing "an unsound node must not disable the index for containers that are
@@ -1613,11 +2282,19 @@
              "b" (into {} (for [i (range 40)] [(format "b%02d" i) i]))}
           o {:stringref false}
           bs (boring/encode-indexed m (assoc o :index 4 :index-min 4))
-          src (nav/source bs o)]
+          src (nav/root bs o)]
       ;; Both containers read correctly, and the index carries a node for each.
-      (let [ix (#'boring.nav/read-index (#'boring.nav/nav-of bs o))]
-        (is (>= (alength ^longs (:containers ix)) 2) "both containers indexed")
-        (is (some? (:node-checked ix)) "and each carries its own verdict slot"))
+      ;;
+      ;; This used to assert `(some? (:node-checked ix))` -- that the index
+      ;; carried a per-node verdict slot. That was checking the MECHANISM, and
+      ;; the mechanism is gone: the verdict was cached in two `boolean[]` sized
+      ;; by the document because the check walked the container to its end, and
+      ;; what is left is three O(1) reads, cheaper to repeat than to remember.
+      ;;
+      ;; The property the name claims is now STRUCTURAL rather than observed.
+      ;; There is no shared verdict store, so there is nothing an unsound node
+      ;; could poison for a sound one -- `node-sound?` is a pure function of the
+      ;; node it is asked about.
       (doseq [i (range 40)]
         (is (= i (some-> (get (get src "a") (format "a%02d" i)) nav/value)))
         (is (= i (some-> (get (get src "b") (format "b%02d" i)) nav/value)))))))
@@ -1635,7 +2312,7 @@
                          ["shapes" {:stringref false :shapes true}]
                          ["indexed" {:stringref false :index 4 :index-min 4}]]]
         (let [bs (if (:index o) (boring/encode-indexed v o) (boring/encode v o))
-              rows (get (nav/source bs o) :rows)]
+              rows (get (nav/root bs o) :rows)]
           (doseq [i (range 40)]
             (is (= {:e i :v (str "val-" i)} (nav/value (get rows i)))
                 (str label ": get " i))
@@ -1652,5 +2329,92 @@
   (testing "the shape a consumer actually writes"
     (let [v {:a {:b [{:c 1} {:c 2} {:c 3}]}}
           o {:stringref false}
-          src (nav/source (boring/encode v o) o)]
+          src (nav/root (boring/encode v o) o)]
       (is (= 2 (nav/value (-> src (get :a) (get :b) (get 1) (get :c))))))))
+
+(defn- counting-source
+  "A ByteSource over `bs` that counts every byte it is asked for.
+
+   `Reader.skips` is the wrong unit for measuring skip WORK: skipping a
+   20 000-element vector is ONE `skipFrom` call, because the walk recurses
+   inside the reader. Bytes read is the honest measure, and it is exact --
+   no clock, no threshold to tune.
+
+   `heapArray` returns nil deliberately, so the Reader cannot take its byte[]
+   fast path around this."
+  [^bytes bs counter]
+  (let [u (fn [^long p] (bit-and (aget bs (int p)) 0xff))]
+    (reify org.replikativ.boring.ByteSource
+      (size [_] (alength bs))
+      (at [_ p] (swap! counter inc) (aget bs (int p)))
+      (i16 [_ p] (swap! counter + 2)
+        (unchecked-short (bit-or (bit-shift-left (u p) 8) (u (inc p)))))
+      (i32 [_ p] (swap! counter + 4)
+        (unchecked-int (bit-or (bit-shift-left (u p) 24) (bit-shift-left (u (+ p 1)) 16)
+                               (bit-shift-left (u (+ p 2)) 8) (u (+ p 3)))))
+      (i64 [_ p] (swap! counter + 8)
+        (bit-or (bit-shift-left (long (u p)) 56)
+                (bit-shift-left (long (u (+ p 1))) 48)
+                (bit-shift-left (long (u (+ p 2))) 40)
+                (bit-shift-left (long (u (+ p 3))) 32)
+                (bit-shift-left (long (u (+ p 4))) 24)
+                (bit-shift-left (long (u (+ p 5))) 16)
+                (bit-shift-left (long (u (+ p 6))) 8)
+                (long (u (+ p 7)))))
+      (copyTo [_ p dst off n] (swap! counter + n)
+        (System/arraycopy bs (int p) dst (int off) (int n)))
+      (heapArray [_] nil))))
+
+(deftest a-bounded-walk-does-not-skip-past-its-last-entry
+  (testing "`scan-map` walks a span by comparing a key and then advancing past
+            the VALUE -- and advancing past a value is a structural walk of that
+            value's whole subtree. It used to advance unconditionally and then
+            discover on the NEXT iteration that it had reached its limit, so the
+            offset it worked out was thrown away.
+
+            Invisible on flat data and decisive on nested data, because the
+            wasted skip is the size of one subtree. An INDEXED lookup walks a
+            bounded span per anchor, so it paid this on every anchor it tried --
+            which is how a correct index came to make lookups SLOWER than no
+            index at all: measured on a 32 KB document, 39.5 us indexed against
+            34.9 unindexed, and 1.95 once fixed.
+
+            Asserted in BYTES READ, not on a clock: the defect is wasted work
+            and this counts exactly how much."
+    (let [;; The giant sibling is a NEST OF SMALL CONTAINERS, so `:index-min 5`
+          ;; indexes the five-entry root and nothing inside it. A flat 20 000
+          ;; element vector would clear the threshold itself and put 20 000
+          ;; anchors in the frame, which measures the frame rather than the walk
+          ;; -- the first version of this test did exactly that.
+          nest (fn nest [^long d]
+                 (if (zero? d) 0 {:a (nest (dec d)) :b (nest (dec d)) :c (nest (dec d))}))
+          big {:huge (nest 8) :a 1 :b 2 :c 3 :d 4}
+          opts {:index 1 :index-min 5}
+          bs (boring/encode-indexed big opts)
+          plain (boring/encode big {:stringref false})
+          ;; `:trust-index :trusted`, because VALIDATION WALKS THE CONTAINER
+          ;; per node -- that is what it is for -- so under the default an index
+          ;; cannot save a walk by construction. This test is about whether the
+          ;; trusted path, where the index is supposed to pay, actually does.
+          ropts {:stringref false :trust-index :trusted}
+          reads (fn [x k]
+                  (let [c (atom 0)
+                        v (nav/value (get (nav/root (counting-source x c) ropts) k))]
+                    [v @c]))]
+      (testing "every answer is what the unindexed document gives"
+        (doseq [k [:a :b :c :d :absent]]
+          (is (= (first (reads plain k)) (first (reads bs k))) (str "answer for " k))))
+      (testing "and reaching a key AFTER the giant sibling reads a bounded
+                number of bytes, not one per element of it"
+        (doseq [k [:a :b :c :d]]
+          (let [[v n] (reads bs k)
+                [_ unindexed] (reads plain k)]
+            (is (some? v))
+            (is (< n (quot unindexed 10))
+                (str "indexed lookup of " k " read " n " bytes against "
+                     unindexed " unindexed; before the fix the index read MORE "
+                     "than the scan, because every anchor it tried walked the "
+                     "whole 20000-element sibling")))))
+      (testing "a MISS still costs the honest walk, because a negative from a
+                possibly-damaged index is re-derived rather than trusted"
+        (is (nil? (first (reads bs :absent))))))))
