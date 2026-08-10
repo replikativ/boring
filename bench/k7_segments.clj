@@ -104,26 +104,53 @@
 ;; `boring.mmap`'s "navigation touches so few bytes that off-heap hardly
 ;; matters" stops holding.
 ;;
-;; AND THE TABLE BELOW STILL DISAGREES WITH ALL OF THAT, which is stated here
-;; rather than smoothed over. Warm, min-over-passes, floor subtracted, nav
-;; costs ~190 us per 1000-row segment against decode's ~108. Isolated from k7
-;; on the SAME shape of data it costs 48.8 against 80.3 -- the other way round,
-;; by about 4x on nav specifically. Ruled out, each by measurement:
+;; THE TABLE BELOW HAS nav LOSING TO decode, and nav wins everywhere else. That
+;; was chased down; the answer is that IT IS NOT A boring RESULT, and the
+;; `payload-scan-only` section at the bottom is the proof. Same 50 payload
+;; buffers, same mmap, k7 out of the timed region:
 ;;
-;;   JIT           8 passes, half discarded
-;;   GC            min over passes, not last-pass
-;;   k7 framing    the floor row, 2.1 ms of the read, charged to every row
-;;   cache         50 DISTINCT 26 KB segments, 1.3 MB total, is the same
-;;                 working set k7 walks -- nav still wins there, 1.42 ms
-;;                 against 2.94 heap and 2.20 against 4.11 direct
+;;   decode           75.2 us/segment
+;;   nav              58.6 us/segment       <- nav wins, 1.28x
+;;   nav, heap copy   56.1 us/segment
 ;;
-;; What is NOT ruled out is the mmap'd page path: k7's payload is a window into
-;; a 256 MB preallocated segment file, while every isolation above uses
-;; `allocateDirect`, which is committed and resident. nav's index-driven jumps
-;; touch scattered pages where a linear decode faults one page and uses all of
-;; it. That is a hypothesis, not a finding. See the task filed against this
-;; file; do not quote the per-segment numbers here as codec numbers until it is
-;; settled.
+;; End-to-end the same work is nav 9.0 ms against decode 7.9. Subtracting the
+;; scans leaves 6.1 ms inside k7 for nav and 4.1 for decode -- for the IDENTICAL
+;; drain loop, differing only in the function applied to each payload. `poll!`
+;; does adaptive batching, so consumer speed feeds back into the polling path.
+;; That asymmetry is k7's, and the two columns should be read as END-TO-END
+;; THROUGHPUT, not as codec numbers.
+;;
+;; Ruled out along the way, each by measurement rather than argument:
+;;
+;;   JIT           8 passes, half discarded. The first version of this file
+;;                 timed one cold pass and had nav and decode indistinguishable
+;;                 at 21 ms; what it measured was compilation.
+;;   GC            min over the measured passes, not the last one. A pass
+;;                 allocates 7-15 MB and a collection triggered by an earlier
+;;                 pass lands inside whichever pass is running.
+;;   mmap pages    bench/source_shapes.clj, one source shape per JVM: an mmap'd
+;;                 read-only slice costs 38.1 us against 39.2 for anonymous
+;;                 `allocateDirect`. Identical. This was the leading hypothesis
+;;                 and it is wrong.
+;;   megamorphism  polluting BufferSource's call site with four ByteBuffer
+;;                 implementation classes first costs ~8%, 38.1 -> 41.0. Real,
+;;                 and the reason source_shapes runs one shape per process, but
+;;                 far too small to matter here.
+;;   FFM           SegmentSource over the SAME mapping costs 40.3 against
+;;                 BufferSource's 38.1. There is no bounds-check win waiting on
+;;                 the foreign-memory path; the ByteBuffer one is already at
+;;                 parity.
+;;
+;; WHAT IS REAL: the off-heap penalty is ASYMMETRIC. nav pays 1.55x moving from
+;; byte[] to mmap (24.6 -> 38.1 us), decode pays 1.32x (54.6 -> 72.2), because
+;; nav does more small reads per byte of useful output and so feels the
+;; interface more. nav still wins 1.9x in every shape.
+;;
+;; AND THE DESIGN CONSEQUENCE, which is why `nav, heap copy` is a row: zero-copy
+;; is worth it for SELECTIVE access and not for full scans. A point read off
+;; mmap costs 1.87 us against 1.60 on heap, so copying 26 KB to reach it would
+;; cost far more than it saves. A full column scan is the opposite -- the heap
+;; copy measured 56.1 us against 58.6 zero-copy, so the copy pays for itself.
 (def read-passes 8)
 
 ;; ------------------------------------------------------------------ writing
@@ -217,6 +244,40 @@
 
 ;; -------------------------------------------------------------------- report
 
+(defn- payload-scan-only
+  "Collect every payload buffer FIRST, then scan them with k7 out of the timed
+  region entirely.
+
+  This is the experiment that decides #49. `bench/source_shapes.clj` measures
+  one payload, reused, and gets nav 38 us against decode 72 -- nav winning by
+  1.9x on exactly the memory k7 hands over, mmap'd and read-only. The end-to-end
+  table gets the opposite. Everything between the two is either k7's polling,
+  which the floor row measures, or the fact that end-to-end walks 50 DISTINCT
+  buffers where the isolation walks one.
+
+  So: same 50 distinct buffers, no poll, no ack, no CRC."
+  [dir]
+  (let [q (k7/queue dir {:fsync-strategy :async})
+        cg (k7/consumer-group q "collector")
+        _ (k7/seek! cg 0)
+        payloads (loop [acc []]
+                   (let [b (k7/poll! cg {:max-batch 256 :timeout-ms 1})]
+                     (if (empty? b)
+                       acc
+                       (recur (into acc (map k7/msg->payload) b)))))
+        run (fn [f] (reduce (fn [^long a p] (+ a (long (f p)))) 0 payloads))]
+    (println (format "\ncollected %d payload buffers; scanning with k7 out of the loop"
+                     (count payloads)))
+    (doseq [[label f] [["decode" sum-column-decoding]
+                       ["nav" sum-column-nav]
+                       ["nav, heap copy" sum-column-nav-heap]]]
+      (dotimes [_ 20] (run f))
+      (let [best (apply min (repeatedly 10 #(first (timed (run f)))))]
+        (println (format "  %-16s %7.2f ms   %7.1f us/segment"
+                         label best (/ (* best 1000.0) (count payloads))))))
+    (k7/close-consumer-group! cg)
+    (k7/close-queue! q)))
+
 (defn -main [& _]
   (println (format "%d events, segments of %d, read pass %d of %d (warm)\n"
                    n-events segment-size read-passes read-passes))
@@ -271,4 +332,11 @@
     (println "\nAll four sum the same column over the same events; a mismatch")
     (println "prints above and none should.")
     (println "\n`payload B` is the bytes handed to enqueue!, not the file size --")
-    (println "k7 preallocates 256 MB segments, so the directory is 256 MB either way.")))
+    (println "k7 preallocates 256 MB segments, so the directory is 256 MB either way."))
+
+  ;; #49: the same payloads, scanned with k7 out of the timed region.
+  (let [dir (tmpdir "k7scan")
+        q (k7/queue dir {:fsync-strategy :async})]
+    (fill-segments! q)
+    (k7/close-queue! q)
+    (payload-scan-only dir)))
