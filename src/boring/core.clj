@@ -870,7 +870,18 @@
          bs (.toByteArray out)]
      ;; A buffered caller slices; a streaming one stages. Same decision, same
      ;; bytes, different mechanism because the constraints differ.
-     (if (and (= 1 (aget info 1)) (< (alength bs) small-enough-to-encode-twice))
+     ;; MEASURED ON `body-end`, NOT ON THE FINISHED ARRAY, because that is what
+     ;; the streaming writer's staging window measures and the two must decide
+     ;; the same way. `bs` is envelope + body + FRAME; staging holds envelope +
+     ;; body. Comparing the larger quantity against the same bound opened a
+     ;; ~41-byte-wide band -- measured 4044 to 4084 for `{:a <string>}` -- where
+     ;; `write-indexed!` dropped the frame and `encode-indexed` did not, so the
+     ;; BUFFERING writer came out 43 bytes LARGER and produced a different kind
+     ;; of artifact: a two-item sequence with an envelope against one plain
+     ;; item. That falsified `writer-streaming-test`'s "buffering may win, never
+     ;; lose", which only sampled values far below the band.
+     (if (and (= 1 (aget info 1))
+              (<= (aget info 0) small-enough-to-encode-twice))
        (let [start (if (and (> (alength bs) 3)
                             (= 0xd9 (bit-and (aget bs 0) 0xff))
                             (= 0x01 (bit-and (aget bs 1) 0xff))
@@ -1943,14 +1954,32 @@
                  ;; somebody else wrote may not answer with an Error.
                  (throw (ex-info "boring: index walk ran out of stack; this document is too deeply nested to index"
                                  {:type :boring/max-depth-exceeded}))))]
-     (when (pos? (alength ^longs (:containers idx)))
-       (cond-> (assoc idx :stride stride)
-         ;; ONLY FOR A DOCUMENT THAT OPENS A NAMESPACE, which is the test
-         ;; `derive-stringref-pointers` makes first -- three bytes, and it is
-         ;; false for every non-stringref document, so nothing that does not
-         ;; use the feature walks anything twice.
-         (.hasStringrefRoot r)
-         (assoc :stringrefs (derive-stringref-pointers r (alength bs))))))))
+     ;; ONLY FOR A DOCUMENT THAT OPENS A NAMESPACE, which is the test
+     ;; `derive-stringref-pointers` makes first -- three bytes, and it is false
+     ;; for every non-stringref document, so nothing that does not use the
+     ;; feature walks anything twice.
+     ;;
+     ;; READ BEFORE THE GATE, because it is half of it. This gate used to be
+     ;; the container count ALONE, which is the pre-#22 rule the streaming
+     ;; writer (`write-indexed-capturing!`) and the ClojureScript builder
+     ;; (`core.cljs:1177`) both moved off and this one did not. A stringref
+     ;; document with references but nothing worth a node then got NO FRAME
+     ;; from `build-index` -- so the documented public pair
+     ;; `(seal-index! w out (build-index bs opts) ...)` produced a document
+     ;; that `nav/source` refuses as `:boring/stringref-not-navigable`, while
+     ;; `encode-indexed` over the same value emits a frame and cljs's
+     ;; `build-index` returns one. Measured on
+     ;; `{:a "a-repeated-string" :b "a-repeated-string"}`: nil here, a frame
+     ;; everywhere else.
+     ;;
+     ;; Carrying the pointer table is reason enough to write a frame -- that is
+     ;; the invariant `write-indexed-capturing!` states, and all three builders
+     ;; have to state it the same way or they write different files.
+     (let [srp (when (.hasStringrefRoot r)
+                 (derive-stringref-pointers r (alength bs)))]
+       (when (or (pos? (alength ^longs (:containers idx))) (some? srp))
+         (cond-> (assoc idx :stride stride)
+           (some? srp) (assoc :stringrefs srp)))))))
 
 (def ^:no-doc ^:const slot-layout-v2
   "Version nibble for a DENSE start table -- one entry per node.

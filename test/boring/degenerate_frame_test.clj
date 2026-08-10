@@ -84,6 +84,37 @@
         (is (= (seq small) (seq big)) label)
         (is (= v (boring/decode small)) label)))))
 
+(deftest the-two-writers-decide-on-the-same-quantity-at-the-bound
+  (testing "THE BAND. Both writers gate on `small-enough-to-encode-twice`, but
+            they measured DIFFERENT THINGS against it: `encode-indexed`
+            compared the finished array -- envelope + body + FRAME -- while the
+            staging window holds envelope + body. The frame is ~43 bytes, so
+            for a value whose body lands just under the bound and whose total
+            lands just over it, the streaming writer dropped the frame and the
+            buffering one did not.
+
+            Measured before the fix, `{:a <4060 x's>}`: 4112 bytes buffered
+            against 4069 streamed. The BUFFERING writer larger, and the two
+            artifacts different in kind -- a two-item sequence carrying an
+            envelope against one plain item. `write-indexed-agrees-with-
+            encode-indexed` and \"buffering may win, never lose\" both missed it
+            because they sample values far below the bound.
+
+            Swept rather than sampled, because a 41-wide band is exactly what
+            point samples walk past."
+    (doseq [[label f] [["{:a <string n>}" (fn [n] {:a (apply str (repeat n \x))})]
+                       ["[<string n>]" (fn [n] [(apply str (repeat n \x))])]
+                       ["<string n>" (fn [n] (apply str (repeat n \x)))]
+                       ["{:a <bytes n>}" (fn [n] {:a (byte-array n)})]]]
+      (let [divergent (for [n (range 4000 4140)
+                            :let [v (f n)
+                                  buffered (boring/encode-indexed v {:index 16})
+                                  flushed (streamed v {:index 16})]
+                            :when (not= (seq buffered) (seq flushed))]
+                        n)]
+        (is (empty? divergent)
+            (str label " diverges at sizes " (vec divergent)))))))
+
 (deftest a-frame-is-never-dropped-once-the-envelope-has-escaped
   (testing "the guard that had to exist. Past the staging window the envelope
             is already at the sink, and skipping the frame then leaves a
