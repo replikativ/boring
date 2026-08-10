@@ -1953,7 +1953,13 @@
                  ;; real limit first. A public entry point that takes bytes
                  ;; somebody else wrote may not answer with an Error.
                  (throw (ex-info "boring: index walk ran out of stack; this document is too deeply nested to index"
-                                 {:type :boring/max-depth-exceeded}))))]
+                                 {:type :boring/max-depth-exceeded}))))
+         ;; AFTER `idx`, which is why it is a binding here rather than a nested
+         ;; `let`: the pointer walk and the index walk share one Reader, so the
+         ;; order is the point. Sequential bindings say that; a nested `let`
+         ;; said it too and clj-kondo correctly called it redundant.
+         srp (when (.hasStringrefRoot r)
+               (derive-stringref-pointers r (alength bs)))]
      ;; ONLY FOR A DOCUMENT THAT OPENS A NAMESPACE, which is the test
      ;; `derive-stringref-pointers` makes first -- three bytes, and it is false
      ;; for every non-stringref document, so nothing that does not use the
@@ -1975,11 +1981,9 @@
      ;; Carrying the pointer table is reason enough to write a frame -- that is
      ;; the invariant `write-indexed-capturing!` states, and all three builders
      ;; have to state it the same way or they write different files.
-     (let [srp (when (.hasStringrefRoot r)
-                 (derive-stringref-pointers r (alength bs)))]
-       (when (or (pos? (alength ^longs (:containers idx))) (some? srp))
-         (cond-> (assoc idx :stride stride)
-           (some? srp) (assoc :stringrefs srp)))))))
+     (when (or (pos? (alength ^longs (:containers idx))) (some? srp))
+       (cond-> (assoc idx :stride stride)
+         (some? srp) (assoc :stringrefs srp))))))
 
 (def ^:no-doc ^:const slot-layout-v2
   "Version nibble for a DENSE start table -- one entry per node.

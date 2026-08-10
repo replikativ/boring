@@ -18,10 +18,18 @@
   The compile-time route is preferred wherever it fits."
   #?(:cljs (:require-macros [boring.records]))
   ;; `boring.core` is used only inside the macro's syntax quote, where the
-  ;; `boring/` alias resolves to `boring.core/` at expansion time. clj-kondo
-  ;; cannot see that through a reader conditional, so it reports the require as
-  ;; unused; it is not, and dropping it would break alias resolution.
-  #_{:clj-kondo/ignore [:unused-namespace]}
+  ;; `boring/` alias resolves to `boring.core/` at expansion time. That used to
+  ;; need a `#_{:clj-kondo/ignore [:unused-namespace]}` because clj-kondo could
+  ;; not see the use through a reader conditional; it can now, and the ignore
+  ;; had become dead -- reported as `Redundant ignore`. Kept as a note rather
+  ;; than a directive: the require is load-bearing and dropping it would break
+  ;; alias resolution at expansion time, which no linter would flag.
+  ;;
+  ;; SUPPRESSED IN `.clj-kondo/config.edn`, scoped to this namespace, rather
+  ;; than with an inline `#_{:clj-kondo/ignore ...}`. Inline, clj-kondo
+  ;; suppressed the warning and then reported the suppression itself as
+  ;; `Redundant ignore` -- both on the `(:require ...)` form and on the libspec
+  ;; -- so there was no placement that left the lint output clean.
   (:require [boring.core :as boring]
             #?(:clj [clojure.string :as str])))
 
