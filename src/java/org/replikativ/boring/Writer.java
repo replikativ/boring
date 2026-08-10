@@ -1027,11 +1027,17 @@ public final class Writer {
          *  type/fields must be read through accessors, not keyword lookup. */
         static final clojure.lang.IFn RECORD_TYPE;
         static final clojure.lang.IFn RECORD_FIELDS;
+        /** CBOR `undefined`, simple value 23 -- which a shaped row uses to mean
+         *  "this key is absent", and which therefore may not also appear as a
+         *  row's VALUE. Identity-compared, so this must be the same singleton
+         *  `boring.data/undefined` holds and the Reader returns. */
+        static final Object UNDEFINED;
 
         static {
             try {
                 clojure.lang.RT.var("clojure.core", "require")
                     .invoke(clojure.lang.Symbol.intern("boring.data"));
+                UNDEFINED = clojure.lang.RT.var("boring.data", "undefined").deref();
                 SIMPLE_VALUE = clojure.lang.RT.classForName("boring.data.SimpleValue");
                 TAGGED_VALUE = clojure.lang.RT.classForName("boring.data.TaggedValue");
                 UNKNOWN_RECORD = clojure.lang.RT.classForName("boring.data.UnknownRecord");
@@ -1763,33 +1769,172 @@ public final class Writer {
                || ((clojure.lang.IObj) o).meta() == null;
     }
 
-    private Object[] homogeneousShape(List l) {
+    /**
+     * The UNION of every row's keys, in first-seen order, or null to decline.
+     *
+     * THIS USED TO REQUIRE EVERY ROW TO CARRY THE SAME KEYS and returned null
+     * the moment one did not, which made shapes all-or-nothing: one ragged row
+     * in a thousand cost the whole table its density, and data arriving at a
+     * system boundary is exactly the ragged case -- optional fields, schema
+     * drift, mixed event types. A row that lacks a key now writes `undefined`
+     * in that position instead, and the encoding survives.
+     *
+     * The idea is draft-ietf-cbor-packed's, whose tag-114 `record` function
+     * uses `undefined` for the same purpose. Only the SEMANTICS are borrowed --
+     * not the packing framework, and not its tag numbers, which are
+     * unassigned. See doc/SHAPES.md.
+     *
+     * MEASURED, 200 rows, against the same data written plain:
+     *
+     *   uniform, every row identical         0.50x   (unchanged by this)
+     *   90% share a core, 10% carry one more 0.52x   (was 1.00x -- no shape)
+     *   5 core keys and 3 optional ones      0.51x   (was 1.00x)
+     *   5 event types with disjoint keys     0.90x   (was 1.00x)
+     *
+     * The last row is the case that argues against a union, and it still WINS:
+     * hoisting 25 keys out of 200 rows saves more than one `undefined` byte per
+     * absent slot costs. There is no density cliff, so there is no
+     * abandon-if-too-sparse guard here.
+     */
+    /**
+     * `m.containsKey(k)` treating a comparison failure as absent.
+     *
+     * `unionShape` has already declined any map whose keys threw while being
+     * traversed, so this should not fire -- but the probe here is a key from a
+     * DIFFERENT row, which is the case that threw a raw ClassCastException out
+     * of `encode` before. Being wrong here writes `undefined` for a key that is
+     * present, which is a lost entry, so it is worth saying plainly that the
+     * guard is defensive and not a design.
+     */
+    /** Whether `v` is CBOR `undefined` -- simple value 23 -- by value. */
+    private static boolean isUndefined(Object v) {
+        if (v == Data.UNDEFINED) return true;
+        if (!Data.SIMPLE_VALUE.isInstance(v)) return false;
+        Object n = clojure.lang.RT.get(v, clojure.lang.Keyword.intern(null, "n"));
+        return n instanceof Number && ((Number) n).intValue() == 23;
+    }
+
+    @SuppressWarnings("rawtypes")
+    private static boolean containsKeyQuietly(Map m, Object k) {
+        try { return m.containsKey(k); } catch (ClassCastException e) { return false; }
+    }
+
+    private Object[] unionShape(List l) {
         int rows = l.size();
         if (rows < 2) return null;               // one row cannot amortise the keys
-        Object first = l.get(0);
-        if (!plainMap(first)) return null;
-        Map m0 = (Map) first;
-        int n = m0.size();
-        if (n == 0) return null;
-        Object[] keys = m0.keySet().toArray();
-        for (int i = 1; i < rows; i++) {
+        java.util.ArrayList<Object> order = new java.util.ArrayList<>();
+        java.util.HashMap<Object, Integer> seen = new java.util.HashMap<>();
+        long totalEntries = 0;   // key occurrences across all rows
+        long totalPadding = 0;   // `undefined` bytes the rows would cost
+        for (int i = 0; i < rows; i++) {
             Object o = l.get(i);
             if (!plainMap(o)) return null;
             Map m = (Map) o;
-            if (m.size() != n) return null;
-            // `containsKey` on a SORTED map runs its comparator, and the key it
-            // is handed comes from a different map -- so
-            // `[{false nil} (sorted-map "0" nil)]` threw a raw
-            // ClassCastException out of `encode`. A map that cannot be probed
-            // is not part of a homogeneous shape; that is an answer, not an
-            // error.
+            int maxPos = -1, size = 0;
+            // entrySet, not keySet: the VALUES have to be looked at anyway --
+            // see the `undefined` check below -- and one traversal answers both
+            // questions. This is also strictly less work per row than the
+            // containsKey probing it replaces, which was O(keys) lookups
+            // against a foreign map.
             try {
-                for (int k = 0; k < n; k++) if (!m.containsKey(keys[k])) return null;
+                for (Object e : m.entrySet()) {
+                    Map.Entry en = (Map.Entry) e;
+                    // A ROW THAT ALREADY CONTAINS `undefined` AS A VALUE cannot
+                    // go in a shape, because absence is spelled the same way and
+                    // the two would be indistinguishable coming back. Declining
+                    // is the only honest answer: `:shapes` is an optimisation,
+                    // and an optimisation that silently changes the value is not
+                    // one.
+                    //
+                    // BY VALUE, not by identity: `boring.data/undefined` is one
+                    // singleton, but `(simple-value 23)` builds an equal-but-
+                    // distinct record, and identity would have shaped that row
+                    // and silently turned the value into an absent key. The
+                    // instance test is what keeps it cheap -- false for every
+                    // ordinary value, so the field read almost never runs.
+                    if (isUndefined(en.getValue())) return null;
+                    Object k = en.getKey();
+                    Integer at = seen.get(k);
+                    if (at == null) { at = order.size(); seen.put(k, at); order.add(k); }
+                    if (at > maxPos) maxPos = at;
+                    size++;
+                }
             } catch (ClassCastException e) {
+                // `containsKey`/`hashCode` on a map whose keys are not mutually
+                // comparable threw a raw ClassCastException out of `encode`
+                // once. A map that cannot be probed is not part of a shape;
+                // that is an answer, not an error.
                 return null;
             }
+            // A row spans from position 0 to its highest-numbered key; the slots
+            // in between that it does not fill cost one `undefined` byte each.
+            // Trailing slots cost nothing, because the row is truncated -- which
+            // is why this is `maxPos + 1` and not the union size.
+            totalPadding += (maxPos + 1) - size;
+            totalEntries += size;
         }
-        return keys;
+        if (order.isEmpty()) return null;
+        return worthShaping(order, totalEntries, totalPadding) ? order.toArray() : null;
+    }
+
+    /**
+     * Whether the union is dense enough to pay for itself.
+     *
+     * THE PATHOLOGICAL CASE IS DISJOINT KEY SETS. Keys are numbered in
+     * first-seen order, so if row `i` introduces all-new keys it sits at
+     * positions `i*M` upward and must be padded past everything before it. The
+     * padding is then O(rows^2), and shaping makes the document dramatically
+     * BIGGER rather than smaller. Measured, 200 rows of 5 keys each, against
+     * the same data written plain:
+     *
+     *   distinct key sets    1     5    10     20     40    200
+     *   shaped / plain    0.21  0.43  0.71   1.19   2.17   9.65
+     *
+     * An earlier version of this comment claimed there was no cliff. That was
+     * measured on schemas that CYCLED, which caps the union at `schemas * M`
+     * and hides the quadratic term entirely. Fully disjoint rows are 9.65x
+     * WORSE than plain.
+     *
+     * The bound compares the two quantities directly rather than guessing at a
+     * ratio: hoisting the keys saves writing `totalEntries - union` key
+     * occurrences, and the padding costs one byte per empty slot. Both are
+     * accumulated during the pass the shape needs anyway, so the check is O(1)
+     * at the end.
+     *
+     * Break-even lands between 10 and 20 distinct key sets above, and this rule
+     * puts it there without a tuned constant in sight.
+     */
+    private static boolean worthShaping(java.util.List<Object> union,
+                                        long totalEntries, long totalPadding) {
+        long unionKeyBytes = 0;
+        for (Object k : union) unionKeyBytes += estimatedKeyBytes(k);
+        // Average, because the saving is per OCCURRENCE and occurrences are
+        // spread across the union's keys in proportions this does not know.
+        long avg = Math.max(1, unionKeyBytes / union.size());
+        return totalPadding < (totalEntries - union.size()) * avg;
+    }
+
+    /**
+     * Roughly what key `k` costs on the wire, for the density bound above.
+     *
+     * An estimate on purpose: the exact figure needs the encoder, stringref
+     * state and the profile, none of which exist yet when the shape is chosen.
+     * Being wrong here changes only whether an optimisation fires.
+     */
+    private static long estimatedKeyBytes(Object k) {
+        if (k instanceof clojure.lang.Keyword) {
+            clojure.lang.Keyword kw = (clojure.lang.Keyword) k;
+            String ns = kw.getNamespace();
+            // tag 39 (2) + text head (1) + ':' + name, plus "ns/" when present
+            return 4 + kw.getName().length() + (ns == null ? 0 : ns.length() + 1);
+        }
+        if (k instanceof String) return 1 + ((String) k).length();
+        if (k instanceof clojure.lang.Symbol) {
+            clojure.lang.Symbol s = (clojure.lang.Symbol) k;
+            String ns = s.getNamespace();
+            return 3 + s.getName().length() + (ns == null ? 0 : ns.length() + 1);
+        }
+        return 8;
     }
 
     /**
@@ -1856,18 +2001,37 @@ public final class Writer {
             if (ra != null && --rc == 0) { ra[rai++] = idxOffset(pos); rc = idxStride; }
             rowsWalk += idxItemsWritten - rowsAtStart;
             Map m = (Map) l.get(r);
+            // TRAILING ABSENCES ARE TRUNCATED, not padded: a row is `nv <= nk`
+            // values, and keys nv..nk-1 are absent by virtue of not being there.
+            // Interior gaps still need a placeholder, since position is what
+            // binds a value to its key.
+            //
+            // Worth more than it looks. The union is in FIRST-SEEN order, so a
+            // row belonging to the first schema encountered tends to fill a
+            // prefix and stop, while padding would make every row as long as
+            // the widest. It is also what would make a single-pass writer
+            // possible later: a row written while the shape had three keys
+            // stays a three-element array and still reads correctly once the
+            // shape grows, with no back-patching.
+            int nv = nk;
+            while (nv > 0 && !containsKeyQuietly(m, keys[nv - 1])) nv--;
             long rowStart = absOffset();
-            head(ARRAY, nk);
-            long[] row = indexing(nk) ? new long[anchorCount(nk)] : null;
+            head(ARRAY, nv);
+            long[] row = indexing(nv) ? new long[anchorCount(nv)] : null;
             int rowSlot = row != null ? reserveNode() : -1;
             int ri = 0, rcd = 1;
             long rowAtStart = idxItemsWritten, rowWalk = 0;
-            for (int i = 0; i < nk; i++) {
+            for (int i = 0; i < nv; i++) {
                 if (row != null && --rcd == 0) { row[ri++] = idxOffset(pos); rcd = idxStride; }
                 rowWalk += idxItemsWritten - rowAtStart;
-                writeValue(m.get(keys[i]));
+                // containsKey, not `get() != null`: a key present with a nil
+                // value is NOT absent, and CBOR spells the two differently --
+                // `null` (0xf6) is a value, `undefined` (0xf7) is absence.
+                // Collapsing them would lose `{:a nil}` versus `{}`.
+                if (containsKeyQuietly(m, keys[i])) writeValue(m.get(keys[i]));
+                else writeSimpleValue(23);
             }
-            if (row != null) fillNode(rowSlot, rowStart, nk, row, rowWalk);
+            if (row != null) fillNode(rowSlot, rowStart, nv, row, rowWalk);
         }
         if (ra != null) fillNode(rowsSlot, rowsStart, nr, ra, rowsWalk);
 
@@ -3324,7 +3488,7 @@ public final class Writer {
         if (x instanceof List) {
             List l = (List) x;
             if (shapes && !canonical) {
-                Object[] shape = homogeneousShape(l);
+                Object[] shape = unionShape(l);
                 if (shape != null) { writeShapedArray(l, shape); return; }
             }
             int n = l.size();

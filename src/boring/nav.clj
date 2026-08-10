@@ -695,6 +695,24 @@
 
 ;; ------------------------------------------------------------------ cursor
 
+(def ^:private ^:const MAJOR-SIMPLE 7)
+(def ^:private ^:const INFO-UNDEFINED 23)
+
+(defn- undefined-at?
+  "Whether the item at `off` is CBOR `undefined` -- simple value 23, the byte
+  0xf7.
+
+  ONLY MEANINGFUL INSIDE A SHAPED ROW, where it marks an absent key. Everywhere
+  else `undefined` is an ordinary value and realises to
+  `boring.data/undefined`; nothing outside the shaped-row paths calls this.
+
+  Two byte reads and no decode, because it sits in the lookup path of every
+  shaped-row `get`."
+  [^Nav nav ^long off]
+  (let [^Reader r (.rdr nav)]
+    (and (= MAJOR-SIMPLE (.majorAt r off))
+         (= INFO-UNDEFINED (.infoAt r off)))))
+
 (defn- realize [^Nav nav ^long off]
   ;; THE choke point: `value`, `Items.nth`, `Items.reduce`, `children`, `get`
   ;; and `zipper` all reach bytes through here. Unwrapped, `nav/value` on a
@@ -1104,6 +1122,23 @@
         (persistent! acc)
         (recur (inc i) (skip r p) (conj! acc p))))))
 
+(defn- shaped-row-entries
+  "`[key offset]` for each key the row at `off` actually carries.
+
+  ABSENCE HAS TWO SPELLINGS and this is the one place both are resolved. A
+  SHORT row stops early -- `map` over two collections ends with the shorter, so
+  keys past the values are simply not produced. An `undefined` in an interior
+  position is filtered. Both are ordinary, because the shape's keys are the
+  UNION of every row's; see `Writer.unionShape`.
+
+  O(values), which `count` on a shaped row did not used to be -- it read the
+  key count and returned it. That was O(1) and, once rows could be ragged,
+  wrong: it counted the shape rather than the row."
+  [^Nav nav ^long off ks]
+  (into [] (comp (remove (fn [[_ p]] (undefined-at? nav (long p))))
+                 (map (fn [[k p]] [k (long p)])))
+        (map vector ks (child-offsets nav off))))
+
 ;; `shape` is nil for every ordinary cursor. It is non-nil only on a cursor
 ;; standing on a ROW of a shaped array, where the bytes are an array of values
 ;; but the logical value is a MAP -- the keys live once in the shape header.
@@ -1156,11 +1191,17 @@
     (if shape
       ;; A ROW of a shaped array. Its bytes are an array, but it IS a map, so
       ;; the key is resolved through the shape to a position and the row is
-      ;; then indexed like any other array. A key the shape does not carry is
-      ;; absent -- `writeShapedArray` only emits rows whose key sets match.
+      ;; then indexed like any other array.
+      ;;
+      ;; ABSENCE HAS THREE SPELLINGS NOW, and all three land on `nf`:
+      ;; a key the shape does not carry at all; a position past the end of a
+      ;; SHORT row, which `nth-item` already answers -1 for; and `undefined`
+      ;; (0xf7) sitting in an interior position. The shape's key vector is the
+      ;; UNION of every row's keys, so a row that lacks one is normal rather
+      ;; than damaged -- see `Writer.unionShape`.
       (if-some [i (get (:pos shape) k)]
         (let [p (nth-item nav off (long i))]
-          (if (neg? p) nf (cursor-at nav p)))
+          (if (or (neg? p) (undefined-at? nav p)) nf (cursor-at nav p)))
         nf)
       (let [mj (major nav off)]
         (cond
@@ -1316,9 +1357,13 @@
   clojure.lang.Counted
   (count [_]
     (if shape
-      ;; A row counts its KEYS. The bytes say the same number -- one value per
-      ;; key -- but going through the shape says why.
-      (count (:ks shape))
+      ;; A row counts the keys it CARRIES, which since shapes became a union is
+      ;; not the same as the keys the shape declares: a short row stops early
+      ;; and an interior `undefined` marks an absent key. This used to return
+      ;; `(count (:ks shape))` in O(1), and that is now a count of the table
+      ;; rather than of the row -- it would report 5 for `{:a 1}` in a 5-key
+      ;; shape, disagreeing with `(count (value c))`.
+      (count (shaped-row-entries nav off (:ks shape)))
       ;; A navigable tag counts what the value it realises to counts: rows for
       ;; a shaped array, elements for a typed one, fields for a record.
       ;; `count` used to refuse every tag while `nth` on a typed array worked
@@ -1382,11 +1427,10 @@
   (seq [_]
     (if shape
       ;; Entries, because a row IS a map: key from the shape, value from the
-      ;; matching position. `child-offsets` gives the row's values in order,
-      ;; which is exactly shape order.
-      (seq (mapv (fn [k p] (clojure.lang.MapEntry. k (cursor-at nav p)))
-                 (:ks shape)
-                 (child-offsets nav off)))
+      ;; matching position. Absent keys are not entries -- a short row and an
+      ;; interior `undefined` both drop out in `shaped-row-entries`.
+      (seq (mapv (fn [[k p]] (clojure.lang.MapEntry. k (cursor-at nav (long p))))
+                 (shaped-row-entries nav off (:ks shape))))
       (let [mj (major nav off)]
         (cond
           (= mj MAJOR-ARRAY) (seq (mapv #(cursor-at nav %) (child-offsets nav off)))
@@ -2183,9 +2227,14 @@
         ;; EVERY ROW IS CHECKED WHEN IT IS REACHED -- see `shape-at` for why not
         ;; up front. On the paths that DO walk rows (`seq`, `reduce`, `nth i`)
         ;; the check costs 0.68 ns/row, because they are there already.
+        ;; `<=`, NOT `=`. The shape's keys are the UNION of every row's, so a
+        ;; row that lacks the trailing ones is simply shorter -- that is how
+        ;; `Writer.writeShapedArray` truncates trailing absences, and the
+        ;; Reader accepts it for the same reason. Longer than the shape is
+        ;; still malformed: there is no key for the extra value to land on.
         (let [row-ok? (fn [^long p]
                         (and (= MAJOR-ARRAY (.majorAt r p))
-                             (= k (.headArgAt r p))))
+                             (<= (.headArgAt r p) k)))
               at (fn [^long i]
                    (let [p (nth-item nav rows-off i)]
                      (cond (neg? p) ::miss
@@ -2454,9 +2503,18 @@
         ;; Realising the offset alone would hand back the values without their
         ;; keys -- a wrong value, not a slow one -- so the shape is reapplied
         ;; here. This is the whole reason the shape rides on the cursor.
+        ;;
+        ;; THROUGH `shaped-row-entries`, which is what makes this agree with
+        ;; `count`, `seq` and `get` on the same cursor. Zipping the shape's keys
+        ;; against the row's values directly was right while every row carried
+        ;; every key; once the shape became a UNION it reported absent keys as
+        ;; present with the value `undefined`, so `(nav/value row)` and
+        ;; `(boring/decode ...)` disagreed about the same bytes -- exactly the
+        ;; divergence between the two readers that this namespace exists to not
+        ;; have.
         (let [nav (.nav c)]
-          (zipmap (:ks sh)
-                  (mapv #(realize nav (long %)) (child-offsets nav (.off c)))))
+          (into {} (map (fn [[k p]] [k (realize nav (long p))]))
+                (shaped-row-entries nav (.off c) (:ks sh))))
         (realize (.nav c) (.off c))))
     c))
 

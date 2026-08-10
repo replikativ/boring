@@ -3113,7 +3113,18 @@ public final class Reader {
                         throw Err.of("bad-tag-content",
                             "boring: shaped array row must be an array", "tag", 39649L);
                     int vn = checkCount(arg(vh & 0x1F), 1);
-                    if (vn != n)
+                    // A ROW MAY BE SHORTER THAN THE SHAPE, and the keys it does
+                    // not reach are absent. Longer is still malformed: there is
+                    // no key for the extra value to land on.
+                    //
+                    // This used to demand exact equality, which made shapes
+                    // all-or-nothing -- one row with a different key set and the
+                    // writer declined to shape the table at all. Absence is now
+                    // spelled two ways, both of them here: a short row, and
+                    // `undefined` (0xf7) in an interior position. See
+                    // doc/SHAPES.md, and note that `null` (0xf6) remains a
+                    // PRESENT value, so `{:a nil}` and `{}` stay distinct.
+                    if (vn > n)
                         throw Err.of("bad-tag-content",
                             "boring: shaped array row has " + vn + " values but the shape has "
                             + n + " keys", "tag", 39649L);
@@ -3124,12 +3135,22 @@ public final class Reader {
                 // n whose `n * 2` overflows signed int on a source larger than
                 // 2 GiB, which was a raw NegativeArraySizeException. Even
                 // below that, the product may exceed any usable heap.
-                Object[] kvs = new Object[kvSlots(n)];
-                    for (int i = 0; i < n; i++) {
-                        kvs[i * 2] = keys[i];
-                        kvs[i * 2 + 1] = read();
+                Object[] kvs = new Object[kvSlots(vn)];
+                    // `p` counts PRESENT pairs, which is `vn` minus however many
+                    // came back `undefined`. Every value is still READ -- the
+                    // bytes have to be consumed either way -- it is only the
+                    // landing in `kvs` that is skipped.
+                    int p = 0;
+                    for (int i = 0; i < vn; i++) {
+                        Object v = read();
+                        if (v == Data.UNDEFINED) continue;   // absent, not nil
+                        kvs[p * 2] = keys[i];
+                        kvs[p * 2 + 1] = v;
+                        p++;
                     }
-                    tv = tv.conj(buildMap(kvs, n));
+                    // Trimmed only when something was absent, so the common
+                    // dense row pays no copy at all.
+                    tv = tv.conj(buildMap(p == vn ? kvs : java.util.Arrays.copyOf(kvs, p * 2), p));
                 }
                 return tv.persistent();
             }

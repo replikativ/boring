@@ -1516,7 +1516,13 @@
                       (err :boring/bad-tag-content "boring: shaped array row must be an array"
                            {:tag 39649}))
                     (let [vn (check-count r (arg! r (bit-and vh 0x1F)) 1)]
-                      (when (not== vn n)
+                      ;; A ROW MAY BE SHORTER THAN THE SHAPE -- the keys it does
+                      ;; not reach are absent. Longer is still malformed: there
+                      ;; is no key for the extra value to land on. Interior
+                      ;; absences are `undefined` (0xf7), handled below. `null`
+                      ;; (0xf6) stays a PRESENT value, so `{:a nil}` and `{}`
+                      ;; remain distinct. Mirrors the JVM Reader.
+                      (when (> vn n)
                         (err :boring/bad-tag-content
                              (str "boring: shaped array row has " vn " values but the shape has "
                                   n " keys") {:tag 39649}))
@@ -1529,15 +1535,32 @@
                         ;; shape is already validated.
                       (recur (inc i)
                              (conj! acc
-                                    (if (<= n arraymap-max)
-                                      (let [arr (js/Array. (* 2 n))]
-                                        (dotimes [j n]
-                                          (aset arr (* 2 j) (aget ks j))
-                                          (aset arr (inc (* 2 j)) (read! r)))
-                                        (PersistentArrayMap. nil n arr nil))
+                                    (if (<= vn arraymap-max)
+                                      ;; `p` counts PRESENT pairs. Every value is
+                                      ;; still READ -- the bytes must be consumed
+                                      ;; either way -- only the landing is
+                                      ;; skipped. The array is sized for `vn` and
+                                      ;; trimmed only when something was absent,
+                                      ;; so a dense row pays no copy.
+                                      (let [arr (js/Array. (* 2 vn))
+                                            p (loop [j 0 p 0]
+                                                (if (== j vn)
+                                                  p
+                                                  (let [val (read! r)]
+                                                    (if (identical? val data/undefined)
+                                                      (recur (inc j) p)
+                                                      (do (aset arr (* 2 p) (aget ks j))
+                                                          (aset arr (inc (* 2 p)) val)
+                                                          (recur (inc j) (inc p)))))))]
+                                        (PersistentArrayMap.
+                                         nil p (if (== p vn) arr (.slice arr 0 (* 2 p))) nil))
                                       (loop [j 0 m (transient {})]
-                                        (if (< j n)
-                                          (recur (inc j) (assoc! m (aget ks j) (read! r)))
+                                        (if (< j vn)
+                                          (let [val (read! r)]
+                                            (recur (inc j)
+                                                   (if (identical? val data/undefined)
+                                                     m
+                                                     (assoc! m (aget ks j) val))))
                                           (persistent! m)))))))))))))))
 
     258 (let [save (.-pos r)

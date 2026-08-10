@@ -11,7 +11,8 @@
             [boring.golden-test]
             [boring.option-matrix-test]
             [boring.skip-parity-test]
-            [boring.streaming-test]))
+            [boring.streaming-test]
+            [boring.union-shape-test]))
 
 (enable-console-print!)
 
@@ -41,6 +42,6 @@
                'boring.cljs-writer-opts-test
                'boring.conformance-test 'boring.generative-test 'boring.golden-test
                'boring.option-matrix-test 'boring.skip-parity-test
-               'boring.streaming-test))
+               'boring.streaming-test 'boring.union-shape-test))
 
 (set! *main-cli-fn* -main)

@@ -84,6 +84,78 @@ One caveat, measured after the fact and worth stating here rather than only in
 a general-purpose compressor is best at. Turn `:shapes` on when you are not
 compressing, or when decode latency matters more than ~10% of compressed size.
 
+Under **deflate** — which is what `permessage-deflate` uses over a WebSocket —
+the four profiles land within 4% of each other (plain 1 404, stringref 1 388,
+shapes 1 399, shapes+stringref 1 342), and shapes+stringref is marginally the
+smallest. So the inversion above is a zstd result, not a general one, and one
+profile can serve both storage and a deflating wire.
+
+### Ragged rows: the key set is a UNION
+
+The rule above — "all maps sharing one key set" — was once literal, and the
+writer declined the moment any row differed. That made shapes all-or-nothing:
+one ragged row in a thousand cost the whole table its density, and data
+arriving at a system boundary is exactly the ragged case (optional fields,
+schema drift, mixed event types).
+
+The keys are now the **union** of every row's, in first-seen order, and a row
+that lacks one says so in one of two ways:
+
+```
+value   [{:a nil :b 1} {:b 2}]
+
+shaped  d9 9ae1               tag 39649
+          82
+            82                  keys :a :b
+              d827 62 3a61
+              d827 62 3a62
+            82                  rows
+              82 f6 01            :a PRESENT with value null
+              82 f7 02            :a ABSENT
+```
+
+- **`undefined`** (simple value 23, `0xf7`) in a value position means that key
+  is absent from this map.
+- **A short row** means every key past its length is absent. Trailing
+  absences are truncated rather than padded, so a row that stops early costs
+  nothing for the keys it never reaches.
+
+`null` (`0xf6`) is untouched and still means a key that is **present** with a
+nil value. `{:a nil}` and `{}` are different maps and stay different bytes —
+that distinction is the whole reason absence needed its own spelling rather
+than reusing null.
+
+A row that carries `undefined` as an actual value cannot be shaped, since the
+two would be indistinguishable coming back; the writer declines such a table.
+
+This is [draft-ietf-cbor-packed][packed]'s idea — its tag-114 `record` function
+uses `undefined` for the same purpose. Only the semantics are borrowed, not the
+packing framework, and not its tag numbers, which are unassigned. See
+[IANA-REGISTRATION.md](IANA-REGISTRATION.md).
+
+### The density bound
+
+The union has a pathological case: **disjoint key sets**. Keys are numbered in
+first-seen order, so a row introducing all-new keys sits at high positions and
+must be padded past everything before it. The padding is then O(rows²) and
+shaping makes the document dramatically *bigger*. Measured, 200 rows of 5 keys
+each, shaped size ÷ plain size:
+
+| distinct key sets | 1 | 5 | 10 | 20 | 40 | 200 |
+|---|---:|---:|---:|---:|---:|---:|
+| ratio | 0.21 | 0.43 | 0.71 | **1.19** | 2.17 | **9.65** |
+
+So the writer measures rather than hopes. Hoisting the keys saves writing
+`total-entries − union` key occurrences; the padding costs one byte per empty
+slot. Both are accumulated during the pass the shape needs anyway, and shaping
+is declined when the padding would exceed the saving — which puts break-even
+between 10 and 20 distinct key sets, with no tuned constant.
+
+The guard's guarantee is narrow and worth stating exactly: **shaped output is
+never larger than the same value written without shapes.**
+
+[packed]: https://datatracker.ietf.org/doc/draft-ietf-cbor-packed/
+
 ---
 
 ## Proposed: tag 39650, shaped map
