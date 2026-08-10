@@ -1,0 +1,11 @@
+;; `boring.records` requires `boring.core` for the `boring/` alias used inside
+;; a macro's syntax quote, which resolves at EXPANSION time. clj-kondo cannot
+;; see that through a reader conditional and reports the require as unused.
+;;
+;; Scoped with `:config-in-ns` rather than excluded globally: an unused require
+;; of `boring.core` anywhere else is still a real finding worth hearing about.
+;;
+;; Not an inline `#_{:clj-kondo/ignore [:unused-namespace]}`, which suppressed
+;; the warning and was then itself reported as `Redundant ignore` at every
+;; placement tried.
+{:config-in-ns {boring.records {:linters {:unused-namespace {:level :off}}}}}

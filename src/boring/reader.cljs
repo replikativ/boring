@@ -1378,7 +1378,19 @@
   ;; behaved differently on the two platforms. Consumers with their own numeric
   ;; types need the built-in mapping to be a DEFAULT, not a ceiling.
   (if-let [override (get-in (.-registry r) [:readers tag])]
-    (override (read! r))
+    ;; GUARDED, because this is caller code running on attacker bytes -- see
+    ;; `Err.fromHandler` on the JVM for the argument. Only the handler call is
+    ;; inside the try: `read!` raises boring's own typed errors and must not be
+    ;; relabelled. A handler's OWN typed `ex-info` passes through unchanged.
+    (let [payload (read! r)]
+      (try (override payload)
+           (catch :default e
+             (if (:type (ex-data e))
+               (throw e)
+               (err :boring/handler-failed
+                    (str "boring: the tag reader registered for " tag " threw: "
+                         (.-message e))
+                    {:handler "tag reader" :id tag})))))
     (read-tagged!** r tag)))
 
 (defn- read-tagged!** [^Reader r tag]
@@ -1973,7 +1985,14 @@
            (when-not (string? nm)
              (err :boring/bad-tag-content "boring: tag 27 name must be a string" {:tag 27}))
            (if-let [ctor (get-in (.-registry r) [:records nm])]
-             (ctor argument)
+             (try (ctor argument)
+                  (catch :default e
+                    (if (:type (ex-data e))
+                      (throw e)
+                      (err :boring/handler-failed
+                           (str "boring: the record constructor registered for "
+                                nm " threw: " (.-message e))
+                           {:handler "record constructor" :id nm}))))
              ;; Built-in collection markers, AFTER the registry so a caller can
              ;; still take these names for themselves.
              (case nm

@@ -3,13 +3,16 @@
   in .cljc. Anything the JVM asserts, CLJS must assert too."
   (:require [cljs.test :as t]
             [goog.object :as gobj]
+            [boring.assigned-tag-test]
             [boring.canonical-parity-test]
             [boring.cljs-index-test]
             [boring.cljs-writer-opts-test]
             [boring.conformance-test]
             [boring.generative-test]
             [boring.golden-test]
+            [boring.handler-failure-test]
             [boring.option-matrix-test]
+            [boring.reserved-tag-test]
             [boring.skip-parity-test]
             [boring.streaming-test]
             [boring.union-shape-test]))
@@ -37,11 +40,14 @@
   ;; in .cljc is not enough to make ClojureScript run it, so a portable test
   ;; can silently cover one platform. That is the same gap this file's
   ;; docstring promises against, one level up.
-  (t/run-tests 'boring.canonical-parity-test
+  (t/run-tests 'boring.assigned-tag-test
+               'boring.canonical-parity-test
                'boring.cljs-index-test
                'boring.cljs-writer-opts-test
                'boring.conformance-test 'boring.generative-test 'boring.golden-test
-               'boring.option-matrix-test 'boring.skip-parity-test
+               'boring.handler-failure-test
+               'boring.option-matrix-test 'boring.reserved-tag-test
+               'boring.skip-parity-test
                'boring.streaming-test 'boring.union-shape-test))
 
 (set! *main-cli-fn* -main)

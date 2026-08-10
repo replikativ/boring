@@ -1080,6 +1080,28 @@ public final class Writer {
     private long[] srOffs;
     private boolean[] srUsed;
 
+    /**
+     * Staging window for the degenerate-frame decision in `write-indexed!`.
+     *
+     * <p>An indexed write seals a frame whenever it opens a stringref
+     * namespace, even with no container worth a node, and on a small value
+     * that frame is most of the file. A buffered caller can simply not emit
+     * it; a streaming one has to hold the first bytes back to have the choice.
+     *
+     * <p>ALLOCATED ONCE PER WRITER, not per call. Per-call it measured a 3.4x
+     * allocation regression on `write-indexed!` -- 1320 B/op to 4488 -- which
+     * is worse than the frame it removes. Reused it is 376 B/op, because the
+     * frame is no longer sealed at all. Like every other scratch here it is
+     * lazy, kept for the life of the writer, and released by {@link #trim()}.
+     */
+    private byte[] idxStaging;
+
+    /** The staging window, allocated on first use. */
+    public byte[] stagingWindow(int cap) {
+        if (idxStaging == null || idxStaging.length < cap) idxStaging = new byte[cap];
+        return idxStaging;
+    }
+
     /** What {@link #trim()} goes back to. */
     private final int initialSize;
 
@@ -1211,6 +1233,11 @@ public final class Writer {
             idxWalk = null;
         }
         if (idxSeq != null && idxSeq.length > 1024) idxSeq = null;
+        // AND THE STAGING WINDOW, for the same reason as the five above: it is
+        // lazy, it is held for the life of the writer, and `trim()` is the one
+        // method whose job is to hand memory back. #39 was exactly this
+        // omission for `idxWalk`.
+        idxStaging = null;
         // THE MAP ANCHOR STACK, which this method's own docstring promised and
         // did not deliver. `idxScratch` grows to the deepest nesting-sum of map
         // entry counts and NEVER shrank: `idxReset` only zeroes the top
@@ -1698,6 +1725,37 @@ public final class Writer {
         if (tag < 0)
             throw Err.of("bad-tag",
                 "boring: tag must be non-negative, got " + tag, "tag", tag);
+        // THE STRINGREF MACHINERY IS THE CODEC'S, NOT THE CALLER'S. Tag 25 is
+        // an index into a table this writer builds while encoding, and tag 256
+        // is what declares that table's scope. A caller-supplied one cannot be
+        // coherent with the numbering, and boring wrote it out anyway:
+        //
+        //   (encode ["hello-world-string" (tagged-value 25 0)] {:stringref false})
+        //     -> bytes boring itself refuses to read, :boring/bad-stringref
+        //   (encode ["hello-world-string" (tagged-value 25 0)] {})
+        //     -> ["hello-world-string" "hello-world-string"], the TaggedValue
+        //        silently RESOLVED to whatever index 0 held. A round-trip that
+        //        changes the value's type is not a round-trip.
+        //   (encode (tagged-value 256 [1 2 3])) -> [1 2 3], tag swallowed.
+        //
+        // Refused rather than escaped, because this namespace is exactly what
+        // `boring.nav`'s pointer table resolves against: a document with a
+        // reference the writer did not number is one no reader can trust.
+        // Encode-side refusal is the house rule for values that cannot be
+        // represented faithfully -- see doc/SECURITY.md's table.
+        //
+        // This funnels every CALLER-supplied tag: `writeTagNumber` for a
+        // `tagged-value`, and a registered handler's own tag. boring's internal
+        // writes go through `head(TAG, ...)` directly and are unaffected.
+        if (tag == TAG_STRINGREF || tag == TAG_SR_NS)
+            throw Err.of("reserved-tag",
+                "boring: tag " + tag + " belongs to the stringref namespace, "
+                + "which the encoder manages itself -- a caller-supplied "
+                + (tag == TAG_STRINGREF
+                   ? "reference cannot be numbered against a table it did not build"
+                   : "namespace would collide with the one being written")
+                + ". Encode the value it stands for instead.",
+                "tag", tag);
         head(TAG, tag);
     }
 
@@ -3221,7 +3279,15 @@ public final class Writer {
         TagRegistry.TagWriter handler = registry.hasWriters() ? registry.writerFor(c) : null;
         if (handler != null) {
             writeTag(handler.tag);                        // validated, not raw head
-            writeValue(handler.fn.invoke(x));
+            {
+                // The write side has the same hole: a tag writer that throws
+                // escaped `encode` raw. Less exposed than the read side --
+                // the value is the caller's own -- but the same guarantee.
+                Object converted;
+                try { converted = handler.fn.invoke(x); }
+                catch (Exception e) { throw Err.fromHandler("tag writer", handler.tag, e); }
+                writeValue(converted);
+            }
             return;
         }
 
@@ -3537,7 +3603,14 @@ public final class Writer {
         if (encodeFallback != null && !inFallback) {
             inFallback = true;
             try {
-                writeValue(encodeFallback.invoke(x));
+                {
+                    Object converted;
+                    try { converted = encodeFallback.invoke(x); }
+                    catch (Exception e) {
+                        throw Err.fromHandler(":encode-fallback", x.getClass().getName(), e);
+                    }
+                    writeValue(converted);
+                }
                 return;
             } finally {
                 inFallback = false;
