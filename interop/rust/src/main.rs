@@ -98,8 +98,39 @@ fn convert_tag(tag: u64, inner: &Value) -> Clj {
             _ => Clj::Other(tag, Box::new(convert(inner))),
         },
         // 39649: boring's shaped array, [keys, [row-values...]]. Provisional,
-        // off by default, and a pure zip -- it needs no state outside the tag,
-        // which is exactly what makes it cheap to support here.
+        // off by default, and it needs no state outside the tag, which is what
+        // makes it cheap to support here.
+        //
+        // THE KEYS ARE THE UNION OF EVERY ROW'S, so a row need not carry all
+        // of them and absence has two spellings: a SHORT row, where every key
+        // past its length is absent, and `undefined` (simple value 23) for a
+        // gap in the middle.
+        //
+        // `null` is NOT absence -- it is a key present with a nil value, and
+        // CBOR spells the two differently on purpose (0xf6 null, 0xf7
+        // undefined), so the distinction has to survive reconstruction.
+        //
+        // A SHORT ROW IS HANDLED HERE AND A MID-ROW GAP CANNOT BE, and the
+        // reason is ciborium's, not boring's: it DECODES `undefined` TO
+        // `Value::Null`. Verified against ciborium 0.2 --
+        //
+        //   from_reader(&[0xf7]) -> Null
+        //   from_reader(&[0xf6]) -> Null
+        //   equal?               -> true
+        //
+        // -- so at the `Value` layer the information the format carries has
+        // already been destroyed, and no amount of care in this function gets
+        // it back. RFC 8949 makes simple values 22 and 23 distinct; collapsing
+        // them loses data.
+        //
+        // `zip` stopping at the shorter side is what makes the short-row case
+        // correct, and that is the common one: the writer truncates trailing
+        // absences, so a row only carries `undefined` for a gap it must span.
+        // A gap decodes here as a key present with a nil value.
+        //
+        // A reader that must be exact needs a decoder that keeps the two
+        // apart. Python's cbor2 does (`cbor2.undefined`), and
+        // `interop/read_boring.py` filters on it. See doc/INTEROP.md.
         39649 => match inner {
             Value::Array(a) if a.len() == 2 => {
                 let keys: Vec<Clj> = match &a[0] {
@@ -363,12 +394,47 @@ fn main() -> ExitCode {
     check!(
         "record",
         Clj::Record(
-            "gen_interop_fixture.Point".into(),
+            "gen-interop-fixture/Point".into(),
             Box::new(Clj::Map(vec![
                 (Clj::Keyword("x".into()), Clj::Int(3)),
                 (Clj::Keyword("y".into()), Clj::Int(4)),
             ])),
         ),
+    );
+
+    // RAGGED SHAPED ROWS, and this assertion deliberately pins a WRONG answer.
+    //
+    // The shape's keys are the union of every row's, so a row can lack one:
+    // `undefined` (0xf7) marks a gap in the middle and a short row marks a
+    // missing tail. ciborium decodes `undefined` to `Value::Null` -- verified
+    // against 0.2, both 0xf6 and 0xf7 give Null and compare equal -- so by the
+    // time this program sees the row, absence and null are indistinguishable.
+    //
+    // Row 2 below therefore gains a phantom `:b` bound to nil, where boring and
+    // Python's cbor2 both report `:b` ABSENT. Asserting the correct value would
+    // just fail; asserting nothing would let the limitation drift out of
+    // doc/INTEROP.md unnoticed. So it is written down here as what ciborium
+    // actually produces, and IF CIBORIUM EVER DISTINGUISHES THE TWO THIS TEST
+    // FAILS -- which is the signal to fix the reader and the doc together.
+    //
+    // The short row (row 3) is handled correctly, because `zip` stops at the
+    // shorter side. That is the common case: the writer truncates trailing
+    // absences, so `undefined` only ever spans a gap.
+    check!(
+        "ragged",
+        Clj::Array(vec![
+            Clj::Map(vec![
+                (Clj::Keyword("a".into()), Clj::Null),      // present, null
+                (Clj::Keyword("b".into()), Clj::Int(1)),
+                (Clj::Keyword("c".into()), Clj::Int(2)),
+            ]),
+            Clj::Map(vec![
+                (Clj::Keyword("a".into()), Clj::Int(3)),
+                (Clj::Keyword("b".into()), Clj::Null),      // ABSENT in truth
+                (Clj::Keyword("c".into()), Clj::Int(4)),
+            ]),
+            Clj::Map(vec![(Clj::Keyword("a".into()), Clj::Int(5))]),
+        ]),
     );
 
     // RFC 8746 typed arrays: registered, standard, and the thing generic

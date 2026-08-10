@@ -57,8 +57,10 @@ tagged-release permalink over a branch URL.
 >
 > **Data item**: array
 >
-> **Semantics**: Shaped array; array of maps sharing one key set, encoded as
-> `[keys, [values-per-row, ...]]`
+> **Semantics**: Shaped array; array of maps with the key set hoisted out,
+> encoded as `[keys, [values-per-row, ...]]`, where `undefined` in a value
+> position and a row shorter than the key set both mean the corresponding key
+> is absent from that map
 >
 > **Reference**: `<SPEC-URL>`
 >
@@ -68,7 +70,7 @@ tagged-release permalink over a branch URL.
 
 The tag content is a two-element array:
 
-1. the key set, as an array, in the order the keys appear in each row;
+1. the KEY SET, as an array: the union of every row's keys, each appearing once;
 2. an array of rows, each an array of values positionally matching the keys.
 
 ```
@@ -84,9 +86,39 @@ encoded  d9 9ae1                 tag 39649
                82 02 d827623a79        row 2: values only
 ```
 
-Every row must have exactly as many values as there are keys; a decoder that
-finds otherwise must reject the item rather than pad or truncate. Keys must be
-distinct. Both are enforced by boring's readers on each platform.
+**A row need not carry every key.** The key set is the union across rows, and
+absence has two spellings:
+
+- **`undefined`** (simple value 23) in a value position: that key is absent
+  from this map.
+- **A short row**: every key from the row's length onward is absent. Trailing
+  absences are truncated rather than padded.
+
+```
+value    [{:a nil :b 1} {:b 2}]
+
+encoded  d9 9ae1  82
+           82  d827623a61  d827623a62      keys :a :b
+           82
+             82 f6 01                      :a PRESENT, value null
+             82 f7 02                      :a ABSENT
+```
+
+**`null` (simple value 22) is not absence.** It is a key that is present with a
+null value, and `{:a null}` and `{}` are different maps. A decoder that
+collapses `undefined` into `null` cannot represent this distinction and will
+report an absent key as present — RFC 8949 makes the two simple values
+distinct, and that distinction is load-bearing here.
+
+A row longer than the key set is malformed: there is no key for the extra value
+to bind to, and a decoder must reject the item rather than truncate. Keys must
+be distinct. Both are enforced by boring's readers on each platform.
+
+The `undefined` convention is taken deliberately from
+[draft-ietf-cbor-packed][packed], whose tag-114 `record` function spells
+absence the same way, so that an implementation of one informs the other.
+
+[packed]: https://datatracker.ietf.org/doc/draft-ietf-cbor-packed/
 
 A decoder that does not implement the tag surfaces an opaque tagged value
 rather than misreading, and the tag is only emitted when the caller opts in

@@ -66,7 +66,7 @@ CBOR has no tag for, under names carrying the same **slash**:
 | `clojure/with-meta` | `[meta, value]` | Clojure metadata, which has nowhere else to go |
 | `clojure/char` | a 1-character string | `(= \a "a")` is **false** in Clojure |
 | `java/period` | an ISO-8601 string, e.g. `"P1Y1M1D"` | a *date* amount; RFC 9581's tag 1002 carries *seconds* |
-| `boring/index` | `[stride, containers, counts, slots, sorted, ptr]` | a file's offset index. Pure metadata — **ignoring it is always correct** |
+| `boring/index` | `[stride, containers, counts, slots, sorted, (stringrefs,) data-end]` — **six or seven elements** | a file's offset index. Pure metadata — **ignoring it is always correct** |
 
 The prefix names the runtime that owns the type. These names are **frozen** —
 they are pinned in the golden corpus, because renaming one is a silent break: a
@@ -97,8 +97,7 @@ lose anyway.
 
 ## The one extension
 
-An array whose elements are all maps sharing one key set is written with the
-keys **once**:
+An array of maps is written with the keys **once**:
 
 ```
 value    [{:e 1 :a :x} {:e 2 :a :y}]
@@ -108,15 +107,49 @@ wire     39649([ [":e", ":a"],            <- the key set, once
                    [2, ":y"] ] ])         <- row 2
 ```
 
-Reconstructing it is a zip, and it needs **no state outside the tag** — that is
-the property that makes it easy to support elsewhere, and the reason it was
-designed this way rather than as a stream-scoped structure table:
+It needs **no state outside the tag** — that is the property that makes it easy
+to support elsewhere, and the reason it was designed this way rather than as a
+stream-scoped structure table.
+
+**It is not quite a zip.** The key set is the UNION of every row's keys, so a
+row need not carry all of them, and absence has two spellings:
+
+- **`undefined`** (simple value 23) in a value position — that key is absent
+  from this map;
+- **a short row** — every key from the row's length onward is absent.
+
+**`null` is not absence.** It is a key present with a null value: `{:a null}`
+and `{}` are different maps, and CBOR spells them differently on purpose —
+`0xf6` is null, `0xf7` is undefined.
+
+```
+value    [{:a nil :b 1} {:b 2}]
+wire     39649([ [":a", ":b"], [ [null, 1], [undefined, 2] ] ])
+                                        ^^^^        ^^^^^^^^^
+                                        present     absent
+```
+
+A plain `dict(zip(keys, row))` gets the short-row case right by accident, since
+`zip` stops at the shorter side, and the mid-row case **wrong**: it produces a
+phantom key holding `undefined`. Filter it:
 
 ```python
 def shaped_array(payload):
     keys, rows = payload
-    return [dict(zip(keys, row)) for row in rows]
+    return [
+        {k: v for k, v in zip(keys, row) if v is not cbor2.undefined}
+        for row in rows
+    ]
 ```
+
+**Your decoder must keep `undefined` and `null` apart**, and not all of them
+do. Python's `cbor2` does, and exposes `cbor2.undefined`. Rust's **ciborium
+does not** — verified against 0.2, both `0xf6` and `0xf7` decode to
+`Value::Null` and compare equal — so `interop/rust` handles short rows
+correctly and cannot distinguish a mid-row gap from a null value. That is a
+limitation of the decoder rather than of the format; RFC 8949 makes the two
+simple values distinct. If your library collapses them, either use
+`{:profile :interop}` below or drop to a lower-level parser for this tag.
 
 It is **off by default** (`:shapes true` opts in), and a decoder that ignores it
 gets an inert tagged value — never a misreading. Use `{:profile :interop}` to

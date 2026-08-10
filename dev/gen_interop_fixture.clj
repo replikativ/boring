@@ -50,9 +50,25 @@
    ;; position. A fixture only catches what it contains.
    "sr-threshold" ["abc" "abc" "wxyz" "wxyz"]
 
-   ;; The one extension: an array of maps sharing a key set. Written with the
-   ;; keys ONCE under tag 39649 when :shapes is on.
-   "shaped"       [{:e 1 :a :x} {:e 2 :a :y}]})
+   ;; The one extension: an array of maps. Written with the keys ONCE under
+   ;; tag 39649 when :shapes is on.
+   "shaped"       [{:e 1 :a :x} {:e 2 :a :y}]
+
+   ;; RAGGED ROWS, and it is here for the same reason "sr-threshold" is: a
+   ;; fixture only catches what it contains. The shape's keys are the UNION of
+   ;; every row's, so a row can lack one -- spelled `undefined` (0xf7) for a
+   ;; gap in the middle and a SHORT ROW for a missing tail. Both reference
+   ;; readers reconstructed this as a zip, which is right for the short row by
+   ;; accident and wrong for the gap: it produced a phantom key holding
+   ;; `undefined`. CI was green throughout, because nothing in this fixture had
+   ;; a ragged row.
+   ;;
+   ;; `:a nil` in the first row is the other half: `null` (0xf6) is a key that
+   ;; is PRESENT with a nil value, and a reader that treats it as absence loses
+   ;; the difference between `{:a nil}` and `{}`.
+   "ragged"       [{:a nil :b 1 :c 2}     ; :a present, value nil
+                   {:a 3 :c 4}            ; :b absent -- a gap, 0xf7
+                   {:a 5}]})              ; :b and :c absent -- a short row
 
 (defn -main [& _]
   (let [out "interop/fixture.cbor"
