@@ -490,27 +490,33 @@
                                       (alength ^bytes bs) o)))
         (is (= v (first (boring/decode-seq (.toByteArray out) o))))))))
 
-(deftest stringref-and-an-index-are-refused-by-every-writer
-  (testing "An index exists to be navigated, and `boring.nav` refuses a
+(deftest stringref-and-an-index-compose-for-a-value-and-not-for-a-sequence
+  (testing "An index exists to be navigated, and `boring.nav` used to refuse a
             stringref document outright -- a stringref is an index into a table
             built from every preceding string, which a cursor holding only an
-            offset cannot resolve. `write-seq!` and `write-indexed!` have
-            raised on that combination all along; `encode-indexed` honoured it
-            and produced a file whose index nothing can use. Three functions,
-            one rule, and one of them did not follow it."
-    (let [v (vec (range 40))
+            offset cannot resolve. The frame's pointer table gives it the
+            defining offset of every slot something references, so the two
+            SINGLE-VALUE writers now honour the combination.
+
+            A SEQUENCE STILL REFUSES IT, and that asymmetry is the point:
+            `write-root!` resets the writer per top-level item, so each item
+            opens its own namespace numbered from zero, and one frame carries
+            one table. Item 1's references would resolve against item N's
+            literals -- silently."
+    (let [v (vec (repeat 40 {:city "amsterdam" :n 1}))
           opts {:index 4 :index-min 2 :stringref true}]
-      (is (= :boring/incompatible-options
-             (try (do (boring/encode-indexed v opts) nil)
-                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
-      (is (= :boring/incompatible-options
-             (try (let [out (ByteArrayOutputStream.)]
-                    (boring/write-indexed! (boring/writer 4096) v out opts) nil)
-                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+      (is (= v (nav/value (nav/root (boring/encode-indexed v opts))))
+          "encode-indexed honours it, and what it writes is navigable")
+      (is (= v (nav/value
+                (nav/root (let [out (ByteArrayOutputStream.)]
+                            (boring/write-indexed! (boring/writer 4096) v out opts)
+                            (.toByteArray out)))))
+          "and so does write-indexed!, which is where the pointers come from")
       (is (= :boring/incompatible-options
              (try (let [out (ByteArrayOutputStream.)]
                     (boring/write-seq! (boring/writer 4096) [v] out opts) nil)
-                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+          "write-seq! refuses, at every stride"))
     (testing "the control: without `:stringref true` all three still write, and
               what they write is navigable"
       (let [v (vec (range 40))

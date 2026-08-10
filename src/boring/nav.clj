@@ -518,6 +518,23 @@
   document without a namespace, which is every `:index`-written file today,
   never reaches this and stays lazy.
 
+  A NAMESPACE THAT WAS NEVER USED IS NOT A PROBLEM, and this refused one for a
+  while. The default profile opens a namespace before it knows the content, so
+  `(encode-indexed (vec (range 40)))` -- forty integers and not one string --
+  came back unnavigable. The fix is on the WRITER's side, not here: an indexed
+  write seals a frame whenever it opens a namespace, and the pointer table is
+  emitted even when empty. So `hasStringrefPointers` distinguishes \"no table\"
+  from \"a table with no entries\", and the refusal below keeps its exact
+  meaning -- this document was never indexed, so nothing can resolve a
+  reference in it.
+
+  Deciding it HERE instead, by accepting a missing table and letting the reader
+  raise at the reference, was tried and is worse. It cannot tell \"referenced
+  nothing\" from \"references something unresolvable\", so it has to accept both
+  -- which moves the failure for an unindexed stringref document from
+  `nav/source` to somewhere deep in a walk. `mmap-source` over millions of rows
+  is the wrong place to learn the file cannot be navigated at all.
+
   `:trust-index :ignore` has no Index at all, so it refuses -- correctly:
   ignoring the index means ignoring the only thing that could resolve a
   reference."

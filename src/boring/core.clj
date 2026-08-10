@@ -1198,35 +1198,67 @@
                   (.abortStream ^Writer w)
                   (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
                   (throw t)))]
-    (if (and indexing? (pos? (alength ^longs (.idxContainers ^Writer w))))
+    ;; READ BEFORE THE GATE, and before `seal-index!` -- sealing calls
+    ;; `write-root!` and so `.reset`, which clears the stringref namespace, so
+    ;; read afterwards this is always empty and silently so.
+    ;;
+    ;; GATED ON `:stringref`, not on whether pointers came back.
+    ;; `stringrefPointers` answers the empty array to both "this document
+    ;; opened no namespace" and "it opened one and referenced nothing", and
+    ;; those need different frames: no element for the first, an EMPTY element
+    ;; for the second. Without the gate every `{:stringref false}` file would
+    ;; gain a two-byte element it has no use for and stop being byte-identical.
+    (let [srp (when (and indexing? (:stringref o)) (.stringrefPointers ^Writer w))]
+      ;; A FRAME IS SEALED WHENEVER A REFERENCE WAS EMITTED, even with no
+      ;; container node to describe. The gate used to be the node count alone,
+      ;; and that wrote a document nothing could read: the writer emits a tag-25
+      ;; reference as soon as a string repeats, but #22's walk threshold
+      ;; declines to index a small container, so
+      ;; `(encode-indexed [{:city "amsterdam"} {:city "amsterdam"}])` came out
+      ;; 49 bytes carrying references and no table -- and `nav/root` refused its
+      ;; own library's output. Small values with repeated keys are the common
+      ;; shape, not an edge case.
+      ;;
+      ;; The invariant this restores is that A REFERENCE IS ONLY EVER WRITTEN
+      ;; WHEN A TABLE EXISTS TO RESOLVE IT. The streaming writer cannot go back
+      ;; and re-encode, so sealing the frame is the only enforcement available
+      ;; -- and it is proportionate, because the frame now has a second job.
+      ;; Carrying the pointer table is reason enough to write one.
+      ;;
+      ;; ON `:stringref`, NOT on whether a reference was actually emitted. The
+      ;; narrower gate saves a frame on documents that open a namespace and
+      ;; never use it -- `(vec (range 40))` is 61 bytes rather than 101 -- but
+      ;; it buys that by making `nav` unable to tell "opened a namespace and
+      ;; referenced nothing" from "references something I cannot resolve", so
+      ;; the only way to accept the first is to stop refusing the second at
+      ;; open. That moves the failure for an UNINDEXED stringref document --
+      ;; the genuine error condition -- from `nav/source` to somewhere deep in
+      ;; a walk, which for `mmap-source` over millions of rows is the wrong
+      ;; place to learn the file cannot be navigated.
+      ;;
+      ;; So the frame is sealed whenever a namespace is opened, and "namespace
+      ;; with no table" goes back to meaning exactly one thing. The cost falls
+      ;; only on values too small to warrant an index in the first place.
+      ;;
       ;; NO SENTINEL NODE HERE, unlike `write-seq!`. That node stands for the
       ;; sequence itself so `nav/items` can seek between top-level items; this
       ;; writes ONE value, which `nav/source` navigates into. Adding a node for
       ;; a sequence of one would claim a shape the file does not have.
-      (let [containers (.idxContainers ^Writer w)
-            counts (.idxCounts ^Writer w)
-            sl (.idxSlots ^Writer w)
-            so (.idxSorted ^Writer w)
-            ;; Before `seal-index!`, for the reason `write-seq!` gives: sealing
-            ;; resets the writer, and reset clears the stringref namespace.
-            ;;
-            ;; GATED ON `:stringref`, not on whether any pointers came back.
-            ;; `stringrefPointers` answers the empty array to both "this
-            ;; document opened no namespace" and "it opened one and referenced
-            ;; nothing", and those need different frames: no element for the
-            ;; first, an EMPTY element for the second. Without the gate every
-            ;; `{:stringref false}` file would gain a two-byte element it has
-            ;; no use for, and stop being byte-identical to what it was.
-            srp (when (:stringref o) (.stringrefPointers ^Writer w))]
-        (.setIndex ^Writer w (int 0) (int 0) 0)
-        (+ total
-           (long (seal-index! w out
-                              {:stride stride :containers containers :counts counts
-                               :slots (vec sl) :sorted (vec so)
-                               :stringrefs srp}
-                              total o))))
-      (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
-          total))))
+      (if (and indexing? (or (pos? (alength ^longs (.idxContainers ^Writer w)))
+                             (some? srp)))
+        (let [containers (.idxContainers ^Writer w)
+              counts (.idxCounts ^Writer w)
+              sl (.idxSlots ^Writer w)
+              so (.idxSorted ^Writer w)]
+          (.setIndex ^Writer w (int 0) (int 0) 0)
+          (+ total
+             (long (seal-index! w out
+                                {:stride stride :containers containers :counts counts
+                                 :slots (vec sl) :sorted (vec so)
+                                 :stringrefs srp}
+                                total o))))
+        (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
+            total)))))
 
 (defn write-indexed!
   "Stream ONE value to `out` and seal it with a container index, in bounded

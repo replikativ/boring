@@ -258,7 +258,14 @@
                         v (nav/value (nav/walk c [:k11]))]
                     {:value v :skips (- (.skips r) before)}))
           embedded (probe blob prefix)
-          standalone (probe (boring/encode-indexed doc idx-opts) 0)
+          ;; `:stringref false` HERE TOO. Everything else in this fixture says
+          ;; it explicitly -- `item`, `blob`'s frame, and `o` -- and this one
+          ;; call inherited the profile default instead, so once stringref and
+          ;; indexing composed the standalone form was a DIFFERENT document
+          ;; from the embedded one and did a different amount of work. The
+          ;; comparison is about where the index is rooted, not about stringref.
+          standalone (probe (boring/encode-indexed
+                             doc (assoc idx-opts :stringref false)) 0)
           unindexed (probe item 0)]
       (is (= 11 (:value embedded) (:value standalone) (:value unindexed))
           "every form gives the same answer")

@@ -1141,8 +1141,20 @@
          end (.-length bs)]
      (loop [p 0] (when (< p end)
                    (recur (index-walk* r p stride min-entries 0 acc 0 #js [0] false))))
-     (when (pos? (.-length acc))
-       (let [idx (vec (sort-by first (vec acc)))]
+     ;; A FRAME IS ALSO EARNED BY A NAMESPACE, not only by a container node.
+     ;; The gate used to be the node count alone, and that returned nil for a
+     ;; small value whose strings repeat -- so `encode-indexed` handed back a
+     ;; document carrying tag-25 references and no table, which `boring.nav`
+     ;; cannot read. #22's walk threshold declines to index a small container,
+     ;; and the writer emits a reference as soon as a string repeats, so the
+     ;; two rules met in the middle and produced an unreadable file.
+     ;;
+     ;; ON THE NAMESPACE, not on whether anything was referenced, matching
+     ;; `write-indexed-resolved!` -- see the long note there for why the
+     ;; narrower gate costs more than the frame it saves.
+     (let [srp (when (rd/has-stringref-root? r) (derive-stringref-pointers r end))]
+       (when (or (pos? (.-length acc)) (some? srp))
+         (let [idx (vec (sort-by first (vec acc)))]
          ;; `:stride` INCLUDED. The JVM's `build-index` returns it and
          ;; `seal-index!` reads it from the index; here it was omitted and
          ;; `seal-index!` took it from its own options map instead, so the
@@ -1158,12 +1170,10 @@
            ;; is a decision input, carried so the three builders can be held to
            ;; the same number before any of them acts on it.
            :walk (mapv #(nth % 4) idx)}
-           ;; ONLY FOR A DOCUMENT THAT OPENS A NAMESPACE -- three bytes, false
-           ;; for every document that does not use the feature, so nothing pays
-           ;; for a walk it has no use for. `cond->`, not a nil value: the JVM
-           ;; `build-index` omits the key entirely here and this map is public.
-           (rd/has-stringref-root? r)
-           (assoc :stringrefs (derive-stringref-pointers r end))))))))
+           ;; `cond->`, not a nil value: the JVM `build-index` omits the key
+           ;; entirely for a document that opens no namespace, and this map is
+           ;; public, so the two platforms must agree on its shape.
+           (some? srp) (assoc :stringrefs srp))))))))
 
 (defn- long->8-bytes [v]
   (let [b (js/Uint8Array. 8)]

@@ -202,7 +202,7 @@
         (is (= v (boring/decode bs o)) "and `decode` still returns the value")
         (is (= [v] (vec (boring/decode-seq bs o))) "with the frame hidden")))))
 
-(deftest write-indexed-is-bounded-and-refuses-stringref
+(deftest write-indexed-is-bounded-and-composes-with-stringref
   (testing "bounded memory, unlike encode-indexed which holds the whole array"
     (let [sink (proxy [OutputStream] [] (write ([_]) ([_ _ _])))
           big (mapv (fn [i] {:id i :name (str "customer-" i)}) (range 40000))
@@ -210,12 +210,33 @@
           n (boring/write-indexed! w big sink {:index 16})]
       (is (> n 1000000))
       (is (<= (alength ^bytes (boring/buffer w)) 65536))))
-  (testing "an explicit :stringref true alongside :index throws rather than one
-            silently winning -- nav cannot resolve a reference from an offset"
-    (is (thrown? clojure.lang.ExceptionInfo
-                 (boring/write-indexed! (boring/writer 4096 nil) {:a 1}
-                                        (ByteArrayOutputStream.)
-                                        {:index 16 :stringref true})))))
+  (testing "`:stringref true` alongside `:index` used to throw, because a
+            cursor holding an offset could not resolve a reference. The frame's
+            pointer table closed that, and this writer is where the pointers
+            come from -- it takes them off its own symbol table as it encodes,
+            which is why it can carry them and the byte-walk builder has to
+            re-derive them."
+    (let [out (ByteArrayOutputStream.)
+          n (boring/write-indexed! (boring/writer 4096 nil)
+                                   (vec (repeat 40 {:city "amsterdam" :n 1}))
+                                   out {:index 16 :stringref true})]
+      (is (pos? n))
+      (is (= (vec (repeat 40 {:city "amsterdam" :n 1}))
+             (nav/value (nav/root (.toByteArray out)))))))
+  (testing "and a REFERENCE EARNS A FRAME even when no container does. A small
+            value whose strings repeat carries tag-25 references, and #22's
+            walk threshold declines to index it -- so the node count alone as a
+            gate produced a document with references and no table, which
+            `nav/root` refused. The writer cannot go back and re-encode, so the
+            frame is sealed: a reference is only ever written when a table will
+            exist to resolve it."
+    (let [v [{:city "amsterdam" :name "a"} {:city "amsterdam" :name "b"}]
+          out (ByteArrayOutputStream.)]
+      (boring/write-indexed! (boring/writer 4096 nil) v out {:index 16})
+      (let [bs (.toByteArray out)]
+        (is (= 0x48 (bit-and (aget bs (- (alength bs) 9)) 0xff))
+            "the 9-byte trailer is there, so a frame was sealed")
+        (is (= v (nav/value (nav/root bs))))))))
 
 (deftest trim-gives-back-what-one-large-job-grew
   (testing "a writer's growth is one-way -- buffer, symbol table and index

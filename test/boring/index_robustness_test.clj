@@ -1283,7 +1283,13 @@
             its own merits -- and the property asserted here is unchanged: nav
             and decode-seq must give the SAME answer."
     (let [v (vec (for [i (range 40)] {:e i :a :n/x :v (str "v" i)}))
-          good (boring/encode-indexed v {:index 4 :index-min 4})
+          ;; `:stringref false` PINS THE FIXTURE AT SIX ELEMENTS, which the
+          ;; splice below depends on. With stringref the frame already carries
+          ;; the pointer table and its header is 0x87, so patching it to 0x87
+          ;; and adding an element produced a frame whose declared count was
+          ;; one short -- and the test failed for a reason with nothing to do
+          ;; with the widening it exists to check.
+          good (boring/encode-indexed v {:index 4 :index-min 4 :stringref false})
           ;; Widen the payload header from 0x86 to 0x87 and splice one more
           ;; element (null) in just before the trailing back-pointer, so the
           ;; pointer stays last and every OTHER property of a genuine frame
