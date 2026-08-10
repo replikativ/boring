@@ -421,9 +421,9 @@
             the caller cannot tell from the outside. Found by writing that
             expression in a probe and having it fail on the sorted case only."
     (let [c (nav/root (boring/encode {"plain"  {"y" 2}
-                                        "sorted" (into (sorted-map) {"x" 1 "y" 2})
-                                        "set"    #{1 2}
-                                        "vec"    [1 2]} o) o)]
+                                      "sorted" (into (sorted-map) {"x" 1 "y" 2})
+                                      "set"    #{1 2}
+                                      "vec"    [1 2]} o) o)]
       (is (= 2 (nav/value (get (get c "plain") "y"))))
       (is (= 2 (nav/value (get (get c "sorted") "y")))
           "the same expression must work through a tag")

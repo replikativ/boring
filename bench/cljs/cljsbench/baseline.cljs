@@ -92,8 +92,7 @@
     (println (pad nm 17)
              (cell (safe #(auto-bench (fn [] (fress-encode-fresh v)))))
              (cell (safe #(auto-bench (fn [] (fress-encode-reused v)))))
-             (cell (safe #(auto-bench (fn [] (transit/write tw v))))))
-    )
+             (cell (safe #(auto-bench (fn [] (transit/write tw v)))))))
 
   (println "\n=== DECODE ===")
   (println (pad "payload" 17) (cell "fress") (cell "transit"))

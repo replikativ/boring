@@ -834,21 +834,21 @@
     (let [pairs (vec pairs)
           n (quot (count pairs) 2)
           mx-i (reduce max 0 (take-nth 2 pairs))
-            mx-o (reduce max 0 (take-nth 2 (drop 1 pairs)))
-            ic (unsigned-width-code mx-i)
-            oc (unsigned-width-code mx-o)
-            iw (bit-shift-left 1 ic)
-            ow (bit-shift-left 1 oc)
-            out (js/Uint8Array. (+ 1 (* n (+ iw ow))))
+          mx-o (reduce max 0 (take-nth 2 (drop 1 pairs)))
+          ic (unsigned-width-code mx-i)
+          oc (unsigned-width-code mx-o)
+          iw (bit-shift-left 1 ic)
+          ow (bit-shift-left 1 oc)
+          out (js/Uint8Array. (+ 1 (* n (+ iw ow))))
             ;; NOT `bit-shift-right`: it coerces to int32, so byte 4 of a u64
             ;; -- and any offset at or above 2^31 -- would come out of a wrapped
             ;; value. Division is exact for the whole 2^53 range JS integers
             ;; cover, which is past every offset a document can carry here.
-            put! (fn [o v sz]
-                   (loop [j 0 x v]
-                     (when (< j sz)
-                       (aset out (+ o j) (bit-and x 0xff))
-                       (recur (inc j) (js/Math.floor (/ x 256))))))]
+          put! (fn [o v sz]
+                 (loop [j 0 x v]
+                   (when (< j sz)
+                     (aset out (+ o j) (bit-and x 0xff))
+                     (recur (inc j) (js/Math.floor (/ x 256))))))]
       (aset out 0 (bit-or stringref-layout-v1
                           (bit-shift-left ic 4)
                           (bit-shift-left oc 6)))
@@ -1181,20 +1181,20 @@
          ;; `seal-index!` took it from its own options map instead, so the
          ;; documented public pair sealed a stride-16 frame over stride-4
          ;; slots whenever the two calls were given different options.
-         (cond->
-          {:stride stride
-           :containers (mapv #(nth % 0) idx)
-           :counts (mapv #(nth % 1) idx)
-           :slots (mapv #(nth % 2) idx)
-           :sorted (mapv #(nth % 3) idx)
+           (cond->
+            {:stride stride
+             :containers (mapv #(nth % 0) idx)
+             :counts (mapv #(nth % 1) idx)
+             :slots (mapv #(nth % 2) idx)
+             :sorted (mapv #(nth % 3) idx)
            ;; `walk` NEVER REACHES THE WIRE -- see the JVM `nodes->index`. It
            ;; is a decision input, carried so the three builders can be held to
            ;; the same number before any of them acts on it.
-           :walk (mapv #(nth % 4) idx)}
+             :walk (mapv #(nth % 4) idx)}
            ;; `cond->`, not a nil value: the JVM `build-index` omits the key
            ;; entirely for a document that opens no namespace, and this map is
            ;; public, so the two platforms must agree on its shape.
-           (some? srp) (assoc :stringrefs srp))))))))
+             (some? srp) (assoc :stringrefs srp))))))))
 
 (defn- long->8-bytes [v]
   (let [b (js/Uint8Array. 8)]

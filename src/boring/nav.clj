@@ -387,7 +387,7 @@
     (let [p (.probes nav)
           m @p]
       (or (get m k)
-        (let [bs (boring/encode k (.opts nav))]
+          (let [bs (boring/encode k (.opts nav))]
           ;; BOUNDED. A context is documented as reusable for as long as its
           ;; options hold, and its cache is shared by every source opened
           ;; through it -- so with computed keys (`(str "id-" i)`) this grew for
@@ -397,9 +397,9 @@
           ;;
           ;; The cache exists for a PATH's keys, which is a handful repeated per
           ;; document. A working set that large is not a path, it is a leak.
-          (when (< (count m) max-cached-probes)
-            (swap! p assoc k bs))
-          bs)))))
+            (when (< (count m) max-cached-probes)
+              (swap! p assoc k bs))
+            bs)))))
 
 ;; A reusable navigation context: resolved options plus the PROBE CACHE, shared
 ;; across every source opened through it.
@@ -3304,8 +3304,7 @@
                  ;; AIOOBE the caller turned into "unusable". As an offset it is
                  ;; a byte of the frame's own back-pointer: in the file,
                  ;; plausible, and wrong. See `sorted-at?`.
-                 (= (long sorted-len) (quot (+ (long n) 7) 8))
-                 )
+                 (= (long sorted-len) (quot (+ (long n) 7) 8)))
         ;; ONE PROVISIONAL INDEX, built as soon as every offset is known, and
         ;; used for the two things that still read `containers`: the sentinel
         ;; check and the sequence node's anchors.

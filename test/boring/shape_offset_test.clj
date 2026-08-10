@@ -196,38 +196,38 @@
 (defspec the-shaped-scan-answers-what-decode-answers 200
   (prop/for-all [rows gen-table
                  idx (gen/choose 0 5)]
-    (let [bs (boring/encode rows opts)
-          s (nav/source bs nil)
-          sh (nav/shape s (nav/root-offset s))
-          ks (vec (keys (first rows)))
-          k (nth ks (mod idx (count ks)))]
+                (let [bs (boring/encode rows opts)
+                      s (nav/source bs nil)
+                      sh (nav/shape s (nav/root-offset s))
+                      ks (vec (keys (first rows)))
+                      k (nth ks (mod idx (count ks)))]
       ;; The writer only shapes when every row carries the same key set, which
       ;; `zipmap` over one `ks` guarantees -- so a nil shape here is a real
       ;; disagreement between the writer and this reader, not a generator that
       ;; wandered off.
-      (and (some? sh)
-           (= (count rows) (nav/shape-count sh))
-           (= (set ks) (set (nav/shape-keys sh)))
-           (= (mapv k rows)
-              (let [col (nav/shape-column sh k)
-                    rows-off (nav/shape-rows sh)]
-                (nav/reduce-at s rows-off
-                               (fn [acc ro]
-                                 (conj acc (nav/value-at
-                                            s (nav/nth-offset s ro col))))
-                               [])))))))
+                  (and (some? sh)
+                       (= (count rows) (nav/shape-count sh))
+                       (= (set ks) (set (nav/shape-keys sh)))
+                       (= (mapv k rows)
+                          (let [col (nav/shape-column sh k)
+                                rows-off (nav/shape-rows sh)]
+                            (nav/reduce-at s rows-off
+                                           (fn [acc ro]
+                                             (conj acc (nav/value-at
+                                                        s (nav/nth-offset s ro col))))
+                                           [])))))))
 
 (defspec the-offset-route-and-the-cursor-route-never-disagree 200
   (prop/for-all [rows gen-table
                  i (gen/choose 0 39)]
-    (let [bs (boring/encode rows opts)
-          s (nav/source bs nil)
-          sh (nav/shape s (nav/root-offset s))
-          row-i (mod i (count rows))
-          k (first (keys (first rows)))
-          via-offset (nav/value-at
-                      s (nav/nth-offset
-                         s (nav/nth-offset s (nav/shape-rows sh) row-i)
-                         (nav/shape-column sh k)))
-          via-cursor (nav/value (nav/walk (nav/root bs) [row-i k]))]
-      (= via-offset via-cursor (get (nth rows row-i) k)))))
+                (let [bs (boring/encode rows opts)
+                      s (nav/source bs nil)
+                      sh (nav/shape s (nav/root-offset s))
+                      row-i (mod i (count rows))
+                      k (first (keys (first rows)))
+                      via-offset (nav/value-at
+                                  s (nav/nth-offset
+                                     s (nav/nth-offset s (nav/shape-rows sh) row-i)
+                                     (nav/shape-column sh k)))
+                      via-cursor (nav/value (nav/walk (nav/root bs) [row-i k]))]
+                  (= via-offset via-cursor (get (nth rows row-i) k)))))

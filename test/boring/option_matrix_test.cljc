@@ -13,7 +13,7 @@
   Both run on both platforms from one table, so a JVM-only fix fails on
   ClojureScript rather than passing quietly."
   (:require [clojure.set]
-             [clojure.test :refer [deftest testing is]]
+            [clojure.test :refer [deftest testing is]]
             [boring.core :as boring]
             [boring.option-matrix :as m]))
 

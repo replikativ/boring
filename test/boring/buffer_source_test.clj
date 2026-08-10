@@ -102,7 +102,7 @@
                 hand out a MUTABLE reference to memory the caller marked
                 read-only"
         (is (nil? (.heapArray (BufferSource/of (.asReadOnlyBuffer
-                                               (ByteBuffer/wrap bs))))))))))
+                                                (ByteBuffer/wrap bs))))))))))
 
 (deftest navigation-works-through-a-buffer-including-shapes
   (testing "the operation the integration exists for: one field of one row of a
@@ -136,5 +136,5 @@
                                  gen/boolean gen/keyword]))
                  base (gen/choose 0 64)
                  direct? gen/boolean]
-    (let [bs (boring/encode v {:stringref false})]
-      (= v (boring/decode (BufferSource/of (embed bs base direct?)))))))
+                (let [bs (boring/encode v {:stringref false})]
+                  (= v (boring/decode (BufferSource/of (embed bs base direct?)))))))

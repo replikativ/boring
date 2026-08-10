@@ -221,25 +221,25 @@
     (println (format "%-44s %10s %10s %8s" "" "nav" "decode" "ratio"))
 
     (let [[a b] (ab-us #(nav/value (get-in c path))
-                    #(get-in (do (.reset rdr bs) (.read rdr)) path)
-                    200 30)]
+                       #(get-in (do (.reset rdr bs) (.read rdr)) path)
+                       200 30)]
       (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                        "get-in one leaf (heap)" a b (/ b a))))
 
     ;; count is read from the head, so it should not depend on size at all
     (let [[a b] (ab-us #(count c)
-                    #(count (do (.reset rdr bs) (.read rdr)))
-                    200 30)]
+                       #(count (do (.reset rdr bs) (.read rdr)))
+                       200 30)]
       (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                        "count the top-level map" a b (/ b a))))
 
     ;; Scanning every customer's :name -- the reducers case. Still beats a full
     ;; decode because the other five fields per record are never materialised.
     (let [[a b] (ab-us #(reduce (fn [acc e] (+ acc (count (nav/value (get (val e) "name")))))
-                             0 c)
-                    #(reduce-kv (fn [acc _ v] (+ acc (count (get v "name")))) 0
-                                (do (.reset rdr bs) (.read rdr)))
-                    50 20)]
+                                0 c)
+                       #(reduce-kv (fn [acc _ v] (+ acc (count (get v "name")))) 0
+                                   (do (.reset rdr bs) (.read rdr)))
+                       50 20)]
       (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                        "reduce over all 200, one field each" a b (/ b a))))
 
@@ -248,8 +248,8 @@
           [mc arena] (mmap/mmap-source f opts)
           ^java.lang.foreign.Arena arena arena]
       (let [[a b] (ab-us #(nav/value (get-in mc path))
-                      #(get-in (do (.reset rdr bs) (.read rdr)) path)
-                      200 30)]
+                         #(get-in (do (.reset rdr bs) (.read rdr)) path)
+                         200 30)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                          "get-in one leaf (mmap'ed file)" a b (/ b a))))
       (.close arena))
@@ -263,13 +263,13 @@
       (println (format "\nblob: one 1 MiB bytestring beside a small map\n"))
       (println (format "%-44s %10s %10s %8s" "" "nav" "decode" "ratio"))
       (let [[a b] (ab-us #(nav/byte-span (get bc "data"))
-                      #(count ^bytes (get (do (.reset brdr bbs) (.read brdr)) "data"))
-                      50 20)]
+                         #(count ^bytes (get (do (.reset brdr bbs) (.read brdr)) "data"))
+                         50 20)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.0fx"
                          "locate the blob vs materialise it" a b (/ b a))))
       (let [[a b] (ab-us #(nav/value (get-in bc ["meta" "id"]))
-                      #(get-in (do (.reset brdr bbs) (.read brdr)) ["meta" "id"])
-                      50 20)]
+                         #(get-in (do (.reset brdr bbs) (.read brdr)) ["meta" "id"])
+                         50 20)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.0fx"
                          "read a field PAST the blob" a b (/ b a)))))
 
@@ -295,17 +295,17 @@
                        (count events) (/ (alength log-bs) 1024.0)))
       (println (format "%-44s %10s %10s %8s" "" "nav" "decode" "ratio"))
       (let [[a b] (ab-us #(into [] xf (nav/items log-bs opts))
-                      #(into [] (comp (filter (fn [e] (= "error" (get e "lvl"))))
-                                      (map (fn [e] (get e "n"))))
-                             (boring/decode-seq log-bs opts))
-                      5 20)]
+                         #(into [] (comp (filter (fn [e] (= "error" (get e "lvl"))))
+                                         (map (fn [e] (get e "n"))))
+                                (boring/decode-seq log-bs opts))
+                         5 20)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                          "scan a log for matching events" a b (/ b a))))
       (let [[a b] (ab-us #(reduce (fn [_ c] (reduced (nav/value (get c "n")))) nil
-                               (nav/items log-bs opts))
-                      #(reduce (fn [_ e] (reduced (get e "n"))) nil
-                               (boring/decode-seq log-bs opts))
-                      50 20)]
+                                  (nav/items log-bs opts))
+                         #(reduce (fn [_ e] (reduced (get e "n"))) nil
+                                  (boring/decode-seq log-bs opts))
+                         50 20)]
         (println (format "%-44s %9.2fµs %9.2fµs %7.1fx"
                          "first event only (early exit)" a b (/ b a)))))
 

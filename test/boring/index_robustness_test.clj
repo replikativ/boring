@@ -96,7 +96,7 @@
                         (doto a (.put k (subs k 1))))
                       (java.util.LinkedHashMap.) ks)
             c (nav/root (boring/encode-indexed m (assoc opts :index 16 :index-min 16))
-                          opts)]
+                        opts)]
         (doseq [k ks]
           (is (= (subs k 1) (some-> (get c k) nav/value))
               (str "key " k " went missing in insertion order " (pr-str ks))))))))
@@ -1522,7 +1522,7 @@
                                     (#'boring.nav/nav-of out o)))))
           "a stride the writer could never emit must be refused")
       (doseq [k ["s000" "s050" "s119"]]
-        (is (= (str "v5-" (Long/parseLong (subs k 1))) 
+        (is (= (str "v5-" (Long/parseLong (subs k 1)))
                (nav/value (get (get (nav/root out o) "sorted") k)))
             (str k ": and every key still answers, by scanning")))
       (is (nil? (get (get (nav/root out o) "sorted") "zzz9"))

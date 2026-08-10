@@ -382,48 +382,48 @@
   `:boring/unexpected-break` here as it does on the JVM, instead of `:ok`."
   ([^Reader r p] (skip-from r p nil))
   ([^Reader r p items]
-  (let [save (.-pos r)
-        limit (skip-limit r)
-        stack #js [1]
-        push! (fn [v]
-                (.push stack v)
-                (when (> (dec (.-length stack)) limit)
-                  (err :boring/max-depth-exceeded
-                       (str "boring: nesting deeper than the skip bound (" limit ")")
-                       {:max-depth limit})))]
-    (set! (.-pos r) p)
-    (while (pos? (.-length stack))
-      (let [d (dec (.-length stack))
-            top (aget stack d)]
-        (cond
+   (let [save (.-pos r)
+         limit (skip-limit r)
+         stack #js [1]
+         push! (fn [v]
+                 (.push stack v)
+                 (when (> (dec (.-length stack)) limit)
+                   (err :boring/max-depth-exceeded
+                        (str "boring: nesting deeper than the skip bound (" limit ")")
+                        {:max-depth limit})))]
+     (set! (.-pos r) p)
+     (while (pos? (.-length stack))
+       (let [d (dec (.-length stack))
+             top (aget stack d)]
+         (cond
           ;; A definite container that owes nothing is closed.
-          (zero? top) (.pop stack)
+           (zero? top) (.pop stack)
 
           ;; An indefinite container at a boundary where a break is legal.
-          (and (or (== top -1) (== top -2)) (== 0xff (b-at r (.-pos r))))
-          (do (set! (.-pos r) (inc (.-pos r))) (.pop stack))
+           (and (or (== top -1) (== top -2)) (== 0xff (b-at r (.-pos r))))
+           (do (set! (.-pos r) (inc (.-pos r))) (.pop stack))
 
-          :else
-          (let [q (.-pos r)
-                h (b-at r q)
-                mj (bit-shift-right h 5)
-                info (bit-and h 0x1F)]
+           :else
+           (let [q (.-pos r)
+                 h (b-at r q)
+                 mj (bit-shift-right h 5)
+                 info (bit-and h 0x1F)]
             ;; ONE ITEM PER HEAD, when the caller asked to count. Mirrors
             ;; `Reader.skipCountingFrom` on the JVM, and must mirror it
             ;; EXACTLY: `walk` decides which containers get an index node, so
             ;; two platforms that count differently write different files for
             ;; the same value.
-            (when items (aset items 0 (inc (aget items 0))))
-            (set! (.-pos r) (inc q))
+             (when items (aset items 0 (inc (aget items 0))))
+             (set! (.-pos r) (inc q))
             ;; Settle the parent BEFORE dispatching -- except for a tag, which
             ;; owes its payload and is settled by whatever the payload turns
             ;; out to be.
-            (when (not== mj 6)
-              (aset stack d (cond (== top -1) -1        ; indefinite array
-                                  (== top -2) -3        ; key read, value owed
-                                  (== top -3) -2        ; pair complete
-                                  :else (dec top))))
-            (case mj
+             (when (not== mj 6)
+               (aset stack d (cond (== top -1) -1        ; indefinite array
+                                   (== top -2) -3        ; key read, value owed
+                                   (== top -3) -2        ; pair complete
+                                   :else (dec top))))
+             (case mj
               ;; DECLARED COUNTS ARE VALIDATED AGAINST THE BYTES THAT REMAIN,
               ;; as `Reader.skipStructural` has always done with `checkCount`.
               ;; Unchecked, `9b ffffffffffffffff` owed 2^64 items and this loop
@@ -432,56 +432,56 @@
               ;; also bounds the total work: the outstanding item count can
               ;; never exceed the bytes left, so the walk is linear in the
               ;; input rather than in what the input claims.
-              (0 1) (arg! r info)                ; info 28-31 -> :reserved-info
-              (2 3) (if (== info 31)
-                      (skip-indefinite-chunks! r mj)
-                      (let [n (check-count r (arg! r info) 1)]
-                        (set! (.-pos r) (+ (.-pos r) n))))
+               (0 1) (arg! r info)                ; info 28-31 -> :reserved-info
+               (2 3) (if (== info 31)
+                       (skip-indefinite-chunks! r mj)
+                       (let [n (check-count r (arg! r info) 1)]
+                         (set! (.-pos r) (+ (.-pos r) n))))
               ;; An EMPTY DEFINITE ARRAY costs no nesting and an empty definite
               ;; map costs one, because that is what `Reader.skipStructural`
               ;; does -- case 4 returns before `enterSkip()` when n is 0, case 5
               ;; does not. Mirrored rather than tidied: the two walkers agreeing
               ;; is worth more here than either one being tidy, and the
               ;; difference is only observable at the bound itself.
-              4 (if (== info 31)
-                  (push! -1)
-                  (let [n (check-count r (arg! r info) 1)]
-                    (when-not (zero? n) (push! n))))
-              5 (if (== info 31)
-                  (push! -2)
-                  (push! (* 2 (check-count r (arg! r info) 2))))
+               4 (if (== info 31)
+                   (push! -1)
+                   (let [n (check-count r (arg! r info) 1)]
+                     (when-not (zero? n) (push! n))))
+               5 (if (== info 31)
+                   (push! -2)
+                   (push! (* 2 (check-count r (arg! r info) 2))))
               ;; A TAG CHAIN IS CONSUMED INLINE AND BOUNDED BY ITS LENGTH, as
               ;; the JVM does. Charging each tag to the nesting budget instead
               ;; was tried there and was wrong: several tag readers parse their
               ;; payload's head without entering, so a mirrored skip refused
               ;; `#{}` at a depth decode accepted.
-              6 (do (arg! r info)
-                    (loop [chain 1]
-                      (let [h2 (b-at r (.-pos r))]
-                        (when (== 6 (bit-shift-right h2 5))
-                          (when (> (inc chain) limit)
-                            (err :boring/max-depth-exceeded
-                                 (str "boring: tag chain longer than the skip bound ("
-                                      limit ")")
-                                 {:max-depth limit}))
+               6 (do (arg! r info)
+                     (loop [chain 1]
+                       (let [h2 (b-at r (.-pos r))]
+                         (when (== 6 (bit-shift-right h2 5))
+                           (when (> (inc chain) limit)
+                             (err :boring/max-depth-exceeded
+                                  (str "boring: tag chain longer than the skip bound ("
+                                       limit ")")
+                                  {:max-depth limit}))
                           ;; EACH TAG IN THE CHAIN IS ITS OWN ITEM. The head
                           ;; above counted the first; the rest are consumed
                           ;; here without passing it.
-                          (when items (aset items 0 (inc (aget items 0))))
-                          (set! (.-pos r) (inc (.-pos r)))
-                          (arg! r (bit-and h2 0x1F))
-                          (recur (inc chain))))))
+                           (when items (aset items 0 (inc (aget items 0))))
+                           (set! (.-pos r) (inc (.-pos r)))
+                           (arg! r (bit-and h2 0x1F))
+                           (recur (inc chain))))))
               ;; Major 7. A break that reaches here is one no indefinite
               ;; container is waiting for -- `83 ff 01 ff 02 03`, a break inside
               ;; a DEFINITE array, which this platform used to skip clean and
               ;; hand to `build-index`.
-              (if (== info 31)
-                (err :boring/unexpected-break
-                     "boring: break code outside an indefinite-length item")
-                (arg! r info)))))))
-    (let [end (.-pos r)]
-      (set! (.-pos r) save)
-      end))))
+               (if (== info 31)
+                 (err :boring/unexpected-break
+                      "boring: break code outside an indefinite-length item")
+                 (arg! r info)))))))
+     (let [end (.-pos r)]
+       (set! (.-pos r) save)
+       end))))
 
 (defn compare-items-at
   "Lexicographic comparison of the ENCODED items at `a` and `b`.

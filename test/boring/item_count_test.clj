@@ -107,12 +107,12 @@
 
 (defspec writer-and-walker-count-the-same-items 400
   (prop/for-all [v any-value]
-    (nil? (counts-agree? v))))
+                (nil? (counts-agree? v))))
 
 (defspec writer-and-walker-agree-under-canonical 300
   ;; The staging paths only run here, and they are the ones with no emit site.
   (prop/for-all [v any-value]
-    (nil? (counts-agree? v {:profile :canonical}))))
+                (nil? (counts-agree? v {:profile :canonical}))))
 
 (defspec writer-and-walker-agree-under-shapes 300
   ;; `:shapes` is only settable under `:clojure`; the other profiles pin it
@@ -120,7 +120,7 @@
   (prop/for-all [v (gen/vector (gen/map gen/string-alphanumeric scalar
                                         {:num-elements 3})
                                0 8)]
-    (nil? (counts-agree? v (assoc opts :shapes true)))))
+                (nil? (counts-agree? v (assoc opts :shapes true)))))
 
 ;; ------------------------------------------------------- what the count MEANS
 

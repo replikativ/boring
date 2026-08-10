@@ -119,7 +119,6 @@
      seventeenth is compared against `payload-count-bytes` separately."
      (byte-array (map unchecked-byte (take prefix-head-length prefix-bytes)))))
 
-
 (defn- be64
   "The 8 big-endian bytes at `off` as a number.
 

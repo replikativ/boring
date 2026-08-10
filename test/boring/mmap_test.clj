@@ -392,8 +392,8 @@
         (is (thrown? clojure.lang.ExceptionInfo
                      (eval `(do (require 'boring.mmap)
                                 (~'boring.mmap/with-mmap [~'c ~path ~opts]
-                                 (reset! boring.mmap-test/escaped-cursor ~'c)
-                                 (throw (ex-info "boom" {})))))))
+                                                         (reset! boring.mmap-test/escaped-cursor ~'c)
+                                                         (throw (ex-info "boom" {})))))))
         (testing "and the arena really did close: the cursor the body leaked is
                   dead. That is also the hazard the docstring warns about when
                   it says not to let a cursor escape the body -- pinned here so

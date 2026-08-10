@@ -514,15 +514,15 @@
                  path (gen/vector (gen/one-of [gen/string-alphanumeric
                                                (gen/choose 0 5)])
                                   0 3)]
-    (let [o {:profile :clojure :stringref false :index 4 :index-min 2}
-          bs (boring/encode-indexed v o)
-          src (nav/source bs o)
-          off (nav/walk-from src 0 path)
-          cur (nav/walk (nav/root bs o) path)]
-      (and (not= -2 off)                       ; unreachable without :shapes
-           (if (neg? off)
-             (nil? cur)
-             (and (some? cur) (= (nav/value-at src off) (nav/value cur))))))))
+                (let [o {:profile :clojure :stringref false :index 4 :index-min 2}
+                      bs (boring/encode-indexed v o)
+                      src (nav/source bs o)
+                      off (nav/walk-from src 0 path)
+                      cur (nav/walk (nav/root bs o) path)]
+                  (and (not= -2 off)                       ; unreachable without :shapes
+                       (if (neg? off)
+                         (nil? cur)
+                         (and (some? cur) (= (nav/value-at src off) (nav/value cur))))))))
 
 (deftest a-compiled-path-answers-what-a-raw-one-answers
   (testing "A key step is matched by comparing BYTES, so a scan should encode

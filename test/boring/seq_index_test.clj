@@ -467,8 +467,8 @@
       (is (apply >= (map second sizes)) (str "size must not rise with threshold: " sizes))
       (doseq [mn [2 8 64]]
         (let [c (nav/root (boring/encode-indexed
-                             wide-map (assoc sorted-opts :index 16 :index-min mn))
-                            sorted-opts)]
+                           wide-map (assoc sorted-opts :index 16 :index-min mn))
+                          sorted-opts)]
           (is (= 42 (nav/value (get-in c ["k0042" "v"]))) (str "min " mn)))))))
 
 (deftest seal-index-accepts-the-nil-build-index-returns
