@@ -61,9 +61,30 @@
 (def ^:const TAG-DECIMAL 4)
 (def ^:const TAG-RATIONAL 30)
 ;; RFC 8746 little-endian typed arrays, keyed by JS constructor name.
+;;
+;; THE UNSIGNED AND 8-BIT TYPES ARE HERE TOO, and used not to be: a
+;; `js/Uint16Array` handed to `encode` fell through to `:boring/unsupported-type`
+;; although RFC 8746 has a tag for it, the reader on BOTH platforms accepts that
+;; tag, and the JVM decodes it to a value. There was nothing to gain by
+;; refusing -- the caller's only recourse was to convert the array by hand into
+;; one of the five spellings that happened to be listed.
+;;
+;; It is not a JVM divergence in the usual sense, because Java has no unsigned
+;; array types and so can never write these; it is a JS type the format covers
+;; and this writer did not. `Uint8Array` is deliberately ABSENT -- it is
+;; boring's byte-string type and is written as major 2, which the branch above
+;; this one settles first.
+;;
+;; Round trip: the JVM reads all of these. This platform's reader decodes the
+;; five original tags to native typed arrays and PRESERVES the rest as
+;; TaggedValues that re-encode identically -- an asymmetry reader.cljs already
+;; documents as deliberate. So the bytes survive everywhere and the JS type
+;; survives on the JVM.
 (def typed-array-tags
   {"Int16Array" 77 "Int32Array" 78 "BigInt64Array" 79
-   "Float32Array" 85 "Float64Array" 86})
+   "Float32Array" 85 "Float64Array" 86
+   "Uint8ClampedArray" 68 "Int8Array" 72
+   "Uint16Array" 69 "Uint32Array" 70 "BigUint64Array" 71})
 
 ;; Above this length TextEncoder's fixed per-call cost is cheaper than looping.
 (def ^:const ASCII-LOOP-MAX 55)
@@ -571,7 +592,41 @@
       (.set (.-buf w) eb (.-pos w))
       (set! (.-pos w) (+ (.-pos w) (.-length eb))))))
 
+(defn- check-byte-string-keys!
+  "Refuse a map whose keys include two byte strings with the same CONTENT.
+
+  Mirrors `Writer.checkByteStringKeys`. Two distinct `js/Uint8Array` objects
+  are two keys to a ClojureScript map -- they hash by identity -- and ONE key
+  in CBOR, which is by content (RFC 8949 5.6). So the map encoded cleanly here
+  and boring's own reader then rejected the result as
+  `:boring/duplicate-map-key`: a successful encode must never produce bytes the
+  paired decoder refuses.
+
+  The canonical path already caught this from the other direction, by comparing
+  ENCODED key bytes -- which is why the defect only showed on the ordinary
+  path, the one most callers take. Checked here, above the branch, so both
+  paths are covered by the same rule the JVM uses.
+
+  O(k^2) in the number of byte-string keys and nothing else: maps with none
+  pay one `instance?` per key and never allocate."
+  [m]
+  (let [seen (array)]
+    (doseq [k (keys m)]
+      (when (instance? js/Uint8Array k)
+        (doseq [b seen]
+          (when (and (== (.-length b) (.-length k))
+                     (loop [i 0] (cond (== i (.-length b)) true
+                                       (== (aget b i) (aget k i)) (recur (inc i))
+                                       :else false)))
+            (throw (ex-info (str "boring: two map keys are byte strings with the same "
+                                 "content, which is ONE key in CBOR (RFC 8949 5.6). "
+                                 "This map cannot be encoded without producing a "
+                                 "duplicate key.")
+                            {:type :boring/duplicate-map-key}))))
+        (.push seen k)))))
+
 (defn- write-map-entries! [^Writer w m]
+  (check-byte-string-keys! m)
   (if-not (.-canonical w)
     (do (head! w MAP (count m))
         (doseq [[k v] m] (write-value! w k) (write-value! w v)))
@@ -876,7 +931,19 @@
     (do (head! w TAG TAG-GENERIC-OBJ)
         (head! w ARRAY 2)
         (write-string! w (data/record-type-name x))
-        (write-map-entries! w (into {} x)))
+        ;; THE RECORD ITSELF, not `(into {} x)`. `Writer.writeRecordFields`
+        ;; iterates in DECLARATION order, and a record seqs in declaration
+        ;; order here too -- but `into {}` does not preserve it. Up to eight
+        ;; fields the result is a PersistentArrayMap, which keeps insertion
+        ;; order and so agreed with the JVM by accident; at nine it promotes to
+        ;; a PersistentHashMap and the fields come out in hash order. Every
+        ;; record fixture in the shared suite has three fields or fewer, so the
+        ;; suite could not see it.
+        ;;
+        ;; Field ORDER is not merely cosmetic: it is the byte order of the map,
+        ;; so the two platforms wrote different files for the same record, and
+        ;; `:canonical` -- which sorts -- hid it again by normalising both.
+        (write-map-entries! w x))
 
     ;; Before map?/set?/sequential?, which would flatten these.
     ;; A custom comparator is refused rather than dropped: it is code, and

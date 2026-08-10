@@ -3263,3 +3263,91 @@
                   (str s " must re-encode to the bytes it came from"))))
         (is (= :boring/bad-tag-content (:err r))
             (str s " must be refused as :boring/bad-tag-content"))))))
+
+;; ## The three divergences #38 left open
+;;
+;; Each was found by MAPPING the two writers against each other rather than by
+;; a failing test, which is the point: the shared suite reached none of them.
+;; They live here, in the file that runs identically on both platforms, so the
+;; next one has to be introduced past a test rather than into a gap.
+
+(defrecord ConfWide [f01 f02 f03 f04 f05 f06 f07 f08 f09 f10])
+
+(deftest a-record-keeps-declaration-order-past-eight-fields
+  (testing "D3. `Writer.writeRecordFields` iterates in DECLARATION order;
+            ClojureScript wrote `(into {} x)`, which keeps insertion order only
+            while the result is a PersistentArrayMap. At NINE entries it
+            promotes to a PersistentHashMap and the fields come out in hash
+            order -- so the two platforms wrote different bytes for the same
+            record, and only for records wide enough that no fixture in this
+            suite had one. Every record here had three fields or fewer.
+
+            Field order IS byte order for a CBOR map, so this is a wire
+            divergence, not a cosmetic one. `:canonical` sorts and would have
+            hidden it a second time, which is why this asserts on the DEFAULT
+            profile."
+    (let [r (->ConfWide 1 2 3 4 5 6 7 8 9 10)
+          ;; ASSERTED ON THE BYTES, because the wire order cannot be recovered
+          ;; from a decoded value: a ten-entry map comes back as a hash map on
+          ;; both platforms, in ITS order rather than the file's. The oracle is
+          ;; the same fields as an `array-map`, which keeps insertion order at
+          ;; any size and goes down the identical `write-map-entries!` path.
+          oracle (data/unknown-record
+                  (data/record-type-name r)
+                  (array-map :f01 1 :f02 2 :f03 3 :f04 4 :f05 5
+                             :f06 6 :f07 7 :f08 8 :f09 9 :f10 10))]
+      (is (= (vec (boring/encode oracle {:stringref false}))
+             (vec (boring/encode r {:stringref false})))
+          "the wire order is the declaration order, on both platforms")
+      (testing "and it still round-trips as itself"
+        (let [reg (boring/register-record (boring/tag-registry)
+                                          (data/record-type-name r) map->ConfWide)]
+          (is (= r (boring/decode (boring/encode r) {:registry reg}))))))))
+
+(deftest two-byte-string-keys-with-the-same-content-are-refused-on-encode
+  (testing "D2. A CBOR map key is compared by CONTENT (RFC 8949 5.6), so two
+            byte strings holding the same bytes are ONE key -- while to a host
+            map they are two, because both platforms hash them by identity. The
+            JVM refused this on encode; ClojureScript happily wrote a map with
+            a duplicate key that boring's OWN reader then rejects.
+
+            A successful encode must never produce bytes the paired decoder
+            refuses, which is the rule this restores."
+    (let [mk (fn [v] #?(:clj (byte-array (map unchecked-byte v))
+                        :cljs (js/Uint8Array. (clj->js v))))
+          ;; Two SEPARATE bindings, and the map built with `assoc` rather than
+          ;; written as a literal: the ClojureScript reader rejects a literal
+          ;; whose key FORMS are identical, before either one is evaluated.
+          k1 (mk [1 2 3])
+          k2 (mk [1 2 3])
+          m (assoc {} k1 "a" k2 "b")]
+      (is (= 2 (count m)) "the control: two keys to the host")
+      (is (= :boring/duplicate-map-key
+             (err-type #(boring/encode m {:stringref false}))))
+      (testing "and byte-string keys that DIFFER are still perfectly legal"
+        (is (= 2 (count (boring/decode
+                         (boring/encode (assoc {} (mk [1 2 3]) "a" (mk [4 5 6]) "b")
+                                        {:stringref false})))))))))
+
+(deftest cljs-writes-the-typed-arrays-rfc-8746-has-tags-for
+  (testing "D8. A `js/Uint16Array` fell through to `:boring/unsupported-type`
+            although RFC 8746 has a tag for it, both readers accept that tag,
+            and the JVM decodes it to a value. Java has no unsigned array
+            types, so it can never WRITE these -- which is why this is a gap in
+            what ClojureScript covers rather than a disagreement about a shared
+            value, and why the assertion below is a decode on whichever
+            platform is running rather than a byte comparison across the two.
+
+            `Uint8Array` is deliberately not in the table: it is boring's
+            byte-string type and is written as major 2."
+    #?(:cljs
+       (doseq [[ctor tag] [[js/Uint8ClampedArray 68] [js/Int8Array 72]
+                           [js/Uint16Array 69] [js/Uint32Array 70]]]
+         (let [a (new ctor (clj->js [1 2 3]))
+               bs (boring/encode a {:stringref false})]
+           (is (not= :boring/unsupported-type (err-type #(boring/encode a)))
+               (str (.-name ctor) " must encode"))
+           (is (= tag (:tag (boring/decode bs)))
+               (str (.-name ctor) " must carry its RFC 8746 tag"))))
+       :clj
+       (is true "JVM has no unsigned array types; see reader.cljs on the read side"))))
