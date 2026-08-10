@@ -861,10 +861,19 @@
 (defn- min-len-for-index
   "The shortest encoded length that earns stringref index `idx`.
 
-  Must agree EXACTLY with `Writer.minLenForIndex`, `Reader.minLenForIndex` and
-  the JVM's `min-len-for-index`: four implementations decide independently
-  whether a given string took an index at all, and a disagreement shifts every
-  LATER index rather than one."
+  Must agree EXACTLY with the other FOUR copies of this rule --
+  `Writer.minLenForIndex`, `Reader.minLenForIndex`, the JVM's
+  `boring.core/min-len-for-index`, and `boring.reader`'s on this platform.
+  Five implementations decide independently whether a given string took an
+  index at all, and a disagreement shifts every LATER index rather than one, so
+  the document decodes to different text with nothing thrown.
+
+  (This said FOUR until the count was checked: it did not know about
+  `boring.reader/min-len-for-index`, which is the one on the cljs decode path.)
+
+  `boring.stringref-threshold-parity-test` asserts the three JVM copies agree
+  over the whole range; the two here are identical source and are covered by
+  the cross-platform byte fixtures."
   [idx]
   (cond (< idx 24)    3
         (< idx 256)   4

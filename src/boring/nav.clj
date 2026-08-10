@@ -829,13 +829,13 @@
             ;; on one is not an answer. It is the cursor reporting that it
             ;; stands INSIDE a namespace whose table it does not have.
             ;;
-            ;; `source`/`source-at` refuse a document that OPENS a namespace,
-            ;; but that check reads byte 0 of the BUFFER and knows nothing about
-            ;; the offset. An offset landing inside a namespace -- reachable
-            ;; whenever a container format puts its own bytes in front, which is
-            ;; exactly what `source-at` exists for -- sailed past it and then
-            ;; reported every referenced key ABSENT. A present key, a wrong
-            ;; answer, no error.
+            ;; `source` refuses a document that opens a namespace WITHOUT an
+            ;; index, but that check reads byte 0 of the BUFFER and knows
+            ;; nothing about the offset. An offset landing inside a namespace --
+            ;; reachable whenever a container format puts its own bytes in
+            ;; front, which is exactly what `cursor`'s three-argument form
+            ;; exists for -- sailed past it and then reported every referenced
+            ;; key ABSENT. A present key, a wrong answer, no error.
             ;;
             ;; One `majorAt` on the miss path, where a memcmp and two skips have
             ;; already happened.
@@ -1590,8 +1590,9 @@
   can very much return a plausible wrong value. Callers derive offsets from the
   format, not from user input.
 
-  The three-argument form is what `source-at` was, and the two-argument form
-  takes raw bytes as well as a source, for the same reason `root` does."
+  The three-argument form is what the removed `source-at` was, and the
+  two-argument form takes raw bytes as well as a source, for the same reason
+  `root` does."
   ([s ^long off] (if (or (bytes? s) (instance? ByteSource s))
                    (cursor-at (source s nil) off)
                    (cursor-at (source-of s) off)))
