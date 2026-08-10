@@ -753,6 +753,7 @@
 
 (declare seal-index! seal-index-with! scan-index scan-into! nodes->index
          build-index write-seq-resolved! write-indexed-resolved!
+         write-indexed-capturing!
          derive-stringref-pointers default-index-stride)
 
 (def ^:private ^:const small-enough-to-encode-twice
@@ -854,38 +855,76 @@
          ;; builders still produce the same file.
          w (writer 1024 o)
          out (java.io.ByteArrayOutputStream. 1024)
-         _ (write-indexed-resolved! w v out o stride (long (get o :index-min 16)))
+         info (long-array 2)
+         _ (write-indexed-capturing! w v out o stride (long (get o :index-min 16)) info)
          bs (.toByteArray out)]
-     ;; SMALL VALUES TAKE WHICHEVER NAVIGABLE ENCODING IS SMALLER, which
-     ;; restores the promise two paragraphs of this docstring make and one
-     ;; change broke.
+     ;; A FRAME THAT DESCRIBES NOTHING IS CUT OUT RATHER THAN OUT-ENCODED.
      ;;
      ;; An indexed write seals a frame whenever it opens a stringref namespace,
      ;; because "namespace with no pointer table" has to keep meaning exactly
-     ;; one thing for `boring.nav` -- see `write-indexed-resolved!`. On a large
+     ;; one thing for `boring.nav` -- see `write-indexed-capturing!`. On a large
      ;; value the frame is noise. On a small one it is most of the file:
-     ;; `{:a 1}` came out at 50 bytes against 7, and `(vec (range 40))` at 101
-     ;; against 58, because #22's placement rule quite correctly declines to
-     ;; index anything that small and the frame is then pure overhead.
+     ;; `{:a 1}` comes out of the writer at 50 bytes against 7, and
+     ;; `(vec (range 40))` at 101 against 58, because #22's placement rule quite
+     ;; correctly declines to index anything that small.
      ;;
-     ;; So below a bound, encode the other way too and keep the shorter. Both
-     ;; candidates are ordinary `encode-indexed` output and both are navigable
-     ;; -- this picks between them, it does not invent a third shape.
+     ;; THIS USED TO ENCODE THE WHOLE VALUE A SECOND TIME with `:stringref
+     ;; false` and keep whichever was shorter, below a 4 KB bound. It worked,
+     ;; and it paid a full second pass to learn something the first pass had
+     ;; already written down: when no container was kept and no string was
+     ;; referenced, the body is byte-identical either way -- with nothing
+     ;; repeating, the writer emits literals whether the namespace is open or
+     ;; not. So the plain encoding is a SLICE of what is already in the buffer,
+     ;; between the envelope and the frame, and one `copyOfRange` replaces an
+     ;; encode. Verified equal on maps, vectors, nested values and strings.
      ;;
-     ;; ONLY `encode-indexed` CAN DO THIS, and that is not an oversight:
-     ;; `write-indexed!` streams to a sink and cannot revisit what it has
-     ;; already flushed. So the two differ in SIZE on small values, never in
-     ;; meaning, and the streaming one is the conservative side.
+     ;; THE COMPARISON STAYS for the case the slice cannot answer. When a
+     ;; string WAS referenced, the two encodings differ in the body and not
+     ;; merely by an envelope, so which is smaller is a real question -- 30
+     ;; small records measure 530 bytes without stringref against 535 with it,
+     ;; and dropping the comparison would silently take the larger. It would
+     ;; also diverge from ClojureScript, which makes the same comparison at
+     ;; `core.cljs:1338`; a size difference between the platforms on identical
+     ;; input is the defect class of #38, not a rounding error.
      ;;
-     ;; THE BOUND IS WHAT KEEPS IT FREE. A second encode of something already
-     ;; known to be under a few kilobytes is cheap; above that the frame is a
-     ;; rounding error and the comparison would be the expensive half of the
-     ;; call. Skipped entirely when the caller already asked for
-     ;; `:stringref false`, which is the candidate being compared against.
-     (if (and (:stringref o) (< (alength bs) small-enough-to-encode-twice))
-       (let [alt (encode-indexed v (assoc opts :stringref false))]
-         (if (< (alength ^bytes alt) (alength bs)) alt bs))
-       bs))))
+     ;; So: slice when the frame describes nothing, compare when it describes
+     ;; something. The second encode now happens only where it can change the
+     ;; answer, which is the half it was always earning its keep in.
+     ;;
+     ;; ONLY A BUFFERING CALLER CAN DO EITHER. `write-indexed!` has flushed and
+     ;; cannot revisit, so the two still differ in SIZE on small values, never
+     ;; in meaning. See `write-indexed-capturing!`.
+     ;; THE BOUND STILL GATES BOTH, and that is not leftover caution. Above it
+     ;; the two writers agree BYTE FOR BYTE -- `write-indexed-agrees-with-
+     ;; encode-indexed` pins exactly that -- and slicing wherever the frame is
+     ;; degenerate would quietly widen the divergence to any size: a 400-entry
+     ;; map of one-character keywords never references anything (a reference
+     ;; costs what the literal costs, so short strings are not registered), so
+     ;; it is degenerate at 5 KB and came out 5213 bytes sliced against 5256
+     ;; framed. Smaller, decodes the same -- and a byte-identity invariant that
+     ;; holds only below a threshold nobody stated is how #30, #34 and #43 got
+     ;; in. The 43 bytes are not worth the invariant.
+     ;;
+     ;; Below the bound the slice returns exactly what the comparison returned:
+     ;; when the frame is degenerate the `:stringref false` candidate IS the
+     ;; slice, and it is always the shorter of the two, so the old code always
+     ;; chose it. Same bytes on both platforms, one `copyOfRange` instead of an
+     ;; encode.
+     (if (and (= 1 (aget info 1)) (< (alength bs) small-enough-to-encode-twice))
+       ;; Past the `d9 01 00` envelope if there is one. Checked rather than
+       ;; assumed: `:stringref` is on in this branch, but a caller can reach
+       ;; here through a profile that never opens a namespace, and slicing
+       ;; three bytes off a document that has none would corrupt it silently.
+       (let [start (if (and (> (alength bs) 3)
+                            (= 0xd9 (bit-and (aget bs 0) 0xff))
+                            (= 0x01 (bit-and (aget bs 1) 0xff))
+                            (= 0x00 (bit-and (aget bs 2) 0xff)))
+                     3 0)]
+         (java.util.Arrays/copyOfRange bs (int start) (int (aget info 0))))
+       (if (and (:stringref o) (< (alength bs) small-enough-to-encode-twice))
+         (let [alt (encode-indexed v (assoc opts :stringref false))]
+           (if (< (alength ^bytes alt) (alength bs)) alt bs))
+         bs)))))
 
 (def ^:const default-index-stride
   "Stride `write-seq!` indexes at unless told otherwise. See its docstring for
@@ -1243,12 +1282,33 @@
       (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
           total))))
 
-(defn- write-indexed-resolved!
-  "`write-indexed!` with options already resolved.
+(defn- write-indexed-capturing!
+  "`write-indexed-resolved!`, reporting what it wrote as well as how much.
 
-  No `^long` return hint: Clojure only supports primitive fns up to four args
-  and this takes six."
-  [^Writer w v ^java.io.OutputStream out o stride min-entries]
+  Returns the byte count, and fills `info` -- a `long[2]` the caller owns, or
+  `nil` -- with `[body-end degenerate?]`. `body-end` is where the value stops
+  and the frame begins; `degenerate?` (1 or 0) says the frame describes
+  NOTHING -- no container cleared the placement rule and no string was
+  referenced -- so the bytes in `[envelope, body-end)` are already the plain
+  encoding, and a buffering caller can take them instead of encoding again.
+
+  AN OUT-PARAMETER RATHER THAN A MAP, which is not premature: this is the one
+  path every `write-indexed!` goes through, and returning `{:total ...}` cost
+  123 B/op on values that never look at it -- measured, a 30-record vector went
+  from 11 585 to 11 708 B/op. A caller that wants nothing passes `nil` and
+  allocates nothing.
+
+  This exists because `encode-indexed` used to answer the same question by
+  ENCODING THE WHOLE VALUE A SECOND TIME with `:stringref false` and keeping
+  whichever came out shorter. That works and is what shipped, but it pays a
+  full second pass to discover bytes the first pass already produced -- the
+  body of a document that referenced nothing is byte-identical with the
+  namespace open or closed, since with nothing repeating the writer emits
+  literals either way. Verified on maps, vectors, nested values and strings.
+
+  A streaming caller cannot use `degenerate?` -- it has flushed -- which is
+  why this reports rather than acts."
+  [^Writer w v ^java.io.OutputStream out o stride min-entries ^longs info]
   (let [stride (long stride)
         indexing? (pos? stride)
         _ (when indexing? (.setIndex ^Writer w (int stride) (int min-entries) 0))
@@ -1259,78 +1319,43 @@
                 (catch Throwable t
                   (.abortStream ^Writer w)
                   (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
-                  (throw t)))]
-    ;; READ BEFORE THE GATE, and before `seal-index!` -- sealing calls
-    ;; `write-root!` and so `.reset`, which clears the stringref namespace, so
-    ;; read afterwards this is always empty and silently so.
-    ;;
-    ;; GATED ON `:stringref`, not on whether pointers came back.
-    ;; `stringrefPointers` answers the empty array to both "this document
-    ;; opened no namespace" and "it opened one and referenced nothing", and
-    ;; those need different frames: no element for the first, an EMPTY element
-    ;; for the second. Without the gate every `{:stringref false}` file would
-    ;; gain a two-byte element it has no use for and stop being byte-identical.
-    ;;
-    ;; THE NESTING IS LOAD-BEARING and clj-kondo cannot see why, so it is
-    ;; ignored rather than merged. This `let` has no bindings between it and
-    ;; the one above, which is exactly the shape `:redundant-let` flags -- but
-    ;; merging it moves the read EARLIER, to before the value has been written,
-    ;; and a `delay` moves it LATER, to after `seal-index!` has reset the
-    ;; writer. Either way `stringrefPointers` answers empty and the frame omits
-    ;; a table for references it really emitted, which is a document nothing
-    ;; can read. The nesting is what places the read between the two.
+                  (throw t)))
+        body-end (long total)]
     #_{:clj-kondo/ignore [:redundant-let]}
-    (let [srp (when (and indexing? (:stringref o)) (.stringrefPointers ^Writer w))]
-      ;; A FRAME IS SEALED WHENEVER A REFERENCE WAS EMITTED, even with no
-      ;; container node to describe. The gate used to be the node count alone,
-      ;; and that wrote a document nothing could read: the writer emits a tag-25
-      ;; reference as soon as a string repeats, but #22's walk threshold
-      ;; declines to index a small container, so
-      ;; `(encode-indexed [{:city "amsterdam"} {:city "amsterdam"}])` came out
-      ;; 49 bytes carrying references and no table -- and `nav/root` refused its
-      ;; own library's output. Small values with repeated keys are the common
-      ;; shape, not an edge case.
-      ;;
-      ;; The invariant this restores is that A REFERENCE IS ONLY EVER WRITTEN
-      ;; WHEN A TABLE EXISTS TO RESOLVE IT. The streaming writer cannot go back
-      ;; and re-encode, so sealing the frame is the only enforcement available
-      ;; -- and it is proportionate, because the frame now has a second job.
-      ;; Carrying the pointer table is reason enough to write one.
-      ;;
-      ;; ON `:stringref`, NOT on whether a reference was actually emitted. The
-      ;; narrower gate saves a frame on documents that open a namespace and
-      ;; never use it -- `(vec (range 40))` is 61 bytes rather than 101 -- but
-      ;; it buys that by making `nav` unable to tell "opened a namespace and
-      ;; referenced nothing" from "references something I cannot resolve", so
-      ;; the only way to accept the first is to stop refusing the second at
-      ;; open. That moves the failure for an UNINDEXED stringref document --
-      ;; the genuine error condition -- from `nav/source` to somewhere deep in
-      ;; a walk, which for `mmap-source` over millions of rows is the wrong
-      ;; place to learn the file cannot be navigated.
-      ;;
-      ;; So the frame is sealed whenever a namespace is opened, and "namespace
-      ;; with no table" goes back to meaning exactly one thing. The cost falls
-      ;; only on values too small to warrant an index in the first place.
-      ;;
-      ;; NO SENTINEL NODE HERE, unlike `write-seq!`. That node stands for the
-      ;; sequence itself so `nav/items` can seek between top-level items; this
-      ;; writes ONE value, which `nav/source` navigates into. Adding a node for
-      ;; a sequence of one would claim a shape the file does not have.
-      (if (and indexing? (or (pos? (alength ^longs (.idxContainers ^Writer w)))
-                             (some? srp)))
-        (let [containers (.idxContainers ^Writer w)
-              counts (.idxCounts ^Writer w)
+    (let [srp (when (and indexing? (:stringref o)) (.stringrefPointers ^Writer w))
+          containers (.idxContainers ^Writer w)
+          ;; BOTH HALVES, because either one alone still needs the frame: a
+          ;; kept container needs its anchors, and an emitted reference needs
+          ;; the pointer table that resolves it. Only when neither exists does
+          ;; the frame describe nothing at all.
+          degenerate? (and indexing?
+                           (zero? (alength ^longs containers))
+                           (some? srp)
+                           (zero? (alength ^longs srp)))]
+      (when info
+        (aset info 0 body-end)
+        (aset info 1 (if degenerate? 1 0)))
+      (if (or (pos? (alength ^longs containers)) (some? srp))
+        (let [counts (.idxCounts ^Writer w)
               sl (.idxSlots ^Writer w)
               so (.idxSorted ^Writer w)]
           (.setIndex ^Writer w (int 0) (int 0) 0)
           (+ total
              (long (seal-index! w out
-                                {:stride stride :containers containers :counts counts
-                                 :slots (vec sl) :sorted (vec so)
-                                 :stringrefs srp}
+                                {:stride stride :containers containers
+                                 :counts counts :slots (vec sl)
+                                 :sorted (vec so) :stringrefs srp}
                                 total o))))
         (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
             total)))))
+
+(defn- write-indexed-resolved!
+  "`write-indexed!` with options already resolved.
+
+  No `^long` return hint: Clojure only supports primitive fns up to four args
+  and this takes six."
+  [^Writer w v ^java.io.OutputStream out o stride min-entries]
+  (write-indexed-capturing! w v out o stride min-entries nil))
 
 (defn write-indexed!
   "Stream ONE value to `out` and seal it with a container index, in bounded
