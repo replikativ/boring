@@ -1255,6 +1255,16 @@
     ;; those need different frames: no element for the first, an EMPTY element
     ;; for the second. Without the gate every `{:stringref false}` file would
     ;; gain a two-byte element it has no use for and stop being byte-identical.
+    ;;
+    ;; THE NESTING IS LOAD-BEARING and clj-kondo cannot see why, so it is
+    ;; ignored rather than merged. This `let` has no bindings between it and
+    ;; the one above, which is exactly the shape `:redundant-let` flags -- but
+    ;; merging it moves the read EARLIER, to before the value has been written,
+    ;; and a `delay` moves it LATER, to after `seal-index!` has reset the
+    ;; writer. Either way `stringrefPointers` answers empty and the frame omits
+    ;; a table for references it really emitted, which is a document nothing
+    ;; can read. The nesting is what places the read between the two.
+    #_{:clj-kondo/ignore [:redundant-let]}
     (let [srp (when (and indexing? (:stringref o)) (.stringrefPointers ^Writer w))]
       ;; A FRAME IS SEALED WHENEVER A REFERENCE WAS EMITTED, even with no
       ;; container node to describe. The gate used to be the node count alone,

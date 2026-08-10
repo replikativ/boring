@@ -17,7 +17,7 @@ here.
   reach item *n* without stepping over the *n-1* before it — 9.8 ms to 1.6 µs on
   a 200 000-item log, at 0.34% file overhead. The frame is ordinary CBOR (tag 27,
   `boring/index`), so a file carrying one stays readable by any CBOR
-  implementation; see [doc/SHAPES.md](doc/SHAPES.md) for the format.
+  implementation; see [doc/INDEX.md](doc/INDEX.md) for the format.
 - `encode-indexed`, `build-index` and `seal-index!` — index an already-encoded
   blob rather than capturing while writing. **Available on both platforms**, and
   byte-identical between them, so a browser and a server produce the same file.
@@ -105,7 +105,86 @@ here.
   interface naming no FFM type; only a caller who CONSTRUCTS a segment-backed
   source needs the newer JDK.
 
+- **`org.replikativ.boring.BufferSource`** — a `ByteSource` over any
+  `java.nio.ByteBuffer`, so a payload need not be copied to be read. NIO
+  channels, Netty, `MappedByteBuffer` and log engines that hand out a read-only
+  slice into an mmap all produce one.
+
+  `SegmentSource` needs JDK 22; this runs on 9 alongside the rest of
+  `src/java`, so it is also the only off-heap source available to a caller who
+  cannot move yet. Measured at parity with the FFM path on the same mapping —
+  38.1 µs against 40.3 on a column scan — so it is not a fallback.
+
+  Every read is absolute and goes through a duplicate, so decoding cannot
+  disturb a cursor the caller still holds, and one buffer can back two sources.
+  Byte order is forced to big-endian on that duplicate: it is a mutable
+  property of a `ByteBuffer`, and a caller who set `LITTLE_ENDIAN` for their
+  own framing would otherwise get every length and float silently byte-swapped.
+
+- **The offset layer of `boring.nav` can read a shaped array.** `shape`,
+  `shape-rows`, `shape-column`, `shape-count` and `shape-keys` expose the
+  key-to-column map that makes the encoding fast, so a scan resolves a key to a
+  column ONCE for the table rather than comparing keys per row:
+
+      (let [sh  (nav/shape s (nav/root-offset s))
+            col (nav/shape-column sh :amount)]
+        (nav/reduce-at s (nav/shape-rows sh)
+                       (fn [acc row]
+                         (+ acc (nav/long-at s (nav/nth-offset s row col))))
+                       0))
+
+  Summing one column over 5 000 rows: 110 µs and 16 bytes allocated for the
+  whole scan, against 267 µs for hako and 1 070 for nippy, both of which must
+  decode every row to reach one field. Reading one field of ONE row is 0.94 µs
+  against 236 and 1 005 — and that gap widens with the table, because it is
+  O(log n) against O(n). `clojure -M:bench -m capability`.
+
+- **`nav/root-offset`** — where the document's root value begins, without
+  building a cursor to throw away. Entering the offset layer previously
+  required `(nav/offset (nav/root bs))`.
+
 ### Changed
+
+- **FORMAT: a shaped array's key set is now the UNION of every row's keys.**
+  Shapes previously required every row to carry an identical key set and
+  declined otherwise, so one ragged row in a thousand cost a whole table its
+  density — and data arriving at a system boundary is exactly the ragged case.
+
+  A row that lacks a key says so in one of two ways: **`undefined`** (simple
+  value 23) in a value position, or a **short row**, whose trailing keys are
+  absent. `null` (simple value 22) is untouched and still means a key that is
+  PRESENT with a nil value — `{:a nil}` and `{}` are different maps and stay
+  different bytes.
+
+  Distinguishing 22 from 23 is therefore a **conformance requirement of tag
+  39649**, and RFC 8949 §3.3 already makes them distinct. Surveyed: `cbor2`,
+  `cbor-x`, `node-cbor` and `clj-cbor` all comply; `ciborium` collapses them at
+  its `Value` layer and Jackson does not surface tags at all. See
+  [doc/INTEROP.md](doc/INTEROP.md).
+
+  The idea is [draft-ietf-cbor-packed][packed]'s, whose tag-114 `record`
+  function spells absence the same way. Only the semantics are borrowed.
+
+  **The writer measures before it shapes.** Disjoint key sets are pathological
+  — first-seen numbering makes the padding O(rows²) — so hoisting is declined
+  when the padding would exceed the key occurrences saved. The guarantee is
+  exact: **shaped output is never larger than the same value written without
+  shapes.**
+
+  Documents written this way are not readable by earlier boring. Nothing
+  released produces them.
+
+  [packed]: https://datatracker.ietf.org/doc/draft-ietf-cbor-packed/
+
+- **`nav/field-offset` and `nav/nth-offset` return `-2` for a non-container**,
+  where `-1` continues to mean absent, and **`nav/container-count` throws**
+  `:boring/not-a-container` rather than joining that convention — a count has
+  no spare value, and every negative long is a plausible count downstream.
+
+  All three previously assumed the caller had checked the major type.
+  `container-count` on a shaped array returned **39649**, the tag number, as a
+  count; the other two walked off the end of the document and raised
+  `:boring/truncated-input`.
 
 - **BREAKING: `boring.nav/source` returns a *source*, not a root cursor.**
   `(nav/root bs opts)` is what it used to be, and is what you want for `get`,

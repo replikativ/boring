@@ -17,6 +17,7 @@
   ["Format" {}
    ["Compatibility policy" {:file "doc/COMPATIBILITY.md"}]
    ["Shapes" {:file "doc/SHAPES.md"}]
+   ["The offset index" {:file "doc/INDEX.md"}]
    ["Security" {:file "doc/SECURITY.md"}]
    ["IANA registration" {:file "doc/IANA-REGISTRATION.md"}]]
   ]}

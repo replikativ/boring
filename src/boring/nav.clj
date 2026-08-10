@@ -929,7 +929,20 @@
         n (head-count nav off)
         ^bytes probe (probe-for nav k)
         ^Index idx (nav-idx nav)
-        ns (node-slot nav off)]
+        ns (node-slot nav off)
+        ;; THE NEXT THREE were a nested `let`. Nothing separated the two
+        ;; scopes, so clj-kondo called it redundant and it was; the commentary
+        ;; that stood between them follows the whole binding vector.
+        ^longs slot (when-not (neg? ns) (slot-at r idx ns))
+        ;; `long`, for the same reason as `stride`: this feeds the binary
+        ;; search's bounds, and an `if` expression is an Object.
+        m (long (if slot (alength slot) 0))
+        ;; GUARDED ON `slot`, because `idx` is nil whenever this container has
+        ;; no node -- the old guard tested `ns` first and never reached a field
+        ;; read. With `slot` nil the value is unused (the branch below scans),
+        ;; but it is still evaluated, and `(.stride nil)` is an NPE out of
+        ;; `get` rather than a scan.
+        stride (long (if slot (if (= m (long n)) 1 (.stride idx)) 1))]
     ;; A node with NO anchors means nothing to jump to -- walk instead. Empty
     ;; containers legitimately produce one (`:index-min 0` will index a `{}`),
     ;; and the sorted branch below assumes at least one anchor: with m=0 its
@@ -958,90 +971,78 @@
     ;; That is what lets one file hold both: a large array at the file's stride,
     ;; where anchors are cheap and a binary search is legal, beside an unsorted
     ;; map at stride 1, where they are the only thing that helps.
-    (let [^longs slot (when-not (neg? ns) (slot-at r idx ns))
-          ;; `long`, for the same reason as `stride` below: this feeds the
-          ;; binary search's bounds, and an `if` expression is an Object.
-          m (long (if slot (alength slot) 0))
-          ;; `long`, or the binary search below auto-boxes its bounds -- the
-          ;; one loop in this namespace that must not.
-          ;; GUARDED ON `slot`, because `idx` is nil whenever this container
-          ;; has no node -- the old guard tested `ns` first and never reached a
-          ;; field read. With `slot` nil the value is unused (the branch below
-          ;; scans), but it is still evaluated, and `(.stride nil)` is an NPE
-          ;; out of `get` rather than a scan.
-          stride (long (if slot (if (= m (long n)) 1 (.stride idx)) 1))]
-      (if (or (nil? slot) (zero? m)
-              (and (> (long stride) 1) (not (sorted-at? r (.sorted-data idx) ns))))
-        (scan-map r (.headEndAt r off) n probe)
-        ;; Entries after anchor a, which is NOT always `stride`: the last
-        ;; anchor covers the remainder. Walking a full stride from it ran off
-        ;; the end of the container and into whatever followed -- found by the
-        ;; missing-key case, where the search lands past the final anchor.
-        (letfn [(span [^long a] (min stride (- n (* a stride))))
-                ;; A MISS FROM THE INDEX IS NOT AN ANSWER, it is a hint that
-                ;; did not pay off.
-                ;;
-                ;; NOTHING PROVES AN ANCHOR IS AN ENTRY BOUNDARY. `slot-at`
-                ;; proves only that one lies inside the data section; proving
-                ;; more means walking the container, which is the work the
-                ;; index exists to avoid. An
-                ;; middle anchor off by one byte therefore made the bounded
-                ;; walk start mid-item and report a present key as absent:
-                ;; measured, eight of forty present keys came back `nil` from a
-                ;; single changed byte, while `decode` of the same bytes
-                ;; returned the true forty-entry map.
-                ;;
-                ;; So a negative answer is re-derived by the honest walk. That
-                ;; makes this namespace's promise -- "a missing or stale index
-                ;; falls back to walking and returns the same answer" -- true
-                ;; for a DAMAGED one as well, which it was not. The cost lands
-                ;; only on genuine misses, where an honest answer requires the
-                ;; walk anyway: trusting an index for a NEGATIVE is exactly
-                ;; what damage makes unsound.
-                ;; WHY `confirm` IS NOT REDUNDANT, beyond the damaged-anchor
-                ;; case argued above. A `:sorted` node over a map the WRITER
-                ;; ordered by something other than canonical CBOR bytes -- a
-                ;; `clojure/sorted-map` payload is ordered by Clojure `compare`
-                ;; -- leaves this binary-searching an array that is not sorted
-                ;; by the function the search compares with. It stays correct
-                ;; only because a negative is re-derived by an honest scan and a
-                ;; positive requires an exact byte match. Deleting `confirm` as
-                ;; a redundant optimisation would break those lookups silently.
-                (confirm [^long hit]
-                  (if (neg? hit) (scan-map r (.headEndAt r off) n probe) hit))]
-          (if (sorted-at? r (.sorted-data idx) ns)
-            ;; Sorted keys: binary search the anchors, then a bounded walk.
-            ;;
-            ;; The PROBE is bounds-checked as well as the walk. An anchor
-            ;; that points mid-item is inside the data section and so survives
-            ;; `slot-at`, and `compareItemToBytes` skips from wherever
-            ;; it is told -- reading a garbage head and running off the buffer,
-            ;; which surfaced as a raw ArrayIndexOutOfBoundsException out of
-            ;; `get`. Found by mutating every byte of a real indexed document
-            ;; and requiring that no lookup ever throws an untyped exception.
-            ;; `.data-end` is a primitive field and so never nil; the `or`
-            ;; against `(.size r)` dated from the fifteen-key map.
-            (let [lim (.data-end idx)]
-              (confirm
-               (loop [lo 0 hi (dec m)]
-                 (if (> lo hi)
-                   (let [anchor (max 0 (min (dec m) hi))]
-                     (scan-map r (aget slot anchor) (span anchor) probe))
-                   (let [mid (quot (+ lo hi) 2)
-                         q (long (aget slot mid))]
-                     (if (or (neg? q) (>= q lim))
-                       -1                      ; a damaged anchor: report a miss
-                       (let [c (.compareItemToBytes r q probe)]
-                         (cond (zero? c) (skip r q)
-                               (neg? c) (recur (inc mid) hi)
-                               :else (recur lo (dec mid))))))))))
-            ;; Unsorted: still jump anchor to anchor rather than entry to entry.
+    (if (or (nil? slot) (zero? m)
+            (and (> (long stride) 1) (not (sorted-at? r (.sorted-data idx) ns))))
+      (scan-map r (.headEndAt r off) n probe)
+      ;; Entries after anchor a, which is NOT always `stride`: the last
+      ;; anchor covers the remainder. Walking a full stride from it ran off
+      ;; the end of the container and into whatever followed -- found by the
+      ;; missing-key case, where the search lands past the final anchor.
+      (letfn [(span [^long a] (min stride (- n (* a stride))))
+              ;; A MISS FROM THE INDEX IS NOT AN ANSWER, it is a hint that
+              ;; did not pay off.
+              ;;
+              ;; NOTHING PROVES AN ANCHOR IS AN ENTRY BOUNDARY. `slot-at`
+              ;; proves only that one lies inside the data section; proving
+              ;; more means walking the container, which is the work the
+              ;; index exists to avoid. An
+              ;; middle anchor off by one byte therefore made the bounded
+              ;; walk start mid-item and report a present key as absent:
+              ;; measured, eight of forty present keys came back `nil` from a
+              ;; single changed byte, while `decode` of the same bytes
+              ;; returned the true forty-entry map.
+              ;;
+              ;; So a negative answer is re-derived by the honest walk. That
+              ;; makes this namespace's promise -- "a missing or stale index
+              ;; falls back to walking and returns the same answer" -- true
+              ;; for a DAMAGED one as well, which it was not. The cost lands
+              ;; only on genuine misses, where an honest answer requires the
+              ;; walk anyway: trusting an index for a NEGATIVE is exactly
+              ;; what damage makes unsound.
+              ;; WHY `confirm` IS NOT REDUNDANT, beyond the damaged-anchor
+              ;; case argued above. A `:sorted` node over a map the WRITER
+              ;; ordered by something other than canonical CBOR bytes -- a
+              ;; `clojure/sorted-map` payload is ordered by Clojure `compare`
+              ;; -- leaves this binary-searching an array that is not sorted
+              ;; by the function the search compares with. It stays correct
+              ;; only because a negative is re-derived by an honest scan and a
+              ;; positive requires an exact byte match. Deleting `confirm` as
+              ;; a redundant optimisation would break those lookups silently.
+              (confirm [^long hit]
+                (if (neg? hit) (scan-map r (.headEndAt r off) n probe) hit))]
+        (if (sorted-at? r (.sorted-data idx) ns)
+          ;; Sorted keys: binary search the anchors, then a bounded walk.
+          ;;
+          ;; The PROBE is bounds-checked as well as the walk. An anchor
+          ;; that points mid-item is inside the data section and so survives
+          ;; `slot-at`, and `compareItemToBytes` skips from wherever
+          ;; it is told -- reading a garbage head and running off the buffer,
+          ;; which surfaced as a raw ArrayIndexOutOfBoundsException out of
+          ;; `get`. Found by mutating every byte of a real indexed document
+          ;; and requiring that no lookup ever throws an untyped exception.
+          ;; `.data-end` is a primitive field and so never nil; the `or`
+          ;; against `(.size r)` dated from the fifteen-key map.
+          (let [lim (.data-end idx)]
             (confirm
-             (loop [a 0]
-               (if (>= a m)
-                 -1
-                 (let [hit (scan-map r (aget slot a) (span a) probe)]
-                   (if (>= hit 0) hit (recur (inc a)))))))))))))
+             (loop [lo 0 hi (dec m)]
+               (if (> lo hi)
+                 (let [anchor (max 0 (min (dec m) hi))]
+                   (scan-map r (aget slot anchor) (span anchor) probe))
+                 (let [mid (quot (+ lo hi) 2)
+                       q (long (aget slot mid))]
+                   (if (or (neg? q) (>= q lim))
+                     -1                      ; a damaged anchor: report a miss
+                     (let [c (.compareItemToBytes r q probe)]
+                       (cond (zero? c) (skip r q)
+                             (neg? c) (recur (inc mid) hi)
+                             :else (recur lo (dec mid))))))))))
+          ;; Unsorted: still jump anchor to anchor rather than entry to entry.
+          (confirm
+           (loop [a 0]
+             (if (>= a m)
+               -1
+               (let [hit (scan-map r (aget slot a) (span a) probe)]
+                 (if (>= hit 0) hit (recur (inc a))))))))))))
 
 (defn- nth-item
   "Offset of element `idx` of the array at `off`, or -1.
@@ -2237,31 +2238,33 @@
             k (count ks)
             n (.n shp)
             rows-off (.rows-off shp)
-            sh {:ks ks :pos (.pos shp)}]
-        ;; EVERY ROW IS CHECKED WHEN IT IS REACHED -- see `shape-at` for why not
-        ;; up front. On the paths that DO walk rows (`seq`, `reduce`, `nth i`)
-        ;; the check costs 0.68 ns/row, because they are there already.
-        ;; `<=`, NOT `=`. The shape's keys are the UNION of every row's, so a
-        ;; row that lacks the trailing ones is simply shorter -- that is how
-        ;; `Writer.writeShapedArray` truncates trailing absences, and the
-        ;; Reader accepts it for the same reason. Longer than the shape is
-        ;; still malformed: there is no key for the extra value to land on.
-        (let [row-ok? (fn [^long p]
-                        (and (= MAJOR-ARRAY (.majorAt r p))
-                             (<= (.headArgAt r p) k)))
-              at (fn [^long i]
-                   (let [p (nth-item nav rows-off i)]
-                     (cond (neg? p) ::miss
-                           (not (row-ok? p))
-                           (fail :boring/bad-tag-content
-                                 (str "boring.nav: shaped row " i
-                                      " does not carry exactly " k
-                                      " values, which is what its shape declares")
-                                 {:offset p :row i :expected k})
-                           :else (->Cursor nav p sh))))]
-          {:kind :vector :n n :nth at :key-pred integer?
-           ;; through `at`, so every row is checked here too
-           :items (fn [] (map at (range n)))})))))
+            sh {:ks ks :pos (.pos shp)}
+            ;; EVERY ROW IS CHECKED WHEN IT IS REACHED -- see `shape-at` for why
+            ;; not up front. On the paths that DO walk rows (`seq`, `reduce`,
+            ;; `nth i`) the check costs 0.68 ns/row, because they are there
+            ;; already.
+            ;;
+            ;; `<=`, NOT `=`. The shape's keys are the UNION of every row's, so
+            ;; a row that lacks the trailing ones is simply shorter -- that is
+            ;; how `Writer.writeShapedArray` truncates trailing absences, and
+            ;; the Reader accepts it for the same reason. Longer than the shape
+            ;; is still malformed: there is no key for the extra value to land
+            ;; on.
+            row-ok? (fn [^long p]
+                      (and (= MAJOR-ARRAY (.majorAt r p))
+                           (<= (.headArgAt r p) k)))
+            at (fn [^long i]
+                 (let [p (nth-item nav rows-off i)]
+                   (cond (neg? p) ::miss
+                         (not (row-ok? p))
+                         (fail :boring/bad-tag-content
+                               (str "boring.nav: shaped row " i " carries more than "
+                                    k " values, which is what its shape declares")
+                               {:offset p :row i :expected k})
+                         :else (->Cursor nav p sh))))]
+        {:kind :vector :n n :nth at :key-pred integer?
+         ;; through `at`, so every row is checked here too
+         :items (fn [] (map at (range n)))}))))
 
 ;; ------------------------------------------------ shapes, on the offset layer
 ;;
