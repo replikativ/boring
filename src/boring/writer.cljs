@@ -486,6 +486,22 @@
     (or (not (js/Number.isInteger t)) (neg? t) (> t js/Number.MAX_SAFE_INTEGER))
     (throw (ex-info (str "boring: tag must be an unsigned integer, got " t)
                     {:type :boring/bad-tag :tag t}))
+
+    ;; THE STRINGREF MACHINERY IS THE CODEC'S, NOT THE CALLER'S. Tag 25 indexes
+    ;; a table this writer builds while encoding and tag 256 declares its
+    ;; scope, so a caller-supplied one cannot be coherent with the numbering.
+    ;; Measured on the JVM before the same refusal landed there:
+    ;; `(encode ["hello-world-string" (tagged-value 25 0)] {:stringref false})`
+    ;; produced bytes boring itself would not read, and under the default
+    ;; profile the same value round-tripped to
+    ;; `["hello-world-string" "hello-world-string"]` -- the TaggedValue
+    ;; silently resolved to whatever index 0 held. Both platforms refuse, or
+    ;; the two disagree about what is encodable.
+    (or (= t TAG-STRINGREF) (= t TAG-SR-NS))
+    (throw (ex-info (str "boring: tag " t " belongs to the stringref namespace, "
+                         "which the encoder manages itself. Encode the value it "
+                         "stands for instead.")
+                    {:type :boring/reserved-tag :tag t}))
     :else t))
 
 (defn write-stringref-namespace! [^Writer w] (head! w TAG TAG-SR-NS))

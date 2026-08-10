@@ -10,6 +10,7 @@
             [boring.generative-test]
             [boring.golden-test]
             [boring.option-matrix-test]
+            [boring.reserved-tag-test]
             [boring.skip-parity-test]
             [boring.streaming-test]
             [boring.union-shape-test]))
@@ -41,7 +42,8 @@
                'boring.cljs-index-test
                'boring.cljs-writer-opts-test
                'boring.conformance-test 'boring.generative-test 'boring.golden-test
-               'boring.option-matrix-test 'boring.skip-parity-test
+               'boring.option-matrix-test 'boring.reserved-tag-test
+               'boring.skip-parity-test
                'boring.streaming-test 'boring.union-shape-test))
 
 (set! *main-cli-fn* -main)

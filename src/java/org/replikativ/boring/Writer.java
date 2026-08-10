@@ -1725,6 +1725,37 @@ public final class Writer {
         if (tag < 0)
             throw Err.of("bad-tag",
                 "boring: tag must be non-negative, got " + tag, "tag", tag);
+        // THE STRINGREF MACHINERY IS THE CODEC'S, NOT THE CALLER'S. Tag 25 is
+        // an index into a table this writer builds while encoding, and tag 256
+        // is what declares that table's scope. A caller-supplied one cannot be
+        // coherent with the numbering, and boring wrote it out anyway:
+        //
+        //   (encode ["hello-world-string" (tagged-value 25 0)] {:stringref false})
+        //     -> bytes boring itself refuses to read, :boring/bad-stringref
+        //   (encode ["hello-world-string" (tagged-value 25 0)] {})
+        //     -> ["hello-world-string" "hello-world-string"], the TaggedValue
+        //        silently RESOLVED to whatever index 0 held. A round-trip that
+        //        changes the value's type is not a round-trip.
+        //   (encode (tagged-value 256 [1 2 3])) -> [1 2 3], tag swallowed.
+        //
+        // Refused rather than escaped, because this namespace is exactly what
+        // `boring.nav`'s pointer table resolves against: a document with a
+        // reference the writer did not number is one no reader can trust.
+        // Encode-side refusal is the house rule for values that cannot be
+        // represented faithfully -- see doc/SECURITY.md's table.
+        //
+        // This funnels every CALLER-supplied tag: `writeTagNumber` for a
+        // `tagged-value`, and a registered handler's own tag. boring's internal
+        // writes go through `head(TAG, ...)` directly and are unaffected.
+        if (tag == TAG_STRINGREF || tag == TAG_SR_NS)
+            throw Err.of("reserved-tag",
+                "boring: tag " + tag + " belongs to the stringref namespace, "
+                + "which the encoder manages itself -- a caller-supplied "
+                + (tag == TAG_STRINGREF
+                   ? "reference cannot be numbered against a table it did not build"
+                   : "namespace would collide with the one being written")
+                + ". Encode the value it stands for instead.",
+                "tag", tag);
         head(TAG, tag);
     }
 
