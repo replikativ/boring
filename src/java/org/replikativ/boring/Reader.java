@@ -399,6 +399,21 @@ public final class Reader {
     private int  srPtrCount;     // number of (index, offset) pairs
     private int  srPtrIw;        // bytes per index field
     private int  srPtrOw;        // bytes per offset field
+    /**
+     * Was a table element PRESENT, as distinct from carrying pairs.
+     *
+     * <p>The two are not the same question and collapsing them was a defect.
+     * A frame with no table describes a document nothing can navigate; a frame
+     * with an EMPTY table describes one that opens a namespace and references
+     * nothing, which navigates perfectly. The default profile opens a namespace
+     * whatever the content turns out to be, so the empty case is every indexed
+     * document that happens to hold no repeated string — including one holding
+     * no strings at all.
+     *
+     * <p>{@code srPtrCount > 0} still gates RESOLUTION, because with no pairs
+     * there is nothing to resolve against; this gates ACCEPTANCE.
+     */
+    private boolean srPtrTable;
     /** Resolved text per PAIR SLOT — not per stringref index, because the table
      *  is sparse. Lazily allocated on the first resolution. */
     private Object[] srPtrCache;
@@ -531,8 +546,27 @@ public final class Reader {
         this.srPtrCount = count;
         this.srPtrIw = iw;
         this.srPtrOw = ow;
+        this.srPtrTable = true;
         // Dropped rather than cleared: a new table means every cached
         // resolution belongs to a different document.
+        this.srPtrCache = null;
+    }
+
+    /**
+     * Record that the frame carries NO pointer table.
+     *
+     * <p>Its own method rather than {@code setStringrefPointers(0, 0, 0, 0)},
+     * which is what the navigator used to call. Once an empty table became a
+     * meaningful state — a document that opens a namespace and references
+     * nothing — "all four numbers are zero" stopped being able to mean "there
+     * is no table", because that is also what an empty one looks like.
+     */
+    public void clearStringrefPointers() {
+        this.srPtrBase = 0;
+        this.srPtrCount = 0;
+        this.srPtrIw = 0;
+        this.srPtrOw = 0;
+        this.srPtrTable = false;
         this.srPtrCache = null;
     }
 
@@ -545,6 +579,7 @@ public final class Reader {
         // survive a reset -- reading through it afterwards would resolve
         // against whatever the new document happens to have at those offsets.
         srPtrBase = 0; srPtrCount = 0; srPtrIw = 0; srPtrOw = 0;
+        srPtrTable = false;
         srPtrCache = null;
         if (srCount > 0) {
             java.util.Arrays.fill(srStrings, 0, srCount, null);
@@ -1345,18 +1380,32 @@ public final class Reader {
         return arg(h & 0x1F);
     }
 
-    /** Whether this document resolves stringrefs by jumping rather than by
-     *  remembering. Checked before every use of the incremental table. */
+    /**
+     * Whether this document resolves stringrefs by jumping rather than by
+     * remembering. Checked before every use of the incremental table.
+     *
+     * <p>Gated on the COUNT, not on {@link #srPtrTable}: an empty table means
+     * the document references nothing, so there is nothing for either mechanism
+     * to do and the cheaper answer is to stay out of offset mode entirely.
+     */
     private boolean srOffsetMode() { return srPtrCount > 0; }
 
     /**
-     * Whether a pointer table has been installed.
+     * Whether a pointer table has been installed — INCLUDING AN EMPTY ONE.
      *
-     * The navigator asks this to decide whether a stringref document is
-     * navigable at all: with a table a cursor can resolve a reference, without
-     * one it cannot, and that is the whole of the difference.
+     * <p>The navigator asks this to decide whether a stringref document is
+     * navigable at all. That is a different question from whether there is
+     * anything to resolve, and answering it with {@code srPtrCount > 0} got it
+     * wrong for every indexed document whose strings happen not to repeat: the
+     * default profile opens a namespace before it knows the content, so
+     * {@code (nav/root (encode-indexed (vec (range 40))))} — a file with no
+     * strings in it at all — was refused as unnavigable.
+     *
+     * <p>The writers now always emit the element for a document that opens a
+     * namespace, empty if need be, so "no table" once again means only what it
+     * says: nothing here can resolve a reference.
      */
-    public boolean hasStringrefPointers() { return srPtrCount > 0; }
+    public boolean hasStringrefPointers() { return srPtrTable; }
 
     /**
      * Where stringref `idx` was defined, or -1 if nothing says.

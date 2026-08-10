@@ -770,22 +770,23 @@
   `encode` -- silently returning an unindexed single item would change what the
   return value IS, from a two-item sequence to one item. Call `encode` instead.
 
-  `:stringref false` IS FORCED, because the sentence above would otherwise be
-  false by default. The default profile writes stringref, and `boring.nav`
-  categorically refuses a stringref document -- a stringref is an index into a
-  table built from every preceding string, which a cursor holding only an offset
-  cannot resolve. So `(nav/root (encode-indexed v))` threw
-  `:boring/stringref-not-navigable` on the very shape this function's docstring
-  recommends. Every test passed `{:stringref false}` or a sorting profile, so the
-  advertised default was the one path never exercised.
+  `:stringref` AND `:index` NOW COMPOSE, and the profile's default is honoured
+  rather than forced off. They were mutually exclusive because a stringref is
+  an index into a table built by decoding every preceding string, so a cursor
+  holding nothing but an offset could not resolve one and `boring.nav` refused
+  such a document outright. The index frame now carries a sixth element -- the
+  offset of the defining literal for each slot something actually references --
+  and a reference resolves by JUMPING to that offset instead of by having
+  decoded everything before it.
 
-  An index exists to be navigated; producing one that cannot be is not a
-  trade-off worth offering -- so an EXPLICIT `:stringref true` is now REFUSED
-  with `:boring/incompatible-options` rather than honoured. It used to be
-  honoured, producing a file whose index `boring.nav` refuses outright, which
-  is the same silent-useless-output this function's siblings already reject:
-  `write-seq!` and `write-indexed!` have raised on that combination all along.
-  Three functions, one rule, and this was the one that did not follow it."
+  So `(nav/root (encode-indexed v))` works on the default profile, which is the
+  shape this docstring recommends and used to be the one path never exercised.
+  Measured on 200 konserve-shaped records: 9115 bytes against 13129 without
+  stringref, a 31% saving, with the pointer table itself 1.26% of the blob.
+
+  A SEQUENCE STILL REFUSES the combination -- see `write-seq!`. Each top-level
+  item restarts the namespace at index 0 and one frame carries one table, so no
+  frame can describe them all. A single value is the shape the table describes."
   (^bytes [v] (encode-indexed v nil))
   (^bytes [v opts]
    ;; THIS IS `write-indexed!` INTO A BYTE ARRAY, and it used to be its own
@@ -808,17 +809,6 @@
    ;; `build-index` KEEPS the byte walk, because it has a job this does not: it
    ;; indexes bytes somebody else wrote, or re-indexes after a compaction, and
    ;; there is no writer in either story.
-   ;; `:stringref` IS STILL FORCED OFF HERE, and lifting it is a SEPARATE
-   ;; change from this one. Delegating is a pure refactor -- byte-identical
-   ;; output, verified -- while letting the default profile's `:stringref true`
-   ;; through alters what this function emits, which moves sizes, makes the
-   ;; frame seven elements, and is visible to `boring.frame`'s footer gate. Two
-   ;; changes at once cost 25 test failures that took a bisect to attribute.
-   (when (true? (:stringref opts))
-     (throw (ex-info (str "boring: :stringref true cannot be combined with an index -- "
-                          "boring.nav cannot resolve string references from an offset, "
-                          "so the index would be unusable. Drop one of the two.")
-                     {:type :boring/incompatible-options :stringref true})))
    (let [o (resolve-opts opts)
          stride (long (get o :index default-index-stride))
          ;; `:index 0` IS REFUSED HERE, not treated as "off". It means off
@@ -832,7 +822,14 @@
              (throw (ex-info (str "boring: :index 0 turns indexing off, which "
                                   "encode-indexed cannot do; use `encode` instead")
                              {:type :boring/bad-option :option :index :value 0})))
-         o (cond-> o (pos? stride) (assoc :stringref false))
+         ;; `:stringref` IS NO LONGER FORCED OFF. This used to be
+         ;; `(cond-> o (pos? stride) (assoc :stringref false))`, because a
+         ;; cursor holding an offset could not resolve a reference and the
+         ;; index would have been unreachable. The frame's pointer table closed
+         ;; that: `write-indexed-resolved!` takes the pointers from the writer's
+         ;; own symbol table, and `build-index` re-derives the same numbering
+         ;; from the byte order for documents it did not write, so both
+         ;; builders still produce the same file.
          w (writer 1024 o)
          out (java.io.ByteArrayOutputStream. 1024)]
      (write-indexed-resolved! w v out o stride (long (get o :index-min 16)))
@@ -1155,7 +1152,15 @@
               ;; READ BEFORE `seal-index!`, which calls `write-root!` and so
               ;; `.reset` -- and reset clears the stringref namespace. Read
               ;; afterwards this is always empty, and silently so.
-              srp (.stringrefPointers ^Writer w)]
+              ;;
+              ;; ALWAYS NIL ON THIS PATH, because `write-seq!` forces
+              ;; `:stringref false` at every stride -- see its comment. Kept as
+              ;; a gate rather than deleted so that a sequence which one day
+              ;; CAN carry pointers (the sectioned v2 table) starts from the
+              ;; same shape the single-value path uses, instead of from an
+              ;; unconditional call that would emit an empty element on every
+              ;; existing sequence file.
+              srp (when (:stringref o) (.stringrefPointers ^Writer w))]
           (.setIndex ^Writer w (int 0) (int 0) 0)   ; capture off again
           (+ total
              (long (seal-index!
@@ -1204,7 +1209,15 @@
             so (.idxSorted ^Writer w)
             ;; Before `seal-index!`, for the reason `write-seq!` gives: sealing
             ;; resets the writer, and reset clears the stringref namespace.
-            srp (.stringrefPointers ^Writer w)]
+            ;;
+            ;; GATED ON `:stringref`, not on whether any pointers came back.
+            ;; `stringrefPointers` answers the empty array to both "this
+            ;; document opened no namespace" and "it opened one and referenced
+            ;; nothing", and those need different frames: no element for the
+            ;; first, an EMPTY element for the second. Without the gate every
+            ;; `{:stringref false}` file would gain a two-byte element it has
+            ;; no use for, and stop being byte-identical to what it was.
+            srp (when (:stringref o) (.stringrefPointers ^Writer w))]
         (.setIndex ^Writer w (int 0) (int 0) 0)
         (+ total
            (long (seal-index! w out
@@ -1237,43 +1250,36 @@
   reader consumes both. Hand it to `boring.nav/source` and lookups inside large
   containers become jumps.
 
-  Same rules as `write-seq!`: `:index` is the stride (default 16), `:index-min`
-  the smallest container worth a node (default 16), `:stringref false` is forced
-  because `boring.nav` cannot resolve a string reference from an offset, and an
-  explicit `:stringref true` alongside `:index` throws rather than one silently
-  winning. No frame is written when no container clears the threshold.
+  `:index` is the stride (default 16) and `:index-min` the smallest container
+  worth a node (default 16). No frame is written when no container clears the
+  threshold.
 
-  Note the size trade: on a value holding many similar records, giving up
-  stringref costs about 2x. See doc/STORAGE.md -- under a compressor it is
-  noise, but uncompressed it is not."
+  `:stringref` COMPOSES WITH `:index` here, unlike in `write-seq!`. It used to
+  be forced off, because `boring.nav` could not resolve a string reference from
+  an offset; the frame's pointer table gives it the defining offset of every
+  slot something references, and this writer takes those pointers from its own
+  symbol table as it encodes. A sequence still refuses the combination -- each
+  top-level item restarts the namespace at index 0, so one frame cannot
+  describe them all -- which is the asymmetry `write-seq!` documents.
+
+  That also reverses the size trade this docstring used to warn about: on a
+  value holding many similar records, giving up stringref cost about 2x. See
+  doc/STORAGE.md."
   (^long [^Writer w v ^java.io.OutputStream out]
-   (let [o (writer-opts w)
-         stride (long (get o :index default-index-stride))]
-     (write-indexed-resolved! w v out
-                              (cond-> o (pos? (long stride)) (assoc :stringref false))
-                              stride (long (get o :index-min 16)))))
+   (let [o (writer-opts w)]
+     (write-indexed-resolved! w v out o
+                              (long (get o :index default-index-stride))
+                              (long (get o :index-min 16)))))
   (^long [^Writer w v ^java.io.OutputStream out opts]
    ;; RESOLVED FIRST, because resolution is what validates. `:index` was read
    ;; and coerced with `long` off the RAW map here, so `{:index "x"}` was a raw
    ;; ClassCastException out of this line -- the exact defect the option
    ;; validator says it closed, reintroduced by reading the option before the
    ;; gate rather than after it.
-   ;;
-   ;; The `:stringref` test below still reads the raw map, and must: a resolved
-   ;; map carries the profile's `:stringref true`, so testing the resolved one
-   ;; would refuse every default indexed write.
-   (let [o (resolve-opts opts)
-         stride (long (get o :index default-index-stride))]
-     (when (and (pos? (long stride)) (true? (:stringref opts)))
-       (throw (ex-info (str "boring: :stringref true cannot be combined with :index -- "
-                            "boring.nav cannot resolve string references from an offset, "
-                            "so the index would be unusable. Drop one of the two.")
-                       {:type :boring/incompatible-options
-                        :stringref true :index stride})))
-     (write-indexed-resolved! w v out
-                              (cond-> o
-                                (pos? (long stride)) (assoc :stringref false))
-                              stride (long (get o :index-min 16))))))
+   (let [o (resolve-opts opts)]
+     (write-indexed-resolved! w v out o
+                              (long (get o :index default-index-stride))
+                              (long (get o :index-min 16))))))
 
 (def ^:const index-name
   "Tag-27 type name for a sequence/container index. See doc/SHAPES.md.
@@ -2070,10 +2076,20 @@
   tier -- the same mistake `pack-slots` records for a single flat typed array,
   in miniature.
 
+  EMPTY IS STILL AN ELEMENT -- one layout byte and no pairs. It would be
+  cheaper to omit it, and that is what this did, but the two states are not the
+  same to a reader: \"the frame carries no table\" is a document nothing can
+  navigate, while \"the frame carries an empty table\" is a document that opens
+  a namespace and references nothing, which is perfectly navigable. Collapsing
+  them made `(nav/root (encode-indexed (vec (range 40))))` refuse a file with
+  no strings in it at all, because the default profile opens a namespace
+  whatever the content turns out to be.
+
   `pairs` is the interleaved `long[]` from `Writer.stringrefPointers`, already
-  ascending; empty in means nil out, and the element is then omitted entirely."
+  ascending. nil in means nil out, and the element is then omitted entirely --
+  which is every document that opens no namespace."
   ^bytes [^longs pairs]
-  (when (pos? (alength pairs))
+  (when pairs
     (let [n (quot (alength pairs) 2)
           mx-i (loop [k 0 m 0] (if (= k n) m (recur (inc k) (max m (aget pairs (* 2 k))))))
           mx-o (loop [k 0 m 0] (if (= k n) m (recur (inc k) (max m (aget pairs (inc (* 2 k)))))))

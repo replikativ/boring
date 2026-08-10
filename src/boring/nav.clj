@@ -2508,15 +2508,20 @@
   [^Reader r ^long p]
   (when-let [[data len] (byte-string-at r p)]
     (let [len (long len)]
-      (when (>= len 2)
+      ;; ONE BYTE IS A VALID TABLE -- the layout byte and no pairs. That is a
+      ;; document which opens a namespace and references nothing, and it is
+      ;; navigable: there is simply nothing to resolve. Requiring `>= 2` and a
+      ;; positive pair count refused every indexed document whose strings did
+      ;; not repeat, including ones holding no strings at all, because the
+      ;; default profile opens a namespace before it knows the content.
+      (when (>= len 1)
         (let [lay (.byteAt r (long data))
               iw (bit-shift-left 1 (bit-and (unsigned-bit-shift-right lay 4) 3))
               ow (bit-shift-left 1 (bit-and (unsigned-bit-shift-right lay 6) 3))
               pw (+ iw ow)
               body (dec len)]
           (when (and (= stringref-layout-v1 (bit-and lay 0xF))
-                     (zero? (rem body pw))
-                     (pos? (quot body pw)))
+                     (zero? (rem body pw)))
             [(inc (long data)) (quot body pw) iw ow]))))))
 
 (defn- slot-le
@@ -2900,7 +2905,11 @@
               (if t
                 (.setStringrefPointers r (long (nth t 0)) (int (nth t 1))
                                        (int (nth t 2)) (int (nth t 3)))
-                (.setStringrefPointers r 0 0 0 0)))
+                ;; NOT `setStringrefPointers` with four zeros, which is what
+                ;; this was. An EMPTY table is now a meaningful state -- a
+                ;; document that opens a namespace and references nothing --
+                ;; so all-zeros can no longer double as "there is no table".
+                (.clearStringrefPointers r)))
           ;; STRIDE POSITIONALLY, which removes the last `.readFrom` from this
           ;; function. A uint under 2^63; a negint is major 1, a bignum major 6,
           ;; a float major 7, and a uint64 above 2^63 comes back negative -- so

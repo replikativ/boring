@@ -2697,14 +2697,24 @@
             thing that is still JVM-only"
     (let [v (vec (for [i (range 40)] {:e i :a :n/x :v (str "value-" i)}))
           plain (boring/encode v {:stringref false})
-          idx (boring/encode-indexed v {:index 4 :index-min 4})]
+          idx (boring/encode-indexed v {:index 4 :index-min 4 :stringref false})]
       (testing "the result is still a CBOR sequence whose first item is the value"
         (is (= v (first (boring/decode-seq idx)))))
       (testing "and the frame is metadata, not an item"
         (is (= 1 (count (boring/decode-seq idx)))))
-      (testing "the index costs something but not much"
+      (testing "the index costs something but not much. LIKE FOR LIKE on
+                `:stringref`, which this pair did not used to have to say:
+                `encode-indexed` forced it off, so its output could only be
+                compared against a non-stringref `encode`. Now that the two
+                compose, leaving it out of one side measures the compression
+                rather than the index -- and gets the sign wrong, because
+                stringref saves more than the frame costs."
         (is (> (count-bytes idx) (count-bytes plain)))
         (is (< (count-bytes idx) (* 1.1 (count-bytes plain)))))
+      (testing "and with stringref on, the indexed file is SMALLER than the
+                plain unreferenced one -- frame included"
+        (is (< (count-bytes (boring/encode-indexed v {:index 4 :index-min 4}))
+               (count-bytes plain))))
       (testing "nothing worth indexing means no frame, so the result still decodes"
         (is (= [1 2] (first (boring/decode-seq
                              (boring/encode-indexed [1 2] {:index-min 16}))))))))
@@ -2796,12 +2806,16 @@
             output. The JVM located the frame by its bytes and never decoded
             it; ClojureScript decoded it and judged afterwards."
     (let [v (vec (for [i (range 40)] {:e i :a "x" :v (str "v" i)}))
-          idx (boring/encode-indexed v {:index 4 :index-min 4})]
+          ;; `:stringref false` EXPLICITLY, and it is now load-bearing rather
+          ;; than incidental. `encode-indexed` used to force it, so this
+          ;; document was three levels deep whatever the caller asked for. Now
+          ;; that the two options compose, the default wraps everything in a
+          ;; tag-256 namespace -- a fourth level that belongs to the DATA and
+          ;; is properly charged to `:max-depth`. Leaving it on here would turn
+          ;; a test about the frame's nesting into a test about the tag's.
+          idx (boring/encode-indexed v {:index 4 :index-min 4 :stringref false})]
       (testing "the control: this data really does fit in three levels, so a
-                failure below is the FRAME's nesting and not the data's.
-                `:stringref false` because `encode-indexed` forces it -- with
-                stringref on, the wrapping tag is a fourth level and the
-                comparison would be against a different document"
+                failure below is the FRAME's nesting and not the data's"
         (is (= v (boring/decode (boring/encode v {:stringref false}) {:max-depth 3}))))
       (testing "so every reader gets it back at that budget"
         (is (= [v] (vec (boring/decode-seq idx {:max-depth 3}))))

@@ -200,20 +200,36 @@
 
 ;; ## `encode-indexed` and `:stringref`
 
-(deftest encode-indexed-refuses-stringref-on-both-platforms
+(defn- count-bytes [bs]
+  #?(:clj (alength ^bytes bs) :cljs (.-length bs)))
+
+(deftest encode-indexed-composes-with-stringref-on-both-platforms
   (let [specimen (vec (repeat 20 "aaaaaaaaaa"))]
-    (testing "an index and a stringref namespace cannot both be useful"
-      (is (= :boring/incompatible-options
-             (verdict #(b/encode-indexed specimen {:index 4 :index-min 4
-                                                   :stringref true})))))
-    (testing "and the option is VALIDATED, not overwritten unread"
+    (testing "an index and a stringref namespace now compose. They were
+              mutually exclusive because a cursor holding an offset could not
+              resolve a reference into a table built from every preceding
+              string; the frame's pointer table gives it the defining offset of
+              every slot something references, so it resolves by JUMPING. Both
+              platforms lifted the refusal together -- ClojureScript's
+              `build-index` re-derives the same numbering by walking the
+              finished bytes in document order, which is the order the JVM's
+              streaming writer assigns indices in."
+      (is (= :ok (verdict #(b/encode-indexed specimen {:index 4 :index-min 4
+                                                       :stringref true})))))
+    (testing "and the option is still VALIDATED, not overwritten unread"
       (is (= :boring/bad-option
              (verdict #(b/encode-indexed specimen {:index 2 :index-min 1
                                                    :stringref "yes"})))))
     (testing "an explicit false, and no mention at all, both still work"
       (is (= :ok (verdict #(b/encode-indexed specimen {:index 4 :index-min 4
                                                        :stringref false}))))
-      (is (= :ok (verdict #(b/encode-indexed specimen {:index 4 :index-min 4})))))))
+      (is (= :ok (verdict #(b/encode-indexed specimen {:index 4 :index-min 4})))))
+    (testing "and the compression is real: 20 copies of one string cost far
+              less with references than without, index frame included"
+      (is (< (count-bytes (b/encode-indexed specimen {:index 4 :index-min 4
+                                                      :stringref true}))
+             (count-bytes (b/encode-indexed specimen {:index 4 :index-min 4
+                                                      :stringref false})))))))
 
 ;; ## Tag readers that implemented the same tag differently
 ;;

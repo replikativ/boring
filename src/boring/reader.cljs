@@ -294,6 +294,18 @@
         (set! (.-pos r) (inc p))
         (let [v (arg! r info)] (set! (.-pos r) save) v)))))
 
+(defn has-stringref-root?
+  "Does the document open with `d9 01 00`, a tag-256 stringref namespace?
+
+  Mirrors `Reader.hasStringrefRoot()`. Three bytes, no parse, and false for
+  every document that does not use the feature -- which is why the index
+  builders can ask it before deciding whether to derive a pointer table, and
+  nothing that never sets `:stringref` pays for the question."
+  [^Reader r]
+  (let [b (.-buf r)]
+    (and (>= (.-length b) 3)
+         (== 0xD9 (aget b 0)) (== 0x01 (aget b 1)) (== 0x00 (aget b 2)))))
+
 (defn head-end-at
   "Offset just past the head at `p` -- where its content begins."
   [^Reader r p]
