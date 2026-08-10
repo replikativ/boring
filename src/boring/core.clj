@@ -933,12 +933,16 @@
   within noise of each other on 2000 record-shaped documents (~30-33x), because
   none of them changed the node count for that data.
 
-  `:index` FORCES `:stringref false`. `boring.nav` cannot resolve a string
-  reference from an offset alone -- a stringref indexes a table built from every
-  preceding string -- so the two options describe incompatible documents, and
-  honouring both produced an index that nothing could read. Passing
-  `:stringref true` alongside `:index` throws `:boring/incompatible-options`
-  rather than silently dropping one. This costs nothing on a sequence: the
+  `write-seq!` FORCES `:stringref false`, at EVERY stride including zero.
+  `boring.nav` cannot resolve a string reference from an offset alone -- a
+  stringref indexes a table built from every preceding string -- and the index
+  frame's pointer table, which is what lets a single value carry both, cannot
+  describe a sequence: the namespace restarts at each top-level item and one
+  frame holds one table, so item 1's references would resolve against item N's
+  literals. Passing `:stringref true` throws `:boring/incompatible-options`
+  rather than silently dropping it. `{:index 0}` used to be the one spelling
+  that kept stringref on, which made it the one spelling ClojureScript could
+  not match. This costs nothing on a sequence: the
   stringref table resets per top-level item, so on 50k ~200-byte records
   stringref is a 1.5% size LOSS, where on the same data as one large value it is
   a 2.1x win. Sequences are the shape that wants an index and the shape that
@@ -963,50 +967,61 @@
   ;; public entry point. `encode-into!` passes `(writer-opts w)` straight to
   ;; `write-root!` without re-resolving; this now follows that model rather than
   ;; merely citing it.
-  ;; INDEXING FORCES `:stringref false`, for the reason spelled out on
-  ;; `encode-indexed`: `boring.nav` categorically refuses a stringref document,
-  ;; because a stringref is an index into a table built from every preceding
-  ;; string and a cursor holding only an offset cannot resolve it.
+  ;; `write-seq!` FORCES `:stringref false`, at EVERY stride including zero.
   ;;
-  ;; Without this, `(write-seq! w items out {:index 16})` under the default
-  ;; profile built the index, wrote the frame, charged for both -- and produced
-  ;; a file `nav/items` then rejected with `:boring/stringref-not-navigable`.
-  ;; The index was unreachable by construction. `encode-indexed` had already
-  ;; been fixed for exactly this; this entry point had not.
+  ;; It used to force it only when indexing, on the grounds that indexing is
+  ;; what declares navigational intent. That left `{:index 0}` writing a
+  ;; namespace per item on the JVM while ClojureScript -- which cannot index at
+  ;; all, and so never had that trigger -- forced it off unconditionally. The
+  ;; SAME portable call produced different bytes on the two platforms, and only
+  ;; the JVM's were unnavigable.
   ;;
-  ;; An EXPLICIT `:stringref true` alongside `:index` throws rather than being
-  ;; overridden in silence -- the two options cannot both be honoured, so the
-  ;; caller has to choose. The 3-arity cannot distinguish an explicit `true`
-  ;; from the profile default (it sees already-resolved options), so there it
-  ;; is forced; that is why the 4-arity is the one that can complain.
+  ;; Sequences are the half of the format the pointer table cannot reach.
+  ;; `write-root!` resets the writer per item, so every top-level item opens its
+  ;; own namespace numbered from zero and one frame carries one table -- see
+  ;; `write-seq-resolved!` for what that silently did to item 1's keys. A single
+  ;; value is the shape the table describes, which is why `write-indexed!` and
+  ;; `encode-indexed` are where stringref is honoured.
+  ;;
+  ;; So `write-seq!` means "a sequence `boring.nav` can read", on both
+  ;; platforms, at every stride. For compression without navigation, call
+  ;; `encode-into!` in a loop -- which both docstrings already pointed at.
+  ;;
+  ;; An EXPLICIT `:stringref true` throws rather than being overridden in
+  ;; silence. The 4-arity is the only one that can tell an explicit `true` from
+  ;; the profile default, because it alone still holds the RAW map:
+  ;; `resolve-opts` merges `:stringref true` into every `:clojure`-profile call,
+  ;; so testing the resolved map would refuse every default write. The 3-arity
+  ;; sees options `writer-opts` already resolved, cannot draw that distinction,
+  ;; and forces.
   (^long [^Writer w values ^java.io.OutputStream out]
-   (let [o (writer-opts w)
-         stride (long (get o :index default-index-stride))]
-     (write-seq-resolved! w values out
-                          (cond-> o (pos? (long stride)) (assoc :stringref false))
-                          stride (long (get o :index-min 16)))))
+   (let [o (writer-opts w)]
+     (write-seq-resolved! w values out (assoc o :stringref false)
+                          (long (get o :index default-index-stride))
+                          (long (get o :index-min 16)))))
   (^long [^Writer w values ^java.io.OutputStream out opts]
    ;; RESOLVED FIRST, because resolution is what validates. `:index` was read
    ;; and coerced with `long` off the RAW map here, so `{:index "x"}` was a raw
    ;; ClassCastException out of this line -- the exact defect the option
    ;; validator says it closed, reintroduced by reading the option before the
-   ;; gate rather than after it.
-   ;;
-   ;; The `:stringref` test below still reads the raw map, and must: a resolved
-   ;; map carries the profile's `:stringref true`, so testing the resolved one
-   ;; would refuse every default indexed write.
-   (let [o (resolve-opts opts)
-         stride (long (get o :index default-index-stride))]
-     (when (and (pos? (long stride)) (true? (:stringref opts)))
-       (throw (ex-info (str "boring: :stringref true cannot be combined with :index -- "
-                            "boring.nav cannot resolve string references from an offset, "
-                            "so the index would be unusable. Drop one of the two.")
+   ;; gate rather than after it. The `:stringref` test below still reads the raw
+   ;; map, and must, for the reason above; it runs after resolution so a call
+   ;; that is wrong in both ways still reports the option error first.
+   (let [o (resolve-opts opts)]
+     (when (true? (:stringref opts))
+       (throw (ex-info (str "boring: :stringref true is not supported by write-seq! -- "
+                            "each top-level item restarts the stringref namespace at "
+                            "index 0, so one index frame cannot describe them all and "
+                            "boring.nav could not resolve a reference from an offset. "
+                            "Use write-indexed! or encode-indexed for a single value, "
+                            "or encode-into! in a loop for compression without "
+                            "navigation.")
                        {:type :boring/incompatible-options
-                        :stringref true :index stride})))
-     (write-seq-resolved! w values out
-                          (cond-> o
-                            (pos? (long stride)) (assoc :stringref false))
-                          stride (long (get o :index-min 16))))))
+                        :stringref true
+                        :index (long (get o :index default-index-stride))})))
+     (write-seq-resolved! w values out (assoc o :stringref false)
+                          (long (get o :index default-index-stride))
+                          (long (get o :index-min 16))))))
 
 (defn- write-seq-resolved!
   "`write-seq!` with options already resolved. See the note on its 3-arity."
@@ -1029,14 +1044,27 @@
   ;; and what a document store needs: a konserve blob is one top-level item.
   ;;
   ;; Supporting sequences would mean an item dimension in the element and a
-  ;; two-level lookup, for a shape nothing has asked for.
-  (when (and (pos? (long stride)) (:stringref o))
-    (throw (ex-info (str "boring: :stringref cannot be combined with :index in "
-                         "write-seq! -- each top-level item restarts the "
-                         "stringref namespace at index 0, so one index frame "
-                         "cannot describe them all. Use write-indexed! or "
-                         "encode-indexed for a single value, or pass "
-                         ":stringref false.")
+  ;; two-level lookup. That shape is designed and its economics are measured --
+  ;; a sectioned table keyed by item start offset, section per item, ~0.4-2.9%
+  ;; of the file against a 22-28% stringref saving -- but it is a FORMAT
+  ;; VERSION, not a patch: the layout byte's low nibble would go to v2, and the
+  ;; reader gates on `stringref-layout-v1`, so today's `nav` refuses a v2 table
+  ;; with a typed error rather than misreading it. That refusal is what makes
+  ;; this safe to leave until a workload asks for it.
+  ;;
+  ;; AT EVERY STRIDE, not only when indexing. Both public arities force
+  ;; `:stringref false` now, so nothing reaches here with it set -- but the
+  ;; wrong answer above does not need an index to happen. It is the per-item
+  ;; namespace reset that causes it, and that happens at stride 0 too; only
+  ;; `nav`'s categorical refusal of a stringref document was hiding it. Guarding
+  ;; on `(pos? stride)` here would have let a future lift through the one door
+  ;; that must stay shut.
+  (when (:stringref o)
+    (throw (ex-info (str "boring: :stringref cannot be used in write-seq! -- each "
+                         "top-level item restarts the stringref namespace at index "
+                         "0, so one index frame cannot describe them all. Use "
+                         "write-indexed! or encode-indexed for a single value, or "
+                         "pass :stringref false.")
                     {:type :boring/incompatible-options
                      :stringref true :index stride})))
   (let [stride (long stride)

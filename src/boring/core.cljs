@@ -514,28 +514,54 @@
                            "or write the indexed file on the JVM.")
                       {:type :boring/unsupported-option :option k :value (get opts k)})))))
 
+(defn- reject-stringref-opt!
+  "Refuse an EXPLICIT `{:stringref true}` to `write-seq!`, matching the JVM.
+
+  `write-root!` resets the writer per item, so every top-level item opens its
+  own stringref namespace numbered from zero. One index frame carries one
+  pointer table, so it can describe at most one of them -- which is why the
+  JVM's `write-seq!` refuses the option outright rather than writing a file
+  whose later items resolve against the wrong literals.
+
+  This platform cannot index at all, so there is no frame to be wrong about
+  here; the refusal exists so the SAME call fails the same way on both. A
+  sequence written here and indexed on the JVM is a supported route, and it
+  must not depend on which side rejected the option.
+
+  Takes the RAW map, before `resolve-opts`, and that is the whole reason this
+  is a separate function: resolution merges the `:clojure` profile's
+  `:stringref true` into every call, so a resolved map cannot tell a caller who
+  asked from a caller who was handed the default. Only `true?` refuses --
+  `{:stringref false}` is the way to say so out loud, and must keep working."
+  [opts]
+  (when (true? (:stringref opts))
+    (throw (ex-info (str "boring: :stringref true is not supported by write-seq! -- "
+                         "each top-level item restarts the stringref namespace at "
+                         "index 0, so one index frame cannot describe them all and "
+                         "boring.nav could not resolve a reference from an offset. "
+                         "Use encode-indexed for a single value, or encode-into! in "
+                         "a loop for compression without navigation.")
+                    {:type :boring/incompatible-options :stringref true}))))
+
 (defn- navigable-seq-opts
-  "`write-seq!`'s options with stringref off, unless the caller asked for it.
+  "`write-seq!`'s options with stringref off.
 
   A stringref is an index into a table built from every preceding string, so a
-  cursor holding only an offset cannot resolve one and `boring.nav` refuses
-  such a document outright. The JVM's `write-seq!` indexes by default and
-  therefore forces stringref off already -- indexing declares navigational
-  intent. This arity cannot index, so it had no such trigger, and the default
-  output carried a `d9 0100` namespace per item: the SAME portable call
-  produced a navigable file on the JVM and an unnavigable one in a browser,
-  while this function's own docstring promised `boring.nav` could read it.
+  cursor holding only an offset cannot resolve one, and `boring.nav` refuses
+  such a document unless the index frame carries a pointer table it can jump
+  through. A sequence cannot carry one: the namespace restarts per item and the
+  frame holds a single table.
 
-  Forced off UNCONDITIONALLY, which is what the JVM does when it indexes --
-  `(cond-> o (pos? stride) (assoc :stringref false))` overrides whatever the
-  writer was built with. Honouring an explicit `{:stringref true}` here is not
-  possible anyway: `resolve-opts` merges the profile, so by the time options
-  arrive `:stringref true` is present whether the caller asked for it or was
-  simply handed the `:clojure` default, and the two cannot be told apart.
+  Forced off UNCONDITIONALLY, and the JVM now does the same at every stride.
+  It used to force it only when indexing -- indexing being what declares
+  navigational intent -- which left `{:index 0}` producing stringref items
+  there and plain ones here, the same portable call writing different bytes on
+  the two platforms. An explicit `{:stringref true}` is refused before this
+  point by `reject-stringref-opt!`, which still holds the raw map; by here the
+  profile default is indistinguishable from a request, so this only forces.
 
-  This mirrors the asymmetry the JVM already has -- `encode` keeps stringref,
-  `write-seq!` does not. If you want stringref compression in a sequence and
-  do not need to navigate it, call `encode-into!` in a loop."
+  If you want stringref compression in a sequence and do not need to navigate
+  it, call `encode-into!` in a loop."
   [o]
   (assoc o :stringref false))
 
@@ -550,11 +576,13 @@
   be navigated. READING past an index written elsewhere works on both platforms
   -- see `decode-seq`.
 
-  **Stringref is off**, as it is on the JVM's indexed default, so the output is
-  navigable. It was on, and this docstring claimed navigability anyway: the
-  same portable call produced a `boring.nav`-readable file on the JVM and a
-  `d9 0100`-prefixed one here that `nav` refuses outright. If you want the
-  compression and do not need to navigate, call `encode-into!` in a loop.
+  **Stringref is off**, at every stride and on both platforms, so the output is
+  navigable. Each top-level item restarts the stringref namespace at index 0
+  and one index frame carries one pointer table, so no frame could describe
+  them all -- a reference in item 1 would resolve against item N's literals.
+  An explicit `{:stringref true}` throws `:boring/incompatible-options` rather
+  than being overridden in silence. If you want the compression and do not need
+  to navigate, call `encode-into!` in a loop.
 
   `sink` receives bytes it OWNS. This used to pass `.subarray` of the writer's
   reusable buffer, which is a view rather than a copy: a sink that retained the
@@ -579,7 +607,12 @@
              0 values)))
   ([w values sink opts]
    (reject-index-opts! opts)
-   (let [o (navigable-seq-opts (resolve-opts opts))]
+   (let [resolved (resolve-opts opts)
+         ;; AFTER resolution, matching the JVM's ordering, so a call that is
+         ;; wrong in both ways reports the option error first. The check itself
+         ;; reads the RAW map -- see `reject-stringref-opt!` for why it must.
+         _ (reject-stringref-opt! opts)
+         o (navigable-seq-opts resolved)]
      (reduce (fn [total v]
                (let [n (wr/position (write-root! w v o))]
                  (sink (.slice (wr/buffer w) 0 n))

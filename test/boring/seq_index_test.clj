@@ -517,3 +517,41 @@
             opts {:index 4 :index-min 2}]
         (is (pos? (alength ^bytes (boring/encode-indexed v opts))))
         (is (= v (nav/value (nav/root (boring/encode-indexed v opts)))))))))
+
+(deftest write-seq-forces-stringref-off-at-every-stride-including-zero
+  (testing "D1, pinned. The rule used to be `:index` forces `:stringref false`,
+            on the grounds that indexing declares navigational intent. That
+            made `{:index 0}` -- the documented OFF switch -- the one spelling
+            that kept stringref ON, and ClojureScript cannot index at all, so
+            it forced unconditionally. The SAME portable call therefore wrote
+            different bytes on the two platforms, and only the JVM's were
+            unnavigable.
+
+            The cause is not the index. It is that `write-root!` resets the
+            writer per top-level item, so each item opens its own namespace
+            numbered from zero; one frame carries one pointer table and can
+            describe at most one of them. That is true at stride 0 too -- only
+            `nav`'s categorical refusal of a stringref document was hiding it."
+    (let [v ["repeated-text" "repeated-text"]
+          bytes-for (fn [opts]
+                      (let [out (ByteArrayOutputStream.)]
+                        (if opts
+                          (boring/write-seq! (boring/writer 4096) [v v] out opts)
+                          (boring/write-seq! (boring/writer 4096) [v v] out))
+                        (.toByteArray out)))
+          ;; d9 0100 is tag 256, the namespace opener. Its absence is the whole
+          ;; navigability claim, so this asserts on the WIRE rather than on a
+          ;; byte count that could match for unrelated reasons.
+          opens-namespace? (fn [^bytes b] (= [0xd9 0x01 0x00] (mapv #(bit-and % 0xff)
+                                                                    (take 3 b))))]
+      (is (not (opens-namespace? (bytes-for nil)))
+          "the default arity, which indexes")
+      (is (not (opens-namespace? (bytes-for {:index 0})))
+          "and stride zero, which does not -- this is the one that regressed")
+      (testing "an explicit :stringref true throws at stride 0 as well, rather
+                than being overridden in silence"
+        (is (= :boring/incompatible-options
+               (try (do (bytes-for {:stringref true :index 0}) nil)
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+      (testing "and :stringref false, the way to say it out loud, still writes"
+        (is (pos? (alength ^bytes (bytes-for {:stringref false :index 0}))))))))
