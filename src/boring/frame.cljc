@@ -85,8 +85,14 @@
 (def payload-count-bytes
   "Array heads a frame's payload may carry: 6 through 15 elements.
 
-  SIX IS WHAT THIS LIBRARY WRITES, and every reader here uses only the first
-  six. Accepting more is forward compatibility, and the reason it matters is
+  SIX OR SEVEN IS WHAT THIS LIBRARY WRITES: six without a stringref namespace,
+  seven with one, the extra element being the pointer table that lets a cursor
+  resolve a reference by jumping. This used to say six was all this library
+  wrote, and that was true until the two composed. `data-end` is LAST in both
+  shapes, which is what keeps the trailer findable -- readers must take it as
+  the last element, never as element five.
+
+  Accepting more is forward compatibility, and the reason it matters is
   that the failure mode of NOT accepting it is the worst one available: a
   reader that does not RECOGNISE a frame never learns `data-end`, so the frame
   is republished as a trailing DATA item and a file of N records reads back as

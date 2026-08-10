@@ -1454,20 +1454,24 @@
 
   An ARRAY or SORTED MAP is binary-searched, and that repays the frame from
   `walk-threshold` mean prefix items, so among containers that reach here
-  `walk` decides and the entry count does not. `:index-min` still gates what
-  reaches here -- see `Writer.keepNode` for why that floor is a capture guard
-  doing policy work, and why changing it is a separate decision.
+  `walk` decides and the entry count does not. `:index-min` gates what reaches
+  here, and since the unsorted rule below moved to items it is inert on every
+  realistic shape -- measured identical at 2, 4, 16 and 64 on konserve-shaped
+  records. It is a floor, not a tuning knob.
 
   An UNSORTED MAP cannot be binary-searched, so at a stride above 1
   `boring.nav` REFUSES the node -- an anchor loop over an unordered map visits
   every entry exactly as a plain scan does. Writing one is pure cost, measured
   at 0.43x-0.81x. At stride 1 it IS usable, and then costs one anchor per
-  entry, so it is gated on the share of the container's own bytes those
-  anchors take -- see `Writer.UNSORTED_ANCHOR_BUDGET`."
+  entry, so it is gated on how many ITEMS each entry costs to skip -- see
+  `Writer.UNSORTED_WALK_PER_ENTRY`. That used to read a byte budget, and bytes
+  are the wrong axis: a 400-char string and a 100-int vector have the same
+  order of bytes per entry and opposite verdicts, because a stride-1 anchor
+  buys skipping the VALUE and a string is one item to skip either way."
   ;; NO PRIMITIVE HINTS: a Clojure fn taking primitives is limited to four
-  ;; arguments, and this takes six. Boxing four longs at one call per
-  ;; container is not on any hot path -- the walk it gates is.
-  [map? sorted walk stride n bytes]
+  ;; arguments, and this takes five. Boxing at one call per container is not on
+  ;; any hot path -- the walk it gates is.
+  [map? sorted walk stride n]
   ;; ONE ANCHOR CANNOT ACCELERATE ANYTHING -- see `Writer.keepNode`. A
   ;; container of n <= stride entries gets a single anchor, which is its own
   ;; first entry, so the search lands where the reader already was.
@@ -1802,7 +1806,7 @@
                 ;; `(- end p)` is the container's own byte span, in the
                 ;; reader's own coordinates -- `base` belongs to the node's
                 ;; OFFSET, not to its length.
-                (when (keep-node? map? sorted walk stride n (- (long end) (long p)))
+                (when (keep-node? map? sorted walk stride n)
                   (.add acc [(int (+ base p)) (int n) kept sorted walk]))))
             end))))))
 
@@ -2308,7 +2312,8 @@
   item, which is also where it begins. The item is:
 
       tag 27 [ `boring/index`,
-               [ stride, containers, counts, slots, sorted, <8-byte data-len> ] ]
+               [ stride, containers, counts, slots, sorted,
+                 (stringrefs,) <8-byte data-len> ] ]
 
   `containers` are the byte offsets of every indexed container, sorted, so a
   reader binary-searches them. `slots` holds each container's entry offsets and
@@ -2333,11 +2338,12 @@
   use. Deltas and absolutes are indistinguishable on the wire, which is why this
   had to land before the format was published rather than after.
 
-  THE PAYLOAD IS SIX ELEMENTS, which is what `boring.frame/prefix-bytes`
-  emits. Readers accept six THROUGH FIFTEEN -- see
-  `boring.frame/payload-count-bytes` -- so that a future widening is
-  RECOGNISED rather than republished as a trailing data item; nothing here
-  writes more than six. A reader too old for this shape
+  THE PAYLOAD IS SIX ELEMENTS, OR SEVEN when the document opens a stringref
+  namespace -- the seventh is the pointer table, and it goes BETWEEN `sorted`
+  and `data-end` so that `data-end` stays last. Readers accept six THROUGH
+  FIFTEEN -- see `boring.frame/payload-count-bytes` -- so that a future
+  widening is RECOGNISED rather than republished as a trailing data item. That
+  forward compatibility is what made adding the seventh element a non-event. A reader too old for this shape
   finds a byte string where it expects an array, fails its own structure check
   and scans, which is the documented answer for an index it cannot use. A reader
   new enough finds an array where it expects a byte string and does the same.

@@ -973,7 +973,7 @@
 (defn- keep-node?
   "Whether a container is worth an index node. Mirrors `Writer.keepNode` and
   the JVM `keep-node?` -- see the JVM version for why the two rules differ."
-  [map? sorted walk stride n bytes]
+  [map? sorted walk stride n]
   ;; ONE ANCHOR CANNOT ACCELERATE ANYTHING -- see `Writer.keepNode`.
   ;; At the node's own stride -- see `Writer.keepNode`.
   (and (>= (let [ns (if (and map? (not sorted)) 1 stride)]
@@ -1126,7 +1126,7 @@
                              (dotimes [a mm] (aset out a (nth kept (* a stride))))
                              (vec out))
                            kept)]
-                (when (keep-node? map? sorted walk stride n (- end p))
+                (when (keep-node? map? sorted walk stride n)
                   (.push acc [(+ p base) n (vec kept) sorted walk]))))
             end))))))
 

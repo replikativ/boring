@@ -42,15 +42,28 @@
 
   TWO HARD CONSTRAINTS, both checked rather than documented-and-hoped:
 
-  1. `:stringref false` is required. A stringref is an index into a table built
-     from every preceding string, so a cursor holding only an offset cannot
-     resolve one -- and skipping a subtree would still have to register the
-     strings inside it. Navigating a stringref document is refused, not
-     silently wrong. boring writes stringref BY DEFAULT, so files meant to be
-     navigated must be written with `{:stringref false}` -- and put that on the
-     WRITER, `(boring/writer n {:stringref false})`, rather than passing it to
-     every call: resolved per call it costs ~250 heap bytes per item, resolved
-     once it costs nothing.
+  1. A stringref document is navigable IF ITS INDEX CARRIES THE POINTER TABLE.
+     This paragraph used to say the opposite -- that `:stringref false` was
+     required and that navigating such a document was refused outright -- which
+     was true, and was the first thing anyone read about this namespace, until
+     the frame gained the table.
+
+     A stringref is an index into a table built from every preceding string, so
+     a cursor holding nothing but an offset cannot rebuild it. The index frame
+     therefore carries the DEFINING OFFSET of every slot something actually
+     references, and a reference resolves by JUMPING to where the string was
+     written. `encode-indexed` and `write-indexed!` emit that table by default;
+     what is still refused, by `check-stringref-navigable!`, is a document that
+     opens a namespace and carries NO table -- one that was never indexed.
+
+     So `(nav/root (boring/encode-indexed v))` works on the default profile,
+     and is 35% smaller than the same document without stringref. A file that
+     was only `encode`d, with no index, still cannot be navigated: decode it
+     whole, or seal an index onto it.
+
+     A SEQUENCE IS THE EXCEPTION. `write-seq!` forces `:stringref false` at
+     every stride, because each top-level item restarts the namespace at index
+     0 and one frame carries one table -- see its docstring.
 
   2. Indefinite-length containers cannot be descended. Their count is not on
      the wire, so `count` could not be O(1) and `Counted` would be a lie.
@@ -2461,12 +2474,16 @@
                            (if (= k remaining) p (recur (inc k) (skip r p)))))))))))
 
 (defn- payload-offsets
-  "Byte offset of each of the frame payload's first five elements, decoding none
+  "Byte offset of each of the frame payload's first SIX elements, decoding none
    of them.
 
    The frame is `27([\"boring/index\", [stride containers counts slots sorted
-   end]])`, so this walks: past the tag, into the two-element array, past the
-   name, into the payload, then element to element.
+   (stringrefs) end]])`, so this walks: past the tag, into the two-element
+   array, past the name, into the payload, then element to element. The sixth
+   is the stringref pointer table, present only when the document opens a
+   namespace -- which is why the caller gates on the payload count rather than
+   reading `e5` positionally and hoping. `data-end` is not returned at all: it
+   is the LAST element whatever the count, and the back-pointer already is it.
 
    Everything here is `headEndAt`/`skipFrom`: a head read and a jump per step,
    never a decode. It USED TO descend into `slots` as well and record where each

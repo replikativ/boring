@@ -832,9 +832,8 @@ public final class Writer {
      */
     private void fillNodeScratch(int slot, long off, int n, int base, boolean sorted,
                                  long walkAcc) {
-        long bytes = absOffset() - off;
         long walk = n > 0 ? walkAcc / n : 0;
-        if (!keepNode(n, sorted, walk, true, bytes)) { cancelNode(slot); return; }
+        if (!keepNode(n, sorted, walk, true)) { cancelNode(slot); return; }
         // An unsorted map is only usable at stride 1; a sorted one takes the
         // file's. The reader derives which from the anchor count alone.
         int stride = sorted ? idxStride : 1;
@@ -856,14 +855,11 @@ public final class Writer {
      * by {@link #fillNodeScratch}, which selects its own stride.
      */
     private void fillNode(int slot, long off, int n, long[] anchors, long walkAcc) {
-        // The container's own byte span. `fillNode` runs immediately after the
-        // last entry at every call site, so `absOffset()` is its end.
-        long bytes = absOffset() - off;
         // FLOOR DIVISION, and the byte walk must divide the same way. `walkAcc`
         // is the SUM of per-entry prefixes; `walk` is their mean. An empty
         // container has no entries to average over and no scan to shorten.
         long walk = n > 0 ? walkAcc / n : 0;
-        if (!keepNode(n, false, walk, false, bytes)) { cancelNode(slot); return; }
+        if (!keepNode(n, false, walk, false)) { cancelNode(slot); return; }
         idxOffs[slot] = checkedOffset(off);
         idxCnts[slot] = n;
         idxSlots[slot] = anchors;
@@ -903,8 +899,7 @@ public final class Writer {
      * class: that one answers an explicit `:index N` request on `write-seq!`,
      * and a metric must not silently switch off a feature asked for by name.
      */
-    private boolean keepNode(int n, boolean sorted, long walk, boolean isMap,
-                             long bytes) {
+    private boolean keepNode(int n, boolean sorted, long walk, boolean isMap) {
         // ONE ANCHOR CANNOT ACCELERATE ANYTHING, whatever the walk says.
         //
         // A container of n <= stride entries gets a single anchor, and that

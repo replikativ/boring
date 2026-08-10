@@ -335,14 +335,17 @@ Two things the **first** example is carrying, both of which used to be silent �
 and neither applies to the indexed forms above, which set `:stringref false`
 themselves:
 
-**The write is where `:stringref false` belongs.** boring writes stringref by
+**Index it, and stringref stops being a problem.** boring writes stringref by
 default, and a stringref is an index into a table built from every preceding
-string, so a cursor holding only an offset cannot resolve one — `nav/source`
-refuses such a document with `:boring/stringref-not-navigable`. Passing
-`{:stringref false}` to `nav/source` does not help: it forces that option
-anyway, in both directions, so the caller's value is ignored. This snippet used
-to pass it there, over bytes the README's own encode example had written *with*
-stringref, and so it threw the very error it looked like the fix for.
+string, so a cursor holding only an offset cannot rebuild it. The index frame
+carries the defining offset of every referenced slot, so a reference resolves by
+jumping — which is why `encode-indexed` keeps stringref and is *smaller* for it.
+
+What `nav/source` still refuses, with `:boring/stringref-not-navigable`, is a
+document that opens a namespace and was never indexed: plain `encode` output.
+For that, either seal an index onto it or write it `{:stringref false}` — and
+put that on the WRITER, `(boring/writer n {:stringref false})`, rather than
+passing it per call, where it costs ~250 heap bytes per item.
 
 **`get-in` descends maps, not arrays.** `Cursor`'s `valAt` handles map keys and
 realises tags; an array position falls through to the not-found value, so

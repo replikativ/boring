@@ -388,10 +388,12 @@ reason is exactly the one stringref runs into below.
 [zstd-seekable]: https://github.com/facebook/zstd/tree/dev/contrib/seekable_format
 [bgzf]: https://samtools.github.io/hts-specs/SAMv1.pdf
 
-### Why stringref and the index are mutually exclusive
+### Why stringref needed a pointer table, and now composes with the index
 
-`boring.nav` refuses a stringref document, and indexing therefore forces
-`:stringref false`. This is not a limitation of the implementation.
+`boring.nav` used to refuse a stringref document outright, and indexing forced
+`:stringref false`. This section argued that was inherent rather than an
+implementation limit. The argument was right about the problem and wrong about
+the conclusion, so it is kept here with the resolution attached.
 
 A stringref (tag 25) is an index into a table built *incrementally, in
 occurrence order, while decoding*. To resolve one at offset X you must already
@@ -403,11 +405,23 @@ The schemes that DO permit random access all use a **static** dictionary
 available up front — Parquet's dictionary pages, [FSST][fsst]'s symbol table, a
 trained zstd dictionary. Given the table, any single value decodes alone.
 
-That is the whole distinction, and it is why the answer is to layer rather than
-fuse. It is also why the cost of giving stringref up is small: stringref is
+That is the whole distinction — and it is also the way out. The scheme has to
+become STATIC at read time, and the index frame is where a static table can
+live: it carries the defining offset of every slot something actually
+references, so a cursor resolves by JUMPING rather than by remembering. The
+dictionary is still built incrementally by the WRITER; the reader no longer has
+to rebuild it.
+
+So `:stringref` and `:index` compose. `encode-indexed` and `write-indexed!`
+honour the profile default; only `write-seq!` still refuses, because each
+top-level item restarts the namespace at index 0 and one frame carries one
+table. Measured on 200 konserve-shaped records: 5323 bytes against 6505, an 18%
+saving, navigable, with the pointer table itself about 1.3% of the blob.
+
+The layering argument still stands for what it was actually about: stringref is
 2.09x on record-shaped data where whole-file zstd is 36.7x, and stringref *plus*
-zstd is only 10% better than zstd alone. Give it up and let a real compressor
-work.
+zstd is only 10% better than zstd alone. Under a compressor stringref is close
+to noise. What changed is that you no longer have to give it up to navigate.
 
 [fsst]: https://www.vldb.org/pvldb/vol13/p2649-boncz.pdf
 

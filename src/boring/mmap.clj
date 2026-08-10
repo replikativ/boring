@@ -124,9 +124,11 @@
   loudly. A shared arena is used rather than a confined one: it is 8% faster
   per access and does not pin the mapping to one thread.
 
-  The file must have been written with `{:stringref false}` -- see
-  `boring.nav`, which refuses a stringref document rather than resolving
-  references wrongly.
+  A stringref file is fine PROVIDED IT WAS INDEXED: the frame carries the
+  offsets a reference resolves by jumping to. What `boring.nav` refuses is a
+  document that opens a namespace and carries no such table -- one that was
+  `encode`d rather than `encode-indexed`. This used to say `{:stringref false}`
+  was required, which it no longer is.
 
   `:offset` and `:length` narrow the mapping to PART of the file, for a
   document that is not the whole of it. konserve stores a blob as a 20-byte
