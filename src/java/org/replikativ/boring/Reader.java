@@ -1449,6 +1449,51 @@ public final class Reader {
         }
     }
 
+    /**
+     * The stringref index whose DEFINING LITERAL is `probe[from..]`, or -1.
+     *
+     * The inverse of {@link #stringrefOffsetFor}, and the one thing a binary
+     * search over reference-keyed anchors cannot do without. Those anchors are
+     * ordered by REFERENCE INDEX -- indices are handed out in first-occurrence
+     * order, so `d8 19 00 < d8 19 01 < ...` really does ascend bytewise, and
+     * the index frame's `sorted` bit is honest about it. What it is not is
+     * comparable against a probe encoded as a LITERAL, which is every probe
+     * `boring.nav` builds. Resolving the anchors instead does not help: they
+     * are not in resolved-literal order (measured: 19 of 39 adjacent pairs
+     * descend), so a search under that comparator is unsound.
+     *
+     * So the probe moves into reference space, and this is the pass that takes
+     * it there. LINEAR, unlike `stringrefOffsetFor`'s binary search, because
+     * the table is sorted by index and this asks the other question. It is a
+     * memcmp per pair against bytes already in the buffer, no decoding, and a
+     * caller that repeats a key is expected to hold the answer -- see
+     * `boring.nav/reference-probe`.
+     *
+     * A PREFIX CANNOT MATCH. The first compared byte is a CBOR head carrying
+     * its own length, so `"abc"` cannot match the start of `"abcd"` -- the
+     * heads are `0x63` and `0x64`. That is what makes a bare memcmp sound here
+     * and in `stringrefKeyMatches`.
+     *
+     * Never throws: a damaged table costs failed comparisons and a -1, not an
+     * exception out of `get`.
+     */
+    public long stringrefIndexForBytes(byte[] probe, int from) {
+        if (srPtrCount <= 0 || probe == null || from < 0 || from >= probe.length)
+            return -1L;
+        int stride = srPtrIw + srPtrOw;
+        try {
+            for (int i = 0; i < srPtrCount; i++) {
+                long pair = srPtrBase + (long) i * stride;
+                long off = srLe(pair + srPtrIw, srPtrOw);
+                if (off >= 0 && bytesEqualAtFrom(off, probe, from))
+                    return srLe(pair, srPtrIw);
+            }
+        } catch (RuntimeException e) {
+            return -1L;
+        }
+        return -1L;
+    }
+
     /** Little-endian unsigned value of `w` bytes at `p`. Every byte goes
      *  through `b`, which bounds-checks and raises a typed truncated-input. */
     private long srLe(long p, int w) {

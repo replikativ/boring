@@ -808,6 +808,66 @@
 
            :else false))))
 
+(defn- uint-bytes
+  "`v` as a CBOR unsigned head -- the argument a tag 25 carries."
+  ^bytes [^long v]
+  (cond
+    (< v 24) (byte-array [(unchecked-byte v)])
+    (< v 0x100) (byte-array [(unchecked-byte 0x18) (unchecked-byte v)])
+    (< v 0x10000) (byte-array [(unchecked-byte 0x19)
+                               (unchecked-byte (bit-shift-right v 8))
+                               (unchecked-byte v)])
+    :else (byte-array [(unchecked-byte 0x1a)
+                       (unchecked-byte (bit-shift-right v 24))
+                       (unchecked-byte (bit-shift-right v 16))
+                       (unchecked-byte (bit-shift-right v 8))
+                       (unchecked-byte v)])))
+
+(defn- reference-probe
+  "`probe` re-encoded as the stringref REFERENCE it would have been written as
+  in this document, or nil if this document never registered it.
+
+  WHY A SECOND PROBE EXISTS AT ALL. `stringref-key-matches?` compares a
+  reference key by moving the comparison to the defining literal, which is
+  enough for EQUALITY and is all a linear scan needs. A binary search needs
+  ORDER, and order is the one thing that move destroys: reference-keyed anchors
+  ascend by reference INDEX -- assigned in first-occurrence order -- and the
+  literals they resolve to are in no order at all (measured on a 40-key
+  document: 19 of 39 adjacent pairs descend). Searching under the resolved
+  comparator is unsound, not merely slow. So the probe moves instead, and the
+  comparison stays in the wire space the `sorted` bit is actually about.
+
+  BOTH FORMS ARE TRIED BY THE CALLER, because one container can hold both. A
+  key repeated from an earlier row is a reference; a key first seen in THIS row
+  is a literal; a row with some of each is still bytewise sorted, since a
+  literal's `0x6X` head sorts before a reference's `0xd8`. No single encoding
+  compares against all of those anchors -- a single-form search measured 10 of
+  20 wrong on such a container. Two searches over one bytewise-sorted array
+  are sound and each still O(log m).
+
+  The two shapes mirror `stringref-key?`. A repeated KEYWORD is `tag 39`
+  wrapping `tag 25`, and its pointer names the TEXT alone -- so the lookup
+  skips the probe's own `d8 27` and the answer puts it back. A repeated string
+  is a bare `tag 25` and is compared whole."
+  ^bytes [^Reader r ^bytes probe]
+  (when (and (.hasStringrefPointers r) (pos? (alength probe)))
+    (let [kw? (and (> (alength probe) 2)
+                   (= 0xd8 (bit-and (aget probe 0) 0xff))
+                   (= 0x27 (bit-and (aget probe 1) 0xff)))
+          idx (.stringrefIndexForBytes r probe (if kw? 2 0))]
+      (when-not (neg? idx)
+        (let [^bytes tail (uint-bytes idx)
+              ^bytes head (if kw?
+                            (byte-array [(unchecked-byte 0xd8) (unchecked-byte 0x27)
+                                         (unchecked-byte 0xd8) (unchecked-byte 0x19)])
+                            (byte-array [(unchecked-byte 0xd8) (unchecked-byte 0x19)]))
+              hn (alength head)
+              tn (alength tail)
+              out (byte-array (+ hn tn))]
+          (System/arraycopy head 0 out 0 hn)
+          (System/arraycopy tail 0 out hn tn)
+          out)))))
+
 (defn- scan-map
   "Linear walk of a map's entries from `start`, at most `limit` of them.
 
@@ -983,7 +1043,13 @@
       ;; anchor covers the remainder. Walking a full stride from it ran off
       ;; the end of the container and into whatever followed -- found by the
       ;; missing-key case, where the search lands past the final anchor.
-      (letfn [(span [^long a] (min stride (- n (* a stride))))
+      (let [;; Hoisted so `bsearch` takes one argument, which is where a probe
+            ;; belongs -- the bound is a property of the INDEX, not of the key.
+            ;; It was tried as a fix for the miss regression below and is not
+            ;; one: measured either way, a 40-key miss stays at ~8.4 us. The
+            ;; boxing theory it was based on did not survive the measurement.
+            lim (long (if slot (.data-end idx) 0))]
+        (letfn [(span [^long a] (min stride (- n (* a stride))))
               ;; A MISS FROM THE INDEX IS NOT AN ANSWER, it is a hint that
               ;; did not pay off.
               ;;
@@ -1004,18 +1070,40 @@
               ;; only on genuine misses, where an honest answer requires the
               ;; walk anyway: trusting an index for a NEGATIVE is exactly
               ;; what damage makes unsound.
-              ;; WHY `confirm` IS NOT REDUNDANT, beyond the damaged-anchor
-              ;; case argued above. A `:sorted` node over a map the WRITER
-              ;; ordered by something other than canonical CBOR bytes -- a
-              ;; `clojure/sorted-map` payload is ordered by Clojure `compare`
-              ;; -- leaves this binary-searching an array that is not sorted
-              ;; by the function the search compares with. It stays correct
-              ;; only because a negative is re-derived by an honest scan and a
-              ;; positive requires an exact byte match. Deleting `confirm` as
-              ;; a redundant optimisation would break those lookups silently.
-              (confirm [^long hit]
-                (if (neg? hit) (scan-map r (.headEndAt r off) n probe) hit))]
-        (if (sorted-at? r (.sorted-data idx) ns)
+              ;; WHAT `confirm` IS FOR, now that it is only that. The
+              ;; damaged-anchor case argued above, and nothing else.
+              ;;
+              ;; This used to claim a second job: a `:sorted` node over a map
+              ;; the WRITER ordered by something other than CBOR bytes -- a
+              ;; `clojure/sorted-map`, ordered by Clojure `compare`. That is
+              ;; not a case. `sorted` is computed FROM THE EMITTED KEY BYTES by
+              ;; every builder, so it cannot claim an order the file is not in:
+              ;; a `sorted-map` whose Clojure order genuinely diverges from
+              ;; byte order is written `sorted: false` and never reaches here.
+              ;;
+              ;; The case that really did depend on `confirm` was stringref,
+              ;; and it depended on it for EVERY LOOKUP rather than for a
+              ;; corner -- see the two searches below, which is where that
+              ;; belongs. A negative is still re-derived, because a damaged
+              ;; anchor can still start a bounded walk mid-item.
+                (confirm [^long hit]
+                  (if (neg? hit) (scan-map r (.headEndAt r off) n probe) hit))
+              ;; The binary search itself, over ONE encoding of the key. Taken
+              ;; twice on a stringref document -- see `reference-probe`.
+                (bsearch [^bytes p]
+                  (loop [lo 0 hi (dec m)]
+                    (if (> lo hi)
+                      (let [anchor (max 0 (min (dec m) hi))]
+                        (scan-map r (aget slot anchor) (span anchor) p))
+                      (let [mid (quot (+ lo hi) 2)
+                            q (long (aget slot mid))]
+                        (if (or (neg? q) (>= q lim))
+                          -1                     ; a damaged anchor: report a miss
+                          (let [c (.compareItemToBytes r q p)]
+                            (cond (zero? c) (skip r q)
+                                  (neg? c) (recur (inc mid) hi)
+                                  :else (recur lo (dec mid)))))))))]
+          (if (sorted-at? r (.sorted-data idx) ns)
           ;; Sorted keys: binary search the anchors, then a bounded walk.
           ;;
           ;; The PROBE is bounds-checked as well as the walk. An anchor
@@ -1027,27 +1115,28 @@
           ;; and requiring that no lookup ever throws an untyped exception.
           ;; `.data-end` is a primitive field and so never nil; the `or`
           ;; against `(.size r)` dated from the fifteen-key map.
-          (let [lim (.data-end idx)]
-            (confirm
-             (loop [lo 0 hi (dec m)]
-               (if (> lo hi)
-                 (let [anchor (max 0 (min (dec m) hi))]
-                   (scan-map r (aget slot anchor) (span anchor) probe))
-                 (let [mid (quot (+ lo hi) 2)
-                       q (long (aget slot mid))]
-                   (if (or (neg? q) (>= q lim))
-                     -1                      ; a damaged anchor: report a miss
-                     (let [c (.compareItemToBytes r q probe)]
-                       (cond (zero? c) (skip r q)
-                             (neg? c) (recur (inc mid) hi)
-                             :else (recur lo (dec mid))))))))))
+          ;; TWO SEARCHES, LITERAL FIRST. The probe is always built as a
+          ;; literal, and on a document without stringrefs that is the only
+          ;; encoding any key has -- so the second search is not reached and
+          ;; costs nothing. On a stringref document a repeated key is a
+          ;; REFERENCE and the literal search cannot match it: measured, 19 of
+          ;; 20 present keys came back -1, and every one of them was then
+          ;; re-derived by `confirm`'s full scan. That is why an indexed miss
+          ;; on a 2000-key map cost 4041 skips against 3998 UNINDEXED -- the
+          ;; index was not merely failing to help, it was pure overhead on top
+          ;; of the walk it was supposed to replace.
+            (let [hit (bsearch probe)]
+              (if-not (neg? hit)
+                hit
+                (let [rp (reference-probe r probe)]
+                  (confirm (if rp (bsearch rp) hit)))))
           ;; Unsorted: still jump anchor to anchor rather than entry to entry.
-          (confirm
-           (loop [a 0]
-             (if (>= a m)
-               -1
-               (let [hit (scan-map r (aget slot a) (span a) probe)]
-                 (if (>= hit 0) hit (recur (inc a))))))))))))
+            (confirm
+             (loop [a 0]
+               (if (>= a m)
+                 -1
+                 (let [hit (scan-map r (aget slot a) (span a) probe)]
+                   (if (>= hit 0) hit (recur (inc a)))))))))))))
 
 (defn- nth-item
   "Offset of element `idx` of the array at `off`, or -1.
