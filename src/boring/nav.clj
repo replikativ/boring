@@ -1890,8 +1890,22 @@
 
   Refuses anything that is not an integer, rather than coercing: a caller
   reaching for this in a loop wants to know that the field it named is a float
-  or a string, not to get a plausible number out of one."
+  or a string, not to get a plausible number out of one.
+
+  REFUSES -1 AND -2 AS `value-at` DOES, and it did not. Those are what
+  `field-offset` and `nth-offset` return for absent and for `there, but no
+  offset names it`, so `(long-at s (field-offset s off k))` is the natural
+  pairing and the one a scan writes -- and on a miss it reported
+  `:boring/truncated-input`, which reads as a damaged document rather than as
+  a key that was not there. Two functions taking the same offsets have to
+  refuse the same sentinels, or one of them turns a lookup miss into a
+  corruption report."
   ^long [s ^long off]
+  (when (neg? off)
+    (fail :boring/absent
+          "boring.nav: no integer at offset -1 -- that is what `field-offset`
+           and `nth-offset` return for a key or index that is not there."
+          {:offset off}))
   (let [^Nav nav (source-of s)
         ^Reader r (.rdr nav)
         mj (major nav off)]

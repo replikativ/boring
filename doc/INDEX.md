@@ -220,12 +220,42 @@ Everything above is reachable without allocating a cursor:
 
 `-1` means **absent**. `-2` means **there, but no offset names it** — a tag, or
 a row of a shaped array whose bytes are an array while its value is a map. Both
-are negative, so a caller that checks `neg?` gets not-found either way;
-`value-at` refuses both rather than reading the head of the document.
+are negative, so a caller that checks `neg?` gets not-found either way.
 
-`container-count` **throws** `:boring/not-a-container` instead of joining that
-convention, because a count has no spare value: every negative long is a
-plausible count to arithmetic downstream.
+### Which functions return a sentinel and which throw
+
+The layer looks inconsistent — three functions return `-1`/`-2` and five throw
+— and it is not. **A function returns a sentinel only when the caller's next
+step will reject it.**
+
+| function | returns | sentinel? | why |
+|---|---|---|---|
+| `walk-from`, `field-offset`, `nth-offset` | an **offset** | `-1` / `-2` | every reader below refuses a negative offset |
+| `container-count` | a **count** | throws | nothing refuses a negative count |
+| `long-at` | a **long value** | throws | the full long range is legitimate data |
+| `value-at` | **any value** | throws | `nil` is a legitimate CBOR `null` |
+| `reduce-at`, `reduce-kv-at` | your **accumulator** | throws | no value is reserved |
+
+The offset rows work because the sentinel is **caught one step later**:
+`value-at`, `long-at` and `nth-offset` all refuse a negative offset, so a miss
+that is passed on unchecked becomes a typed error rather than a wrong answer.
+That pairing is what makes `-1` safe, and it is why `long-at` grew the same
+guard `value-at` always had — without it, `(long-at s (field-offset s off k))`
+reported `:boring/truncated-input` on a miss, which reads as a damaged document
+rather than as a key that was not there.
+
+A count has no such partner. `(dotimes [i -2] …)` runs zero times, `(range -2)`
+is empty and `(< 0 -2)` is false — verified — so a sentinel count would be
+**silently** empty at every call site. That is the whole argument, and it is
+about what the caller does next, not about whether a spare value exists.
+
+The three value-returning functions have no spare value at all: every long,
+every Clojure value and every accumulator is something a document could
+legitimately hold.
+
+**So the rule to remember is one sentence: an offset can be a sentinel because
+offsets are only ever handed back to this layer; anything you would use
+directly throws.**
 
 ---
 

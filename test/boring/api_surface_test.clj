@@ -83,3 +83,38 @@
       (is (= 0 (nav/shape-column sh :a)))
       (is (= -1 (nav/shape-column sh :nope)))
       (is (pos? (nav/shape-rows sh))))))
+
+(deftest the-two-offset-readers-refuse-the-same-sentinels
+  (testing "`field-offset` and `nth-offset` return -1 for absent and -2 for
+            `there, but no offset names it`, so `(long-at s (field-offset ...))`
+            is the pairing a scan writes. `value-at` refused both and `long-at`
+            did not, so the same miss reported `:boring/absent` through one and
+            `:boring/truncated-input` -- which reads as a DAMAGED DOCUMENT --
+            through the other.
+
+            Two readers taking the same offsets must refuse the same sentinels,
+            or one of them turns a lookup miss into a corruption report."
+    (doseq [off [-1 -2]]
+      (doseq [[label f] [["value-at" #(nav/value-at ints off)]
+                         ["long-at" #(nav/long-at ints off)]]]
+        (is (= :boring/absent
+               (try (do (f) nil)
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+            (str label " at " off)))))
+  (testing "and a real offset still reads"
+    (let [o (nav/nth-offset ints (nav/root-offset ints) 5)]
+      (is (= 5 (nav/long-at ints o)))
+      (is (= 5 (nav/value-at ints o))))))
+
+(deftest a-sentinel-count-would-be-silently-empty-which-is-why-there-is-none
+  (testing "the argument for `container-count` throwing, kept as a test so it
+            cannot quietly stop being true. An offset sentinel is safe because
+            the next reader refuses it; a COUNT sentinel has no such partner."
+    (is (= 0 (count (range -2))) "range of a negative is empty, not an error")
+    (is (false? (< 0 -2)))
+    (is (= :boring/not-a-container
+           (try (do (nav/container-count ints
+                                         (nav/nth-offset ints (nav/root-offset ints) 0))
+                    nil)
+                (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+        "a scalar is not a container, and that is loud rather than -2")))
