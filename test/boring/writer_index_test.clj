@@ -74,18 +74,32 @@
   (gen/one-of [gen/large-integer gen/string-ascii gen/boolean
                (gen/return nil) gen/keyword]))
 
+;; SCALED, and the cap is the point rather than a tuning knob. Five recursive
+;; branches each drawing up to 25 children, at test.check's default max size of
+;; 200, make a rose tree whose SHRINK path is what exhausts the heap -- not the
+;; generated value. Measured before the cap: `OutOfMemoryError: Java heap space`
+;; out of `rose-tree/remove` on roughly one run in thirteen, red CI with no
+;; diagnostic, and -- worse -- a real failing case would present the same way,
+;; since the OOM destroys the shrink output that would have named it.
+;;
+;; A flake that is indistinguishable from a genuine failure is the failure mode
+;; this suite can least afford. Depth is what these tests are about -- a
+;; container nested inside a container, and whether the walk and the writer
+;; agree about it -- and that is reached at size 30 as surely as at 200.
 (def gen-container
-  (gen/recursive-gen
-   (fn [inner]
-     (gen/one-of
-      [(gen/fmap (fn [vs] (into {} (map-indexed (fn [i v] [(format "k%03d" i) v]) vs)))
-                 (gen/vector inner 0 25))
-       (gen/vector inner 0 25)
-       (gen/fmap set (gen/vector gen/large-integer 0 25))
-       (gen/fmap #(into (sorted-map) (map-indexed (fn [i v] [(format "s%03d" i) v]) %))
-                 (gen/vector inner 0 20))
-       (gen/fmap #(apply list %) (gen/vector inner 0 20))]))
-   gen-leaf))
+  (gen/scale
+   #(min % 30)
+   (gen/recursive-gen
+    (fn [inner]
+      (gen/one-of
+       [(gen/fmap (fn [vs] (into {} (map-indexed (fn [i v] [(format "k%03d" i) v]) vs)))
+                  (gen/vector inner 0 25))
+        (gen/vector inner 0 25)
+        (gen/fmap set (gen/vector gen/large-integer 0 25))
+        (gen/fmap #(into (sorted-map) (map-indexed (fn [i v] [(format "s%03d" i) v]) %))
+                  (gen/vector inner 0 20))
+        (gen/fmap #(apply list %) (gen/vector inner 0 20))]))
+    gen-leaf)))
 
 (def profiles
   [{:stringref false}
