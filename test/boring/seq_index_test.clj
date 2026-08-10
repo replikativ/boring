@@ -222,9 +222,17 @@
             small map beside a large blob must leave the small node at u8."
     (let [o (ByteArrayOutputStream.)
           w (boring/writer 262144 opts)
-          vs [(zipmap (map #(str "k" %) (range 40)) (range 40))
+          ;; VALUES ARE ITEM-RICH, and have to be. An unsorted map earns a
+          ;; node on how many CBOR items each value costs to skip, not on how
+          ;; many bytes -- so the original fixture, whose values were an
+          ;; integer and a 3000-char string, earned no node at all once that
+          ;; rule was corrected and this test failed with "not a tag-27 frame".
+          ;; Both maps still differ the way the test is about: small deltas
+          ;; against large ones.
+          vs [(zipmap (map #(str "k" %) (range 40))
+                      (repeat (vec (range 8))))
               (zipmap (map #(str "b" %) (range 40))
-                      (repeat (apply str (repeat 3000 \x))))]]
+                      (repeat (vec (repeat 30 (apply str (repeat 100 \x))))))]]
       (boring/write-seq! w vs o (assoc opts :index 1 :index-min 4))
       (let [packed (index-slots (.toByteArray o) opts)
             codes (map #(width-code packed %) (range 3))]
@@ -350,10 +358,14 @@
 
 (def sorted-opts {:profile :archival})          ; sorts map keys, drops stringref
 
+;; ENTRIES ARE ITEM-RICH. An unsorted map earns a node on the ITEMS a lookup
+;; skips per entry, not the bytes, so a 3-item value left `wide-map` with no
+;; node and `indexed-descent-agrees-with-scanning` asserting nothing.
 (def wide-map
-  (into {} (for [i (range 300)] [(format "k%04d" i) {"v" i "w" (str "x" i)}])))
+  (into {} (for [i (range 300)]
+             [(format "k%04d" i) {"v" i "w" (str "x" i) "z" (vec (range 8))}])))
 
-(def wide-vec (vec (for [i (range 300)] {"n" i "s" (str "s" i)})))
+(def wide-vec (vec (for [i (range 300)] {"n" i "s" (str "s" i) "z" (vec (range 8))})))
 
 (deftest indexed-descent-agrees-with-scanning
   (testing "every key of a wide map resolves identically with and without an

@@ -546,10 +546,14 @@
                   (.setAccessible true))
           live (fn [] (count (remove nil? (seq ^objects (.get slots w)))))]
       (.setIndex w (int 1) (int 2) 0)
+      ;; ITEM-RICH VALUES, because an unsorted map earns a node on the items
+      ;; a lookup skips per entry, not on the bytes. With a bare string value
+      ;; these maps earn none, `(live)` is 1, and the assertion below asserts
+      ;; nothing -- which is what it says about itself.
       (boring/encode-buffered! w (vec (for [i (range 40)]
                                         (into {} (for [j (range 20)]
                                                    [(format "k%02d" j)
-                                                    (format "v%03d-%03d" i j)])))))
+                                                    (vec (repeat 8 (format "v%03d-%03d" i j)))])))))
       (is (< 1 (live))
           "the fixture must keep MANY nodes, or this asserts nothing")
       (.idxReset w)
@@ -1776,8 +1780,14 @@
     ;; the container comfortably over.
     (let [doc (vec (for [i (range 40)]
                      (into {} (for [j (range 20)]
+                                ;; ITEM-RICH: an unsorted map earns a node on
+                                ;; the items a lookup skips per entry, not on
+                                ;; the bytes, so a bare string value left this
+                                ;; fixture with one node -- exactly the
+                                ;; collapse the comment above warns about.
                                 [(format "k%02d" j)
-                                 (format "v%03d-%06d" j (+ (* 100 i) j))]))))
+                                 (vec (repeat 8 (format "v%03d-%06d"
+                                                        j (+ (* 100 i) j))))]))))
           ;; STRIDE 1, not 16. The inner maps are UNSORTED, and an unsorted
           ;; map cannot be binary-searched -- so above stride 1 `boring.nav`
           ;; refuses its node and the writer no longer emits one. At stride 16
@@ -1816,8 +1826,14 @@
             never had more than one node to get wrong"
     (let [doc (vec (for [i (range 40)]
                      (into {} (for [j (range 20)]
+                                ;; ITEM-RICH: an unsorted map earns a node on
+                                ;; the items a lookup skips per entry, not on
+                                ;; the bytes, so a bare string value left this
+                                ;; fixture with one node -- exactly the
+                                ;; collapse the comment above warns about.
                                 [(format "k%02d" j)
-                                 (format "v%03d-%06d" j (+ (* 100 i) j))]))))
+                                 (vec (repeat 8 (format "v%03d-%06d"
+                                                        j (+ (* 100 i) j))))]))))
           ;; Stride 1, matching the property above and for the same reason:
           ;; these inner maps are unsorted, and an unsorted map earns no node
           ;; above stride 1 because the reader would refuse it anyway.
@@ -1829,7 +1845,7 @@
       ;; byte offset into the frame and there is nothing to `alength`.
       (is (< 1 (long (:containers ix)))
           "and has many nodes, which is the whole point of this fixture")
-      (is (= "v007-001907" (some-> (nav/walk (nav/root clean o) [19 "k07"]) nav/value))
+      (is (= "v007-001907" (some-> (nav/walk (nav/root clean o) [19 "k07" 0]) nav/value))
           "and a key in a middle node reads correctly"))))
 
 (deftest a-sequence-node-claiming-no-items-must-be-backed-by-no-data
