@@ -743,6 +743,13 @@
          build-index write-seq-resolved! write-indexed-resolved!
          derive-stringref-pointers default-index-stride)
 
+(def ^:private ^:const small-enough-to-encode-twice
+  "Below this many bytes, `encode-indexed` encodes both ways and keeps the
+  shorter. See its docstring: the index frame is a rounding error on a large
+  value and most of the file on a small one, and only the buffering entry
+  point can look at both."
+  4096)
+
 (defn encode-indexed
   "Encode `v` and seal an index onto it, returning a byte[].
 
@@ -831,9 +838,39 @@
          ;; from the byte order for documents it did not write, so both
          ;; builders still produce the same file.
          w (writer 1024 o)
-         out (java.io.ByteArrayOutputStream. 1024)]
-     (write-indexed-resolved! w v out o stride (long (get o :index-min 16)))
-     (.toByteArray out))))
+         out (java.io.ByteArrayOutputStream. 1024)
+         _ (write-indexed-resolved! w v out o stride (long (get o :index-min 16)))
+         bs (.toByteArray out)]
+     ;; SMALL VALUES TAKE WHICHEVER NAVIGABLE ENCODING IS SMALLER, which
+     ;; restores the promise two paragraphs of this docstring make and one
+     ;; change broke.
+     ;;
+     ;; An indexed write seals a frame whenever it opens a stringref namespace,
+     ;; because "namespace with no pointer table" has to keep meaning exactly
+     ;; one thing for `boring.nav` -- see `write-indexed-resolved!`. On a large
+     ;; value the frame is noise. On a small one it is most of the file:
+     ;; `{:a 1}` came out at 50 bytes against 7, and `(vec (range 40))` at 101
+     ;; against 58, because #22's placement rule quite correctly declines to
+     ;; index anything that small and the frame is then pure overhead.
+     ;;
+     ;; So below a bound, encode the other way too and keep the shorter. Both
+     ;; candidates are ordinary `encode-indexed` output and both are navigable
+     ;; -- this picks between them, it does not invent a third shape.
+     ;;
+     ;; ONLY `encode-indexed` CAN DO THIS, and that is not an oversight:
+     ;; `write-indexed!` streams to a sink and cannot revisit what it has
+     ;; already flushed. So the two differ in SIZE on small values, never in
+     ;; meaning, and the streaming one is the conservative side.
+     ;;
+     ;; THE BOUND IS WHAT KEEPS IT FREE. A second encode of something already
+     ;; known to be under a few kilobytes is cheap; above that the frame is a
+     ;; rounding error and the comparison would be the expensive half of the
+     ;; call. Skipped entirely when the caller already asked for
+     ;; `:stringref false`, which is the candidate being compared against.
+     (if (and (:stringref o) (< (alength bs) small-enough-to-encode-twice))
+       (let [alt (encode-indexed v (assoc opts :stringref false))]
+         (if (< (alength ^bytes alt) (alength bs)) alt bs))
+       bs))))
 
 (def ^:const default-index-stride
   "Stride `write-seq!` indexes at unless told otherwise. See its docstring for

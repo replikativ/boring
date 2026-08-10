@@ -1268,6 +1268,12 @@
             ;; once.
             (assoc (or opts {}) :stringref false))))
 
+(def ^:private small-enough-to-encode-twice
+  "Below this many bytes, `encode-indexed` encodes both ways and keeps the
+  shorter. MUST equal the JVM's constant of the same name, or the two
+  platforms write different files for the same small value."
+  4096)
+
 (defn encode-indexed
   "Encode `v` and seal an index onto it, returning a Uint8Array.
 
@@ -1307,14 +1313,23 @@
    ;; letting the two options compose amounts to.
    (let [o (or (opt/check-opts opts) {})
          body (encode v o)
-         idx (build-index body o)]
-     (if-not idx
-       body
-       (let [frame (seal-index! idx (.-length body) o)
-             out (js/Uint8Array. (+ (.-length body) (.-length frame)))]
-         (.set out body 0)
-         (.set out frame (.-length body))
-         out)))))
+         idx (build-index body o)
+         bs (if-not idx
+              body
+              (let [frame (seal-index! idx (.-length body) o)
+                    out (js/Uint8Array. (+ (.-length body) (.-length frame)))]
+                (.set out body 0)
+                (.set out frame (.-length body))
+                out))]
+     ;; SMALL VALUES TAKE WHICHEVER NAVIGABLE ENCODING IS SMALLER -- see the
+     ;; JVM `encode-indexed` for the reasoning and the measurements. Mirrored
+     ;; here because the two platforms must write the same file, and the
+     ;; choice changes which bytes come out.
+     (if (and (:stringref (resolve-opts o))
+              (< (.-length bs) small-enough-to-encode-twice))
+       (let [alt (encode-indexed v (assoc (or opts {}) :stringref false))]
+         (if (< (.-length alt) (.-length bs)) alt bs))
+       bs))))
 
 (defn tag-registry
   "An empty registry. Shape:

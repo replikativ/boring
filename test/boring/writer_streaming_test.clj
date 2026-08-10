@@ -180,16 +180,40 @@
             emits them and holds one chunk. They must agree byte-for-byte, since
             `boring.writer-index-test` already pins writer-capture against the
             byte walk for sequences and this is the single-value case."
-    (doseq [[label v] [["wide map" (into {} (for [i (range 400)] [(str "k" i) {:v i}]))]
-                       ["wide vec" (mapv (fn [i] {:id i :name (str "n" i)}) (range 400))]
-                       ["nested"   {:a (vec (range 100)) :b (into {} (for [i (range 60)] [i i]))}]
-                       ["tiny"     {:a 1}]]]
-      (let [expect (boring/encode-indexed v {:index 16})
-            got (let [out (ByteArrayOutputStream.)
-                      w (boring/writer 64 o)]           ; tiny buffer: many flushes
-                  (boring/write-indexed! w v out {:index 16})
-                  (.toByteArray out))]
-        (is (= (vec expect) (vec got)) label))))
+    (let [streamed (fn [v opts]
+                     (let [out (ByteArrayOutputStream.)
+                           w (boring/writer 64 o)]      ; tiny buffer: many flushes
+                       (boring/write-indexed! w v out opts)
+                       (.toByteArray out)))]
+      (doseq [[label v] [["wide map" (into {} (for [i (range 400)] [(str "k" i) {:v i}]))]
+                         ["wide vec" (mapv (fn [i] {:id i :name (str "n" i)}) (range 400))]]]
+        (is (= (vec (boring/encode-indexed v {:index 16}))
+               (vec (streamed v {:index 16})))
+            label))
+
+      (testing "BELOW `small-enough-to-encode-twice` THEY MAY DIFFER, and that
+                is deliberate rather than a drift. `encode-indexed` buffers the
+                whole result, so it can encode both ways and keep the shorter;
+                a frame is a rounding error on a large value and most of the
+                file on a small one -- `{:a 1}` was 50 bytes against 7.
+                `write-indexed!` streams to a sink and cannot revisit what it
+                has flushed, so it takes the conservative side.
+
+                What must still hold is that they MEAN the same thing, and
+                that the buffering one is never the larger."
+        (doseq [[label v] [["nested" {:a (vec (range 100))
+                                      :b (into {} (for [i (range 60)] [i i]))}]
+                           ["tiny"   {:a 1}]]]
+          (let [buffered (boring/encode-indexed v {:index 16})
+                flushed (streamed v {:index 16})]
+            (is (<= (alength ^bytes buffered) (alength ^bytes flushed))
+                (str label " -- buffering may win, never lose"))
+            (is (= v (first (boring/decode-seq buffered)))
+                (str label " -- and both decode to the value"))
+            (is (= v (first (boring/decode-seq flushed))) label)
+            (is (= v (nav/value (nav/root buffered)))
+                (str label " -- and both stay navigable"))
+            (is (= v (nav/value (nav/root flushed))) label))))))
   (testing "and the result is navigable, which is the point of having it"
     (let [v (into {} (for [i (range 500)] [(str "key-" i) {:v i}]))
           out (ByteArrayOutputStream.)
