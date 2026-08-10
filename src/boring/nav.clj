@@ -115,7 +115,7 @@
 
 (set! *warn-on-reflection* true)
 
-(declare ->Cursor cursor cursor-at nav-of-items read-index read-index* tag-view
+(declare ->Cursor cursor cursor-at nav-of-items items? read-index read-index* tag-view
          nth-item realize lookup-map head-count child-offsets)
 
 ;; A shaped array is `39649([keys, [row, row, ...]])`, where each row is an
@@ -1573,11 +1573,31 @@
   the identity in the docstring above is `(cursor (source-of c) (offset c))`,
   and `cursor` takes `source-of` of its own first argument. Without this the
   bridge would not compose with itself -- which is exactly what the test that
-  pins the identity found."
+  pins the identity found.
+
+  TAKES RAW BYTES TOO, because `root` and `cursor` do and the offset layer is
+  supposed to be the same API without the allocation. It did not: every
+  function below routes through here, and the `:else` branch was an unchecked
+  cast, so `(nav/root-offset bs)` -- the documented way into the offset layer --
+  died with `ClassCastException: [B cannot be cast to boring.nav.Items`, naming
+  a type the caller has never heard of. `root-offset`, `probe`, `walk-from`,
+  `field-offset`, `nth-offset`, `container-count`, `value-at`, `long-at`,
+  `reduce-at` and `reduce-kv-at` were all affected.
+
+  Constructing a source per call is NOT what you want in a loop -- that is the
+  whole reason the layer takes one -- so this is a convenience for the first
+  call, not a licence. Hold the source."
   [c]
   (cond (instance? Cursor c) (.nav ^Cursor c)
         (instance? Nav c) c
-        :else (nav-of-items c)))
+        (or (bytes? c) (instance? ByteSource c)) (source c nil)
+        ;; ANYTHING ELSE IS AN `Items`, and if it is not, say so in the
+        ;; vocabulary of this namespace rather than in the JVM's.
+        (items? c) (nav-of-items c)
+        :else (fail :boring/unsupported-source
+                    (str "boring.nav: not a source, cursor, items, byte[] or "
+                         "ByteSource: " (some-> c class .getName))
+                    {:type-of (some-> c class .getName)})))
 
 (defn offset
   "The byte offset `c` addresses. The inverse of `cursor`."
@@ -2290,6 +2310,23 @@
 ;; against 367 us for hako and 1414 us for nippy, both of which must decode the
 ;; whole table to reach one field of it. This allocates nothing at all.
 
+(defn- need-shape
+  "`sh`, or a typed error naming the accessor that was reached with nil.
+
+  `shape` returns NIL for anything that is not a shaped array, and says so --
+  \"a caller asking whether a document is shaped is asking a question, not
+  asserting an answer\". The four accessors are `^Shape` field reads, so that
+  documented nil arrived as `NullPointerException: Cannot read field
+  \"rows_off\" because \"sh\" is null`, which names a private deftype field and
+  tells the caller nothing. The nil is the API working; the message was not."
+  ^Shape [sh who]
+  (or sh
+      (fail :boring/not-a-shape
+            (str "boring.nav/" who " needs a shape, got nil -- which is what "
+                 "`shape` returns when the offset does not hold a shaped array. "
+                 "Branch on it: (if-let [sh (nav/shape s off)] ...)")
+            {:accessor who})))
+
 (defn shape
   "The shape of the shaped array at `off`, or nil if there is not one there.
 
@@ -2311,15 +2348,19 @@
   arrays, which `nth-offset`, `reduce-at` and `container-count` handle knowing
   nothing about shapes.
 
-  This is the bridge: everything below it is plain, and the tag stops mattering."
-  ^long [^Shape sh] (.rows-off sh))
+  This is the bridge: everything below it is plain, and the tag stops mattering.
+
+  REFUSES NIL, which is what `shape` returns for anything that is not a shaped
+  array. A `^Shape` field read on nil is a NullPointerException naming a
+  private deftype field, which tells a caller nothing about what they did."
+  ^long [^Shape sh] (.rows-off (need-shape sh 'shape-rows)))
 
 (defn shape-count
   "How many rows the shape has. O(1) -- read from the rows-array head.
 
   What `container-count` cannot answer, because the shaped array is a TAG and a
-  tag has no count."
-  ^long [^Shape sh] (.n sh))
+  tag has no count. Refuses nil -- see `shape-rows`."
+  ^long [^Shape sh] (.n (need-shape sh 'shape-count)))
 
 (defn shape-column
   "The COLUMN INDEX of key `k`, or -1 if the shape does not carry that key.
@@ -2328,11 +2369,12 @@
   index and answers -1 in turn, so a missing key reads as absent rather than as
   column zero -- which is what an unchecked `(get pos k)` would have given, and
   is the difference between not-found and the wrong field's value."
-  ^long [^Shape sh k] (let [i (get (.pos sh) k)] (if i (long i) -1)))
+  ^long [^Shape sh k]
+  (let [i (get (.pos (need-shape sh 'shape-column)) k)] (if i (long i) -1)))
 
 (defn shape-keys
   "The shape's keys, in column order. The vector `shape-column` indexes into."
-  [^Shape sh] (.ks sh))
+  [^Shape sh] (.ks (need-shape sh 'shape-keys)))
 
 (defn- record-view
   "WRAPPER. A record writes `27([name, {fields}])`, so the field map begins past
@@ -3574,8 +3616,27 @@
   namespace."
   ([src] (items src nil))
   ([src opts]
-   (let [nav (nav-of src (or opts {}))]
+   ;; A SOURCE IS ACCEPTED HERE TOO, as it is by `root` and `cursor`. This took
+   ;; `nav-of` directly, which knows only bytes and a ByteSource, so
+   ;; `(items (source bs))` raised `:boring/unsupported-source` -- a `source`
+   ;; was the universal handle for one half of the namespace and rejected by
+   ;; the other.
+   ;;
+   ;; `opts` is ignored for a source that already exists, because its Reader is
+   ;; already configured; passing different options here would silently not
+   ;; apply them.
+   (let [nav (if (or (bytes? src) (instance? ByteSource src))
+               (nav-of src (or opts {}))
+               (source-of src))]
      (Items. nav (nav-idx nav)))))
+
+(defn- items?
+  "Whether `x` is an `Items`. Declared above and defined here for the same
+  reason `nav-of-items` is: `source-of` has to discriminate on the type, and
+  naming `Items` up there is a class the compiler has not seen yet -- which is
+  a compile error, not a warning, and one the REPL hides because a previous
+  load left the class present."
+  [x] (instance? Items x))
 
 (defn- nav-of-items
   "The `Nav` behind an `items`. Exists only so `source-of` can reach it: that
