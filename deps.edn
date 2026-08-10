@@ -120,19 +120,6 @@
               "-XX:+UnlockDiagnosticVMOptions" "-XX:+DebugNonSafepoints"
               "-Djdk.attach.allowAttachSelf"]}
 
-  ;; The log-segment experiment: k7 as the append-only log, boring as the
-  ;; payload format, boring.nav as the query layer. LOCAL ONLY and deliberately
-  ;; separate from :bench -- k7 is not published to Maven, so this needs a
-  ;; ../k7 checkout, and no CI job may use it. Nothing in src/ depends on k7;
-  ;; the integration is `BufferSource` over the ByteBuffer k7 already hands out,
-  ;; and that has no k7 in it either.
-  :k7
-  {:extra-paths ["bench" "target/classes"]
-   :extra-deps {com.s-exp/k7 {:local/root "../k7"}
-                com.taoensso/nippy {:mvn/version "3.7.0"}
-                criterium/criterium {:mvn/version "0.4.6"}}
-   :jvm-opts ["-server" "-Xmx4g" "--enable-native-access=ALL-UNNAMED"]}
-
   ;; The optional hasch integration. hasch is NOT a runtime dependency of
   ;; boring -- this alias exists to test the namespace, and a consumer who
   ;; requires boring.hasch supplies hasch themselves.

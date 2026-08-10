@@ -34,9 +34,6 @@ Three kinds of thing live in this directory:
 | `mmap.clj` | everything mmap, in three sections (`read`/`write`/`compress`): selective decode beats a `pread` per item 2.3x; mmap **loses** to a buffered stream for append; and the chunked-zstd curve that picks a chunk size. `clojure -M:bench -m mmap write` runs one section |
 | `nav.clj` | navigation, in five sections (`skip`/`cursor`/`index`/`index-min`/`write`): how cheap it is to walk past a value without decoding it — the inner loop — then what the shipped `boring.nav` api delivers against decode-then-`get-in`, then the index's stride and threshold economics. Records a NEGATIVE result too: early-exit on the first item of a log is *slower* than `decode-seq`, which is lazy already. `clojure -M:bench -m nav index` runs one section |
 | `capability.clj` | the table that is not about codec speed: reading a field out of stored bytes WITHOUT materialising the value it belongs to, against hako and nippy, which have no partial read. Point read, column scan, filter-and-project, with allocation |
-| `source_shapes.clj` | ONE SOURCE SHAPE PER JVM — byte[], heap/direct/mmap ByteBuffer, FFM segment — because `BufferSource`'s accessors go megamorphic if one process measures four ByteBuffer classes. Pass the shape as an argument |
-| `k7_segments.clj` | k7 as an append-only log with boring as the payload: per-event against per-segment framing, and what segmenting buys. Needs `../k7` and the `:k7` alias |
-| `k7_throughput.clj` | k7's own ceiling with the codec taken out of the loop, by message size |
 | `fuzz.clj` | mutation fuzzer over valid encodings. Found 154 untyped failures per 60k mutants on its first run. Run it after any decoder change. |
 | `prof.clj` | clj-async-profiler driver for the JVM decode loop |
 | `large.clj` | MB-scale payloads and streaming throughput, with a bounded-memory check |
@@ -90,3 +87,24 @@ Packed CBOR's verdict moved into `doc/COMPATIBILITY.md`, which
   than the named variable — a `#js [v pos]` tuple returned per value, and
   Keyword-vs-string `aset` keys.
 - **Warm the whole process, not the cell.** See `ab.clj`.
+
+- **`java.io.tmpdir` IS A MEMORY FILESYSTEM on most Linux boxes**, and a
+  benchmark that writes there is not measuring storage. `/tmp` here is `tmpfs`,
+  16 GB, so `Files/createTempDirectory` and `File/createTempFile` hand back a
+  path backed by RAM.
+
+  This invalidated a whole set of results before anyone noticed. An append-only
+  log benchmark reported 16 M messages/s and 69–98 M events/s and concluded
+  "the pipeline is codec-bound, not log-bound" — measured entirely against
+  memory, with no page writeback and no fsync cost, so the log side was
+  effectively free by construction. A separate probe concluded that an mmap'd
+  slice costs the same as anonymous `allocateDirect`; over tmpfs an mmap IS
+  anonymous memory, so that comparison could not have come out any other way.
+
+  Both were withdrawn and their scripts deleted rather than corrected, because
+  the correction needs a mapping over real storage and this repository has no
+  harness for one.
+
+  **Any benchmark whose subject is IO must name its filesystem**, the same way
+  every table here names its hardware — and prefer an explicit path on a real
+  disk over a temp directory, since the default is the misleading case.

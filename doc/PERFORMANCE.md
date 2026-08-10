@@ -223,13 +223,26 @@ an mmap they never copied. `SegmentSource` needs JDK 22; this runs on 9
 alongside the rest of `src/java`, so it is also the only off-heap source
 available to a caller who cannot move yet.
 
-Measured on the same mapping, a column scan over a 1000-row segment:
-`BufferSource` **38.1 µs**, `SegmentSource` **40.3 µs** — parity, so there is
-no foreign-memory win waiting on the other side. An mmap'd slice also costs the
-same as anonymous `allocateDirect` (39.2 µs), which is worth stating because
-the intuition says otherwise. `clojure -M:k7 -m source-shapes <shape>` runs one
-source shape per JVM, deliberately: the accessors go megamorphic if one process
-measures four `ByteBuffer` implementation classes, which is worth ~8%.
+One thing about it IS measured and worth keeping: reading through a
+`ByteBuffer` field goes **megamorphic** if one process meets more than two
+`ByteBuffer` implementation classes — `HeapByteBuffer`, `HeapByteBufferR`,
+`DirectByteBuffer`, `DirectByteBufferR` — and that costs about 8%. Any
+benchmark comparing buffer kinds must therefore use one shape per JVM, or it
+measures a megamorphic call site for everything after the second.
+
+**No numbers are quoted here for `BufferSource` against `SegmentSource`, and
+that is deliberate.** An earlier version of this section reported them at
+parity (38.1 µs against 40.3) and an mmap'd slice at parity with anonymous
+`allocateDirect` — all measured over files in `/tmp`, which on this machine is
+**tmpfs**. A mapping backed by tmpfs is memory; it never faults a page from
+storage, so a comparison against `allocateDirect` was memory against memory and
+could not have shown a difference even if one exists. The numbers were not
+wrong about what they measured, they were wrong about what they were *for*.
+
+Re-measuring properly needs mappings over real storage, which this repository
+has no harness for. Until it does, the honest statement is the narrow one:
+`BufferSource` exists for **reach** — it runs on JDK 9 and takes a buffer from
+any source — and whether the FFM path is faster over a real disk is untested.
 
 ### What shipped: one parser, two accessors
 
