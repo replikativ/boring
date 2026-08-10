@@ -1388,11 +1388,29 @@
   independently and must decide the same way."
   64)
 
-(def ^:private ^:const unsorted-anchor-budget
-  "What an unsorted map's anchors may cost, as a divisor of its own bytes.
-  MUST equal `Writer.UNSORTED_ANCHOR_BUDGET` -- see it for the measurements
-  and for why this branch is gated on SIZE rather than on `walk`."
+(def ^:private ^:const map-capture-span-guard
+  "Bytes per entry a map must plausibly have before the walk captures it at
+  stride 1, which costs `n` longs.
+
+  AN ALLOCATION BOUND, not the placement rule -- `keep-node?` decides that,
+  later, once `sorted` and `walk` are known. `build-index` is public and takes
+  bytes somebody else wrote: a minimal map pair is two bytes, so a well-formed
+  60 MB file declaring 30M pairs made the walk allocate 240 MB before
+  `keep-node?` refused the node.
+
+  It was the placement rule until the unsorted branch moved to `walk`, and
+  #43's divergence was the two builders computing that rule on byte spans that
+  differed by a head's width. As a bound it has no such hazard, because it only
+  has to be no STRICTER than what `keep-node?` will admit."
   10)
+
+(def ^:private ^:const unsorted-walk-per-entry
+  "Mean prefix items an unsorted map must cross per ENTRY to earn a node.
+  MUST equal `Writer.UNSORTED_WALK_PER_ENTRY` -- see it for the measurements,
+  and for why this branch is gated on ITEMS where it used to be gated on
+  bytes: an unsorted map's node buys one thing, skipping each VALUE instead of
+  walking it, and what that is worth is how many CBOR items a value is."
+  4)
 
 (defn- keep-node?
   "Whether a container is worth an index node. Mirrors `Writer.keepNode`.
@@ -1428,8 +1446,10 @@
        (if (or (not map?) sorted)
          (>= (long walk) walk-threshold)
          ;; An unsorted map is written at stride 1 whatever the file's
-         ;; stride, so only the size budget decides.
-         (<= (* unsorted-anchor-budget (long n)) (long bytes)))))
+         ;; stride, so the file's stride does not enter into it. What decides
+         ;; is how many ITEMS the node lets a lookup skip -- see
+         ;; `Writer.UNSORTED_WALK_PER_ENTRY`. `bytes` is no longer read.
+         (>= (long walk) (* unsorted-walk-per-entry (long n))))))
 
 (defn- frame-payload-array?
   "Is the container at `p` the 2-element `[name, args]` array of a TAG-27 FRAME?
@@ -1612,8 +1632,14 @@
                 ;; two builders writing different files, which is the one thing
                 ;; the differential test exists to prevent. Found by that test,
                 ;; intermittently, because only the exact boundary shows it.
+                ;; AN ALLOCATION BOUND, NOT THE PLACEMENT RULE, and the
+                ;; distinction is new. `sorted` is not known here -- it cannot
+                ;; be until the last key has been compared -- so this cannot
+                ;; ask `keep-node?`, which needs it. What it must do is capture
+                ;; at least as widely as `keep-node?` will later want, while
+                ;; refusing to allocate `n` longs for a hostile declared count.
                 span-bound (- (.size r) (long p))
-                cap-stride (if (and map? (<= (* unsorted-anchor-budget (long n))
+                cap-stride (if (and map? (<= (* map-capture-span-guard (long n))
                                              (long span-bound)))
                              1 stride)
                 m (if keep?

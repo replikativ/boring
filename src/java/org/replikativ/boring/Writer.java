@@ -407,29 +407,36 @@ public final class Writer {
     private static final long WALK_THRESHOLD = 64;
 
     /**
-     * What an unsorted map's anchors may cost, as a divisor of the container's
-     * own bytes: 10 means "at most a tenth".
+     * Mean prefix items an unsorted map must cross per ENTRY to earn a node.
+     * `walk` is that mean over the whole container, so the test is
+     * {@code walk >= UNSORTED_WALK_PER_ENTRY * n}.
      *
-     * A DIRECT BUDGET ON WHAT IS PAID, not a proxy. An unsorted map is only
-     * usable at stride 1, so its node costs ONE ANCHOR PER ENTRY -- roughly `n`
-     * bytes against the container's `n * bytes-per-entry`. The trade is
-     * therefore governed by ENTRY SIZE, and `walk` cannot express it: measured
-     * at the same walk of ~500, a 512-entry map of scalars gained 1.35x for
-     * 13.02% of the file while a 16-entry map of 64-element vectors gained
-     * 4.02x for 3.68%. Same metric, opposite verdicts.
+     * THE AXIS IS ITEMS, NOT BYTES. This replaces a direct budget on the
+     * anchors' size -- "at most a tenth of the container" -- whose javadoc
+     * argued that `walk` could not express the trade. It had it backwards:
+     * BYTES cannot express it. An unsorted map is usable only at stride 1, so
+     * its node buys exactly one thing, skipping each VALUE instead of walking
+     * it, and what that is worth depends on how many CBOR items a value is --
+     * not on how many bytes.
      *
-     * Validated against 27 measured points spanning 2 to 66 items per entry and
-     * 32 to 512 entries. Every container this refuses measured at most 2.40x,
-     * including both outright losses (0.43x and 0.63x); every container it
-     * admits measured at least 1.65x, up to 13.65x.
+     * Measured, same n, near-identical bytes per entry, opposite verdicts:
      *
-     * Approximate on the safe side: it counts one byte per anchor, which is
-     * what a u8 delta costs, and a container whose deltas are wider is one
-     * whose entries are large -- exactly the case that clears the budget
-     * comfortably. It also ignores the frame's fixed overhead, which is
-     * per-FILE and amortises over every node in it.
+     *   values                    B/entry   n=20    n=64    n=200
+     *   400-char strings (1 item)     409  0.30x   0.64x    0.67x
+     *   100-int vectors (101 items)   184  0.78x   2.61x   14.21x
+     *
+     * The old rule admitted both. A big string is the exact shape it cannot
+     * help -- one cheap skip either way -- and konserve-shaped records are
+     * mostly that, which is why `:index-min 16` had to mask it.
+     *
+     * Swept over n in {8, 32, 128, 512} x items-per-entry in {1, 4, 16, 64,
+     * 256}. Every admitted node at 16 items per entry or more measured at
+     * least 1.84x, up to 18.13x; 4 items per entry straddled (0.77x at n=32,
+     * 2.62x at n=512), and 1 loses everywhere. 4 mean items per entry -- this
+     * constant, against `walk` which is a half-sum -- sits below the clear
+     * wins and above every measured loss.
      */
-    private static final long UNSORTED_ANCHOR_BUDGET = 10;
+    private static final long UNSORTED_WALK_PER_ENTRY = 4;
 
     /** Set when a node has been refused, cleared by {@link #compactNodes}. */
     private boolean idxDirty;
@@ -925,10 +932,12 @@ public final class Writer {
         if (!isMap || sorted) return walk >= WALK_THRESHOLD;
         // An unsorted map is written at STRIDE 1 whatever the file's stride --
         // it is the only stride that helps one -- so the file's stride does not
-        // enter into the decision. All that matters is whether one anchor per
-        // entry is a small enough share of the container. See
-        // UNSORTED_ANCHOR_BUDGET for why the test is on SIZE and not on `walk`.
-        return UNSORTED_ANCHOR_BUDGET * n <= bytes;
+        // enter into the decision. What decides is how many ITEMS the node
+        // lets each lookup skip, which is what `walk` measures. See
+        // UNSORTED_WALK_PER_ENTRY, and note that `bytes` is no longer read:
+        // the rule it fed admitted big strings, the one shape a stride-1
+        // anchor cannot help.
+        return walk >= UNSORTED_WALK_PER_ENTRY * n;
     }
 
     /**

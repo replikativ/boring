@@ -957,10 +957,18 @@
   builders decide with it independently and must decide the same way."
   64)
 
-(def ^:private unsorted-anchor-budget
-  "What an unsorted map's anchors may cost, as a divisor of its own bytes. MUST
-  equal `Writer.UNSORTED_ANCHOR_BUDGET` and the JVM `unsorted-anchor-budget`."
+(def ^:private map-capture-span-guard
+  "Bytes per entry a map must plausibly have before the walk captures it at
+  stride 1. An ALLOCATION BOUND, not the placement rule -- see the JVM
+  `map-capture-span-guard`. MUST be no stricter than `keep-node?` admits."
   10)
+
+(def ^:private unsorted-walk-per-entry
+  "Mean prefix items an unsorted map must cross per ENTRY to earn a node. MUST
+  equal `Writer.UNSORTED_WALK_PER_ENTRY` and the JVM `unsorted-walk-per-entry`
+  -- see the Java constant for the measurements, and for why this branch is
+  gated on ITEMS where it used to be gated on bytes."
+  4)
 
 (defn- keep-node?
   "Whether a container is worth an index node. Mirrors `Writer.keepNode` and
@@ -973,8 +981,9 @@
        (if (or (not map?) sorted)
          (>= walk walk-threshold)
          ;; An unsorted map is written at stride 1 whatever the file's
-         ;; stride, so only the size budget decides.
-         (<= (* unsorted-anchor-budget n) bytes))))
+         ;; stride, so what decides is how many ITEMS the node lets a lookup
+         ;; skip. `bytes` is no longer read.
+         (>= walk (* unsorted-walk-per-entry n)))))
 
 (defn- index-walk*
   "Walk the value at `p`, returning where it ends, accumulating nodes into `acc`.
@@ -1053,7 +1062,10 @@
                                          (if map? " pairs" " elements")
                                          " but only " avail " bytes remain")
                                     {:type :boring/bad-count :count n :offset p})))
-                cap-stride (if (and map? (<= (* unsorted-anchor-budget n) avail))
+                ;; AN ALLOCATION BOUND, NOT THE PLACEMENT RULE -- `sorted`
+                ;; is not known here, so this cannot ask `keep-node?`. See the
+                ;; JVM `map-capture-span-guard`.
+                cap-stride (if (and map? (<= (* map-capture-span-guard n) avail))
                              1 stride)
                 m (if keep?
                     (cond (<= n 0) 0
