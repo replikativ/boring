@@ -190,9 +190,16 @@ public final class Reader {
      */
     public long maxItems = 0;
 
-    /** Items charged so far. Public so the sequence decoders and `boring.nav`
-     *  can save and restore it around reading boring's OWN index frame, which
-     *  must not spend the caller's budget. */
+    /**
+     * Items charged so far, against {@link #maxItems}.
+     *
+     * <p>Public, but NOT because anything outside this class touches it. The
+     * javadoc here used to say "so the sequence decoders and `boring.nav` can
+     * save and restore it around reading boring's OWN index frame" -- no JVM
+     * Clojure reads or writes this field, and nav.clj records that those
+     * overrides are dead. The frame is kept off the caller's budget inside
+     * this class instead.
+     */
     public long items;
 
     /** Items crossed by the current structural skip. NOT the same quantity as

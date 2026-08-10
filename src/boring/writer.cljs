@@ -45,7 +45,6 @@
 ;; symmetric across our two platforms. There is no JS URI type, so tag 32
 ;; decodes to a plain string here -- lossless, since a URI IS its string form,
 ;; unlike a BigDecimal which is why that one needed a stand-in type.
-(def ^:const TAG-URI 32)
 (def ^:const TAG-REGEX 35)
 (def ^:const TAG-GENERIC-OBJ 27)
 ;; Reserved tag-27 names for Clojure collections CBOR cannot distinguish. See

@@ -765,20 +765,6 @@ public final class Writer {
     }
 
     /**
-     * An index offset, checked to fit the int the format stores it in.
-     *
-     * The index carries offsets as int32 -- `containers` and every slot are
-     * int arrays on the wire. Past 2 GiB the cast silently produced NEGATIVE
-     * offsets, which is the worst of all outcomes: `node-slot` binary-searches
-     * `containers` and they stop ascending, sequence `nth` seeks to a negative
-     * position, and past 4 GiB offsets collide outright. Nothing warned. The
-     * back-pointer is 8 bytes and `nav` is long-clean throughout, so 2 GiB is a
-     * limit of the index alone -- and `write-seq!` is explicitly for
-     * long-running files, so it is reachable rather than theoretical.
-     *
-     * Refusing is right until the format carries wider offsets: an unindexed
-     * file is correct and a wrongly-indexed one is not.
-     */
     /**
      * ABSOLUTE offsets are 64-bit. They used to be capped at 2 GiB because the
      * index stored them as int32, which made a mapping larger than that
@@ -2512,16 +2498,14 @@ public final class Writer {
                     + items[order[j - 1]] + " and " + items[order[j]] + ")");
 
         head(TAG, TAG_SET);
-        long start = absOffset();                       // the array, not the tag
         head(ARRAY, n);
-        long[] anchors = indexing(n) ? new long[anchorCount(n)] : null;
-        int slot = anchors != null ? reserveNode() : -1;
-        long itemsAtStart = idxItemsWritten, walkAcc = 0;
-        int a = 0, countdown = 1;
+        // NO INDEX CAPTURE HERE, and none is reachable. This method's only
+        // caller raises idxSuspend around the call (see writeValueInner's
+        // "A SET IS INDEXED NOWHERE"), and `indexing(n)` requires
+        // idxSuspend == 0 -- so the anchor array, the reserved node and the
+        // fillNode that used to sit in this loop were inert on every path.
+        // Twenty-eight lines that read live and could not run.
         for (int j = 0; j < n; j++) {
-            if (anchors != null && --countdown == 0) {
-                anchors[a++] = idxOffset(pos); countdown = idxStride;
-            }
             // The STAGED bytes, not a second `writeValue`. Re-encoding asked a
             // registered handler for the value twice, and a handler may be
             // stateful or read the clock -- so the bytes that decided the sort
@@ -2529,7 +2513,6 @@ public final class Writer {
             // out DESCENDING. Canonical maps already copy their staged keys;
             // this is the same fix, and it also restores one handler call per
             // value.
-            walkAcc += idxItemsWritten - itemsAtStart;
             byte[] eb = encoded[order[j]];
             // THE STAGED BYTES CARRY NO EMIT SITE, so nothing has counted the
             // items inside them -- the scratch writer counted them into ITS
@@ -2541,7 +2524,6 @@ public final class Writer {
             System.arraycopy(eb, 0, buf, pos, eb.length);
             pos += eb.length;
         }
-        if (anchors != null) fillNode(slot, start, n, anchors, walkAcc);
     }
 
     /**

@@ -280,3 +280,30 @@
           (is (pos? (alength cs)))
           (is (every? #(>= % prefix) (seq cs))
               "a container offset below the prefix is an un-rebased one"))))))
+
+(deftest reserved-name-frames-are-indexed-the-same-by-both-builders
+  (testing "`clojure/sorted-set` and `clojure/queue` route through
+            `writeSeqAsArray`, and #40 flagged that they do so OUTSIDE any
+            `idxSuspend` -- so the writer captures a node for their element
+            array while `Reader.recordDescendable` refuses every reserved name,
+            which means `nav` realises those frames opaquely and can never
+            reach an offset inside one.
+
+            The open question was whether the BYTE-WALK builder keeps that node
+            too. It does. The node is unreachable either way, so it is waste
+            rather than a defect -- but the two builders writing DIFFERENT
+            files would have been a defect, and that is what this pins.
+
+            Left as agreement rather than suppressed on both sides: suppressing
+            is a wire change for a handful of bytes, and every past attempt to
+            make one builder skip a node the other kept is exactly how #30 and
+            #34 happened."
+    (let [o {:stringref false}]
+      (doseq [[label v] [["sorted-set" (into (sorted-set) (range 200))]
+                         ["queue" (into clojure.lang.PersistentQueue/EMPTY
+                                        (range 200))]
+                         ["sorted-set beside a plain vector"
+                          {:s (into (sorted-set) (range 200))
+                           :t (vec (range 200))}]]]
+        (testing label
+          (is (= (walked v o 4 4) (hooked v o 4 4))))))))
