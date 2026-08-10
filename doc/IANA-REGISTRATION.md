@@ -105,10 +105,20 @@ encoded  d9 9ae1  82
 ```
 
 **`null` (simple value 22) is not absence.** It is a key that is present with a
-null value, and `{:a null}` and `{}` are different maps. A decoder that
-collapses `undefined` into `null` cannot represent this distinction and will
-report an absent key as present — RFC 8949 makes the two simple values
-distinct, and that distinction is load-bearing here.
+null value, and `{:a null}` and `{}` are different maps.
+
+**Distinguishing simple values 22 and 23 is therefore a conformance requirement
+of this tag.** RFC 8949 §3.3 already makes them distinct data items; an
+implementation that maps both to one host value cannot implement this tag
+correctly and should decline it rather than report an absent key as present.
+The marker appears only inside this tag's content, so a decoder that does not
+implement the tag never encounters it.
+
+Surveyed at time of writing, decoding
+`39649([["a","b"],[[null,1],[undefined,2]]])`: `cbor2` (Python), `cbor-x` and
+`cbor` (JavaScript) and `clj-cbor` all keep the two apart and preserve the tag.
+`ciborium` (Rust) preserves the tag but collapses the marker at its `Value`
+layer, so an implementer must decode below it. See `doc/INTEROP.md`.
 
 A row longer than the key set is malformed: there is no key for the extra value
 to bind to, and a decoder must reject the item rather than truncate. Keys must

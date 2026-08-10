@@ -142,14 +142,40 @@ def shaped_array(payload):
     ]
 ```
 
-**Your decoder must keep `undefined` and `null` apart**, and not all of them
-do. Python's `cbor2` does, and exposes `cbor2.undefined`. Rust's **ciborium
-does not** — verified against 0.2, both `0xf6` and `0xf7` decode to
-`Value::Null` and compare equal — so `interop/rust` handles short rows
-correctly and cannot distinguish a mid-row gap from a null value. That is a
-limitation of the decoder rather than of the format; RFC 8949 makes the two
-simple values distinct. If your library collapses them, either use
-`{:profile :interop}` below or drop to a lower-level parser for this tag.
+**Keeping `undefined` and `null` apart is a conformance requirement of this
+tag.** RFC 8949 §3.3 makes simple values 22 and 23 distinct data items; a
+decoder that maps both to one host value has lost information the format
+carries. The marker only ever appears *inside* tag 39649's content, so a reader
+that does not implement the tag never encounters it — this is a requirement on
+implementers of 39649, not on CBOR readers generally.
+
+Measured, decoding `39649([["a","b"],[[null,1],[undefined,2]]])`:
+
+| library | 22 vs 23 | keeps tag 39649 | can implement this tag |
+|---|---|---|---|
+| `cbor2` (Python) | yes — `cbor2.undefined` | yes | **yes** |
+| `cbor-x` (JavaScript) | yes — `null` / `undefined` | yes, as `{value, tag}` | **yes** |
+| `cbor` (node-cbor) | yes | yes, as `Tagged` | **yes** |
+| `clj-cbor` | yes — an `Undefined` value | yes | **yes** |
+| `ciborium` (Rust) | **no** — both give `Value::Null` | yes | only below `Value` |
+| Jackson (Java) | **no** | **no** — swallows tags | no |
+
+Two notes on the failures, because they are different problems.
+
+**ciborium** preserves the tag but collapses the marker inside it, so an
+implementer must drop below `ciborium::value::Value` to read row values.
+`interop/rust` does not, and therefore handles short rows correctly and reports
+a mid-row gap as a null — the assertion there pins that wrong answer
+deliberately, so it fails the day ciborium distinguishes them.
+
+**Jackson** does not surface tags at the token level at all, so it cannot see
+tag 39649 in the first place. No choice of absence marker would help; a Jackson
+consumer needs `{:profile :interop}` below, which turns shapes off entirely.
+
+Do **not** reach for an unassigned simple value as a private marker if you are
+designing something similar: measured, Jackson decodes `simple(0)` to the
+*integer* `0` — indistinguishable from real data — and ciborium rejects the
+document outright.
 
 It is **off by default** (`:shapes true` opts in), and a decoder that ignores it
 gets an inert tagged value — never a misreading. Use `{:profile :interop}` to
