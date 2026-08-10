@@ -573,3 +573,46 @@
                     (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
       (testing "and :stringref false, the way to say it out loud, still writes"
         (is (pos? (alength ^bytes (bytes-for {:stringref false :index 0}))))))))
+
+(deftest nth-through-the-sequence-index-does-far-less-walking
+  (testing "THE INDEX IS A PURE OPTIMISATION, so no assertion about the VALUE
+            `nth` returns can tell a live index from a dead one -- the scan
+            returns the same item. `bin/index-mutants` measures that directly by
+            replacing each index branch with its scan and asking which tests
+            notice, and this path had NOBODY: `Items.nth`'s `.offsets` branch
+            could be deleted with the whole suite still green.
+
+            That is the same hole the same tool found in `lookup-map` and
+            `nth-item`, both of which then turned out to carry real defects. The
+            observable that distinguishes them is the WALKING, which
+            `nav/skips` counts.
+
+            `nav/skips` takes a cursor rather than an `Items`, and every item
+            `nth` returns IS one over the same Reader -- so the counter is read
+            through an item, and it counts what the sequence walk did."
+    ;; `(build 0)`, NOT `(build nil)`. `write-seq!` INDEXES BY DEFAULT -- this
+    ;; file says so at the top -- so `(build nil)` is a SEALED sequence and the
+    ;; first version of this test compared an index against itself, which is
+    ;; how it failed. `:index 0` is the documented off switch.
+    (let [indexed (nav/items (build 16) opts)
+          plain (nav/items (build 0) opts)
+          walked (fn [its i]
+                   (let [c0 (nth its 0)]
+                     (nav/skips c0 0)
+                     (nav/value (nth its i))
+                     (nav/skips c0)))]
+      (testing "both reach the same item -- the index changes the work, not the
+                answer, which is why this cannot be a value assertion"
+        (is (= (nth items 400) (nav/value (nth indexed 400))))
+        (is (= (nth items 400) (nav/value (nth plain 400)))))
+      (let [with (walked indexed 400)
+            without (walked plain 400)]
+        (is (< (* 4 with) without)
+            (str "reaching item 400 through the index must walk far less: "
+                 with " against " without))
+        ;; A CEILING as well as a ratio. At stride 16 the walk from an anchor is
+        ;; bounded by the stride, so this cannot quietly degrade into "slightly
+        ;; better than scanning" while still passing the ratio.
+        (is (< with 40)
+            (str "and it must be bounded by the stride, not by the sequence: "
+                 with))))))
