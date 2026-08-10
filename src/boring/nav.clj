@@ -102,7 +102,7 @@
 
 (set! *warn-on-reflection* true)
 
-(declare ->Cursor cursor cursor-at nav-of-items read-index read-index* source-at tag-view
+(declare ->Cursor cursor cursor-at nav-of-items read-index read-index* tag-view
          nth-item realize lookup-map head-count child-offsets)
 
 ;; A shaped array is `39649([keys, [row, row, ...]])`, where each row is an
@@ -632,13 +632,6 @@
   was standing in for a document that had no name."
   ([src] (source src nil))
   ([src opts] (nav-of src (or opts {}))))
-
-(defn ^:deprecated source-at
-  "DEPRECATED: use `cursor`, which is this under a name that says what it
-  returns. Kept as a one-line forward because removing an entry point outright
-  is how a caller finds out at runtime instead of at compile time."
-  ([src off] (cursor src off nil))
-  ([src off opts] (cursor src off opts)))
 
 ;; ------------------------------------------------------------- wire queries
 
@@ -1726,11 +1719,6 @@
   it -- which is exactly how a public function can end up silently rebound to
   a private one that answers a different question."
   ^long [s ^long off] (head-count (source-of s) off))
-
-(defn end-at
-  "Byte offset one past the item at `off`. `byte-span` without a cursor."
-  ^long [s ^long off]
-  (let [^Nav nav (source-of s)] (skip ^Reader (.rdr nav) off)))
 
 (defn value-at
   "The value at `off`, realised.
