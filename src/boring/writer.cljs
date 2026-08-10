@@ -897,7 +897,15 @@
          (get-in (.-registry w) [:writers (type x)]))
     (let [h (get-in (.-registry w) [:writers (type x)])]
       (head! w TAG (check-tag! (:tag h)))
-      (write-value! w ((:fn h) x)))
+      (write-value! w (try ((:fn h) x)
+                           (catch :default e
+                             (if (:type (ex-data e))
+                               (throw e)
+                               (throw (ex-info
+                                       (str "boring: the tag writer registered for "
+                                            (:tag h) " threw: " (.-message e))
+                                       {:type :boring/handler-failed
+                                        :handler "tag writer" :id (:tag h)})))))))
 
     (instance? js/Date x)
     ;; toISOString always prints milliseconds; ISO_INSTANT on the JVM omits
@@ -1086,7 +1094,16 @@
     ;; also unencodable would otherwise loop forever.
     (if (and (.-encodeFallback w) (not (.-inFallback w)))
       (do (set! (.-inFallback w) true)
-          (try (write-value! w ((.-encodeFallback w) x))
+          (try (write-value! w (try ((.-encodeFallback w) x)
+                                    (catch :default e
+                                      (if (:type (ex-data e))
+                                        (throw e)
+                                        (throw (ex-info
+                                                (str "boring: the :encode-fallback threw: "
+                                                     (.-message e))
+                                                {:type :boring/handler-failed
+                                                 :handler ":encode-fallback"
+                                                 :id (pr-str (type x))}))))))
                (finally (set! (.-inFallback w) false))))
       (throw (ex-info (str "boring: no encoding for " (pr-str (type x)))
                       {:type :boring/unsupported-type :value x})))))

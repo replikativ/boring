@@ -2846,7 +2846,14 @@ public final class Reader {
         // -- a Julia-style Float16, a fixed-point, a unit-carrying quantity --
         // need the built-in mapping to be a DEFAULT, not a ceiling.
         clojure.lang.IFn override = registry.readerFor(tag);
-        if (override != null) return override.invoke(read());
+        if (override != null) {
+            // GUARDED, because this is caller code running on attacker bytes.
+            // Only the handler call is inside the try: `read()` raises boring's
+            // own typed errors and must not be relabelled as the handler's.
+            Object payload = read();
+            try { return override.invoke(payload); }
+            catch (Exception e) { throw Err.fromHandler("tag reader", tag, e); }
+        }
 
         switch ((int) tag) {
             case 256: {                                      // stringref namespace
@@ -3418,7 +3425,15 @@ public final class Reader {
                 }
                 // No Class.forName: an unregistered name yields a plain value,
                 // never an arbitrary instantiation.
-                if (ctor != null) return ctor.invoke(argument);
+                if (ctor != null) {
+                    // Same guard as the tag reader above. A record constructor
+                    // handed a payload shaped for something else threw
+                    // IllegalArgumentException or ClassCastException straight
+                    // out of `decode` -- reachable with any registered name,
+                    // not only the reserved ones that made it easy to find.
+                    try { return ctor.invoke(argument); }
+                    catch (Exception e) { throw Err.fromHandler("record constructor", name, e); }
+                }
                 // The fallback is chosen by PAYLOAD SHAPE, not by any claim
                 // about the sender -- tag 27 carries no record/non-record bit,
                 // and could not: its content is [type-name, *constructor-args],

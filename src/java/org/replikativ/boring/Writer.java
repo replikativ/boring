@@ -3279,7 +3279,15 @@ public final class Writer {
         TagRegistry.TagWriter handler = registry.hasWriters() ? registry.writerFor(c) : null;
         if (handler != null) {
             writeTag(handler.tag);                        // validated, not raw head
-            writeValue(handler.fn.invoke(x));
+            {
+                // The write side has the same hole: a tag writer that throws
+                // escaped `encode` raw. Less exposed than the read side --
+                // the value is the caller's own -- but the same guarantee.
+                Object converted;
+                try { converted = handler.fn.invoke(x); }
+                catch (Exception e) { throw Err.fromHandler("tag writer", handler.tag, e); }
+                writeValue(converted);
+            }
             return;
         }
 
@@ -3595,7 +3603,14 @@ public final class Writer {
         if (encodeFallback != null && !inFallback) {
             inFallback = true;
             try {
-                writeValue(encodeFallback.invoke(x));
+                {
+                    Object converted;
+                    try { converted = encodeFallback.invoke(x); }
+                    catch (Exception e) {
+                        throw Err.fromHandler(":encode-fallback", x.getClass().getName(), e);
+                    }
+                    writeValue(converted);
+                }
                 return;
             } finally {
                 inFallback = false;
