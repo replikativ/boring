@@ -163,8 +163,16 @@
   heap -- which is the combination this whole feature is for: seek into a large
   file without faulting in the pages you skipped.
 
-  Same rules as `mmap-source`: the caller closes the arena, nothing derived from
-  it may escape, and the file must have been written `{:stringref false}`."
+  Same rules as `mmap-source`: the caller closes the arena and nothing derived
+  from it may escape.
+
+  A SEQUENCE still needs `{:stringref false}`, which is not the same claim
+  `mmap-source` makes and is why this no longer says \"same rules\" about it.
+  `write-seq!` resets the namespace per top-level item, so one index frame
+  cannot carry a pointer table for all of them and it forces the option off.
+  A single mapped DOCUMENT keeps stringref and resolves references through the
+  frame -- see `mmap-source`, which used to carry this restriction and no
+  longer does."
   ([file] (mmap-items file nil))
   ([file opts]
    ;; The arena is CLOSED if anything after it throws. It owns the mapping, and

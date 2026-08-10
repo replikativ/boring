@@ -1,4 +1,4 @@
-(ns boring.reader
+(ns ^:no-doc boring.reader
   "CBOR reader for ClojureScript. Mirrors the JVM decoder's structure and, more
   importantly, its hardening: validated counts, a nesting cap, duplicate-key
   rejection, UTF-8 validation and typed errors. Those were all found the hard

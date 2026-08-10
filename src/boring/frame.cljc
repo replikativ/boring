@@ -68,7 +68,10 @@
 
 (def prefix-bytes
   "The exact bytes every sealed frame starts with: tag 27, a two-element array,
-  the text string `boring/index`, and the six-element payload array.
+  the text string `boring/index`, and a payload array head. Six or
+  SEVEN elements are written -- seven when the document opens a stringref
+  namespace -- and `payload-count-bytes` below accepts six through fifteen, so
+  only the first 16 bytes are compared as a constant.
 
   A CONSTANT, compared before anything is decoded. That is the whole point:
   the gates that preceded it judged the frame only AFTER materialising it, and

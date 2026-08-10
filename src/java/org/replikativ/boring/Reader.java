@@ -923,16 +923,23 @@ public final class Reader {
      * Measuring the span in bytes gets that backwards, which is the error two
      * earlier versions of the index policy made.
      *
-     * <p>Refuses while a stringref namespace is open, where `skipValue` falls
-     * back to a full `read` and would count nothing. Not a live restriction:
-     * `:stringref` and `:index` cannot be combined, and the index builders are
-     * the only callers.
+     * <p>Refuses while a stringref namespace is ACTIVELY BEING DECODED, where
+     * `skipValue` falls back to a full `read` and would count nothing.
+     *
+     * <p>This used to say the restriction was not live "because `:stringref`
+     * and `:index` cannot be combined". They compose now -- the index frame
+     * carries a pointer table -- and the runtime message said so too, which
+     * made it a user-visible string asserting a rule the library had dropped.
+     * The guard is still unreachable in practice, but for a different reason:
+     * the index builders walk a finished document with `srActive` false, and
+     * `build-index` over a stringref document is exercised and works.
      */
     public long skipCountingFrom(long p) {
         if (busy) throw concurrentUse();
         if (srActive) throw Err.of("unsupported-option",
-            "boring: items cannot be counted inside an open stringref namespace"
-            + " -- :stringref and :index are mutually exclusive");
+            "boring: items cannot be counted while a stringref namespace is"
+            + " being decoded -- skipping cannot resolve a reference, so the"
+            + " count would be wrong rather than merely slow");
         skips++;
         busy = true;
         long save = pos; int d = depth, sd = skipDepth;

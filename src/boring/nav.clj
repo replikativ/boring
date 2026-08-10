@@ -162,7 +162,7 @@
 ;; other two are read off the WIRE by those tests now, not off this type.
 ;;
 ;; The hot paths use direct field access; `valAt` is for tests and debugging.
-(deftype Index
+(deftype ^:no-doc Index
          ;; NO READER. The Index carries offsets and arrays and nothing that can
          ;; read them, deliberately: `fork-nav` builds a FRESH `Reader` per fork
          ;; and SHARES the decoded index, justified in its own comment by "it is
@@ -261,7 +261,7 @@
 ;; Separate from `probes` rather than sharing it: `probes` is keyed by USER key
 ;; values, so a caller whose key happened to equal a cache key would get a view
 ;; where encoded bytes were expected.
-(deftype Nav [^Reader rdr opts probes idx src views]
+(deftype ^:no-doc Nav [^Reader rdr opts probes idx src views]
   ;; ILookup ONLY IN ORDER TO REFUSE. A source is not a value and implements no
   ;; collection interface -- but `clojure.core/get` answers nil for anything
   ;; that is not ILookup, so `(get (source bs) :k)` would have been SILENTLY
@@ -421,7 +421,7 @@
 ;; repeated that per document -- 44 000 map lookups over 4000 blobs, each one a
 ;; linear scan of a PersistentArrayMap, for an answer fixed before the scan
 ;; began. Same shape as the encoded-key cache this type already carries.
-(deftype NavContext [opts probes ^objects cfg])
+(deftype ^:no-doc NavContext [opts probes ^objects cfg])
 
 (defn context
   "A reusable navigation context for `opts`, to be passed to `source` in place
@@ -630,8 +630,13 @@
   `boring.mmap/mmap-source` gives. NOT a cursor: see `root`.
 
   `opts` are the decode options realisation will use (`:registry` and friends),
-  and must describe how the document was WRITTEN. `:stringref false` is forced;
-  see the namespace docstring.
+  and must describe how the document was WRITTEN.
+
+  A STRINGREF DOCUMENT NEEDS AN INDEX to be navigable -- the pointer table in
+  the frame is the only thing that can resolve a reference from an offset -- so
+  one without a frame is refused here rather than answered wrongly. That is a
+  narrower rule than the `:stringref false` this used to demand, and it pointed
+  at a paragraph of the namespace docstring that now exists to say so.
 
   ADDRESSES THE FIRST ITEM ONLY. A log or stream is usually a CBOR sequence
   (RFC 8742) -- many top-level items concatenated, which is what `write-to!` in
@@ -1160,7 +1165,7 @@
 ;; Carried on the cursor rather than looked up from the row's offset because a
 ;; row does not know it is a row: nothing in its own bytes distinguishes it
 ;; from any other array. The parent hands it down.
-(deftype Cursor [^Nav nav ^long off shape]
+(deftype ^:no-doc Cursor [^Nav nav ^long off shape]
   ;; Associative, not merely ILookup: `contains?` and `find` are what a caller
   ;; reaches for after `get`, and both threw "not supported on type" -- an
   ;; untyped IllegalArgumentException on undamaged data. `assoc` is refused,
@@ -2197,7 +2202,7 @@
 ;; resolution OUT OF THE ROW LOOP is what a scan wants -- one map lookup per
 ;; TABLE rather than a key comparison per row -- and that is only expressible
 ;; if the caller can hold the shape. See `shape`.
-(deftype Shape [ks pos ^long rows-off ^long n])
+(deftype ^:no-doc Shape [ks pos ^long rows-off ^long n])
 
 (defn- shape-at
   "The parsed header of the shaped array at `off`, or nil.
@@ -3483,7 +3488,7 @@
                   ;; constructor.
                   (Index. 0 0 0 0 0 -1 0 0 0 0 0 ptr nil nil)))))))))
 
-(deftype Items [^Nav nav ^Index idx]
+(deftype ^:no-doc Items [^Nav nav ^Index idx]
   clojure.lang.Seqable
   (seq [this] (seq (into [] this)))
 
@@ -3612,7 +3617,9 @@
   Detecting the index is not only about speed. The index is itself a top-level
   item, so without recognising it this would yield it as though it were data.
 
-  The `:stringref false` requirement applies per item, as everywhere in this
+  A SEQUENCE forces `:stringref false`, per item -- `write-seq!` resets the
+  namespace for each top-level item, so one frame cannot describe them all.
+  That is specific to sequences and NOT true of the rest of this
   namespace."
   ([src] (items src nil))
   ([src opts]

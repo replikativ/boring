@@ -1,4 +1,4 @@
-(ns boring.writer
+(ns ^:no-doc boring.writer
   "CBOR writer for ClojureScript.
 
   Design follows measurements taken on node before any of this

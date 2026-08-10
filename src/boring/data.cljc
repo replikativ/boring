@@ -99,7 +99,7 @@
 ;; `incognito`'s IncognitoTaggedLiteral carries {:tag :value} and requires
 ;; reaching through :value to see a field; this does not.
 
-(deftype UnknownRecord [rtype rfields _meta]
+(deftype ^:no-doc UnknownRecord [rtype rfields _meta]
   #?@(:clj
       [clojure.lang.ILookup
        (valAt [_ k] (get rfields k))

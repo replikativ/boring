@@ -1450,7 +1450,7 @@ public final class Writer {
         }
     }
 
-    public void writeLong(long n) {
+    void writeLong(long n) {
         if (n >= 0) head(UINT, n);
         else head(NINT, -1L - n);
     }
@@ -1476,7 +1476,7 @@ public final class Writer {
      * bignum tags (2/3) beyond it — so 2^64-1 is `1bffffffffffffffff`, not a
      * tagged bignum, while 2^64 is `c249010000000000000000`.
      */
-    public void writeBigInteger(java.math.BigInteger v) {
+    void writeBigInteger(java.math.BigInteger v) {
         // Same tension as floats: RFC-preferred encoding is the most compact
         // form, but that erases the distinction between a BigInt and a Long on
         // the way back. Under :preserve-width we always tag, so the type
@@ -1535,7 +1535,7 @@ public final class Writer {
      * encode differently and both survive the round trip — datahike's dump requirements
      * §2 needs this, since 1.50M is not equal to 1.5M for their purposes.
      */
-    public void writeBigDecimal(java.math.BigDecimal v) {
+    void writeBigDecimal(java.math.BigDecimal v) {
         head(TAG, TAG_DECIMAL);
         head(ARRAY, 2);
         writeLong(-v.scale());
@@ -1552,7 +1552,7 @@ public final class Writer {
         }
     }
 
-    public void writeDouble(double d) {
+    void writeDouble(double d) {
         if (!preserveWidth) { writeShortestFloat(d); return; }
         writeF64(d);
     }
@@ -1565,7 +1565,7 @@ public final class Writer {
         pos += 9;
     }
 
-    public void writeFloat(float f) {
+    void writeFloat(float f) {
         if (!preserveWidth) { writeShortestFloat(f); return; }
         writeF32(f);
     }
@@ -1663,7 +1663,7 @@ public final class Writer {
     }
 
     /** Simple value (major 7). Codes 0-23 inline, 32-255 in the following byte. */
-    public void writeSimpleValue(int n) {
+    void writeSimpleValue(int n) {
         // head()'s `val < 24` test is true for negatives, so a negative simple
         // value became a malformed header — (simple-value -1) emitted 0xFF, the
         // break code, producing a document this library then rejects.
@@ -1694,7 +1694,7 @@ public final class Writer {
         pos += 2;
     }
 
-    public void writeTag(long tag) {
+    void writeTag(long tag) {
         if (tag < 0)
             throw Err.of("bad-tag",
                 "boring: tag must be non-negative, got " + tag, "tag", tag);
@@ -2386,14 +2386,14 @@ public final class Writer {
         return s;
     }
 
-    public void writeInstant(java.time.Instant t) {
+    void writeInstant(java.time.Instant t) {
         String s = rfc3339(java.time.format.DateTimeFormatter.ISO_INSTANT.format(t),
                            TAG_DATETIME);
         head(TAG, TAG_DATETIME);
         writeString(s);
     }
 
-    public void writeUUID(java.util.UUID u) {
+    void writeUUID(java.util.UUID u) {
         head(TAG, TAG_UUID);
         head(BYTES, 16);
         ensure(16);
@@ -2403,7 +2403,7 @@ public final class Writer {
     }
 
     /** Tag 30, rational number: [numerator, denominator]. */
-    public void writeRatio(clojure.lang.Ratio r) {
+    void writeRatio(clojure.lang.Ratio r) {
         head(TAG, TAG_RATIONAL);
         head(ARRAY, 2);
         writeBigIntegerCompact(r.numerator);
@@ -2434,19 +2434,19 @@ public final class Writer {
         ensure((int) byteLen);
     }
 
-    public void writeLongArray(long[] a) {
+    void writeLongArray(long[] a) {
         typedArrayHeader(TAG_ARR_S64_LE, (long) a.length * 8);
         for (int i = 0; i < a.length; i++) LONG_LE.set(buf, pos + (i << 3), a[i]);
         pos += a.length << 3;
     }
 
-    public void writeIntArray(int[] a) {
+    void writeIntArray(int[] a) {
         typedArrayHeader(TAG_ARR_S32_LE, (long) a.length * 4);
         for (int i = 0; i < a.length; i++) INT_LE.set(buf, pos + (i << 2), a[i]);
         pos += a.length << 2;
     }
 
-    public void writeShortArray(short[] a) {
+    void writeShortArray(short[] a) {
         typedArrayHeader(TAG_ARR_S16_LE, (long) a.length * 2);
         for (int i = 0; i < a.length; i++) SHORT_LE.set(buf, pos + (i << 1), a[i]);
         pos += a.length << 1;
@@ -2465,7 +2465,7 @@ public final class Writer {
      * unacceptable state: the same API worked or did not depending only on
      * which class you named, and nothing said which.
      */
-    public static boolean isRegisterableClass(Class<?> c) {
+    static boolean isRegisterableClass(Class<?> c) {
         return !(c == String.class || c == Long.class || c == Integer.class
                  || c == Short.class || c == Byte.class
                  || c == Double.class || c == Float.class
@@ -2574,14 +2574,14 @@ public final class Writer {
         }
     }
 
-    public void writeDoubleArray(double[] a) {
+    void writeDoubleArray(double[] a) {
         typedArrayHeader(TAG_ARR_F64_LE, (long) a.length * 8);
         for (int i = 0; i < a.length; i++)
             LONG_LE.set(buf, pos + (i << 3), Double.doubleToRawLongBits(a[i]));
         pos += a.length << 3;
     }
 
-    public void writeFloatArray(float[] a) {
+    void writeFloatArray(float[] a) {
         typedArrayHeader(TAG_ARR_F32_LE, (long) a.length * 4);
         for (int i = 0; i < a.length; i++)
             INT_LE.set(buf, pos + (i << 2), Float.floatToRawIntBits(a[i]));
@@ -2844,10 +2844,10 @@ public final class Writer {
                    idxScratchTop = base; }
     }
 
-    public void writeBoolean(boolean b) { u8(SIMPLE | (b ? 21 : 20)); }
-    public void writeNull()             { u8(SIMPLE | 22); }
+    void writeBoolean(boolean b) { u8(SIMPLE | (b ? 21 : 20)); }
+    void writeNull()             { u8(SIMPLE | 22); }
 
-    public void writeBytes(byte[] bs) {
+    void writeBytes(byte[] bs) {
         head(BYTES, bs.length);
         writePayload(bs, 0, bs.length);
     }
@@ -2895,7 +2895,7 @@ public final class Writer {
      * just keywords — the decoder registers on every literal it reads, so the
      * encoder must register on every literal it writes or the two diverge.
      */
-    public void writeString(String s) {
+    void writeString(String s) {
         if (!stringref) { writeStringLiteral(s, -1); return; }
 
         // Single probe for lookup-or-insert. The previous version probed twice

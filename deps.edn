@@ -1,4 +1,17 @@
-{:paths ["src" "target/classes"]
+;; `src-hasch` IS ON THE PATH, not only in the jar. `build.clj` adds it to
+;; `write-pom` and `copy-dir`, so a Maven consumer gets `boring.hasch` -- but a
+;; `:local/root` or `:git/url` consumer gets THIS `:paths` vector instead, and
+;; the comment below names four of them. The result was that
+;; `boring.core/hasch-integration?` answered TRUE for a Maven consumer and
+;; FALSE for konserve, kabel, konserve-sync and datahike on an otherwise
+;; identical classpath -- and the failure mode is exactly the one boring.hasch
+;; exists to prevent, since two record types and a plain map then
+;; content-address to the same uuid with nothing thrown.
+;;
+;; Safe for a consumer WITHOUT hasch: the `defonce` at the end of `boring.core`
+;; probes `hasch.benc` before `boring.hasch`, which is there so that shipping
+;; the namespace cannot break anyone. See the comment on it.
+{:paths ["src" "src-hasch" "target/classes"]
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}}
 
  ;; boring has a Java hot path, so `target/classes` on :paths above is BUILT,
