@@ -1080,6 +1080,28 @@ public final class Writer {
     private long[] srOffs;
     private boolean[] srUsed;
 
+    /**
+     * Staging window for the degenerate-frame decision in `write-indexed!`.
+     *
+     * <p>An indexed write seals a frame whenever it opens a stringref
+     * namespace, even with no container worth a node, and on a small value
+     * that frame is most of the file. A buffered caller can simply not emit
+     * it; a streaming one has to hold the first bytes back to have the choice.
+     *
+     * <p>ALLOCATED ONCE PER WRITER, not per call. Per-call it measured a 3.4x
+     * allocation regression on `write-indexed!` -- 1320 B/op to 4488 -- which
+     * is worse than the frame it removes. Reused it is 376 B/op, because the
+     * frame is no longer sealed at all. Like every other scratch here it is
+     * lazy, kept for the life of the writer, and released by {@link #trim()}.
+     */
+    private byte[] idxStaging;
+
+    /** The staging window, allocated on first use. */
+    public byte[] stagingWindow(int cap) {
+        if (idxStaging == null || idxStaging.length < cap) idxStaging = new byte[cap];
+        return idxStaging;
+    }
+
     /** What {@link #trim()} goes back to. */
     private final int initialSize;
 
@@ -1211,6 +1233,11 @@ public final class Writer {
             idxWalk = null;
         }
         if (idxSeq != null && idxSeq.length > 1024) idxSeq = null;
+        // AND THE STAGING WINDOW, for the same reason as the five above: it is
+        // lazy, it is held for the life of the writer, and `trim()` is the one
+        // method whose job is to hand memory back. #39 was exactly this
+        // omission for `idxWalk`.
+        idxStaging = null;
         // THE MAP ANCHOR STACK, which this method's own docstring promised and
         // did not deliver. `idxScratch` grows to the deepest nesting-sum of map
         // entry counts and NEVER shrank: `idxReset` only zeroes the top

@@ -757,10 +757,20 @@
          derive-stringref-pointers default-index-stride)
 
 (def ^:private ^:const small-enough-to-encode-twice
-  "Below this many bytes, `encode-indexed` encodes both ways and keeps the
-  shorter. See its docstring: the index frame is a rounding error on a large
-  value and most of the file on a small one, and only the buffering entry
-  point can look at both."
+  "The window inside which an indexed write will reconsider its frame.
+
+  TWO JOBS, and the second is structural rather than a tuning knob.
+
+  It began as a COST CAP: below this many bytes `encode-indexed` encodes both
+  ways and keeps the shorter, and above it that second encode would be the
+  expensive half of the call while the frame it might save is a rounding error.
+
+  It is now also THE BOUND BOTH WRITERS DECIDE INSIDE, which is what keeps them
+  byte-identical. `write-indexed!` stages this many bytes to get the same
+  choice; `encode-indexed` slices within the same bound. Raise it for one and
+  not the other, or raise it for `encode-indexed` alone, and the two produce
+  different bytes for the same value -- the divergence class of #30, #34 and
+  #43. It is not a number to tune in isolation."
   4096)
 
 (defn encode-indexed
@@ -858,63 +868,9 @@
          info (long-array 2)
          _ (write-indexed-capturing! w v out o stride (long (get o :index-min 16)) info)
          bs (.toByteArray out)]
-     ;; A FRAME THAT DESCRIBES NOTHING IS CUT OUT RATHER THAN OUT-ENCODED.
-     ;;
-     ;; An indexed write seals a frame whenever it opens a stringref namespace,
-     ;; because "namespace with no pointer table" has to keep meaning exactly
-     ;; one thing for `boring.nav` -- see `write-indexed-capturing!`. On a large
-     ;; value the frame is noise. On a small one it is most of the file:
-     ;; `{:a 1}` comes out of the writer at 50 bytes against 7, and
-     ;; `(vec (range 40))` at 101 against 58, because #22's placement rule quite
-     ;; correctly declines to index anything that small.
-     ;;
-     ;; THIS USED TO ENCODE THE WHOLE VALUE A SECOND TIME with `:stringref
-     ;; false` and keep whichever was shorter, below a 4 KB bound. It worked,
-     ;; and it paid a full second pass to learn something the first pass had
-     ;; already written down: when no container was kept and no string was
-     ;; referenced, the body is byte-identical either way -- with nothing
-     ;; repeating, the writer emits literals whether the namespace is open or
-     ;; not. So the plain encoding is a SLICE of what is already in the buffer,
-     ;; between the envelope and the frame, and one `copyOfRange` replaces an
-     ;; encode. Verified equal on maps, vectors, nested values and strings.
-     ;;
-     ;; THE COMPARISON STAYS for the case the slice cannot answer. When a
-     ;; string WAS referenced, the two encodings differ in the body and not
-     ;; merely by an envelope, so which is smaller is a real question -- 30
-     ;; small records measure 530 bytes without stringref against 535 with it,
-     ;; and dropping the comparison would silently take the larger. It would
-     ;; also diverge from ClojureScript, which makes the same comparison at
-     ;; `core.cljs:1338`; a size difference between the platforms on identical
-     ;; input is the defect class of #38, not a rounding error.
-     ;;
-     ;; So: slice when the frame describes nothing, compare when it describes
-     ;; something. The second encode now happens only where it can change the
-     ;; answer, which is the half it was always earning its keep in.
-     ;;
-     ;; ONLY A BUFFERING CALLER CAN DO EITHER. `write-indexed!` has flushed and
-     ;; cannot revisit, so the two still differ in SIZE on small values, never
-     ;; in meaning. See `write-indexed-capturing!`.
-     ;; THE BOUND STILL GATES BOTH, and that is not leftover caution. Above it
-     ;; the two writers agree BYTE FOR BYTE -- `write-indexed-agrees-with-
-     ;; encode-indexed` pins exactly that -- and slicing wherever the frame is
-     ;; degenerate would quietly widen the divergence to any size: a 400-entry
-     ;; map of one-character keywords never references anything (a reference
-     ;; costs what the literal costs, so short strings are not registered), so
-     ;; it is degenerate at 5 KB and came out 5213 bytes sliced against 5256
-     ;; framed. Smaller, decodes the same -- and a byte-identity invariant that
-     ;; holds only below a threshold nobody stated is how #30, #34 and #43 got
-     ;; in. The 43 bytes are not worth the invariant.
-     ;;
-     ;; Below the bound the slice returns exactly what the comparison returned:
-     ;; when the frame is degenerate the `:stringref false` candidate IS the
-     ;; slice, and it is always the shorter of the two, so the old code always
-     ;; chose it. Same bytes on both platforms, one `copyOfRange` instead of an
-     ;; encode.
+     ;; A buffered caller slices; a streaming one stages. Same decision, same
+     ;; bytes, different mechanism because the constraints differ.
      (if (and (= 1 (aget info 1)) (< (alength bs) small-enough-to-encode-twice))
-       ;; Past the `d9 01 00` envelope if there is one. Checked rather than
-       ;; assumed: `:stringref` is on in this branch, but a caller can reach
-       ;; here through a profile that never opens a namespace, and slicing
-       ;; three bytes off a document that has none would corrupt it silently.
        (let [start (if (and (> (alength bs) 3)
                             (= 0xd9 (bit-and (aget bs 0) 0xff))
                             (= 0x01 (bit-and (aget bs 1) 0xff))
@@ -1308,9 +1264,20 @@
 
   A streaming caller cannot use `degenerate?` -- it has flushed -- which is
   why this reports rather than acts."
-  [^Writer w v ^java.io.OutputStream out o stride min-entries ^longs info]
+  [^Writer w v ^java.io.OutputStream real-out o stride min-entries ^longs info]
   (let [stride (long stride)
         indexing? (pos? stride)
+        ;; STAGE THE FIRST `small-enough-to-encode-twice` BYTES so a streaming
+        ;; write can decline a frame that describes nothing, which until now
+        ;; only the buffered entry point could do.
+        ;; STAGING IS FOR STREAMING CALLERS ONLY. A buffered caller already has
+        ;; every byte and can slice, which costs a `copyOfRange` against
+        ;; staging's held-then-copy -- measured 3904 B/op against 6072. It
+        ;; signals that by passing `info`.
+        stage (when (and indexing? (:stringref o) (nil? info))
+                (org.replikativ.boring.StagingStream.
+                 real-out (.stagingWindow ^Writer w (int small-enough-to-encode-twice))))
+        ^java.io.OutputStream out (or stage real-out)
         _ (when indexing? (.setIndex ^Writer w (int stride) (int min-entries) 0))
         _ (.beginStream ^Writer w out)
         total (try
@@ -1335,19 +1302,33 @@
       (when info
         (aset info 0 body-end)
         (aset info 1 (if degenerate? 1 0)))
-      (if (or (pos? (alength ^longs containers)) (some? srp))
-        (let [counts (.idxCounts ^Writer w)
-              sl (.idxSlots ^Writer w)
-              so (.idxSorted ^Writer w)]
+      ;; DROPPABLE ONLY IF STAGING STILL HOLDS EVERYTHING:
+      ;; once it has overflowed the envelope is already at the sink, and
+      ;; skipping the frame then leaves a document that opens a namespace with
+      ;; no pointer table -- which `nav/source` refuses outright. Measured
+      ;; before this guard: a 400-entry map came back
+      ;; `:boring/stringref-not-navigable` from boring's own writer.
+      (let [droppable? (and stage degenerate?
+                            (not (.overflowed ^org.replikativ.boring.StagingStream stage)))]
+        (when droppable?
           (.setIndex ^Writer w (int 0) (int 0) 0)
-          (+ total
-             (long (seal-index! w out
-                                {:stride stride :containers containers
-                                 :counts counts :slots (vec sl)
-                                 :sorted (vec so) :stringrefs srp}
-                                total o))))
-        (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
-            total)))))
+          (.releaseRange ^org.replikativ.boring.StagingStream stage
+                         (int 3) (int (.held ^org.replikativ.boring.StagingStream stage))))
+        (when stage (.release ^org.replikativ.boring.StagingStream stage))
+        (if (and (or (pos? (alength ^longs containers)) (some? srp))
+                 (not droppable?))
+          (let [counts (.idxCounts ^Writer w)
+                sl (.idxSlots ^Writer w)
+                so (.idxSorted ^Writer w)]
+            (.setIndex ^Writer w (int 0) (int 0) 0)
+            (+ total
+               (long (seal-index! w out
+                                  {:stride stride :containers containers
+                                   :counts counts :slots (vec sl)
+                                   :sorted (vec so) :stringrefs srp}
+                                  total o))))
+          (do (when indexing? (.setIndex ^Writer w (int 0) (int 0) 0))
+              total))))))
 
 (defn- write-indexed-resolved!
   "`write-indexed!` with options already resolved.

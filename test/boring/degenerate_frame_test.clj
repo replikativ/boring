@@ -51,15 +51,51 @@
              (seq (boring/encode-indexed v {})))
           label))))
 
-(deftest the-dropped-frame-is-what-the-streaming-writer-still-carries
-  (testing "the streaming writer takes the conservative side, and the gap is
-            the frame. This is the measurement the change exists for."
+(deftest the-streaming-writer-drops-it-too
+  (testing "this used to assert the streaming writer carried the frame anyway
+            -- 7 bytes buffered against 50 flushed -- because it had already
+            flushed by the time it knew. It now stages the first
+            `small-enough-to-encode-twice` bytes and gets the same choice, so
+            the asymmetry is gone rather than documented."
     (let [buffered (boring/encode-indexed {:a 1} {})
           flushed (streamed {:a 1} {})]
       (is (= 7 (alength ^bytes buffered)))
-      (is (= 50 (alength ^bytes flushed)))
-      (testing "and they mean the same thing"
-        (is (= {:a 1} (boring/decode buffered) (boring/decode flushed)))))))
+      (is (= 7 (alength ^bytes flushed)))
+      (is (= (seq buffered) (seq flushed)))
+      (is (= {:a 1} (boring/decode buffered) (boring/decode flushed))))))
+
+(deftest the-decision-does-not-depend-on-the-writers-buffer-size
+  (testing "THE REASON THE WINDOW IS FIXED rather than opportunistic. The
+            Writer already tracks whether it has flushed, so the cheap version
+            is `slice if flushed == 0` -- and that makes a `(writer 64)` keep
+            the frame where a `(writer 65536)` drops it, for the same value and
+            the same options. Output must not depend on a buffering knob."
+    (doseq [[label v] [["tiny" {:a 1}]
+                       ["past a 64-byte buffer" {:id 1 :name "alice" :city "amsterdam"}]
+                       ["well past it" (vec (range 40))]
+                       ["past the window" (mapv (fn [i] {:id i :name (str "n" i)})
+                                                (range 400))]]]
+      (let [small (let [out (ByteArrayOutputStream.)]
+                    (boring/write-indexed! (boring/writer 64) v out {})
+                    (.toByteArray out))
+            big (let [out (ByteArrayOutputStream.)]
+                  (boring/write-indexed! (boring/writer 65536) v out {})
+                  (.toByteArray out))]
+        (is (= (seq small) (seq big)) label)
+        (is (= v (boring/decode small)) label)))))
+
+(deftest a-frame-is-never-dropped-once-the-envelope-has-escaped
+  (testing "the guard that had to exist. Past the staging window the envelope
+            is already at the sink, and skipping the frame then leaves a
+            document that opens a stringref namespace with no pointer table --
+            which `nav/source` refuses outright. Measured while building this:
+            a 400-entry map came back `:boring/stringref-not-navigable` from
+            boring's own writer."
+    (let [v (into {} (for [i (range 400)] [(str "k" i) {:v i}]))
+          bs (streamed v {})]
+      (is (> (alength ^bytes bs) 4096) "past the window, so the guard applies")
+      (is (some? (nav/source bs nil)))
+      (is (= v (boring/decode bs))))))
 
 (deftest a-frame-doing-work-is-kept
   (testing "either half is reason enough to seal one: a kept container needs
