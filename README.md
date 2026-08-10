@@ -321,11 +321,15 @@ For a log, `write-seq!` indexes by default and `nav/items` uses it:
     (nav/value (nth items 199999))))
 ```
 
-Measured on 200 000 `{:id n :s "event-n"}` items with the code above: reaching
-the **last** item takes 7.8 µs indexed against 4.34 ms scanning — 557× — for
-**0.44%** more file. Build `items` once and reuse it; constructing it reads the
-index frame, so folding that into every lookup measures setup rather than the
-jump.
+On 200 000 small items, reaching the **last** one is a jump of about a
+microsecond instead of a scan of about twelve milliseconds, for **0.34%** more
+file at the default stride. The table with every stride, and the harness that
+produces it, live in [doc/SHAPES.md](doc/SHAPES.md#stride-is-a-parameter-not-a-constant) —
+`clojure -M:bench -m nav index`. This paragraph used to restate its own set of
+figures for the same corpus, and three of the four disagreed with that table.
+
+Build `items` once and reuse it; constructing it reads the index frame, so
+folding that into every lookup measures setup rather than the jump.
 
 Two things the **first** example is carrying, both of which used to be silent —
 and neither applies to the indexed forms above, which set `:stringref false`

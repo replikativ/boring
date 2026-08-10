@@ -436,18 +436,30 @@
     (doseq [st [1 8 16 64 256]]
       (let [^bytes bs (build st)
             idx (- (alength bs) plain)
-            ;; the slot as it sits on the wire, BEFORE expansion -- its class is
-            ;; the width, since the CBOR element type is what declares it
             ;; Read the frame WHERE IT IS, not as a trailing item of
             ;; `decode-seq` -- which recognises it as metadata and does not
             ;; yield it. This line predates that and had been broken since.
-            slot (nth (nth (boring.data/frame-payload
-                            (.readFrom (Reader. ^bytes bs)
-                                       (long (#'boring.frame/footer-start bs)))) 3) 0)
-            width (condp instance? slot
-                    (Class/forName "[B") "u8 bytes"
-                    (Class/forName "[S") "sint16"
-                    "sint32")
+            ;;
+            ;; SLOTS ARE ONE PACKED BYTE STRING, and this column used to report
+            ;; the CBOR element type of a per-node typed array -- the layout
+            ;; #17 replaced. Since then payload element 3 has been a byte[], so
+            ;; `(nth ... 0)` yielded a BYTE, `condp instance?` fell past both
+            ;; arms, and every row printed "sint32" whatever it actually was.
+            ;; The doc built on this column recorded a byte string at stride 1
+            ;; and sint16 elsewhere, which is the layout from before #17: the
+            ;; harness and the table it backs had drifted apart in two
+            ;; different directions.
+            ;;
+            ;; The width is now a 2-BIT CODE PER NODE inside that byte string --
+            ;; see `boring.core/pack-slots`. Node 0 is the sequence node, which
+            ;; is the only one these payloads have.
+            ^bytes slots (nth (boring.data/frame-payload
+                               (.readFrom (Reader. ^bytes bs)
+                                          (long (#'boring.frame/footer-start bs)))) 3)
+            width (if (< (alength slots) 2)
+                    "(empty)"
+                    (case (bit-and (bit-shift-right (aget slots 1) 0) 3)
+                      0 "u8" 1 "u16" 2 "i32" 3 "i64"))
             items (nav/items bs seq-opts)]
         (println (format "  %-8d %10d %12s %11.1f %10.2f%% %10.3f %12.3f"
                          st (quot 200000 st) width (/ idx 1024.0)
@@ -536,10 +548,48 @@
           (flush))))
     (println "  (file size" (.length f) "bytes)")))
 
+(defn run-index-min
+  "`:index-min` -- the dominant size knob, and the one whose FAILURE mode is a
+  slower lookup rather than a bigger file.
+
+  This table lived only in `boring.core/write-seq!`'s docstring, with no
+  harness anywhere, and had been copied verbatim into konserve-lmdb -- so a
+  figure nobody could regenerate spanned two repositories. #41.
+
+  The shape being measured: a node is only worth its cost if a lookup will
+  actually jump through it. A container narrow enough to walk cheaply still
+  gets a node when `:index-min` is below its width, and then every lookup pays
+  to find that node -- a binary search over the container list, per level --
+  before discovering the jump saves nothing."
+  []
+  (println)
+  (println "INDEX-MIN — a node nothing jumps through is not free")
+  (println (format "  %-22s %-14s %8s %12s" "payload" ":index-min" "nodes" "us/last"))
+  (doseq [[label v mins]
+          [["4096 x 4-key maps"
+            (vec (for [i (range 4096)] {:a i :b i :c i :d i})) [4 16]]
+           ["256 x 64-key maps"
+            (vec (for [i (range 256)]
+                   (into {} (for [j (range 64)] [(keyword (format "k%02d" j)) (+ i j)]))))
+            [16 65]]]
+          mn mins]
+    (let [bs (boring/encode-indexed v {:index 16 :index-min mn :stringref false})
+          n (dec (count v))
+          o {:trust-index :trusted}
+          nodes (count (:containers (boring/build-index
+                                     (boring/encode v {:stringref false})
+                                     {:index 16 :index-min mn})))
+          root (nav/root bs o)]
+      (println (format "  %-22s %-14d %8d %12.2f"
+                       label mn nodes
+                       (/ (timed #(nav/value (nth root n)) 200 8) 1000.0)))
+      (flush))))
+
 (defn -main [& args]
   (let [only (set args)
         run? (fn [k] (or (empty? only) (contains? only (name k))))]
     (when (run? :skip) (run-skip))
     (when (run? :cursor) (run-cursor))
     (when (run? :index) (run-index))
+    (when (run? :index-min) (run-index-min))
     (when (run? :write) (run-write))))

@@ -878,8 +878,11 @@
   at stride 16. Since offsets are only knowable after the fact, a file written
   without an index can never gain one without a rewrite, so the default has to
   be the useful one or the feature is unreachable for anyone who did not plan
-  ahead. It is close to free: +4.3% write time, +0.06% size on 50k ~200-byte
-  records, and -1.5% from the `:stringref false` it forces, netting SMALLER.
+  ahead. It is close to free: +3% write time at stride 16, +0.06% size on 50k
+  ~200-byte records, and -1.5% from the `:stringref false` it forces, netting
+  SMALLER. The write-cost figure is doc/SHAPES.md's, from
+  `clojure -M:bench -m nav write`, and lives there rather than here -- this
+  docstring used to say +4.3% for the same corpus and the same stride.
 
   Unlike `encode`, this changes nothing about what the bytes ARE. A sequence is
   already `application/cbor-seq` (RFC 8742), where extra items are expected;
@@ -914,21 +917,28 @@
   only the containers on ONE path. So a node is a certain cost against a
   possible saving, and lowering the bar buys nodes that are never visited.
 
-  Measured, reaching the last element with `:trust-index :trusted`:
+  Measured, reaching the last element with `:trust-index :trusted` --
+  reproduce with `clojure -M:bench -m nav index-min`:
 
-    4096 x 4-key maps   :index-min 4    4097 nodes   105.14 us    1.7x
-    4096 x 4-key maps   :index-min 16      1 node      3.03 us   54.9x
-     256 x 64-key maps  :index-min 16    257 nodes    19.71 us    7.4x
-     256 x 64-key maps  :index-min 65      1 node     13.72 us   10.6x
+    4096 x 4-key maps   :index-min 4     1 node    11.93 us
+    4096 x 4-key maps   :index-min 16    1 node    12.54 us
+     256 x 64-key maps  :index-min 16    3 nodes   35.61 us
+     256 x 64-key maps  :index-min 65    1 node    30.54 us
 
-  The per-node figure held to within 10% across all three shapes. So the
-  failure mode of a LOW `:index-min` is not a slightly bigger file, it is a
-  35x slower lookup -- and the default of 16 is not conservative, it is
-  roughly where store-shaped data stops adding nodes it will not use.
+  THIS TABLE REPLACES ONE THAT DESCRIBED A FAILURE MODE THE CODE NO LONGER
+  HAS. It used to report 4097 nodes at `:index-min 4` against 1 at 16, and
+  concluded that a low setting costs a 35x slower lookup. Both node counts
+  are now 1: #22's placement rule decides where nodes go -- `walk >= 64` for
+  arrays and sorted maps, a byte budget for unsorted ones -- and it declines a
+  4-key map at any `:index-min`. The old numbers had no harness, and had been
+  copied verbatim into konserve-lmdb, so a figure nobody could regenerate
+  outlived the behaviour it described in two repositories. See #41.
 
-  Raising it further is safe and sometimes better: 16, 32, 64, 128 and 512 were
-  within noise of each other on 2000 record-shaped documents (~30-33x), because
-  none of them changed the node count for that data.
+  What is still true: `:index-min` gates nodes, and raising it past a
+  container's width removes them (65 excludes the 64-key maps above, 16 does
+  not). What is no longer true is that a low value floods the index -- #22 is
+  the deciding rule now and `:index-min` is a floor under it. The default of 16
+  is a reasonable floor rather than a load-bearing safety limit.
 
   `write-seq!` FORCES `:stringref false`, at EVERY stride including zero.
   `boring.nav` cannot resolve a string reference from an offset alone -- a

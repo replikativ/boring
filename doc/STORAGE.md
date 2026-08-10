@@ -268,8 +268,9 @@ Four things follow from the default:
 
 The frame is one extra CBOR item holding the offsets of every Nth item, and
 `nav/items` then jumps rather than skips — on 200 000 records, reaching the last
-one takes **10.6 ms** unindexed against **1–2 µs** indexed, for 0.34% of the
-file. Those are the stride-16 numbers, which is what the paragraph above says
+one takes about **12 ms** unindexed against **1 µs** indexed, for 0.34% of the
+file. Those figures come from the stride-16 row of `doc/SHAPES.md`'s table,
+which is their one home; do not restate them from here. Those are the stride-16 numbers, which is what the paragraph above says
 the default is; an earlier version of this sentence quoted the **stride-8** row
 of `doc/SHAPES.md`'s table (0.6 µs, 0.68%) under the stride-16 heading, so it
 promised a seek twice as fast at twice the cost. The
