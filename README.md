@@ -383,8 +383,39 @@ that `cbor2` and `ciborium` read.
 It is also not a free win everywhere: taking only the first item of a log is
 *slower* than `decode-seq`, which is already lazy.
 
-[Storage](doc/STORAGE.md) covers the model, memory mapping, writing logs,
-compression, and what can be updated in place.
+### One representation, disk to socket
+
+This is where the reach argument stops being philosophical. A format the rest
+of the world reads is a format you never have to *convert out of* — so the
+value can stay bytes at every boundary it crosses.
+
+A mapped `MemorySegment` answers `.asByteBuffer()` for free, and http-kit
+passes a `ByteBuffer` body through untouched, writing it with a gathering
+`writev`:
+
+```clojure
+(defonce blob (mmap/mmap-segment "customers.cbor" arena))   ; mapped once
+
+(defn handler [_]
+  {:status 200
+   :headers {"content-type" "application/cbor"}
+   :body (.duplicate (.asByteBuffer ^MemorySegment blob))})
+```
+
+Measured on a 731 KB blob: **64 bytes** of heap allocated per request, against
+731 705 for `Files/readAllBytes`. Never parsed, never re-encoded, never a JVM
+object — and the consumer can be Python, Rust or a browser, because what went
+out is ordinary CBOR. The index frame rides along as a second item any
+conformant reader consumes and ignores.
+
+Stated honestly, because the phrase is overused: this is **not** sendfile. The
+kernel still copies page cache to socket buffer. What it removes is everything
+on the JVM side. And for a whole static file with no logic, nginx does it
+better — the case that is boring's is serving a **slice** of a larger file,
+found by walking the index, without materialising the rest.
+
+[Storage](doc/STORAGE.md) covers the model, memory mapping, serving a mapping
+to a socket, writing logs, compression, and what can be updated in place.
 
 ## Status
 

@@ -231,6 +231,73 @@ Three things to know:
 - **Prefer a shared or global arena** over a confined one: 1.35× against 1.46×,
   because a confined arena adds a thread check to every access.
 
+### Serving a mapping straight to a socket
+
+A `MemorySegment` answers `.asByteBuffer()` for free, and **http-kit passes a
+`ByteBuffer` body through untouched** — its own source says so, above the
+branch that does it: *"makes ultimate optimization possible: no copy"*. It then
+writes headers and body in one gathering `writev`. So a mapped blob can go out
+without the JVM ever building the value it holds:
+
+```clojure
+(require '[boring.mmap :as mmap] '[org.httpkit.server :as hk])
+(import '[java.lang.foreign Arena MemorySegment])
+
+;; ONE long-lived mapping, not one per request
+(defonce arena (Arena/ofShared))
+(defonce blob  (mmap/mmap-segment "customers.cbor" arena))
+
+(defn handler [_]
+  {:status 200
+   :headers {"content-type" "application/cbor"}
+   ;; .duplicate gives this request its own position/limit over the SAME memory
+   :body (.duplicate (.asByteBuffer ^MemorySegment blob))})
+```
+
+Measured on a 731 KB indexed blob, heap allocated per request to build the
+body:
+
+| body | bytes |
+|---|---:|
+| `.duplicate` of the mapping | **64** |
+| `Files/readAllBytes` | 731 705 |
+
+The 64 bytes are the `ByteBuffer` wrapper. The payload is never on the heap,
+never parsed, and never re-encoded: the bytes on disk are the bytes on the
+wire.
+
+**This is not sendfile, and the difference is worth stating.** The kernel still
+copies page cache to socket buffer; true zero-copy needs
+`FileChannel.transferTo`, which http-kit does not expose. What this avoids is
+everything on the JVM side — the read into heap, the payload allocation, and
+the heap-to-direct staging copy NIO performs for a `byte[]` body.
+
+**The other body types do not have this property.** `InputStream` and `File`
+are both read fully into heap first (`HttpUtils.bodyBuffer`); http-kit issue
+#90 is that limitation and is open. So an `OutputStream`-shaped API is the one
+approach that does *not* work here.
+
+Three constraints:
+
+- **The arena must outlive the write.** http-kit responds asynchronously, so
+  the handler returns before the bytes are on the wire; a `with-open` per
+  request closes the mapping underneath an in-flight response. Map once, per
+  file. The failure is at least loud rather than corrupting — an arena closed
+  under a live buffer raises `IllegalStateException: Already closed`, not a
+  segfault, which is the same reason the arena owns the mapping in the first
+  place.
+- **Compression and TLS re-materialise the bytes.** Terminating TLS at nginx
+  and proxying plaintext to http-kit restores the property on the JVM side —
+  though nginx then does its own copying, so the claim remains "the JVM never
+  materialises the value", not end-to-end zero copy.
+- **For a whole static file with no logic, nginx beats this outright** —
+  `X-Accel-Redirect` and let it `sendfile`. That is what http-kit's own *"better
+  be done by Nginx"* comment means. What nginx cannot do is serve a **slice**:
+  `mmap-source`'s `:offset`/`:length`, or a span found with `nav/byte-span`,
+  hands out one value from inside a larger file — computed by walking the
+  index, still without materialising anything. That case is the reason this
+  section exists.
+
 ## Writing
 
 **mmap does not help.** Appending 200 000 items: `BufferedOutputStream`
