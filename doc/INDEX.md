@@ -180,12 +180,27 @@ the file's. One comparison, no extra bytes.
 A lookup that finds nothing does **not** trust that answer. `confirm` re-walks
 the container honestly before reporting absent.
 
-This looks like a damage check and is not. A node marked `sorted` over a map
-ordered by something *other* than canonical CBOR bytes — a Clojure `sorted-map`
-is ordered by `compare` — leaves the binary search comparing with a function
-the array is not sorted by. Re-deriving negatives is what keeps it correct.
-Deleting it as a redundant optimisation breaks lookups on undamaged, correctly
-written data.
+**It is a damage check, and only that.** This section used to claim a second
+job: a node marked `sorted` over a map ordered by something *other* than
+encoded CBOR bytes — a Clojure `sorted-map` is ordered by `compare` — leaving
+the binary search comparing with a function the array is not sorted by. That
+case does not exist. Every builder computes `sorted` **from the emitted key
+bytes**, so it cannot claim an order the file is not in: a `sorted-map` whose
+`compare` order genuinely diverges from byte order is written `sorted: false`
+and never reaches the search.
+
+The case that really did depend on re-derivation was **stringref**, and it
+depended on it for every lookup rather than for a corner — a repeated key is
+written as a reference and the probe is built as a literal, so the search
+compared across two encodings and missed 19 times in 20. That is fixed where it
+belongs, by compiling the probe into reference form and searching twice; see
+"Resolving a stringref through the index".
+
+What remains is genuine and narrow: nothing proves an anchor is an entry
+*boundary*, so a damaged one can start a bounded walk mid-item and report a
+present key absent. Re-deriving negatives is what makes the promise below true
+for a damaged index as well as a stale one. It costs only misses, where an
+honest answer requires the walk anyway.
 
 ### Resolving a stringref through the index
 
@@ -202,6 +217,32 @@ is proportional to the references that exist rather than to the namespace.
 why `{:trust-index :ignore}` refuses one: ignoring the index means ignoring the
 only thing that can resolve a reference. `boring/decode` is unaffected — it
 decodes in order and builds the table itself, consulting no frame.
+
+#### The table is read backwards too, and a search needs it that way
+
+A key repeated across rows is written as a **reference**, so a container of
+repeated keys has reference-shaped keys — and reference indices are handed out
+in first-occurrence order, so those keys ascend bytewise and `sorted` is set,
+honestly. The probe is not comparable against them: `probe-for` always encodes
+a literal. A binary search then compares across two encodings, walks the wrong
+way, and reports a miss. Every present key took that path.
+
+Resolving the *anchors* to their defining literals — the direction the table is
+built for — does not fix it. Reference order is first-occurrence order, and the
+literals behind it are in no order at all: on a 40-key document 19 of 39
+adjacent pairs descend. A search under that comparator is unsound, not merely
+slow.
+
+So the **probe** moves instead, by scanning the table for the entry whose
+literal it matches and rebuilding it as `39(25(n))` — or bare `25(n)` for a
+string key. The comparison stays in the wire space `sorted` is actually about.
+
+**Two searches, not one**, because one container can hold both encodings: keys
+repeated from an earlier row are references, keys first seen in *this* row are
+literals, and such a row is still bytewise sorted, since a literal's `0x6X`
+head sorts before a reference's `0xd8`. A single-form search gets half of them
+wrong. The literal probe is tried first — on a document without stringrefs it
+is the only encoding any key has, so the second search is never reached.
 
 ### The offset layer
 

@@ -45,6 +45,22 @@ a lookup lands on. It is bounded the same way: offsets are range-checked
 against the data section, so the worst case remains a wrong answer inside the
 document rather than a read outside it.
 
+**That table is read in both directions.** A key repeated inside a document is
+written as a reference, and a binary search over such keys compares against
+references — so `nav` compiles the *probe* into reference form by scanning the
+table for the literal it matches. A chosen table therefore also steers which
+key a probe becomes, and so which entry a lookup lands on. That is the same
+class again and the same bound — the probe either matches a table entry or the
+lookup falls back to scanning the container — but position misdirection no
+longer comes from the anchors alone, and this page said it did.
+
+The reverse pass is **linear in the pointer table**, whose size the attacker
+chooses. It is named here because this file charges quadratic scans as a real
+defect class below, not because it is a regression: the path it replaced walked
+the whole container on every lookup, so the bound is no worse and the measured
+cost is 1.7–5.4× lower. What it is not is free, and a document with a large
+table and few repeated keys is the shape that pays most.
+
 **It matters when an application verifies one part of a document and then acts
 on another.** Two `get`s can be made to resolve to overlapping regions, so you
 checked one thing and used a different one — the shape of Android's Master Key
