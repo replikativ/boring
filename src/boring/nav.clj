@@ -130,7 +130,7 @@
 ;; ---------------------------------------------------------------- the source
 
 (declare slot-at sorted-at? container-at count-at check-stringref-navigable!
-         byte-string-at root-cursor root-offset)
+         byte-string-at root-cursor reader-root-offset)
 
 ;; A TYPE, not a fifteen-key map. `index-payload` used to return one, and on a
 ;; source that is read ONCE -- which is every read of a store handing out a
@@ -1458,7 +1458,7 @@
   Object
   (toString [_] (str "#boring.nav/cursor[" off (when shape " shaped") "]")))
 
-(defn- root-offset
+(defn- reader-root-offset
   "Where a document's root VALUE begins: 0, or past a stringref namespace head.
 
   A tag 256 at offset 0 is an ENVELOPE, not a value -- it says \"references
@@ -1574,10 +1574,20 @@
 
 (defn- root-cursor
   "A cursor at the document's root VALUE -- past a stringref envelope if there
-  is one. See `root-offset` for why only `root` does this and `cursor` does
+  is one. See `reader-root-offset` for why only `root` does this and `cursor` does
   not."
   [^Nav nav]
-  (cursor-at nav (root-offset ^Reader (.rdr nav))))
+  (cursor-at nav (reader-root-offset ^Reader (.rdr nav))))
+
+(defn root-offset
+  "Where the document's root VALUE begins, as an offset. Allocates nothing.
+
+  The offset layer's entry point, and what `root` uses internally. It is 0 for
+  almost every document and past the head of a tag-256 stringref envelope for
+  the rest -- which is exactly the distinction a caller should not have to know
+  about, and the reason entering the offset layer used to require building a
+  cursor (`(nav/offset (nav/root bs))`) purely to throw it away."
+  ^long [s] (reader-root-offset ^Reader (.rdr ^Nav (source-of s))))
 
 ;; ------------------------------------------------------- the offset layer
 ;;
@@ -1714,12 +1724,30 @@
   hand-rolled reader would do. That is the whole point of this existing: a
   caller who writes their own walker over `Reader` CANNOT reach the index,
   because the index lives on the source and `Reader.skipFrom` knows nothing
-  about it."
-  ^long [s ^long off k] (lookup-map (source-of s) off k))
+  about it.
+
+  RETURNS -2 WHEN `off` IS NOT A MAP. Two shapes reach it and both are ordinary
+  rather than damage: a TAG, which may still hold a map underneath (a record's
+  fields, a shaped array's rows) but is not one itself, and a ROW OF A SHAPED
+  ARRAY, whose bytes are an array while its value is a map -- its keys live once
+  in the shape header, so no key comparison against these bytes can find them.
+  Use `shape`/`shape-column` for the second and `walk`/`walk-from` for the
+  first. See `walk-from`, which has always spelled -2 this way."
+  ^long [s ^long off k]
+  (let [^Nav nav (source-of s)]
+    (if (= MAJOR-MAP (major nav off)) (lookup-map nav off k) -2)))
 
 (defn nth-offset
-  "Byte offset of element `i` of the array at `off`, or -1."
-  ^long [s ^long off ^long i] (nth-item (source-of s) off i))
+  "Byte offset of element `i` of the array at `off`, or -1.
+
+  RETURNS -2 WHEN `off` IS NOT AN ARRAY, for the reason `field-offset` gives.
+  A shaped array is the case that matters: it is a TAG, and `(nth-offset s
+  tag-off i)` cannot mean row `i` because the row's offset would answer a
+  vector where the truth is a map. `(shape-rows (shape s off))` is the array
+  this wants, and indexing THAT is exactly what the shaped scan does."
+  ^long [s ^long off ^long i]
+  (let [^Nav nav (source-of s)]
+    (if (= MAJOR-ARRAY (major nav off)) (nth-item nav off i) -2)))
 
 (defn container-count
   "Element count of the array, or pair count of the map, at `off`.
@@ -1730,8 +1758,28 @@
   further down this file. Two definitions of the same name in one namespace do
   not collide loudly -- the later one simply wins, and the earlier calls go to
   it -- which is exactly how a public function can end up silently rebound to
-  a private one that answers a different question."
-  ^long [s ^long off] (head-count (source-of s) off))
+  a private one that answers a different question.
+
+  REFUSES A NON-CONTAINER, rather than joining the -1/-2 convention its
+  neighbours use: a count has no spare value. Every negative long is a
+  plausible count to arithmetic downstream, and the failure this replaces was
+  exactly that -- on a shaped array's tag this returned 39649, the TAG NUMBER,
+  because `headArgAt` answers a tag's argument as readily as a container's
+  length and nothing here looked at the major type. A silently wrong count out
+  of a public function is the one outcome this namespace's trust boundary is
+  supposed to make impossible. For a shaped array the count you want is
+  `shape-count`."
+  ^long [s ^long off]
+  (let [^Nav nav (source-of s)
+        mj (major nav off)]
+    (if (or (= mj MAJOR-ARRAY) (= mj MAJOR-MAP))
+      (head-count nav off)
+      (fail :boring/not-a-container
+            (str "boring.nav: container-count is only defined for arrays and "
+                 "maps. Major type " mj " at offset " off
+                 (when (= mj MAJOR-TAG)
+                   " is a tag -- if it is a shaped array, use `shape-count`."))
+            {:offset off :major mj}))))
 
 (defn value-at
   "The value at `off`, realised.
@@ -2057,6 +2105,63 @@
       (let [a (.headEndAt r pair)]
         [a (skip r a)]))))
 
+;; A PARSED SHAPE HEADER, and the one thing both layers read a shaped array
+;; through. `ks` are the keys in column order, `pos` maps a key to its column,
+;; `rows-off` is the rows ARRAY -- an ordinary CBOR array that `nth-item` and
+;; `reduce-at` handle with no knowledge of shapes at all -- and `n` is the row
+;; count.
+;;
+;; WHY IT IS A VALUE AND NOT A CLOSURE. `shaped-view` used to parse this inline
+;; and close over it, which left the cursor layer able to read shaped data and
+;; the offset layer unable to reach it: the key-to-column map, which is the
+;; whole reason shapes are fast, was not addressable from outside. Hoisting the
+;; resolution OUT OF THE ROW LOOP is what a scan wants -- one map lookup per
+;; TABLE rather than a key comparison per row -- and that is only expressible
+;; if the caller can hold the shape. See `shape`.
+(deftype Shape [ks pos ^long rows-off ^long n])
+
+(defn- shape-at
+  "The parsed header of the shaped array at `off`, or nil.
+
+  Nil for anything that is not exactly what `writeShapedArray` emits, including
+  a duplicate key -- which the Reader rejects outright in `checkShapeKeys`, and
+  which `pos` cannot represent (`assoc!` keeps the last, `ks` keeps both, and
+  one cursor then reported `count` 2 against `(count (value c))` 1).
+
+  ROWS ARE NOT VALIDATED HERE. The Reader enforces `row length == key count`,
+  but checking every row eagerly takes shaped `count` from 644 ns to 10.4 us --
+  16x on well-formed data -- and would also be WRONG: `count` reads the
+  rows-array header and touches no row, so a bad row 5 is not in the subtree it
+  examined. Charging it for that is the same mistake as charging a partial read
+  for `:max-items`. The paths that DO walk rows check as they go, for 0.68
+  ns/row, because they are there already."
+  ^Shape [^Nav nav ^long off]
+  (let [^Reader r (.rdr nav)]
+    (when (and (= MAJOR-TAG (.majorAt r off))
+               (= TAG-SHAPED-ARRAY (.headArgAt r off)))
+      (when-let [pr (tag-pair r off)]
+        (let [ks-off (long (nth pr 0))
+              rows-off (long (nth pr 1))]
+          (when (and (= MAJOR-ARRAY (.majorAt r ks-off))
+                     (= MAJOR-ARRAY (.majorAt r rows-off)))
+            (let [k (.headArgAt r ks-off)
+                  n (.headArgAt r rows-off)]
+              ;; `(pos? k)`: the Reader requires at least one key
+              ;; (`Reader.java`), and a zero-key shape navigated to `[{}]`
+              ;; against a `:boring/bad-tag-content` from `decode`.
+              (when (and (pos? k) (<= 0 n))
+                (let [ks (loop [i 0 p (.headEndAt r ks-off) acc (transient [])]
+                           (if (= i k)
+                             (persistent! acc)
+                             (recur (inc i) (skip r p)
+                                    (conj! acc (realize nav p)))))]
+                  (when (= (count ks) (count (set ks)))
+                    (->Shape ks
+                             (persistent!
+                              (reduce-kv (fn [m i kk] (assoc! m kk i))
+                                         (transient {}) ks))
+                             rows-off n)))))))))))
+
 (defn- shaped-view
   "RESTRUCTURING. A shaped array is `39649([keys, [row, ...]])`: the keys are
   hoisted out and each row is an ARRAY of values matching them positionally. It
@@ -2064,70 +2169,104 @@
   semantics and must carry the shape -- nothing in a row's own bytes says it is
   a row.
 
-  Returns nil for anything that is not exactly what `writeShapedArray` emits."
+  The header comes from `shape-at`, so this view and the offset layer's
+  `shape` cannot disagree about what a shaped array is."
   [^Nav nav ^long off ^long tag]
   (when (= tag TAG-SHAPED-ARRAY)
-    (let [^Reader r (.rdr nav)
-          pr (tag-pair r off)]
-      (when pr
-        (let [ks-off (nth pr 0)]
-          (when (= MAJOR-ARRAY (.majorAt r ks-off))
-            (let [rows-off (nth pr 1)]
-              (when (= MAJOR-ARRAY (.majorAt r rows-off))
-                (let [k (.headArgAt r ks-off)
-                      n (.headArgAt r rows-off)]
-                  ;; `(pos? k)`: the Reader requires at least one key
-                  ;; (`Reader.java`), and a zero-key shape navigated to `[{}]`
-                  ;; against a `:boring/bad-tag-content` from `decode`.
-                  (when (and (pos? k) (<= 0 n))
-                    (let [ks (loop [i 0 p (.headEndAt r ks-off) acc (transient [])]
-                               (if (= i k)
-                                 (persistent! acc)
-                                 (recur (inc i) (skip r p)
-                                        (conj! acc (realize nav p)))))
-                          ;; DUPLICATE KEYS, which the Reader rejects
-                          ;; unconditionally in `checkShapeKeys`. `:pos` is built
-                          ;; with `assoc!` so the last wins, while `:ks` keeps
-                          ;; both -- one cursor then reported `count` 2 with
-                          ;; `(count (value c))` 1. O(K) once per view, against
-                          ;; keys already realised on the line above.
-                          dup? (not= (count ks) (count (set ks)))
-                          sh {:ks ks
-                              :pos (persistent!
-                                    (reduce-kv (fn [m i kk] (assoc! m kk i))
-                                               (transient {}) ks))}
-                          ;; EVERY ROW IS CHECKED WHEN IT IS REACHED, not when
-                          ;; the view is built. The Reader enforces
-                          ;; `row length == key count`; a 3-value row against 2
-                          ;; keys navigated fine here.
-                          ;;
-                          ;; Deliberately NOT validated up front. Checking every
-                          ;; row eagerly takes shaped `count` from 644 ns to
-                          ;; 10.4 us -- 16x on well-formed data -- and it would
-                          ;; also be WRONG: `count` reads the rows-array header
-                          ;; and touches no row, so a bad row 5 is not in the
-                          ;; subtree it examined. Charging it for that is the
-                          ;; same mistake as charging a partial read for
-                          ;; `:max-items`. On the paths that DO walk rows --
-                          ;; `seq`, `reduce`, `nth i` -- the check comes for
-                          ;; free, 0.68 ns/row, because they are there already.
-                          row-ok? (fn [^long p]
-                                    (and (= MAJOR-ARRAY (.majorAt r p))
-                                         (= k (.headArgAt r p))))
-                          at (fn [^long i]
-                               (let [p (nth-item nav rows-off i)]
-                                 (cond (neg? p) ::miss
-                                       (not (row-ok? p))
-                                       (fail :boring/bad-tag-content
-                                             (str "boring.nav: shaped row " i
-                                                  " does not carry exactly " k
-                                                  " values, which is what its shape declares")
-                                             {:offset p :row i :expected k})
-                                       :else (->Cursor nav p sh))))]
-                      (when-not dup?
-                        {:kind :vector :n n :nth at :key-pred integer?
-                         ;; through `at`, so every row is checked here too
-                         :items (fn [] (map at (range n)))}))))))))))))
+    (when-let [^Shape shp (shape-at nav off)]
+      (let [^Reader r (.rdr nav)
+            ks (.ks shp)
+            k (count ks)
+            n (.n shp)
+            rows-off (.rows-off shp)
+            sh {:ks ks :pos (.pos shp)}]
+        ;; EVERY ROW IS CHECKED WHEN IT IS REACHED -- see `shape-at` for why not
+        ;; up front. On the paths that DO walk rows (`seq`, `reduce`, `nth i`)
+        ;; the check costs 0.68 ns/row, because they are there already.
+        (let [row-ok? (fn [^long p]
+                        (and (= MAJOR-ARRAY (.majorAt r p))
+                             (= k (.headArgAt r p))))
+              at (fn [^long i]
+                   (let [p (nth-item nav rows-off i)]
+                     (cond (neg? p) ::miss
+                           (not (row-ok? p))
+                           (fail :boring/bad-tag-content
+                                 (str "boring.nav: shaped row " i
+                                      " does not carry exactly " k
+                                      " values, which is what its shape declares")
+                                 {:offset p :row i :expected k})
+                           :else (->Cursor nav p sh))))]
+          {:kind :vector :n n :nth at :key-pred integer?
+           ;; through `at`, so every row is checked here too
+           :items (fn [] (map at (range n)))})))))
+
+;; ------------------------------------------------ shapes, on the offset layer
+;;
+;; A shaped array is the densest thing boring writes and the fastest thing it
+;; can read, and until these four functions existed the second half was not
+;; reachable from the offset layer at all -- `nth-offset` on the tag threw and
+;; `container-count` answered 39649.
+;;
+;; THE POINT IS THAT THE KEY LOOKUP LEAVES THE LOOP. A row of an ordinary array
+;; of maps costs a key comparison per row per field; a shaped row costs an array
+;; index, because the key was resolved to a column ONCE for the whole table.
+;; That is the entire reason the encoding exists, and the API has to let a
+;; caller hoist it or the density is all anyone can use.
+;;
+;;     (let [sh  (nav/shape s (nav/root-offset s))
+;;           col (nav/shape-column sh :amount)]
+;;       (nav/reduce-at s (nav/shape-rows sh)
+;;                      (fn [acc row]
+;;                        (+ acc (nav/long-at s (nav/nth-offset s row col))))
+;;                      0))
+;;
+;; Measured over 5000 rows of five fields, summing one column: 152 us here,
+;; against 367 us for hako and 1414 us for nippy, both of which must decode the
+;; whole table to reach one field of it. This allocates nothing at all.
+
+(defn shape
+  "The shape of the shaped array at `off`, or nil if there is not one there.
+
+      (nav/shape s off)                   ; of a source, at an offset
+      (nav/shape c)                       ; of a cursor, at its own offset
+
+  Nil rather than a throw for ANYTHING else -- a plain array, a map, a scalar,
+  another tag, or a damaged shape header. A caller asking whether a document is
+  shaped is asking a question, not asserting an answer, and the branch is
+  `if-let`.
+
+  Hold it across the whole scan. Building one realises the key vector, which is
+  O(keys) and wasted if it happens per row."
+  ([c] (shape (source-of c) (offset c)))
+  ([s ^long off] (shape-at (source-of s) off)))
+
+(defn shape-rows
+  "The offset of a shape's ROWS ARRAY -- an ordinary CBOR array of ordinary CBOR
+  arrays, which `nth-offset`, `reduce-at` and `container-count` handle knowing
+  nothing about shapes.
+
+  This is the bridge: everything below it is plain, and the tag stops mattering."
+  ^long [^Shape sh] (.rows-off sh))
+
+(defn shape-count
+  "How many rows the shape has. O(1) -- read from the rows-array head.
+
+  What `container-count` cannot answer, because the shaped array is a TAG and a
+  tag has no count."
+  ^long [^Shape sh] (.n sh))
+
+(defn shape-column
+  "The COLUMN INDEX of key `k`, or -1 if the shape does not carry that key.
+
+  Hand it to `nth-offset` on a row. -1 composes: `nth-item` rejects a negative
+  index and answers -1 in turn, so a missing key reads as absent rather than as
+  column zero -- which is what an unchecked `(get pos k)` would have given, and
+  is the difference between not-found and the wrong field's value."
+  ^long [^Shape sh k] (let [i (get (.pos sh) k)] (if i (long i) -1)))
+
+(defn shape-keys
+  "The shape's keys, in column order. The vector `shape-column` indexes into."
+  [^Shape sh] (.ks sh))
 
 (defn- record-view
   "WRAPPER. A record writes `27([name, {fields}])`, so the field map begins past
@@ -2405,7 +2544,7 @@
         ;; and read from the middle of the new value: `[1 2 [7 8 9]]` came back
         ;; as `[7 8 9]`, no exception. This is the documented zero-allocation
         ;; scan idiom, so a mixed store hit it on every other row.
-        at-root? (= (.off ^Cursor c) (root-offset r))]
+        at-root? (= (.off ^Cursor c) (reader-root-offset r))]
     (cond
       (bytes? src) (.reset r ^bytes src)
       (instance? ByteSource src) (.reset r ^ByteSource src)
@@ -2426,7 +2565,7 @@
     ;; the rows where the envelope actually changes shape, and nothing on a
     ;; store whose blobs are written with one set of options -- which is every
     ;; store, and why this was invisible until a mixed pair was tried.
-    (let [nr (root-offset r)]
+    (let [nr (reader-root-offset r)]
       (if (and at-root? (not= nr (.off ^Cursor c)))
         (cursor-at nav nr)
         c))))
