@@ -360,7 +360,7 @@
               ;; `containers` from handing this container another one's
               ;; anchors: a search that cannot find its node returns -1, and
               ;; -1 means walk. Nothing here checks the node against the DATA
-              ;; -- per-node validation was removed, see doc/SHAPES.md.
+              ;; -- per-node validation was removed, see doc/INDEX.md.
               (= c off) mid
               (< c off) (recur (inc mid) hi)
               :else (recur lo (dec mid))))))
@@ -814,7 +814,7 @@
   buffer, raising a raw ArrayIndexOutOfBoundsException at the caller of `get`.
 
   So the walk stops at the source's end and reports a miss. A damaged index may
-  still give a wrong ANSWER -- that is the trust boundary doc/SHAPES.md
+  still give a wrong ANSWER -- that is the trust boundary doc/INDEX.md
   describes, and it cannot be closed here -- but it may not throw an untyped
   exception out of a lookup."
   ^long [^Reader r ^long start ^long limit ^bytes probe]
@@ -826,7 +826,7 @@
     ;; decoder fast and what makes a damaged offset land here.
     ;;
     ;; An out-of-range walk is reported as a MISS. With a damaged index the
-    ;; answer may be wrong either way -- doc/SHAPES.md is explicit that this is
+    ;; answer may be wrong either way -- doc/INDEX.md is explicit that this is
     ;; a trust boundary -- but it may not be an untyped exception out of `get`,
     ;; and the unsorted branch above simply tries the next anchor.
     ;;
@@ -1063,7 +1063,7 @@
   stepping over 16 twenty-entry maps is ~640 sub-skips, measured at warm 1.14 ->
   4.90 us on 769 maps of 20. An index we have decided to trust does not earn
   that, and validating one jump while leaving the rest of the frame trusted was
-  never a coherent position anyway. See doc/SHAPES.md for what a trusted
+  never a coherent position anyway. See doc/INDEX.md for what a trusted
   index does and does not promise."
   ^long [^Nav nav ^long off ^long idx]
   (let [^Reader r (.rdr nav)
@@ -3496,7 +3496,7 @@
             ;; 60-item file and `nth 32` returned -1768167461 where `decode-seq`
             ;; returned the record. That is still true; it is now the
             ;; documented consequence of trusting the frame rather than a
-            ;; defect. See doc/SHAPES.md.
+            ;; defect. See doc/INDEX.md.
             (let [anchor (quot (long i) stride)]
               ;; THE ANCHOR MUST BE THERE. `total` and the anchor array's
               ;; length are INDEPENDENT now: the count comes off the wire and
@@ -3563,7 +3563,7 @@
   `:index N`), `nth` uses it: O(1) to the nearest anchor, then at most N-1
   skips. Without one it skips from the start. Either way the answer is the
   same -- an index is an optimisation, not load-bearing for correctness (see
-  doc/SHAPES.md for where that stops: damage leaving the payload structurally
+  doc/INDEX.md for where that stops: damage leaving the payload structurally
   CONSISTENT, bit rot included, can still misdirect), and
   a missing, truncated or stale one falls back to scanning.
 

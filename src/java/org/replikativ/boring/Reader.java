@@ -2813,7 +2813,7 @@ public final class Reader {
                 // `writeStringrefNamespace` and opens one namespace at the
                 // root, so there is no second table for it to be wrong about.
                 // Reaching here with real nesting means a damaged frame, where
-                // doc/SHAPES.md already allows a wrong answer; what it does not
+                // doc/INDEX.md already allows a wrong answer; what it does not
                 // allow is an untyped throw or a read outside the file, and
                 // `srResolve` refuses by shape and bounds-checks every byte.
                 if (srOffsetMode()) return read();

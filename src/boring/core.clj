@@ -96,8 +96,11 @@
   to passing the same map on every call: `resolve-opts` merges the caller's map
   over the profile defaults, which allocates ~230-300 B per call. On a log
   event that is the difference between 452 and 220 heap bytes, and it bites
-  hardest exactly where it is least wanted -- a navigable file needs
-  `:stringref false`, so it cannot use the nil-opts fast path.
+  hardest exactly where it is least wanted -- a SEQUENCE needs
+  `:stringref false`, so it cannot use the nil-opts fast path. (A single
+  indexed document keeps stringref and is smaller for it; the restriction is
+  specific to `write-seq!`, which resets the namespace per top-level item so
+  one frame cannot describe them all.)
 
   Passing opts explicitly to a 3-arity call still wins, and REPLACES these
   rather than merging with them -- one place to look for what a call used."
@@ -368,11 +371,20 @@
   return value IS -- one item becomes a sequence, `application/cbor` becomes
   `application/cbor-seq` -- which is a change of kind, not of setting.
 
-  Note the size trade, which runs the other way: indexing forces
-  `:stringref false`, because `boring.nav` cannot resolve a string reference
-  from an offset. On a value holding many similar records that costs about 2x.
-  Under a compressor it is noise -- zstd reaches 37x where stringref reaches
-  2.09x -- so see doc/STORAGE.md before optimising this by hand."
+  INDEXING NO LONGER COSTS YOU STRINGREF. It used to force `:stringref false`,
+  because `boring.nav` cannot rebuild a reference table from an offset, and on
+  a value holding many similar records that cost about 2x. The index frame now
+  carries a pointer table -- each referenced index to the offset where that
+  string was defined -- so a cursor resolves a reference by jumping to the
+  literal. `encode-indexed` therefore KEEPS stringref and is smaller for it:
+  measured on 200 records, 5063 bytes with both against 6648 with shapes
+  alone.
+
+  The consequence runs the other way now. A stringref document is navigable
+  ONLY if it carries an index, so plain `encode` output -- stringref on by
+  default, no frame -- is refused by `nav/source` rather than answered wrongly.
+  Decoding it is unaffected: `decode` builds the table as it reads and consults
+  no frame."
   (^bytes [v] (encode v nil))
   (^bytes [v opts]
    (let [o (resolve-opts opts)]
@@ -781,10 +793,13 @@
   rather than forced off. They were mutually exclusive because a stringref is
   an index into a table built by decoding every preceding string, so a cursor
   holding nothing but an offset could not resolve one and `boring.nav` refused
-  such a document outright. The index frame now carries a sixth element -- the
-  offset of the defining literal for each slot something actually references --
-  and a reference resolves by JUMPING to that offset instead of by having
-  decoded everything before it.
+  such a document outright. The index frame now carries ONE MORE PAYLOAD
+  ELEMENT -- seven rather than six, the extra one sitting between `sorted` and
+  `data-end` -- holding the offset of the defining literal for each slot
+  something actually references, so a reference resolves by JUMPING to that
+  offset instead of by having decoded everything before it. `data-end` stays
+  last whatever the width, which is what lets a reader take the count off the
+  array head and know which element is which. See doc/INDEX.md.
 
   So `(nav/root (encode-indexed v))` works on the default profile, which is the
   shape this docstring recommends and used to be the one path never exercised.
@@ -917,7 +932,7 @@
   be the useful one or the feature is unreachable for anyone who did not plan
   ahead. It is close to free: +3% write time at stride 16, +0.06% size on 50k
   ~200-byte records, and -1.5% from the `:stringref false` it forces, netting
-  SMALLER. The write-cost figure is doc/SHAPES.md's, from
+  SMALLER. The write-cost figure is doc/INDEX.md's, from
   `clojure -M:bench -m nav write`, and lives there rather than here -- this
   docstring used to say +4.3% for the same corpus and the same stride.
 
@@ -1371,7 +1386,7 @@
                               (long (get o :index-min 16))))))
 
 (def ^:const index-name
-  "Tag-27 type name for a sequence/container index. See doc/SHAPES.md.
+  "Tag-27 type name for a sequence/container index. See doc/INDEX.md.
 
   A NAME under tag 27, not a tag number of its own. Tag 27 is CBOR's registered
   extension point for exactly this -- \"serialised language-independent object
