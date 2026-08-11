@@ -129,7 +129,7 @@
 
 ;; ---------------------------------------------------------------- the source
 
-(declare slot-at sorted-at? container-at count-at check-stringref-navigable!
+(declare slot-at anchor-at sorted-at? container-at count-at check-stringref-navigable!
          byte-string-at root-cursor reader-root-offset)
 
 ;; A TYPE, not a fifteen-key map. `index-payload` used to return one, and on a
@@ -871,12 +871,23 @@
 (def ^:private ^:const jump-min-entries
   "Below this many entries, do not consult the index to skip a container.
 
-  It is boring's own `:index-min` default, and the point is that a container
-  under it CANNOT have earned a node -- so the lookup would be a binary search
-  over the container offsets that is guaranteed to miss. Two byte reads decide
-  it: the major type and the head argument, which for a container is its
-  element count."
-  16)
+  MUST EQUAL `boring.core/default-index-min`, and the reason is that this is
+  not a tuning knob at all: it is the reader's copy of the writer's floor, and
+  its only job is to skip a binary search over the container table that is
+  GUARANTEED to miss because no such container can have earned a node. Two byte
+  reads decide it -- the major type and the head argument, which for a
+  container is its element count.
+
+  IT SAID 16 AND MEANT `:index-min`'s DEFAULT, and then the default moved to 4
+  without this moving with it. For a while the writer placed nodes on 4- to
+  15-entry containers and this refused to consult them -- including the
+  five-key top-level map whose node was the entire argument for lowering the
+  floor. The docstring still claimed the two were the same number, which is how
+  it survived review.
+
+  `index-layout-test` pins them equal now, because a comment saying MUST EQUAL
+  is what was already here."
+  4)
 
 (defn- skip-value
   "Where the value at `vp` ENDS -- by jumping over it through the index when it
@@ -929,15 +940,29 @@
           (.skipFrom r vp)
           (try
             (let [idx (nav-idx nav)
-                  ^longs anchors (slot-at r idx ns*)
-                  a (alength anchors)
+                  ;; THE LAST ANCHOR AND THE COUNT, without building the node.
+                  ;; This read `slot-at`, which allocates a `long[m]` and
+                  ;; prefix-sums every anchor, to use exactly two of its
+                  ;; values -- 24 016 B and 9.075 us on a 3000-element array
+                  ;; against 32 B and 4.580 here. See `anchor-at`.
+                  ^longs la (anchor-at r idx ns* -1)
+                  a (aget la 1)
+                  ;; A NODE WITH NO ANCHORS HAS TO BE REFUSED HERE. `slot-at`
+                  ;; returned an empty array and `(aget anchors -1)` raised an
+                  ;; AIOOBE that the `catch` below turned into a walk, so the
+                  ;; guard was accidental. `anchor-at` reports the count
+                  ;; instead, and without this `a` of 0 makes `span` one stride
+                  ;; too long AND starts the walk at the container's own head
+                  ;; rather than an entry -- a wrong END, which is a wrong
+                  ;; ANSWER. `:index-min 0` legitimately produces such a node.
+                  _ (when (zero? a) (throw (ex-info "no anchors" {:node ns*})))
                   n (.headArgAt r vp)
                   ;; Same derivation as `lookup-map`: anchor count equals entry
                   ;; count only at stride 1.
                   stride (long (if (= a (long n)) 1 (.stride ^Index idx)))
                   span (- (long n) (* (dec a) stride))
                   map? (= 5 m)
-                  e (loop [q (long (aget anchors (dec a))) k (long span)]
+                  e (loop [q (long (aget la 0)) k (long span)]
                       (if (or (zero? k) (neg? q)) q
                           (recur (long (if map?
                                          (.skipFrom r (.skipFrom r q))
@@ -3288,6 +3313,72 @@
             (aset a k v)
             (recur (inc k) (+ p sz) v))))
       a)))
+
+(defn- anchor-at
+  "Node `i`'s anchor `k`, and its anchor COUNT, without materialising the node.
+
+  `slot-at` allocates a `long[m]` and prefix-sums every anchor of the node.
+  Two of its three callers then read ONE element: `skip-value` takes the last
+  anchor, `nth-item` takes the anchor its index lands on. Only `lookup-map`'s
+  binary search genuinely needs random access, and it keeps `slot-at`.
+
+  MEASURED on a 3000-element array of two-key maps, one skip per row, min of 7
+  runs of 20 000 calls:
+
+      slot-at, stride 1 (m=3000)     9.075 us   24016 B
+      this,    stride 1              4.580 us      32 B
+      slot-at, stride 16 (m=188)     0.584 us    1520 B
+      this,    stride 16             0.352 us      32 B
+
+  The 24 KB is a `long[3000]` built to read its last element, and it was the
+  whole of the stride-1 allocation penalty: 24016 + 1290 (the index open) + 11
+  (the rest of the per-row path) is exactly the 25 317 B/row a scan measured.
+
+  `k` OF -1 MEANS THE LAST ANCHOR, which is what `skip-value` wants and what it
+  would otherwise need the count to ask for.
+
+  RETURNS TWO LONGS IN A FRESH `long[2]` -- [anchor count] -- rather than a
+  vector or a map. 32 bytes against the 24 016 a `long[3000]` costs, and it
+  cannot take the array from the caller instead: that would be a fifth
+  argument, and Clojure caps a fn with primitive hints at four.
+
+  THE BOUNDS ARE `slot-at`'s, deliberately duplicated rather than shared: they
+  are what keeps a damaged frame from reaching `Reader.skipFrom`'s unchecked
+  array access, and a refactor that let one path keep them while the other
+  drifted is the failure this file has had three times. Any change here is a
+  change there.
+
+  DO NOT BOX THE ACCUMULATOR. Written first with the result array constructed
+  inside the loop's else branch, which made the accumulator an Object for all
+  m iterations and ran 3x SLOWER than the allocating version it replaces."
+  ^longs [^Reader r ^Index ix ^long i ^long k]
+  (let [sdata (.slots-data ix)
+        slen (.slots-len ix)
+        lim (.data-end ix)
+        w (width-code r sdata i)
+        sz (bit-shift-left 1 w)
+        start (slot-start r (.slots-tbase ix) (.slots-wstart ix) i)
+        nxt (slot-start r (.slots-tbase ix) (.slots-wstart ix) (inc i))
+        m (quot (- nxt start) sz)]
+    (when (or (neg? start) (neg? m) (> (+ start (* m sz)) slen))
+      (throw (ex-info "boring: index slot segment outside the packed slots"
+                      {:type :boring/bad-index :node i :start start
+                       :anchors m :width sz :slots-length slen})))
+    (let [want (if (neg? k) (dec m) k)]
+      (loop [j 0
+             p (+ sdata start)
+             acc (max 0 (container-at r ix i))]
+        (if (or (>= j m) (> j want))
+          (doto (long-array 2) (aset 0 acc) (aset 1 m))
+          ;; `unchecked-add` and the range check for the reasons `slot-at`
+          ;; gives -- a width-3 delta is an unconstrained signed 64-bit value
+          ;; off the wire, and `+` on primitive longs throws on overflow.
+          (let [v (unchecked-add acc (delta-at r p w))]
+            (when (or (neg? v) (>= v lim))
+              (throw (ex-info "boring: index anchor outside the data section"
+                              {:type :boring/bad-index :node i :anchor j
+                               :offset v :data-end lim})))
+            (recur (inc j) (+ p sz) v)))))))
 
 (defn- index-payload
   "The usable index in the tag-27 frame at `ptr`, or nil meaning \"scan\".
