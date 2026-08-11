@@ -2981,7 +2981,11 @@
         ;; decided here -- the payload's element COUNT says so, and the caller
         ;; has already read that off the array head.
         e5 (.skipFrom r e4)]
-    [e0 e1 e2 e3 e4 e5]))
+    ;; A `long[6]`, NOT a vector: this is one allocation per index open, and the
+    ;; open is what a scan pays per row. Six boxed Longs in a PersistentVector
+    ;; against 64 bytes of primitives.
+    (doto (long-array 6)
+      (aset 0 e0) (aset 1 e1) (aset 2 e2) (aset 3 e3) (aset 4 e4) (aset 5 e5))))
 
 (def ^:private ^:const stringref-layout-v1 1)
 
@@ -3004,6 +3008,12 @@
   nil for any shape this does not recognise, which the caller treats as
   \"no pointer table\" -- the same answer a six-element payload gives."
   [^Reader r ^long p]
+  ;; KEEPS `byte-string-at`, where `index-payload` uses the single-long
+  ;; `bs-data`/`bs-len`. Those are defined BELOW this function, so using them
+  ;; here means going through the `declare` -- which loses the `^long` return
+  ;; hint and made the open 0.87 us / 647 B become 10.5 us / 25 370 B, a 39x
+  ;; allocation regression from a forward reference. Called once per open, so
+  ;; the vector costs less than moving the definitions would risk.
   (when-let [[data len] (byte-string-at r p)]
     (let [len (long len)]
       ;; ONE BYTE IS A VALID TABLE -- the layout byte and no pairs. That is a
@@ -3020,7 +3030,10 @@
               body (dec len)]
           (when (and (= stringref-layout-v1 (bit-and lay 0xF))
                      (zero? (rem body pw)))
-            [(inc (long data)) (quot body pw) iw ow]))))))
+            ;; A `long[4]`, not a vector -- see `slot-table`. [base count iw ow].
+            (doto (long-array 4)
+              (aset 0 (inc (long data))) (aset 1 (quot body pw))
+              (aset 2 iw) (aset 3 ow))))))))
 
 (defn- slot-le
   "The `w`-byte little-endian value at ABSOLUTE offset `p`.
@@ -3074,7 +3087,9 @@
                  (>= slots-len (+ tbase (* entries w)))
                  (= slots-len
                     (slot-le r (+ slots-data tbase (* (dec entries) w)) w)))
-        [(+ slots-data tbase) w]))))
+        ;; A `long[2]`, not a vector -- one allocation per index open, and the
+        ;; open is what a scan pays per row. [table-base entry-width].
+        (doto (long-array 2) (aset 0 (+ slots-data tbase)) (aset 1 w))))))
 
 (defn- slot-start
   "Byte offset where node `i`'s deltas begin, RELATIVE to the packed slots.
@@ -3136,32 +3151,41 @@
   (when (and (= 2 (.majorAt r off)) (not= 31 (.infoAt r off)))
     [(.headEndAt r off) (.headArgAt r off)]))
 
-(defn- le-array-at
-  "Data offset and byte length of the RFC 8746 little-endian typed array at
-  `off`, or nil.
+;; ONE LONG EACH, because the vector above is per-OPEN allocation on the scan
+;; path and the open is now the whole of what a scan allocates per row. Two
+;; calls re-read the head, which is a byte and a branch; the vector was ~72
+;; bytes and a boxed pair. `-1` for "not a definite-length byte string", which
+;; every caller already treats as "no index".
+(defn- bs-data ^long [^Reader r ^long off]
+  (if (and (= 2 (.majorAt r off)) (not= 31 (.infoAt r off))) (.headEndAt r off) -1))
 
-  Requires the tag AND that its payload is a DEFINITE-length byte string. The
-  major check is not optional: without it the previous frame shape -- where this
-  element was a CBOR array -- gets a `headEndAt` and a `headArgAt` that both
-  succeed, returning the element COUNT and the first element's offset, and the
-  reader goes on to compute node offsets from them. The refusal has to be exact,
-  which is the whole compatibility argument for changing the layout.
+(defn- bs-len ^long [^Reader r ^long off]
+  (if (and (= 2 (.majorAt r off)) (not= 31 (.infoAt r off))) (.headArgAt r off) -1))
 
-  WHAT KEEPS THE RESULTING OFFSETS INSIDE THE FILE is not here, and is worth
-  naming because nothing near the accessors says it. Neither length returned
-  here is checked against the file. `count-at` and `container-at` are
-  nevertheless in-file for every `i < n` because of TWO things elsewhere:
-  `read-index*`'s `(= n (skip r ptr))` forces the whole frame to tile exactly
-  to EOF, and `Reader.checkCount` refuses any byte-string length exceeding
-  `remaining()`. That EOF check is documented where it lives purely as the
-  stale-index defence -- the concatenated-sealed-batches bug -- and is now also
-  the sole bound on two byte-offset accessors. Relaxing it would silently
-  un-bound both."
-  [^Reader r ^long off ^long tag]
-  (when (and (= 6 (.majorAt r off)) (= tag (.headArgAt r off)))
-    (let [bs (.headEndAt r off)]
-      (when (and (= 2 (.majorAt r bs)) (not= 31 (.infoAt r bs)))
-        [(.headEndAt r bs) (.headArgAt r bs)]))))
+;; ONE LONG EACH -- see `bs-data`. `index-payload` reads `containers` and
+;; `counts` through these and tries tag 78 before 79, so the vector-returning
+;; `le-array-at` these replace allocated up to four per open.
+;;
+;; THE TAG CHECK IS NOT OPTIONAL, and this is the whole compatibility argument
+;; for the v2 layout: without it the PREVIOUS frame shape -- where this element
+;; was a CBOR array -- gets a `headEndAt` and a `headArgAt` that both succeed,
+;; returning the element COUNT and the first element's offset, and the reader
+;; goes on to compute node offsets from them. The refusal has to be exact.
+;;
+;; NEITHER LENGTH IS CHECKED AGAINST THE FILE HERE. `count-at` and
+;; `container-at` are in-file for every `i < n` because of two things
+;; elsewhere: `read-index*`'s `(= n (skip r ptr))` forces the frame to tile
+;; exactly to EOF, and `Reader.checkCount` refuses a byte-string length past
+;; `remaining()`.
+(defn- le-data ^long [^Reader r ^long off ^long tag]
+  (if (and (= 6 (.majorAt r off)) (= tag (.headArgAt r off)))
+    (bs-data r (.headEndAt r off))
+    -1))
+
+(defn- le-len ^long [^Reader r ^long off ^long tag]
+  (if (and (= 6 (.majorAt r off)) (= tag (.headArgAt r off)))
+    (bs-len r (.headEndAt r off))
+    -1))
 
 (defn- le-signed-at
   "The signed little-endian value of width `w` (4 or 8) at absolute offset `p`.
@@ -3448,9 +3472,13 @@
           ;; the `.readFrom` vector, so `payload-offsets` ran BEFORE the override
           ;; and `slot-table` ran AFTER the restore. Invisible, and a trap to
           ;; preserve blindly.
-          [off-stride off-containers off-counts off-slots off-sorted off-after]
-          (try (payload-offsets r ptr)
-               (catch Exception _ [nil nil nil nil nil nil]))
+          ^longs offs (try (payload-offsets r ptr) (catch Exception _ nil))
+          off-stride (when offs (aget offs 0))
+          off-containers (when offs (aget offs 1))
+          off-counts (when offs (aget offs 2))
+          off-slots (when offs (aget offs 3))
+          off-sorted (when offs (aget offs 4))
+          off-after (when offs (aget offs 5))
           ;; THE PAYLOAD'S ELEMENT COUNT decides what `off-after` names. Six
           ;; elements and it is `data-end`; seven and it is the stringref
           ;; pointer table, with `data-end` after it. `read-index*` has already
@@ -3467,8 +3495,8 @@
                       (try (stringref-table-at r (long off-after))
                            (catch Exception _ nil)))]
               (if t
-                (.setStringrefPointers r (long (nth t 0)) (int (nth t 1))
-                                       (int (nth t 2)) (int (nth t 3)))
+                (.setStringrefPointers r (aget ^longs t 0) (int (aget ^longs t 1))
+                                       (int (aget ^longs t 2)) (int (aget ^longs t 3)))
                 ;; NOT `setStringrefPointers` with four zeros, which is what
                 ;; this was. An EMPTY table is now a meaningful state -- a
                 ;; document that opens a namespace and references nothing --
@@ -3483,17 +3511,22 @@
                             (zero? (.majorAt r (long off-stride)))
                             (< (.infoAt r (long off-stride)) 28))
                    (.headArgAt r (long off-stride)))
-          [slots-data slots-len] (when off-slots (byte-string-at r (long off-slots)))
-          [sorted-data sorted-len] (when off-sorted (byte-string-at r (long off-sorted)))
+          slots-data (when off-slots (let [d (bs-data r (long off-slots))]
+                                       (when-not (neg? d) d)))
+          slots-len (when slots-data (bs-len r (long off-slots)))
+          sorted-data (when off-sorted (let [d (bs-data r (long off-sorted))]
+                                         (when-not (neg? d) d)))
+          sorted-len (when sorted-data (bs-len r (long off-sorted)))
           ;; CONTAINERS AT EITHER WIDTH, chosen by the tag rather than tested
           ;; for. Tag 78 is int32, tag 79 sint64; both are RFC 8746
           ;; little-endian, so entry `i` is `cw` bytes at `containers-data +
           ;; cw*i`. The `long[]` normalisation this replaces cost 1.21 us per
           ;; open on a 770-node frame -- more than the decode it normalised.
-          [containers-data containers-len cw]
-          (when off-containers
-            (or (when-let [[d l] (le-array-at r (long off-containers) 78)] [d l 4])
-                (when-let [[d l] (le-array-at r (long off-containers) 79)] [d l 8])))
+          cw (when off-containers
+               (cond (not (neg? (le-data r (long off-containers) 78))) 4
+                     (not (neg? (le-data r (long off-containers) 79))) 8))
+          containers-data (when cw (le-data r (long off-containers) (if (= 4 cw) 78 79)))
+          containers-len (when cw (le-len r (long off-containers) (if (= 4 cw) 78 79)))
           ;; COUNTS IS NOT DECODED. It is a tag-78 typed array, so its entries
           ;; are four little-endian bytes each and `count-at` loads one on
           ;; demand. Materialising it cost 1.07 us per open on a 770-node frame.
@@ -3507,10 +3540,11 @@
           ;; (RFC 8746); only 66, 74 and 75 are big-endian. So tag 70 has the
           ;; IDENTICAL byte layout to 78 and differs only in signedness, which
           ;; makes it the cheapest widening available if one is ever wanted.
-          [counts-data counts-len nw]
-          (when off-counts
-            (or (when-let [[d l] (le-array-at r (long off-counts) 78)] [d l 4])
-                (when-let [[d l] (le-array-at r (long off-counts) 79)] [d l 8])))
+          nw (when off-counts
+               (cond (not (neg? (le-data r (long off-counts) 78))) 4
+                     (not (neg? (le-data r (long off-counts) 79))) 8))
+          counts-data (when nw (le-data r (long off-counts) (if (= 4 nw) 78 79)))
+          counts-len (when nw (le-len r (long off-counts) (if (= 4 nw) 78 79)))
           ;; `readTypedArray` used to throw on a byte length that is not a
           ;; multiple of the element width; `quot` truncates instead. Without
           ;; this a 3081-byte counts string would yield n=770, agree with a
@@ -3581,7 +3615,7 @@
               ix0 (Index. st (long containers-data) (long cw)
                           (long counts-data) (long nw) (long n)
                           (long slots-data) (long slots-len)
-                          (long (nth table 0)) (long (nth table 1))
+                          (aget ^longs table 0) (aget ^longs table 1)
                           (long sorted-data) ptr nil nil)]
           ;; NO ASCENDING CHECK, and no counts check either -- a negative
           ;; count cannot reach past `slot-at`, which bounds its own segment
@@ -3634,7 +3668,7 @@
                   (Index. st (long containers-data) (long cw)
                           (long counts-data) (long nw) (long n)
                           (long slots-data) (long slots-len)
-                          (long (nth table 0)) (long (nth table 1))
+                          (aget ^longs table 0) (aget ^longs table 1)
                           (long sorted-data) ptr
                           (count-at r ix0 (long seq-slot))
                           seq-anchors)
