@@ -868,6 +868,84 @@
           (System/arraycopy tail 0 out hn tn)
           out)))))
 
+(def ^:private ^:const jump-min-entries
+  "Below this many entries, do not consult the index to skip a container.
+
+  It is boring's own `:index-min` default, and the point is that a container
+  under it CANNOT have earned a node -- so the lookup would be a binary search
+  over the container offsets that is guaranteed to miss. Two byte reads decide
+  it: the major type and the head argument, which for a container is its
+  element count."
+  16)
+
+(defn- skip-value
+  "Where the value at `vp` ENDS -- by jumping over it through the index when it
+  is a container with a node, and by walking it otherwise.
+
+  WHY THIS EXISTS. A CBOR array or map carries an ELEMENT COUNT, not a byte
+  length, so `skipFrom` past one is a structural walk of its whole subtree.
+  Reaching a field that sits after a big container therefore costs the whole
+  container, and the index did nothing about it: it accelerated lookups INSIDE
+  a container and left skipping PAST one linear. Measured on a 3000-element
+  array of maps, one skip: 139.62 us walking against 0.54 us jumping, 224x, and
+  the jump is FLAT in container size while the walk is linear. It already wins
+  at 50 entries (5.80 us against 0.83).
+
+  HOW. A node's anchors are entry boundaries -- key positions for a map,
+  element positions for an array -- so the LAST anchor is within `stride`
+  entries of the end. Walk only that remainder. At stride 1 it is one entry
+  (0.11 us); at stride 64 it is up to 56 (3.03 us), which is why the stride is
+  the lever here as everywhere else.
+
+  THE ANSWER IS VERIFIED AGAINST THE WALK IN THE TESTS, not trusted from the
+  frame: a wrong end is a wrong ANSWER rather than an error, which is the one
+  outcome this namespace exists to make hard. The bounds check below rejects an
+  end that is not strictly after `vp` and inside the source, so a damaged
+  anchor falls back to the honest walk rather than returning a plausible
+  offset. Damage that stays inside those bounds remains the trust boundary
+  doc/INDEX.md describes and cannot be closed here.
+
+  Falls back to `skipFrom` on anything unexpected -- no node, no index, a slot
+  that will not read -- because this is an optimisation and its failure mode
+  must be slowness, never a different answer."
+  ^long [^Nav nav ^Reader r ^long vp]
+  (let [m (.majorAt r vp)]
+    ;; THE GATE IS PAID ON EVERY VALUE A SCAN STEPS OVER, and it is not free:
+    ;; measured over 60 small values at stride 1, 4.23 us against 3.36 for the
+    ;; unpatched walk -- about 14 ns per entry for the call, two reads and a
+    ;; branch. That is the price of the 135.13 -> 17.53 us on the case this
+    ;; exists for, and of 133.45 -> 3.35 at stride 16.
+    ;;
+    ;; Checking `infoAt` first was tried, on the theory that CBOR's five-bit
+    ;; info field IS the count under 24 and would settle a small container
+    ;; without `headArgAt`'s possible multi-byte read. It bought nothing --
+    ;; 4.27 against 4.23 -- because `headArgAt` on a small container reads
+    ;; exactly those same bits. The cost is the call, not the read.
+    (if-not (and (or (= 4 m) (= 5 m))
+                 (>= (.headArgAt r vp) jump-min-entries))
+      (.skipFrom r vp)
+      (let [ns* (node-slot nav vp)]
+        (if (neg? ns*)
+          (.skipFrom r vp)
+          (try
+            (let [idx (nav-idx nav)
+                  ^longs anchors (slot-at r idx ns*)
+                  a (alength anchors)
+                  n (.headArgAt r vp)
+                  ;; Same derivation as `lookup-map`: anchor count equals entry
+                  ;; count only at stride 1.
+                  stride (long (if (= a (long n)) 1 (.stride ^Index idx)))
+                  span (- (long n) (* (dec a) stride))
+                  map? (= 5 m)
+                  e (loop [q (long (aget anchors (dec a))) k (long span)]
+                      (if (or (zero? k) (neg? q)) q
+                          (recur (long (if map?
+                                         (.skipFrom r (.skipFrom r q))
+                                         (.skipFrom r q)))
+                                 (dec k))))]
+              (if (and (> e vp) (<= e (.size r))) e (.skipFrom r vp)))
+            (catch RuntimeException _ (.skipFrom r vp))))))))
+
 (defn- scan-map
   "Linear walk of a map's entries from `start`, at most `limit` of them.
 
@@ -882,8 +960,12 @@
   still give a wrong ANSWER -- that is the trust boundary doc/INDEX.md
   describes, and it cannot be closed here -- but it may not throw an untyped
   exception out of a lookup."
-  ^long [^Reader r ^long start ^long limit ^bytes probe]
-  (let [end (.size r)]
+  ;; `r` IS DERIVED, not passed. Clojure caps a primitive-returning fn at four
+  ;; arguments -- the same rule `write-indexed-resolved!` records -- and losing
+  ;; the `^long` return here would box on the hot path.
+  ^long [^Nav nav ^long start ^long limit ^bytes probe]
+  (let [^Reader r (.rdr nav)
+        end (.size r)]
     ;; The walk itself is guarded, not just its starting point. A start can be
     ;; in range while the item's DECLARED length runs past the buffer, so the
     ;; throw happens inside `skipFrom` before any check on its result could see
@@ -948,7 +1030,12 @@
             ;; being taken correctly and then thrown away by this line.
               (if (>= (inc i) limit)
                 -1
-                (let [q (skip r (skip r p))]
+                ;; THE VALUE IS SKIPPED THROUGH THE INDEX where it is a big
+                ;; container -- see `skip-value`. Reaching a field that sits
+                ;; after one used to cost the whole container, because a CBOR
+                ;; container carries an element count rather than a byte
+                ;; length.
+                (let [q (skip-value nav r (skip r p))]
                   (if (or (<= q p) (> q end)) -1 (recur (inc i) q))))))))
       (catch IndexOutOfBoundsException _ -1))))
 
@@ -1038,7 +1125,7 @@
     ;; map at stride 1, where they are the only thing that helps.
     (if (or (nil? slot) (zero? m)
             (and (> (long stride) 1) (not (sorted-at? r (.sorted-data idx) ns))))
-      (scan-map r (.headEndAt r off) n probe)
+      (scan-map nav (.headEndAt r off) n probe)
       ;; Entries after anchor a, which is NOT always `stride`: the last
       ;; anchor covers the remainder. Walking a full stride from it ran off
       ;; the end of the container and into whatever followed -- found by the
@@ -1087,14 +1174,14 @@
               ;; belongs. A negative is still re-derived, because a damaged
               ;; anchor can still start a bounded walk mid-item.
                 (confirm [^long hit]
-                  (if (neg? hit) (scan-map r (.headEndAt r off) n probe) hit))
+                  (if (neg? hit) (scan-map nav (.headEndAt r off) n probe) hit))
               ;; The binary search itself, over ONE encoding of the key. Taken
               ;; twice on a stringref document -- see `reference-probe`.
                 (bsearch [^bytes p]
                   (loop [lo 0 hi (dec m)]
                     (if (> lo hi)
                       (let [anchor (max 0 (min (dec m) hi))]
-                        (scan-map r (aget slot anchor) (span anchor) p))
+                        (scan-map nav (aget slot anchor) (span anchor) p))
                       (let [mid (quot (+ lo hi) 2)
                             q (long (aget slot mid))]
                         (if (or (neg? q) (>= q lim))
@@ -1135,7 +1222,7 @@
              (loop [a 0]
                (if (>= a m)
                  -1
-                 (let [hit (scan-map r (aget slot a) (span a) probe)]
+                 (let [hit (scan-map nav (aget slot a) (span a) probe)]
                    (if (>= hit 0) hit (recur (inc a)))))))))))))
 
 (defn- nth-item
