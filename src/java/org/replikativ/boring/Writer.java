@@ -366,7 +366,15 @@ public final class Writer {
     // there.
 
     private int idxStride = 0;
-    private int idxMinEntries = 16;
+    /**
+     * The `:index-min` floor. MUST equal `boring.core/default-index-min` --
+     * the two index builders apply it independently and must decide the same
+     * way, which is the divergence class of #30, #34 and #43.
+     *
+     * <p>4, down from 16. See `boring.core/default-index-min` for the
+     * measurements and for why the sweep stopped at 4 rather than 2.
+     */
+    private int idxMinEntries = 4;
     /** Added to every recorded offset, so `write-seq!` gets file offsets. */
     private long idxBase = 0;
 

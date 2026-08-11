@@ -629,6 +629,16 @@
   "Stride used when `:index` is not given. Matches the JVM's."
   16)
 
+(def ^:const default-index-min
+  "`:index-min` floor when it is not given. MUST equal the JVM's
+  `boring.core/default-index-min` and `Writer.idxMinEntries` -- three builders
+  now apply it, and #38 is about what happens when one of them drifts.
+
+  4, down from 16: a floor of 16 denied a node to the small top-level map a
+  document store's documents are, which is where the win is. See the JVM
+  docstring for the sweep and for why not 2."
+  4)
+
 ;; ## Indexing an already-encoded blob
 ;;
 ;; `encode-indexed` on ClojureScript. konserve is portable and wants to offer
@@ -1143,8 +1153,7 @@
   "Index nodes for the containers inside already-encoded `bs`, or nil.
 
   `:index` is the stride (default 16) and `:index-min` the smallest container
-  worth a node (default 16). `:index-min` is the dominant size knob -- see the
-  JVM docstring for the measurements."
+  worth a node (default 4 -- `keep-node?` is the actual rule). See the JVM docstring for the measurements."
   ([bs] (build-index bs nil))
   ([bs opts]
    ;; RESOLVED, like every other public entry point, even though nothing here
@@ -1156,7 +1165,7 @@
              (throw (ex-info (str "boring: :index 0 turns indexing off, which build-index "
                                   "cannot do; use `encode` instead")
                              {:type :boring/bad-option :option :index :value 0})))
-         min-entries (get opts :index-min 16)
+         min-entries (get opts :index-min default-index-min)
          r (rd/reader bs)
          acc (array)
          end (.-length bs)]
