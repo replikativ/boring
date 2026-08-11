@@ -962,11 +962,36 @@
                   stride (long (if (= a (long n)) 1 (.stride ^Index idx)))
                   span (- (long n) (* (dec a) stride))
                   map? (= 5 m)
+                  ;; THE REMAINDER WALK SKIPS ITS ENTRIES THROUGH THIS SAME
+                  ;; FUNCTION, not through `.skipFrom`. The last anchor is
+                  ;; within `stride` entries of the end, and those entries are
+                  ;; walked -- but an entry's VALUE can itself be a large
+                  ;; indexed container, and `.skipFrom` past one is the full
+                  ;; subtree walk this function exists to remove. So the
+                  ;; pathological case was "the jump worked, and then we walked
+                  ;; a 3000-element array anyway because it happened to be the
+                  ;; last entry". Recursing makes the skip O(nesting depth)
+                  ;; instead of O(subtree).
+                  ;;
+                  ;; A MAP'S KEY GOES THROUGH `.skipFrom` and only its VALUE
+                  ;; recurses: a key is a string or an integer, never a
+                  ;; container worth a node, so recursing on it would pay the
+                  ;; gate's two reads for nothing.
+                  ;;
+                  ;; Terminating: each recursion is on a value strictly inside
+                  ;; this container, so the depth is the document's nesting
+                  ;; depth and not the entry count.
+                  ;;
+                  ;; MEASURED on a 20-element array at stride 16 whose entry 18
+                  ;; is a 3000-element array with a node of its own -- so the
+                  ;; jump lands and the remainder walk meets it: 107.3 us
+                  ;; through `.skipFrom` against 3.78 recursing, 28.4x, on a
+                  ;; byte-identical blob. `remainder-skip-test` pins it.
                   e (loop [q (long (aget la 0)) k (long span)]
                       (if (or (zero? k) (neg? q)) q
                           (recur (long (if map?
-                                         (.skipFrom r (.skipFrom r q))
-                                         (.skipFrom r q)))
+                                         (skip-value nav r (.skipFrom r q))
+                                         (skip-value nav r q)))
                                  (dec k))))]
               (if (and (> e vp) (<= e (.size r))) e (.skipFrom r vp)))
             (catch RuntimeException _ (.skipFrom r vp))))))))
