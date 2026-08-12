@@ -1591,7 +1591,6 @@
   independently and must decide the same way."
   64)
 
-
 (def ^:private ^:const map-capture-span-guard
   "Bytes per entry a map must plausibly have before the walk captures it at
   stride 1, which costs `n` longs.

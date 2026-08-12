@@ -921,7 +921,7 @@
   must be slowness, never a different answer."
   (^long [^Nav nav ^Reader r ^long vp] (skip-value nav r vp 0))
   (^long [^Nav nav ^Reader r ^long vp ^long sdepth]
-  (let [m (.majorAt r vp)]
+   (let [m (.majorAt r vp)]
     ;; THE GATE IS PAID ON EVERY VALUE A SCAN STEPS OVER, and it is not free:
     ;; measured over 60 small values at stride 1, 4.23 us against 3.36 for the
     ;; unpatched walk -- about 14 ns per entry for the call, two reads and a
@@ -941,22 +941,22 @@
     ;; size. Honest anchors nest no deeper than the document does, and
     ;; `:max-depth` caps documents at 1024; past that this falls back to the
     ;; structural walk, which is slow and correct.
-    (if-not (and (< sdepth 1024)
-                 (or (= 4 m) (= 5 m))
-                 (>= (.headArgAt r vp) jump-min-entries))
-      (.skipFrom r vp)
-      (let [ns* (node-slot nav vp)]
-        (if (neg? ns*)
-          (.skipFrom r vp)
-          (try
-            (let [idx (nav-idx nav)
+     (if-not (and (< sdepth 1024)
+                  (or (= 4 m) (= 5 m))
+                  (>= (.headArgAt r vp) jump-min-entries))
+       (.skipFrom r vp)
+       (let [ns* (node-slot nav vp)]
+         (if (neg? ns*)
+           (.skipFrom r vp)
+           (try
+             (let [idx (nav-idx nav)
                   ;; THE LAST ANCHOR AND THE COUNT, without building the node.
                   ;; This read `slot-at`, which allocates a `long[m]` and
                   ;; prefix-sums every anchor, to use exactly two of its
                   ;; values -- 24 016 B and 9.075 us on a 3000-element array
                   ;; against 32 B and 4.580 here. See `anchor-at`.
-                  ^longs la (anchor-at r idx ns* -1)
-                  a (aget la 1)
+                   ^longs la (anchor-at r idx ns* -1)
+                   a (aget la 1)
                   ;; A NODE WITH NO ANCHORS HAS TO BE REFUSED HERE. `slot-at`
                   ;; returned an empty array and `(aget anchors -1)` raised an
                   ;; AIOOBE that the `catch` below turned into a walk, so the
@@ -965,13 +965,13 @@
                   ;; too long AND starts the walk at the container's own head
                   ;; rather than an entry -- a wrong END, which is a wrong
                   ;; ANSWER. `:index-min 0` legitimately produces such a node.
-                  _ (when (zero? a) (throw (ex-info "no anchors" {:node ns*})))
-                  n (.headArgAt r vp)
+                   _ (when (zero? a) (throw (ex-info "no anchors" {:node ns*})))
+                   n (.headArgAt r vp)
                   ;; Same derivation as `lookup-map`: anchor count equals entry
                   ;; count only at stride 1.
-                  stride (long (if (= a (long n)) 1 (.stride ^Index idx)))
-                  span (- (long n) (* (dec a) stride))
-                  map? (= 5 m)
+                   stride (long (if (= a (long n)) 1 (.stride ^Index idx)))
+                   span (- (long n) (* (dec a) stride))
+                   map? (= 5 m)
                   ;; THE REMAINDER WALK SKIPS ITS ENTRIES THROUGH THIS SAME
                   ;; FUNCTION, not through `.skipFrom`. The last anchor is
                   ;; within `stride` entries of the end, and those entries are
@@ -1003,20 +1003,20 @@
                   ;; through the RuntimeException catch below. `anchor-at`
                   ;; bounds anchors to (0, data-end) but nothing tied them to
                   ;; THIS container; a frame is bytes somebody else wrote.
-                  _ (when (<= (aget la 0) vp) (throw (ex-info "anchor at or before head" {})))
-                  e (loop [q (long (aget la 0)) k (long span)]
-                      (if (or (zero? k) (neg? q)) q
+                   _ (when (<= (aget la 0) vp) (throw (ex-info "anchor at or before head" {})))
+                   e (loop [q (long (aget la 0)) k (long span)]
+                       (if (or (zero? k) (neg? q)) q
                           ;; MONOTONIC OR WALK. Each step must land strictly
                           ;; past where it started, or the loop is riding a
                           ;; crafted cycle; `.skipFrom` consumes at least one
                           ;; byte or throws typed, so the fallback restores
                           ;; progress as well as truth.
-                          (let [q' (long (if map?
-                                           (skip-value nav r (.skipFrom r q) (inc sdepth))
-                                           (skip-value nav r q (inc sdepth))))]
-                            (recur (if (> q' q) q' (.skipFrom r q)) (dec k)))))]
-              (if (and (> e vp) (<= e (.size r))) e (.skipFrom r vp)))
-            (catch RuntimeException _ (.skipFrom r vp)))))))))
+                           (let [q' (long (if map?
+                                            (skip-value nav r (.skipFrom r q) (inc sdepth))
+                                            (skip-value nav r q (inc sdepth))))]
+                             (recur (if (> q' q) q' (.skipFrom r q)) (dec k)))))]
+               (if (and (> e vp) (<= e (.size r))) e (.skipFrom r vp)))
+             (catch RuntimeException _ (.skipFrom r vp)))))))))
 
 (defn- scan-map
   "Linear walk of a map's entries from `start`, at most `limit` of them.
