@@ -15,6 +15,40 @@ happen to have been designed in the same week.
 
 ---
 
+## When it pays, in one table
+
+A CBOR container carries an element COUNT, not a byte length, so stepping past
+a value is a structural walk of its subtree. The cost of reaching a field is
+therefore proportional to **the number of CBOR items in front of it** — not to
+the document's size in bytes, and not to how many entries its containers have.
+An index replaces that walk with a jump.
+
+Measured by sweeping exactly that one quantity and holding the rest still
+(`konserve-lmdb`'s `bench-crossover`, 200 documents, one field read per
+document, ZFS, CPU pinned to one power profile):
+
+| items before the field | walk | jump (`:index 16`) |
+|---|---|---|
+| 32 | 0.80 µs | 0.73 µs |
+| 160 | 1.68 | 1.80 |
+| 288 | 2.38 | 1.69 |
+| 512 | 4.02 | 1.75 |
+| 2048 | 15.36 | 1.94 |
+| 8192 | **56.84** | **2.79** |
+
+- **A walk costs ~7 ns per item.** That is the slope of the left column.
+- **A jump is flat** — 1.7 to 2.8 µs while the walk grows 34x. What it costs is
+  opening the frame, and that does not depend on what it skips.
+- **The crossover is a few hundred items.** Below ~200 the two are within noise;
+  the index pulls away durably from ~300. Under that, opening the frame costs
+  more than the walk it saves.
+
+So: index a document when the fields you read sit behind bulk. Do not index one
+you read from the front, and do not index one you decode whole — a decode pays
+once for everything, where navigation pays per lookup.
+
+---
+
 ## The layout
 
 A sealed document is a CBOR **sequence** (RFC 8742) of two or more top-level

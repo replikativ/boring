@@ -129,7 +129,7 @@
 
 ;; ---------------------------------------------------------------- the source
 
-(declare slot-at sorted-at? container-at count-at check-stringref-navigable!
+(declare slot-at anchor-at sorted-at? container-at count-at check-stringref-navigable!
          byte-string-at root-cursor reader-root-offset)
 
 ;; A TYPE, not a fifteen-key map. `index-payload` used to return one, and on a
@@ -459,7 +459,7 @@
   ;; `:canonical` in it and re-resolving reads that as the caller trying to
   ;; override what the profile locks.
   (let [_ (when-not (or (map? opts) (nil? opts) (instance? NavContext opts))
-            (fail :boring/bad-options
+            (fail :boring/bad-argument
                   (str "boring.nav: expected an options map or a `nav/context`, got "
                        (some-> opts class .getName))
                   {:got (class opts)}))
@@ -868,6 +868,156 @@
           (System/arraycopy tail 0 out hn tn)
           out)))))
 
+(def ^:private ^:const jump-min-entries
+  "Below this many entries, do not consult the index to skip a container.
+
+  MUST EQUAL `boring.core/default-index-min`, and the reason is that this is
+  not a tuning knob at all: it is the reader's copy of the writer's floor, and
+  its only job is to skip a binary search over the container table that is
+  GUARANTEED to miss because no such container can have earned a node. Two byte
+  reads decide it -- the major type and the head argument, which for a
+  container is its element count.
+
+  IT SAID 16 AND MEANT `:index-min`'s DEFAULT, and then the default moved to 4
+  without this moving with it. For a while the writer placed nodes on 4- to
+  15-entry containers and this refused to consult them -- including the
+  five-key top-level map whose node was the entire argument for lowering the
+  floor. The docstring still claimed the two were the same number, which is how
+  it survived review.
+
+  `index-layout-test` pins them equal now, because a comment saying MUST EQUAL
+  is what was already here."
+  4)
+
+(defn- skip-value
+  "Where the value at `vp` ENDS -- by jumping over it through the index when it
+  is a container with a node, and by walking it otherwise.
+
+  WHY THIS EXISTS. A CBOR array or map carries an ELEMENT COUNT, not a byte
+  length, so `skipFrom` past one is a structural walk of its whole subtree.
+  Reaching a field that sits after a big container therefore costs the whole
+  container, and the index did nothing about it: it accelerated lookups INSIDE
+  a container and left skipping PAST one linear. Measured on a 3000-element
+  array of maps, one skip: 139.62 us walking against 0.54 us jumping, 224x, and
+  the jump is FLAT in container size while the walk is linear. It already wins
+  at 50 entries (5.80 us against 0.83).
+
+  HOW. A node's anchors are entry boundaries -- key positions for a map,
+  element positions for an array -- so the LAST anchor is within `stride`
+  entries of the end. Walk only that remainder. At stride 1 it is one entry
+  (0.11 us); at stride 64 it is up to 56 (3.03 us), which is why the stride is
+  the lever here as everywhere else.
+
+  THE ANSWER IS VERIFIED AGAINST THE WALK IN THE TESTS, not trusted from the
+  frame: a wrong end is a wrong ANSWER rather than an error, which is the one
+  outcome this namespace exists to make hard. The bounds check below rejects an
+  end that is not strictly after `vp` and inside the source, so a damaged
+  anchor falls back to the honest walk rather than returning a plausible
+  offset. Damage that stays inside those bounds remains the trust boundary
+  doc/INDEX.md describes and cannot be closed here.
+
+  Falls back to `skipFrom` on anything unexpected -- no node, no index, a slot
+  that will not read -- because this is an optimisation and its failure mode
+  must be slowness, never a different answer."
+  (^long [^Nav nav ^Reader r ^long vp] (skip-value nav r vp 0))
+  (^long [^Nav nav ^Reader r ^long vp ^long sdepth]
+   (let [m (.majorAt r vp)]
+    ;; THE GATE IS PAID ON EVERY VALUE A SCAN STEPS OVER, and it is not free:
+    ;; measured over 60 small values at stride 1, 4.23 us against 3.36 for the
+    ;; unpatched walk -- about 14 ns per entry for the call, two reads and a
+    ;; branch. That is the price of the 135.13 -> 17.53 us on the case this
+    ;; exists for, and of 133.45 -> 3.35 at stride 16.
+    ;;
+    ;; Checking `infoAt` first was tried, on the theory that CBOR's five-bit
+    ;; info field IS the count under 24 and would settle a small container
+    ;; without `headArgAt`'s possible multi-byte read. It bought nothing --
+    ;; 4.27 against 4.23 -- because `headArgAt` on a small container reads
+    ;; exactly those same bits. The cost is the call, not the read.
+    ;; THE DEPTH CAP IS A HOSTILE-FRAME BOUND, not a data bound. The
+    ;; remainder below recurses through skip-value for each entry it walks,
+    ;; and the recursion argument comes off the FRAME: a crafted anchor chain
+    ;; -- each anchor legally in bounds, each a byte past the last -- nests
+    ;; one call per link, so the depth is attacker-chosen up to the file
+    ;; size. Honest anchors nest no deeper than the document does, and
+    ;; `:max-depth` caps documents at 1024; past that this falls back to the
+    ;; structural walk, which is slow and correct.
+     (if-not (and (< sdepth 1024)
+                  (or (= 4 m) (= 5 m))
+                  (>= (.headArgAt r vp) jump-min-entries))
+       (.skipFrom r vp)
+       (let [ns* (node-slot nav vp)]
+         (if (neg? ns*)
+           (.skipFrom r vp)
+           (try
+             (let [idx (nav-idx nav)
+                  ;; THE LAST ANCHOR AND THE COUNT, without building the node.
+                  ;; This read `slot-at`, which allocates a `long[m]` and
+                  ;; prefix-sums every anchor, to use exactly two of its
+                  ;; values -- 24 016 B and 9.075 us on a 3000-element array
+                  ;; against 32 B and 4.580 here. See `anchor-at`.
+                   ^longs la (anchor-at r idx ns* -1)
+                   a (aget la 1)
+                  ;; A NODE WITH NO ANCHORS HAS TO BE REFUSED HERE. `slot-at`
+                  ;; returned an empty array and `(aget anchors -1)` raised an
+                  ;; AIOOBE that the `catch` below turned into a walk, so the
+                  ;; guard was accidental. `anchor-at` reports the count
+                  ;; instead, and without this `a` of 0 makes `span` one stride
+                  ;; too long AND starts the walk at the container's own head
+                  ;; rather than an entry -- a wrong END, which is a wrong
+                  ;; ANSWER. `:index-min 0` legitimately produces such a node.
+                   _ (when (zero? a) (throw (ex-info "no anchors" {:node ns*})))
+                   n (.headArgAt r vp)
+                  ;; Same derivation as `lookup-map`: anchor count equals entry
+                  ;; count only at stride 1.
+                   stride (long (if (= a (long n)) 1 (.stride ^Index idx)))
+                   span (- (long n) (* (dec a) stride))
+                   map? (= 5 m)
+                  ;; THE REMAINDER WALK SKIPS ITS ENTRIES THROUGH THIS SAME
+                  ;; FUNCTION, not through `.skipFrom`. The last anchor is
+                  ;; within `stride` entries of the end, and those entries are
+                  ;; walked -- but an entry's VALUE can itself be a large
+                  ;; indexed container, and `.skipFrom` past one is the full
+                  ;; subtree walk this function exists to remove. So the
+                  ;; pathological case was "the jump worked, and then we walked
+                  ;; a 3000-element array anyway because it happened to be the
+                  ;; last entry". Recursing makes the skip O(nesting depth)
+                  ;; instead of O(subtree).
+                  ;;
+                  ;; A MAP'S KEY GOES THROUGH `.skipFrom` and only its VALUE
+                  ;; recurses: a key is a string or an integer, never a
+                  ;; container worth a node, so recursing on it would pay the
+                  ;; gate's two reads for nothing.
+                  ;;
+                  ;; Terminating: each recursion is on a value strictly inside
+                  ;; this container, so the depth is the document's nesting
+                  ;; depth and not the entry count.
+                  ;;
+                  ;; MEASURED on a 20-element array at stride 16 whose entry 18
+                  ;; is a 3000-element array with a node of its own -- so the
+                  ;; jump lands and the remainder walk meets it: 107.3 us
+                  ;; through `.skipFrom` against 3.78 recursing, 28.4x, on a
+                  ;; byte-identical blob. `remainder-skip-test` pins it.
+                  ;; THE LAST ANCHOR MUST BE PAST THE CONTAINER HEAD. An
+                  ;; anchor AT the head recursed into skip-value(vp) forever
+                  ;; -- StackOverflowError, which is an Error, straight
+                  ;; through the RuntimeException catch below. `anchor-at`
+                  ;; bounds anchors to (0, data-end) but nothing tied them to
+                  ;; THIS container; a frame is bytes somebody else wrote.
+                   _ (when (<= (aget la 0) vp) (throw (ex-info "anchor at or before head" {})))
+                   e (loop [q (long (aget la 0)) k (long span)]
+                       (if (or (zero? k) (neg? q)) q
+                          ;; MONOTONIC OR WALK. Each step must land strictly
+                          ;; past where it started, or the loop is riding a
+                          ;; crafted cycle; `.skipFrom` consumes at least one
+                          ;; byte or throws typed, so the fallback restores
+                          ;; progress as well as truth.
+                           (let [q' (long (if map?
+                                            (skip-value nav r (.skipFrom r q) (inc sdepth))
+                                            (skip-value nav r q (inc sdepth))))]
+                             (recur (if (> q' q) q' (.skipFrom r q)) (dec k)))))]
+               (if (and (> e vp) (<= e (.size r))) e (.skipFrom r vp)))
+             (catch RuntimeException _ (.skipFrom r vp)))))))))
+
 (defn- scan-map
   "Linear walk of a map's entries from `start`, at most `limit` of them.
 
@@ -882,8 +1032,12 @@
   still give a wrong ANSWER -- that is the trust boundary doc/INDEX.md
   describes, and it cannot be closed here -- but it may not throw an untyped
   exception out of a lookup."
-  ^long [^Reader r ^long start ^long limit ^bytes probe]
-  (let [end (.size r)]
+  ;; `r` IS DERIVED, not passed. Clojure caps a primitive-returning fn at four
+  ;; arguments -- the same rule `write-indexed-resolved!` records -- and losing
+  ;; the `^long` return here would box on the hot path.
+  ^long [^Nav nav ^long start ^long limit ^bytes probe]
+  (let [^Reader r (.rdr nav)
+        end (.size r)]
     ;; The walk itself is guarded, not just its starting point. A start can be
     ;; in range while the item's DECLARED length runs past the buffer, so the
     ;; throw happens inside `skipFrom` before any check on its result could see
@@ -948,7 +1102,12 @@
             ;; being taken correctly and then thrown away by this line.
               (if (>= (inc i) limit)
                 -1
-                (let [q (skip r (skip r p))]
+                ;; THE VALUE IS SKIPPED THROUGH THE INDEX where it is a big
+                ;; container -- see `skip-value`. Reaching a field that sits
+                ;; after one used to cost the whole container, because a CBOR
+                ;; container carries an element count rather than a byte
+                ;; length.
+                (let [q (skip-value nav r (skip r p))]
                   (if (or (<= q p) (> q end)) -1 (recur (inc i) q))))))))
       (catch IndexOutOfBoundsException _ -1))))
 
@@ -1038,7 +1197,7 @@
     ;; map at stride 1, where they are the only thing that helps.
     (if (or (nil? slot) (zero? m)
             (and (> (long stride) 1) (not (sorted-at? r (.sorted-data idx) ns))))
-      (scan-map r (.headEndAt r off) n probe)
+      (scan-map nav (.headEndAt r off) n probe)
       ;; Entries after anchor a, which is NOT always `stride`: the last
       ;; anchor covers the remainder. Walking a full stride from it ran off
       ;; the end of the container and into whatever followed -- found by the
@@ -1087,14 +1246,14 @@
               ;; belongs. A negative is still re-derived, because a damaged
               ;; anchor can still start a bounded walk mid-item.
                 (confirm [^long hit]
-                  (if (neg? hit) (scan-map r (.headEndAt r off) n probe) hit))
+                  (if (neg? hit) (scan-map nav (.headEndAt r off) n probe) hit))
               ;; The binary search itself, over ONE encoding of the key. Taken
               ;; twice on a stringref document -- see `reference-probe`.
                 (bsearch [^bytes p]
                   (loop [lo 0 hi (dec m)]
                     (if (> lo hi)
                       (let [anchor (max 0 (min (dec m) hi))]
-                        (scan-map r (aget slot anchor) (span anchor) p))
+                        (scan-map nav (aget slot anchor) (span anchor) p))
                       (let [mid (quot (+ lo hi) 2)
                             q (long (aget slot mid))]
                         (if (or (neg? q) (>= q lim))
@@ -1135,7 +1294,7 @@
              (loop [a 0]
                (if (>= a m)
                  -1
-                 (let [hit (scan-map r (aget slot a) (span a) probe)]
+                 (let [hit (scan-map nav (aget slot a) (span a) probe)]
                    (if (>= hit 0) hit (recur (inc a)))))))))))))
 
 (defn- nth-item
@@ -1762,6 +1921,36 @@
   cursor (`(nav/offset (nav/root bs))`) purely to throw it away."
   ^long [s] (reader-root-offset ^Reader (.rdr ^Nav (source-of s))))
 
+;; --- the offset-layer sentinels, named -----------------------------------
+;;
+;; The offset layer returns a `long`: a real byte offset, or one of two
+;; sentinels. Naming them here means the contract lives in ONE place -- a
+;; future change to the values cannot silently desync a downstream `cond`, the
+;; way konserve-lmdb, kabel and datahike would each hardcode -1/-2 otherwise.
+;; Primitive `^long` in, boolean out, inlined so there is no boxing on scans.
+
+(def ^:no-doc ^:const absent-offset -1)
+(def ^:no-doc ^:const unnameable-offset -2)
+
+(defn absent?
+  "True when an offset-layer return means the path led to nothing -- no such
+  key, or an index out of range. See `walk-from`."
+  {:inline (fn [o] `(== (long ~o) -1))}
+  [^long o] (== o -1))
+
+(defn no-offset?
+  "True when the value is PRESENT but no byte offset can name it, so a caller
+  should fall back to the cursor `walk`/`value`. Tag structures and
+  shaped-array rows are the two cases. See `walk-from`."
+  {:inline (fn [o] `(== (long ~o) -2))}
+  [^long o] (== o -2))
+
+(defn found?
+  "True when the return is a real offset -- neither sentinel -- so
+  `value-at`/`long-at` will read it rather than raise `:boring/absent`."
+  {:inline (fn [o] `(not (neg? (long ~o))))}
+  [^long o] (not (neg? o)))
+
 ;; ------------------------------------------------------- the offset layer
 ;;
 ;; Everything below takes `(source, offset)` and returns a `long` or a scalar.
@@ -1771,8 +1960,19 @@
 ;; caller writing its own walker. konserve-lmdb wrote two, and both disagreed
 ;; with this namespace.
 ;;
-;; -1 MEANS ABSENT, everywhere, and that is the only sentinel. A caller that
-;; passes it on to `value-at` gets a typed error rather than a wrong answer.
+;; TWO SENTINELS, both negative, both refused by `value-at`/`long-at` as a
+;; typed `:boring/absent` rather than a wrong answer:
+;;
+;;   -1  ABSENT -- the path led nowhere (no such key, index out of range).
+;;   -2  PRESENT BUT UNNAMEABLE -- the value is there, but no offset can name
+;;       it, so fall back to the cursor `walk`. A tag structure and a shaped-
+;;       array row are the two cases: `walk-from` cannot descend a tag, and a
+;;       shaped row is synthesised, not a byte range.
+;;
+;; `walk-from`'s docstring is canonical for both; the predicates `absent?`,
+;; `no-offset?` and `found?` below name them so no caller hardcodes the
+;; numbers. This comment said "-1 is the only sentinel" through three releases
+;; that returned -2 from `walk-from`, `field-offset` and `nth-offset`.
 
 (defn probe
   "`k` encoded once, to hand to `field-offset` in a loop.
@@ -2869,7 +3069,11 @@
         ;; decided here -- the payload's element COUNT says so, and the caller
         ;; has already read that off the array head.
         e5 (.skipFrom r e4)]
-    [e0 e1 e2 e3 e4 e5]))
+    ;; A `long[6]`, NOT a vector: this is one allocation per index open, and the
+    ;; open is what a scan pays per row. Six boxed Longs in a PersistentVector
+    ;; against 64 bytes of primitives.
+    (doto (long-array 6)
+      (aset 0 e0) (aset 1 e1) (aset 2 e2) (aset 3 e3) (aset 4 e4) (aset 5 e5))))
 
 (def ^:private ^:const stringref-layout-v1 1)
 
@@ -2892,6 +3096,12 @@
   nil for any shape this does not recognise, which the caller treats as
   \"no pointer table\" -- the same answer a six-element payload gives."
   [^Reader r ^long p]
+  ;; KEEPS `byte-string-at`, where `index-payload` uses the single-long
+  ;; `bs-data`/`bs-len`. Those are defined BELOW this function, so using them
+  ;; here means going through the `declare` -- which loses the `^long` return
+  ;; hint and made the open 0.87 us / 647 B become 10.5 us / 25 370 B, a 39x
+  ;; allocation regression from a forward reference. Called once per open, so
+  ;; the vector costs less than moving the definitions would risk.
   (when-let [[data len] (byte-string-at r p)]
     (let [len (long len)]
       ;; ONE BYTE IS A VALID TABLE -- the layout byte and no pairs. That is a
@@ -2908,7 +3118,10 @@
               body (dec len)]
           (when (and (= stringref-layout-v1 (bit-and lay 0xF))
                      (zero? (rem body pw)))
-            [(inc (long data)) (quot body pw) iw ow]))))))
+            ;; A `long[4]`, not a vector -- see `slot-table`. [base count iw ow].
+            (doto (long-array 4)
+              (aset 0 (inc (long data))) (aset 1 (quot body pw))
+              (aset 2 iw) (aset 3 ow))))))))
 
 (defn- slot-le
   "The `w`-byte little-endian value at ABSOLUTE offset `p`.
@@ -2962,7 +3175,9 @@
                  (>= slots-len (+ tbase (* entries w)))
                  (= slots-len
                     (slot-le r (+ slots-data tbase (* (dec entries) w)) w)))
-        [(+ slots-data tbase) w]))))
+        ;; A `long[2]`, not a vector -- one allocation per index open, and the
+        ;; open is what a scan pays per row. [table-base entry-width].
+        (doto (long-array 2) (aset 0 (+ slots-data tbase)) (aset 1 w))))))
 
 (defn- slot-start
   "Byte offset where node `i`'s deltas begin, RELATIVE to the packed slots.
@@ -3024,32 +3239,41 @@
   (when (and (= 2 (.majorAt r off)) (not= 31 (.infoAt r off)))
     [(.headEndAt r off) (.headArgAt r off)]))
 
-(defn- le-array-at
-  "Data offset and byte length of the RFC 8746 little-endian typed array at
-  `off`, or nil.
+;; ONE LONG EACH, because the vector above is per-OPEN allocation on the scan
+;; path and the open is now the whole of what a scan allocates per row. Two
+;; calls re-read the head, which is a byte and a branch; the vector was ~72
+;; bytes and a boxed pair. `-1` for "not a definite-length byte string", which
+;; every caller already treats as "no index".
+(defn- bs-data ^long [^Reader r ^long off]
+  (if (and (= 2 (.majorAt r off)) (not= 31 (.infoAt r off))) (.headEndAt r off) -1))
 
-  Requires the tag AND that its payload is a DEFINITE-length byte string. The
-  major check is not optional: without it the previous frame shape -- where this
-  element was a CBOR array -- gets a `headEndAt` and a `headArgAt` that both
-  succeed, returning the element COUNT and the first element's offset, and the
-  reader goes on to compute node offsets from them. The refusal has to be exact,
-  which is the whole compatibility argument for changing the layout.
+(defn- bs-len ^long [^Reader r ^long off]
+  (if (and (= 2 (.majorAt r off)) (not= 31 (.infoAt r off))) (.headArgAt r off) -1))
 
-  WHAT KEEPS THE RESULTING OFFSETS INSIDE THE FILE is not here, and is worth
-  naming because nothing near the accessors says it. Neither length returned
-  here is checked against the file. `count-at` and `container-at` are
-  nevertheless in-file for every `i < n` because of TWO things elsewhere:
-  `read-index*`'s `(= n (skip r ptr))` forces the whole frame to tile exactly
-  to EOF, and `Reader.checkCount` refuses any byte-string length exceeding
-  `remaining()`. That EOF check is documented where it lives purely as the
-  stale-index defence -- the concatenated-sealed-batches bug -- and is now also
-  the sole bound on two byte-offset accessors. Relaxing it would silently
-  un-bound both."
-  [^Reader r ^long off ^long tag]
-  (when (and (= 6 (.majorAt r off)) (= tag (.headArgAt r off)))
-    (let [bs (.headEndAt r off)]
-      (when (and (= 2 (.majorAt r bs)) (not= 31 (.infoAt r bs)))
-        [(.headEndAt r bs) (.headArgAt r bs)]))))
+;; ONE LONG EACH -- see `bs-data`. `index-payload` reads `containers` and
+;; `counts` through these and tries tag 78 before 79, so the vector-returning
+;; `le-array-at` these replace allocated up to four per open.
+;;
+;; THE TAG CHECK IS NOT OPTIONAL, and this is the whole compatibility argument
+;; for the v2 layout: without it the PREVIOUS frame shape -- where this element
+;; was a CBOR array -- gets a `headEndAt` and a `headArgAt` that both succeed,
+;; returning the element COUNT and the first element's offset, and the reader
+;; goes on to compute node offsets from them. The refusal has to be exact.
+;;
+;; NEITHER LENGTH IS CHECKED AGAINST THE FILE HERE. `count-at` and
+;; `container-at` are in-file for every `i < n` because of two things
+;; elsewhere: `read-index*`'s `(= n (skip r ptr))` forces the frame to tile
+;; exactly to EOF, and `Reader.checkCount` refuses a byte-string length past
+;; `remaining()`.
+(defn- le-data ^long [^Reader r ^long off ^long tag]
+  (if (and (= 6 (.majorAt r off)) (= tag (.headArgAt r off)))
+    (bs-data r (.headEndAt r off))
+    -1))
+
+(defn- le-len ^long [^Reader r ^long off ^long tag]
+  (if (and (= 6 (.majorAt r off)) (= tag (.headArgAt r off)))
+    (bs-len r (.headEndAt r off))
+    -1))
 
 (defn- le-signed-at
   "The signed little-endian value of width `w` (4 or 8) at absolute offset `p`.
@@ -3202,6 +3426,72 @@
             (recur (inc k) (+ p sz) v))))
       a)))
 
+(defn- anchor-at
+  "Node `i`'s anchor `k`, and its anchor COUNT, without materialising the node.
+
+  `slot-at` allocates a `long[m]` and prefix-sums every anchor of the node.
+  Two of its three callers then read ONE element: `skip-value` takes the last
+  anchor, `nth-item` takes the anchor its index lands on. Only `lookup-map`'s
+  binary search genuinely needs random access, and it keeps `slot-at`.
+
+  MEASURED on a 3000-element array of two-key maps, one skip per row, min of 7
+  runs of 20 000 calls:
+
+      slot-at, stride 1 (m=3000)     9.075 us   24016 B
+      this,    stride 1              4.580 us      32 B
+      slot-at, stride 16 (m=188)     0.584 us    1520 B
+      this,    stride 16             0.352 us      32 B
+
+  The 24 KB is a `long[3000]` built to read its last element, and it was the
+  whole of the stride-1 allocation penalty: 24016 + 1290 (the index open) + 11
+  (the rest of the per-row path) is exactly the 25 317 B/row a scan measured.
+
+  `k` OF -1 MEANS THE LAST ANCHOR, which is what `skip-value` wants and what it
+  would otherwise need the count to ask for.
+
+  RETURNS TWO LONGS IN A FRESH `long[2]` -- [anchor count] -- rather than a
+  vector or a map. 32 bytes against the 24 016 a `long[3000]` costs, and it
+  cannot take the array from the caller instead: that would be a fifth
+  argument, and Clojure caps a fn with primitive hints at four.
+
+  THE BOUNDS ARE `slot-at`'s, deliberately duplicated rather than shared: they
+  are what keeps a damaged frame from reaching `Reader.skipFrom`'s unchecked
+  array access, and a refactor that let one path keep them while the other
+  drifted is the failure this file has had three times. Any change here is a
+  change there.
+
+  DO NOT BOX THE ACCUMULATOR. Written first with the result array constructed
+  inside the loop's else branch, which made the accumulator an Object for all
+  m iterations and ran 3x SLOWER than the allocating version it replaces."
+  ^longs [^Reader r ^Index ix ^long i ^long k]
+  (let [sdata (.slots-data ix)
+        slen (.slots-len ix)
+        lim (.data-end ix)
+        w (width-code r sdata i)
+        sz (bit-shift-left 1 w)
+        start (slot-start r (.slots-tbase ix) (.slots-wstart ix) i)
+        nxt (slot-start r (.slots-tbase ix) (.slots-wstart ix) (inc i))
+        m (quot (- nxt start) sz)]
+    (when (or (neg? start) (neg? m) (> (+ start (* m sz)) slen))
+      (throw (ex-info "boring: index slot segment outside the packed slots"
+                      {:type :boring/bad-index :node i :start start
+                       :anchors m :width sz :slots-length slen})))
+    (let [want (if (neg? k) (dec m) k)]
+      (loop [j 0
+             p (+ sdata start)
+             acc (max 0 (container-at r ix i))]
+        (if (or (>= j m) (> j want))
+          (doto (long-array 2) (aset 0 acc) (aset 1 m))
+          ;; `unchecked-add` and the range check for the reasons `slot-at`
+          ;; gives -- a width-3 delta is an unconstrained signed 64-bit value
+          ;; off the wire, and `+` on primitive longs throws on overflow.
+          (let [v (unchecked-add acc (delta-at r p w))]
+            (when (or (neg? v) (>= v lim))
+              (throw (ex-info "boring: index anchor outside the data section"
+                              {:type :boring/bad-index :node i :anchor j
+                               :offset v :data-end lim})))
+            (recur (inc j) (+ p sz) v)))))))
+
 (defn- index-payload
   "The usable index in the tag-27 frame at `ptr`, or nil meaning \"scan\".
 
@@ -3270,9 +3560,13 @@
           ;; the `.readFrom` vector, so `payload-offsets` ran BEFORE the override
           ;; and `slot-table` ran AFTER the restore. Invisible, and a trap to
           ;; preserve blindly.
-          [off-stride off-containers off-counts off-slots off-sorted off-after]
-          (try (payload-offsets r ptr)
-               (catch Exception _ [nil nil nil nil nil nil]))
+          ^longs offs (try (payload-offsets r ptr) (catch Exception _ nil))
+          off-stride (when offs (aget offs 0))
+          off-containers (when offs (aget offs 1))
+          off-counts (when offs (aget offs 2))
+          off-slots (when offs (aget offs 3))
+          off-sorted (when offs (aget offs 4))
+          off-after (when offs (aget offs 5))
           ;; THE PAYLOAD'S ELEMENT COUNT decides what `off-after` names. Six
           ;; elements and it is `data-end`; seven and it is the stringref
           ;; pointer table, with `data-end` after it. `read-index*` has already
@@ -3289,8 +3583,8 @@
                       (try (stringref-table-at r (long off-after))
                            (catch Exception _ nil)))]
               (if t
-                (.setStringrefPointers r (long (nth t 0)) (int (nth t 1))
-                                       (int (nth t 2)) (int (nth t 3)))
+                (.setStringrefPointers r (aget ^longs t 0) (int (aget ^longs t 1))
+                                       (int (aget ^longs t 2)) (int (aget ^longs t 3)))
                 ;; NOT `setStringrefPointers` with four zeros, which is what
                 ;; this was. An EMPTY table is now a meaningful state -- a
                 ;; document that opens a namespace and references nothing --
@@ -3305,17 +3599,22 @@
                             (zero? (.majorAt r (long off-stride)))
                             (< (.infoAt r (long off-stride)) 28))
                    (.headArgAt r (long off-stride)))
-          [slots-data slots-len] (when off-slots (byte-string-at r (long off-slots)))
-          [sorted-data sorted-len] (when off-sorted (byte-string-at r (long off-sorted)))
+          slots-data (when off-slots (let [d (bs-data r (long off-slots))]
+                                       (when-not (neg? d) d)))
+          slots-len (when slots-data (bs-len r (long off-slots)))
+          sorted-data (when off-sorted (let [d (bs-data r (long off-sorted))]
+                                         (when-not (neg? d) d)))
+          sorted-len (when sorted-data (bs-len r (long off-sorted)))
           ;; CONTAINERS AT EITHER WIDTH, chosen by the tag rather than tested
           ;; for. Tag 78 is int32, tag 79 sint64; both are RFC 8746
           ;; little-endian, so entry `i` is `cw` bytes at `containers-data +
           ;; cw*i`. The `long[]` normalisation this replaces cost 1.21 us per
           ;; open on a 770-node frame -- more than the decode it normalised.
-          [containers-data containers-len cw]
-          (when off-containers
-            (or (when-let [[d l] (le-array-at r (long off-containers) 78)] [d l 4])
-                (when-let [[d l] (le-array-at r (long off-containers) 79)] [d l 8])))
+          cw (when off-containers
+               (cond (not (neg? (le-data r (long off-containers) 78))) 4
+                     (not (neg? (le-data r (long off-containers) 79))) 8))
+          containers-data (when cw (le-data r (long off-containers) (if (= 4 cw) 78 79)))
+          containers-len (when cw (le-len r (long off-containers) (if (= 4 cw) 78 79)))
           ;; COUNTS IS NOT DECODED. It is a tag-78 typed array, so its entries
           ;; are four little-endian bytes each and `count-at` loads one on
           ;; demand. Materialising it cost 1.07 us per open on a 770-node frame.
@@ -3329,10 +3628,11 @@
           ;; (RFC 8746); only 66, 74 and 75 are big-endian. So tag 70 has the
           ;; IDENTICAL byte layout to 78 and differs only in signedness, which
           ;; makes it the cheapest widening available if one is ever wanted.
-          [counts-data counts-len nw]
-          (when off-counts
-            (or (when-let [[d l] (le-array-at r (long off-counts) 78)] [d l 4])
-                (when-let [[d l] (le-array-at r (long off-counts) 79)] [d l 8])))
+          nw (when off-counts
+               (cond (not (neg? (le-data r (long off-counts) 78))) 4
+                     (not (neg? (le-data r (long off-counts) 79))) 8))
+          counts-data (when nw (le-data r (long off-counts) (if (= 4 nw) 78 79)))
+          counts-len (when nw (le-len r (long off-counts) (if (= 4 nw) 78 79)))
           ;; `readTypedArray` used to throw on a byte length that is not a
           ;; multiple of the element width; `quot` truncates instead. Without
           ;; this a 3081-byte counts string would yield n=770, agree with a
@@ -3403,7 +3703,7 @@
               ix0 (Index. st (long containers-data) (long cw)
                           (long counts-data) (long nw) (long n)
                           (long slots-data) (long slots-len)
-                          (long (nth table 0)) (long (nth table 1))
+                          (aget ^longs table 0) (aget ^longs table 1)
                           (long sorted-data) ptr nil nil)]
           ;; NO ASCENDING CHECK, and no counts check either -- a negative
           ;; count cannot reach past `slot-at`, which bounds its own segment
@@ -3456,7 +3756,7 @@
                   (Index. st (long containers-data) (long cw)
                           (long counts-data) (long nw) (long n)
                           (long slots-data) (long slots-len)
-                          (long (nth table 0)) (long (nth table 1))
+                          (aget ^longs table 0) (aget ^longs table 1)
                           (long sorted-data) ptr
                           (count-at r ix0 (long seq-slot))
                           seq-anchors)

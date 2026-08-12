@@ -349,6 +349,51 @@
   (.writeValue w v)
   w)
 
+(def ^:private ^ThreadLocal tl-writer
+  "One parked `Writer` per thread, reused by `encode`.
+
+  WHY: `encode` built a fresh 256-byte writer per call, so every call re-paid
+  two growth ladders -- the buffer's doublings up to the payload size, and the
+  stringref table's array/rehash climb. Measured on nippy's 15 KB stress
+  payload: 649 us fresh against 168 reusing a writer, and the reused writer
+  with stringref ON beat a fresh one with it OFF (168 vs 261) -- the ladders
+  were most of what stringref appeared to cost. nippy's `fast-freeze` is
+  `(impl/with-cache ...)`, the same device; comparing our fresh-per-call
+  against their cached one was never a codec comparison.
+
+  SAFE BECAUSE take-and-clear: `encode` takes the writer and nulls the slot,
+  so a REENTRANT encode -- a tag write-fn that itself calls `encode` -- finds
+  nil and builds fresh rather than corrupting the outer document. The finally
+  parks it back after `.reset`, so a writer that THREW is clean before reuse
+  (the same `write-root!`-resets-first contract `encode-into!` reuse already
+  relies on) and retains no reference to the last document's strings while
+  parked.
+
+  BOUNDED: a writer whose buffer grew past `tl-writer-max-retain` is dropped
+  rather than parked, so one huge payload does not pin a huge buffer on every
+  thread that ever encoded one."
+  (ThreadLocal.))
+
+(def ^:private ^:const tl-writer-max-retain
+  "Largest buffer worth parking, 1 MiB. Above it the next call rebuilds from
+  4 KiB, which costs the ladder once rather than holding megabytes per thread."
+  1048576)
+
+(def ^:private ^ThreadLocal tl-reader
+  "One parked `Reader` per thread, reused by `decode` for byte-array input.
+
+  The same two arguments as `tl-writer`: a fresh Reader per call re-grows the
+  stringref registration table every document, and take-and-clear makes
+  reentrancy build fresh instead of corrupting. Parked pointing at an EMPTY
+  array, so it retains neither the caller's input bytes nor -- via
+  `resetState` -- any decoded strings. Options are NOT sticky: `decode` runs
+  `configure-reader!` on every call, which sets every field unconditionally."
+  (ThreadLocal.))
+
+;; NOT ^:const: a const def INLINES ITS VALUE at every call site, and a
+;; byte[] cannot be embedded in compiled code ("Can't embed object in code").
+(def ^:private tl-reader-empty (byte-array 0))
+
 (defn encode
   "Encode `v` to a fresh byte[]: ONE CBOR data item, and never anything else.
 
@@ -387,8 +432,22 @@
   no frame."
   (^bytes [v] (encode v nil))
   (^bytes [v opts]
-   (let [o (resolve-opts opts)]
-     (.toByteArray ^Writer (write-root! (writer 256) v o)))))
+   (let [o (resolve-opts opts)
+         ;; TAKE-AND-CLEAR from the thread-local cache -- see `tl-writer` for
+         ;; why this is safe and what it is worth. A nested `encode` (a tag
+         ;; handler that encodes) finds nil and builds fresh; the `finally`
+         ;; parks the writer back whatever happened, RESET so it retains no
+         ;; reference to this document's strings while it waits.
+         cached (let [w (.get ^ThreadLocal tl-writer)]
+                  (when w (.set ^ThreadLocal tl-writer nil))
+                  w)
+         ^Writer w (or cached (writer 4096))]
+     (try
+       (.toByteArray ^Writer (write-root! w v o))
+       (finally
+         (when (<= (alength ^bytes (.buffer w)) tl-writer-max-retain)
+           (.reset w)
+           (.set ^ThreadLocal tl-writer w)))))))
 
 (defn encode-into!
   "Encode `v` using the reusable writer `w`, returning a byte[]. Reusing `w`
@@ -705,8 +764,23 @@
   (`clojure/char`, `java/period`, …) are known names and never reach this."
   ([src] (decode src nil))
   ([src opts]
-   (with-decode-errors (.read (configure-reader! (reader-of src "decode")
-                                                 (opt/check-opts opts))))))
+   (if (bytes? src)
+     ;; The dominant call shape, through the thread-local cache -- see
+     ;; `tl-reader`. `configure-reader!` runs per call and sets every option
+     ;; field unconditionally, so nothing about the previous call is sticky.
+     (let [cached (let [r (.get ^ThreadLocal tl-reader)]
+                    (when r (.set ^ThreadLocal tl-reader nil))
+                    r)
+           ^Reader r (if cached
+                       (doto ^Reader cached (.reset ^bytes src))
+                       (Reader. ^bytes src))]
+       (try
+         (with-decode-errors (.read (configure-reader! r (opt/check-opts opts))))
+         (finally
+           (.reset r ^bytes tl-reader-empty)
+           (.set ^ThreadLocal tl-reader r))))
+     (with-decode-errors (.read (configure-reader! (reader-of src "decode")
+                                                   (opt/check-opts opts)))))))
 
 (defn decode-at
   "Decode the CBOR item starting at byte offset `off` in `src`.
@@ -773,6 +847,54 @@
   #43. It is not a number to tune in isolation."
   4096)
 
+(def ^:private ^:const default-index-min
+  "The `:index-min` floor. MUST equal `Writer.idxMinEntries`'s initialiser and
+  the ClojureScript `default-index-min` -- three builders apply it and #38 is
+  about what happens when one drifts.
+
+  4, DOWN FROM 16, BECAUSE 16 DENIED A NODE TO THE ONE CONTAINER THAT MATTERS.
+  A document store's document is a small top-level map wrapping bulk -- a
+  header and a payload. At stride 1 a node on that map anchors every entry, so
+  a key lookup JUMPS OVER each preceding value instead of walking it. A
+  five-key root map never reached `keep-node?` at a floor of 16, and the node
+  it was denied was worth 5-8x.
+
+  MEASURED, 200 rows through a re-pointed source, one JVM per arm. `dom` is a
+  crawled-page record with a six-entry root over a thousand-item DOM subtree,
+  read at `[\"extracted\" \"canonical\"]`; `wide400` is a 400-event record read
+  at `[\"tail\" \"city\"]`:
+
+      floor    dom read   dom encode    wide400 read   wide400 encode
+         2    0.878 us    0.0509 ms       0.740 us       0.0718 ms
+         4    0.848       0.0330          0.562          0.0633
+         5    0.869       0.0294          0.563          0.0620
+         6    0.541       0.0344          0.542          0.0623
+         8    4.333       0.0246          1.209          0.0627
+        16    4.639       0.0232          1.261          0.0710
+
+  WHY 4 AND NOT 2. The floor is a CAPTURE gate on the write side: everything
+  that reaches `keep-node?` captures anchors first and is refused after. At 2
+  every two-entry map is a candidate, and the refused work is not free --
+  encode went 2.2x slower on `wide400` and the streaming writer's buffer
+  doubled -- for output that was BYTE-IDENTICAL at every floor. 4 keeps the
+  read win and most of the write cost goes away.
+
+  WHY NOT 6, WHICH READS BEST. Both fixtures happen to have six-entry roots, so
+  the cliff between 6 and 8 is a fact about them and not about documents. 6
+  would be a constant fitted to two records -- which is exactly the mistake
+  `keep-node?`'s previous docstring made, generalising \"inert at 2, 4, 16 and
+  64\" from flat konserve records to every shape.
+
+  WHAT WOULD BE BETTER THAN ANY NUMBER is exempting the ROOT container from the
+  floor: one container per item, so the capture is bounded, and no constant to
+  fit. Tried, and reverted -- the streaming writer and the byte walk do not
+  agree on which container is the root when the value is tag-wrapped, because
+  `Writer.depth` counts tags and `index-walk*`'s does not. The parity property
+  caught it. It is the right fix and it needs that mismatch resolved first.
+
+  `keep-node?` STILL DECIDES. The floor only controls what reaches it."
+  4)
+
 (defn encode-indexed
   "Encode `v` and seal an index onto it, returning a byte[].
 
@@ -789,7 +911,8 @@
   this; the sentence above used to be unconditional here only.
 
   `:index` is the stride (default 16) and `:index-min` the smallest container
-  worth a node (default 16). Sorted map keys -- `:canonical` or `:archival` --
+  worth a node (default 4 -- see `default-index-min`; `keep-node?` is the
+  actual rule and this is the floor under it). Sorted map keys -- `:canonical` or `:archival` --
   additionally allow binary search; without them a lookup still jumps anchor to
   anchor rather than entry to entry.
 
@@ -866,7 +989,7 @@
          w (writer 1024 o)
          out (java.io.ByteArrayOutputStream. 1024)
          info (long-array 2)
-         _ (write-indexed-capturing! w v out o stride (long (get o :index-min 16)) info)
+         _ (write-indexed-capturing! w v out o stride (long (get o :index-min default-index-min)) info)
          bs (.toByteArray out)]
      ;; A buffered caller slices; a streaming one stages. Same decision, same
      ;; bytes, different mechanism because the constraints differ.
@@ -947,7 +1070,7 @@
   appending a frame to a single `encode`d value would make it stop being a
   single well-formed CBOR item, which is why that is not done and will not be.
 
-  `:index-min` (default 16) is a SEPARATE knob and gates CONTAINER nodes, not
+  `:index-min` (default 4) is a SEPARATE knob and gates CONTAINER nodes, not
   the frame: a map or array with fewer than that many entries gets no node of
   its own. Raising it ABOVE the largest container but NO HIGHER THAN the item
   count gives an index over the ITEMS ONLY -- the right shape for a log you
@@ -1063,7 +1186,7 @@
    (let [o (writer-opts w)]
      (write-seq-resolved! w values out (assoc o :stringref false)
                           (long (get o :index default-index-stride))
-                          (long (get o :index-min 16)))))
+                          (long (get o :index-min default-index-min)))))
   (^long [^Writer w values ^java.io.OutputStream out opts]
    ;; RESOLVED FIRST, because resolution is what validates. `:index` was read
    ;; and coerced with `long` off the RAW map here, so `{:index "x"}` was a raw
@@ -1086,7 +1209,7 @@
                         :index (long (get o :index default-index-stride))})))
      (write-seq-resolved! w values out (assoc o :stringref false)
                           (long (get o :index default-index-stride))
-                          (long (get o :index-min 16))))))
+                          (long (get o :index-min default-index-min))))))
 
 (defn- write-seq-resolved!
   "`write-seq!` with options already resolved. See the note on its 3-arity."
@@ -1372,7 +1495,8 @@
   containers become jumps.
 
   `:index` is the stride (default 16) and `:index-min` the smallest container
-  worth a node (default 16). No frame is written when no container clears the
+  worth a node (default 4 -- see `default-index-min`; `keep-node?` is the
+  actual rule and this is the floor under it). No frame is written when no container clears the
   threshold.
 
   `:stringref` COMPOSES WITH `:index` here, unlike in `write-seq!`. It used to
@@ -1390,7 +1514,7 @@
    (let [o (writer-opts w)]
      (write-indexed-resolved! w v out o
                               (long (get o :index default-index-stride))
-                              (long (get o :index-min 16)))))
+                              (long (get o :index-min default-index-min)))))
   (^long [^Writer w v ^java.io.OutputStream out opts]
    ;; RESOLVED FIRST, because resolution is what validates. `:index` was read
    ;; and coerced with `long` off the RAW map here, so `{:index "x"}` was a raw
@@ -1400,7 +1524,7 @@
    (let [o (resolve-opts opts)]
      (write-indexed-resolved! w v out o
                               (long (get o :index default-index-stride))
-                              (long (get o :index-min 16))))))
+                              (long (get o :index-min default-index-min))))))
 
 (def ^:const index-name
   "Tag-27 type name for a sequence/container index. See doc/INDEX.md.
@@ -1497,9 +1621,17 @@
   An ARRAY or SORTED MAP is binary-searched, and that repays the frame from
   `walk-threshold` mean prefix items, so among containers that reach here
   `walk` decides and the entry count does not. `:index-min` gates what reaches
-  here, and since the unsorted rule below moved to items it is inert on every
-  realistic shape -- measured identical at 2, 4, 16 and 64 on konserve-shaped
-  records. It is a floor, not a tuning knob.
+  here, and it is a floor rather than a tuning knob -- but only since its
+  default came down to 2.
+
+  THIS USED TO CLAIM THE FLOOR WAS INERT: \"measured identical at 2, 4, 16 and
+  64 on konserve-shaped records\". That measurement was real and its
+  generalisation was false. konserve-shaped records are FLAT, and the shape it
+  missed is the one a document store actually holds -- a small top-level map
+  wrapping bulk. Such a map never reached this function at a floor of 16, and
+  the node it was denied was worth 6.4x. See `default-index-min`. A claim of
+  the form \"inert on every realistic shape\" from one family of fixtures is
+  exactly the failure mode #42 is about.
 
   An UNSORTED MAP cannot be binary-searched, so at a stride above 1
   `boring.nav` REFUSES the node -- an anchor loop over an unordered map visits
@@ -1944,7 +2076,7 @@
                                          "build-index cannot do; use `encode` instead")
                                     {:type :boring/bad-option :option :index :value 0})))
                   i)
-         min-entries (long (get opts :index-min 16))
+         min-entries (long (get opts :index-min default-index-min))
          idx (try
                (scan-index r 0 (alength bs) stride min-entries (long base))
                (catch StackOverflowError _
@@ -2812,20 +2944,23 @@
 ;; hiding it would reproduce the silent-wrong-hash failure this exists to stop.
 (defonce ^{:doc "True if the optional hasch integration is active."}
   hasch-integration?
-  (try
-    ;; HASCH ITSELF IS PROBED FIRST, not `boring.hasch`. The catch below reads
-    ;; as "the integration namespace is absent", and that was the same thing
-    ;; only while `boring/hasch.cljc` was missing from the jar -- which it was,
-    ;; silently, in every release. Shipping it made the two different: the
-    ;; require now FINDS the namespace and fails inside it on `hasch.benc`,
-    ;; wrapped in a Compiler$CompilerException that neither catch matches, so
-    ;; `(require 'boring.core)` threw for every consumer without hasch.
-    ;;
-    ;; Probing the optional dependency directly is what the comment above
-    ;; always claimed this did.
-    (require 'hasch.benc)
-    (require 'boring.hasch)
-    true
-    (catch java.io.FileNotFoundException _ false)
-    (catch ClassNotFoundException _ false)
-    (catch Exception _ false)))
+  ;; STAGED, so a hasch that is ABSENT reads false but a hasch that is
+  ;; PRESENT-BUT-BROKEN throws rather than reading false. `hasch.benc` is the
+  ;; optional dependency: probe it FIRST, catching only the "namespace absent"
+  ;; exceptions -- if it is missing we are a consumer without hasch and false
+  ;; is right. Once it loads, `boring.hasch` is OUR code and its require is
+  ;; UNGUARDED: a future hasch API change that breaks the integration must
+  ;; SURFACE at load, not be swallowed into `false`. A silent false is the
+  ;; exact content-addressing divergence `boring.hasch` exists to prevent --
+  ;; hasch on the classpath, but records and maps hashing differently because
+  ;; the integration quietly did not load. Historically this whole form was one
+  ;; try with a broad `(catch Exception _ false)`, which did that swallowing;
+  ;; and before THAT, `boring/hasch.cljc` was missing from the jar entirely, so
+  ;; the two states were indistinguishable. Shipping it (build.clj) plus this
+  ;; staging is what makes a Maven and a :local/root consumer agree.
+  (let [present? (try (require 'hasch.benc) true
+                      (catch java.io.FileNotFoundException _ false)
+                      (catch ClassNotFoundException _ false))]
+    (if present?
+      (do (require 'boring.hasch) true)     ; a load failure here PROPAGATES
+      false)))

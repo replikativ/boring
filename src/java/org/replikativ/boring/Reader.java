@@ -2807,7 +2807,7 @@ public final class Reader {
                 for (int i = 0; i < n; i++)
                     a[i] = Double.longBitsToDouble((long) LONG_BE.get(b, off + (i << 3)));
                 return a; }
-            default: throw Err.of("malformed", "boring: unhandled typed array " + tag);
+            default: throw Err.of("bad-tag-content", "boring: unhandled typed array " + tag);
         }
     }
 

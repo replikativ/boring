@@ -366,7 +366,15 @@ public final class Writer {
     // there.
 
     private int idxStride = 0;
-    private int idxMinEntries = 16;
+    /**
+     * The `:index-min` floor. MUST equal `boring.core/default-index-min` --
+     * the two index builders apply it independently and must decide the same
+     * way, which is the divergence class of #30, #34 and #43.
+     *
+     * <p>4, down from 16. See `boring.core/default-index-min` for the
+     * measurements and for why the sweep stopped at 4 rather than 2.
+     */
+    private int idxMinEntries = 4;
     /** Added to every recorded offset, so `write-seq!` gets file offsets. */
     private long idxBase = 0;
 
@@ -1723,7 +1731,7 @@ public final class Writer {
 
     void writeTag(long tag) {
         if (tag < 0)
-            throw Err.of("bad-tag",
+            throw Err.of("bad-tag-number",
                 "boring: tag must be non-negative, got " + tag, "tag", tag);
         // THE STRINGREF MACHINERY IS THE CODEC'S, NOT THE CALLER'S. Tag 25 is
         // an index into a table this writer builds while encoding, and tag 256
@@ -1779,14 +1787,14 @@ public final class Writer {
         if (tag instanceof java.math.BigInteger) {
             java.math.BigInteger b = (java.math.BigInteger) tag;
             if (b.signum() < 0 || b.bitLength() > 64)
-                throw Err.of("bad-tag",
+                throw Err.of("bad-tag-number",
                     "boring: tag must be an unsigned 64-bit integer, got " + b);
             if (b.bitLength() > 63) { headU64(TAG, b.longValue()); return; }
             head(TAG, b.longValue());
             return;
         }
         if (!(tag instanceof Number))
-            throw Err.of("bad-tag", "boring: tag must be an integer, got "
+            throw Err.of("bad-tag-number", "boring: tag must be an integer, got "
                 + (tag == null ? "nil" : tag.getClass().getSimpleName()));
         // FRACTIONAL tags were truncated, not refused: `longValue()` turned tag
         // 1.5 into tag 1, so `(tagged-value 1.5 0)` and `(tagged-value 1 0)`
@@ -1794,7 +1802,7 @@ public final class Writer {
         // else is a mistake the caller should hear about, not a value to round.
         if (tag instanceof Double || tag instanceof Float
             || tag instanceof java.math.BigDecimal || tag instanceof clojure.lang.Ratio)
-            throw Err.of("bad-tag",
+            throw Err.of("bad-tag-number",
                 "boring: tag must be an integer, got " + tag);
         writeTag(((Number) tag).longValue());
     }
@@ -2998,6 +3006,7 @@ public final class Writer {
         srCount++;
     }
 
+    @SuppressWarnings("deprecation")
     private void writeStringLiteral(String s, int slot) {
         int n = s.length();
         // CAPTURED BEFORE `ensure`, and that is safe rather than lucky:
@@ -3021,15 +3030,25 @@ public final class Writer {
         int hdrStart = pos;
         int hdrLen = headLen(n);
         int p = hdrStart + hdrLen;
+        // SCAN, THEN BULK COPY -- not one fused char-at-a-time write loop.
+        // The fused loop was a scalar read+branch+store per character, and
+        // `writeString` was 25% of a whole-payload encode profile with a 3 KB
+        // string paying ~3000 iterations. Split, the scan is a read-only
+        // compare loop and the copy is `String.getBytes(int,int,byte[],int)`,
+        // which on a Latin-1 compact string is a single System.arraycopy.
+        //
+        // That getBytes overload is deprecated because it TRUNCATES chars to
+        // bytes -- which is exactly wrong for non-ASCII and exactly right
+        // after the scan has proven every char < 0x80. The slow path keeps
+        // the careful streaming encoder, unpaired-surrogate refusal included.
         for (int i = 0; i < n; i++) {
-            char c = s.charAt(i);
-            if (c >= 0x80) { writeStringSlow(s, slot, off); return; }
-            buf[p++] = (byte) c;
+            if (s.charAt(i) >= 0x80) { writeStringSlow(s, slot, off); return; }
         }
+        s.getBytes(0, n, buf, p);
         // ASCII: byte length == char length, so the reserved header size is right.
         pos = hdrStart;
         head(TEXT, n);
-        pos = p;
+        pos = p + n;
         if (slot >= 0) srInsertAt(slot, s, n, off);
     }
 
@@ -3564,7 +3583,16 @@ public final class Writer {
             int slot = anchors != null ? reserveNode() : -1;
             int a = 0, countdown = 1, seen = 0;
             long itemsAtStart = idxItemsWritten, walkAcc = 0;
-            if (x instanceof java.util.RandomAccess) {
+            // NOT PersistentVector, although it is RandomAccess: its `get(i)`
+            // is `nth(i)`, and nth re-descends the trie to find the leaf array
+            // for EVERY element -- `arrayFor` alone was 8% of a whole-payload
+            // encode profile. Its iterator walks leaf arrays chunked, 32
+            // elements per descent, so PV takes the iterator branch below
+            // (whose seen>n guard is redundant for an immutable vector but
+            // harmless). ArrayList and friends keep the indexed branch, where
+            // get(i) is a flat array read.
+            if (x instanceof java.util.RandomAccess
+                    && !(x instanceof clojure.lang.PersistentVector)) {
                 // Indexed by position, so it cannot yield more or fewer than n.
                 for (int i = 0; i < n; i++) {
                     if (anchors != null && --countdown == 0) {

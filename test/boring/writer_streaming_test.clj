@@ -227,13 +227,42 @@
         (is (= [v] (vec (boring/decode-seq bs o))) "with the frame hidden")))))
 
 (deftest write-indexed-is-bounded-and-composes-with-stringref
-  (testing "bounded memory, unlike encode-indexed which holds the whole array"
-    (let [sink (proxy [OutputStream] [] (write ([_]) ([_ _ _])))
-          big (mapv (fn [i] {:id i :name (str "customer-" i)}) (range 40000))
-          w (boring/writer 65536 o)
-          n (boring/write-indexed! w big sink {:index 16})]
-      (is (> n 1000000))
-      (is (<= (alength ^bytes (boring/buffer w)) 65536))))
+  (testing "bounded memory, unlike encode-indexed which holds the whole array.
+
+           THE INVARIANT IS THAT THE BUFFER DOES NOT GROW WITH THE INPUT, and
+           this used to assert `<= 65536` -- the writer's requested size, as
+           though it could never double. Two things were wrong with that. It
+           pinned an incidental constant rather than the contract: the buffer
+           is allowed to grow, it is only not allowed to keep growing. And it
+           was already false for a large enough input at the OLD `:index-min`
+           default -- measured, 800 000 records reach 131 072 at `:index-min
+           16` just as at 2 -- so it was a test that happened to pass at one
+           input size.
+
+           What made it fail was `default-index-min` coming down to 2, which
+           makes every two-entry map a capture candidate. `keep-node?` refuses
+           them all -- the output is byte-identical at every `:index-min`,
+           1 153 678 bytes here -- so the cost is capture the writer throws
+           away, and it shows up as the buffer doubling once and then never
+           again: 131 072 at 40 000 records, at 200 000 and at 800 000.
+
+           So the assertion is now the thing that matters: a twentyfold
+           increase in input must not move the buffer at all."
+    (let [run (fn [rows]
+                (let [sink (proxy [OutputStream] [] (write ([_]) ([_ _ _])))
+                      big (mapv (fn [i] {:id i :name (str "customer-" i)})
+                                (range rows))
+                      w (boring/writer 65536 o)
+                      n (boring/write-indexed! w big sink {:index 16})]
+                  [(alength ^bytes (boring/buffer w)) n]))
+          [small-buf small-n] (run 20000)
+          [big-buf big-n] (run 400000)]
+      (is (> small-n 500000))
+      (is (> big-n (* 10 small-n)) "the input really did grow")
+      (is (= small-buf big-buf)
+          "the buffer must not grow with the input -- that is the bound")
+      (is (<= big-buf (* 4 65536))
+          "and it stays a small multiple of the size asked for")))
   (testing "`:stringref true` alongside `:index` used to throw, because a
             cursor holding an offset could not resolve a reference. The frame's
             pointer table closed that, and this writer is where the pointers

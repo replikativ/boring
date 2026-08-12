@@ -152,30 +152,33 @@ nippy reports, plus boring and the compressed tiers:
 
 | codec | freeze µs | thaw µs | round µs | bytes |
 |---|---:|---:|---:|---:|
-| **boring** | **285** | **310** | **595** | 15 326 |
-| boring `:shapes` | 288 | 315 | 603 | 15 326 |
-| nippy/fast | 399 | 533 | 932 | 17 105 |
-| nippy (LZ4) | 527 | 575 | 1 102 | 8 518 |
-| **boring + zstd** | 637 | 465 | 1 102 | **4 900** |
-| boring `:shapes` + zstd | 641 | 460 | 1 101 | 4 900 |
-| nippy/encrypted | 546 | 618 | 1 164 | 8 546 |
-| fressian | 1 647 | 1 213 | 2 860 | 12 222 |
-| fressian + zstd | 2 007 | 1 117 | 3 124 | 4 600 |
-| `pr-str` + `read-string` | 2 220 | 3 149 | 5 369 | 15 880 |
-| nippy/lzma2 | 6 336 | 2 743 | 9 079 | 3 888 |
+| nippy/fast | 584 | 1 075 | 1 659 | 14 017 |
+| boring | 728 | 934 | 1 662 | 15 326 |
+| boring `:shapes` | 746 | 940 | 1 686 | 15 326 |
+| nippy (LZ4) | 893 | 1 157 | 2 050 | 7 835 |
+| nippy/encrypted | 979 | 1 289 | 2 268 | 7 863 |
+| boring + zstd | 1 812 | 1 409 | 3 221 | 4 900 |
+| boring `:shapes` + zstd | 1 861 | 1 382 | 3 243 | 4 900 |
+| fressian | 5 165 | 3 286 | 8 451 | 12 222 |
+| fressian + zstd | 5 981 | 3 298 | 9 279 | 4 600 |
+| `pr-str` + `read-string` | 7 094 | 10 075 | 17 169 | 15 880 |
+| nippy/lzma2 | 15 804 | 7 162 | 22 966 | 3 700 |
 
-Raw against raw, boring is about 1.5× nippy/fast and over 4× fressian on
-round-trip. Two measurements on the same machine put those at 1.57×/4.81× and
-1.50×/4.16×; fressian is the one that moves, so the weaker bound is the one
-quoted.
+Measured against nippy **3.9.0-beta1** on `power-saver`; the harness now
+prints both, because the previous table outlived a nippy upgrade unnoticed —
+nippy/fast's output shrank 18% between releases and the drift read as our
+regression until the byte columns gave it away.
+
+Raw against raw, boring round-trips at parity with nippy/fast (1 662 against
+1 659): thaw 13% faster, freeze 1.25× behind. Against nippy's default it is
+1.23× faster, and over 5× fressian.
 
 The size column needs the compressed rows to be read fairly: `nippy/freeze`
-compresses above a size threshold, so its 8 518 is a codec *plus* a compressor
+compresses above a size threshold, so its 7 835 is a codec *plus* a compressor
 against boring's raw 15 326. Put both behind a compressor and **boring+zstd
-lands at 4 900 bytes against nippy's 8 518, in about the same round-trip
-time** — 1.7× smaller, within 10% on time (measured 1 102 µs against 1 102,
-and 1 186 against 1 099). nippy/lzma2 is smaller still at 3 888, for 8× the
-round-trip. fressian+zstd is 6% smaller than boring+zstd and 2.8× slower.
+lands at 4 900 bytes against nippy's 7 835 — 1.60× smaller — at 1.6× the
+round-trip time.** nippy/lzma2 is smaller still at 3 700, for 7× boring+zstd's
+round-trip. fressian+zstd is 6% smaller than boring+zstd and 2.9× slower.
 
 ## Reading: `byte[]`, FFM, and navigation
 

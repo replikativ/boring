@@ -235,7 +235,7 @@
       (head! w major (js/Number val))            ; shortest form, as usual
       (do (when (or (neg? val) (> val (js/BigInt "18446744073709551615")))
             (throw (ex-info (str "boring: tag must be an unsigned 64-bit integer, got " val)
-                            {:type :boring/bad-tag})))
+                            {:type :boring/bad-tag-number})))
           (ensure! w 9)
           (aset (.-buf w) (.-pos w) (bit-or major 27))
           (.setBigUint64 (.-dv w) (inc (.-pos w)) val)
@@ -478,14 +478,14 @@
     (= "bigint" (goog/typeOf t))
     (if (or (< t (js/BigInt 0)) (> t (js/BigInt "18446744073709551615")))
       (throw (ex-info (str "boring: tag must be an unsigned 64-bit integer, got " t)
-                      {:type :boring/bad-tag :tag (str t)}))
+                      {:type :boring/bad-tag-number :tag (str t)}))
       t)
     (not (number? t))
     (throw (ex-info (str "boring: tag must be an integer, got " (pr-str t))
-                    {:type :boring/bad-tag :tag t}))
+                    {:type :boring/bad-tag-number :tag t}))
     (or (not (js/Number.isInteger t)) (neg? t) (> t js/Number.MAX_SAFE_INTEGER))
     (throw (ex-info (str "boring: tag must be an unsigned integer, got " t)
-                    {:type :boring/bad-tag :tag t}))
+                    {:type :boring/bad-tag-number :tag t}))
 
     ;; THE STRINGREF MACHINERY IS THE CODEC'S, NOT THE CALLER'S. Tag 25 indexes
     ;; a table this writer builds while encoding and tag 256 declares its
