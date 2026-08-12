@@ -349,6 +349,51 @@
   (.writeValue w v)
   w)
 
+(def ^:private ^ThreadLocal tl-writer
+  "One parked `Writer` per thread, reused by `encode`.
+
+  WHY: `encode` built a fresh 256-byte writer per call, so every call re-paid
+  two growth ladders -- the buffer's doublings up to the payload size, and the
+  stringref table's array/rehash climb. Measured on nippy's 15 KB stress
+  payload: 649 us fresh against 168 reusing a writer, and the reused writer
+  with stringref ON beat a fresh one with it OFF (168 vs 261) -- the ladders
+  were most of what stringref appeared to cost. nippy's `fast-freeze` is
+  `(impl/with-cache ...)`, the same device; comparing our fresh-per-call
+  against their cached one was never a codec comparison.
+
+  SAFE BECAUSE take-and-clear: `encode` takes the writer and nulls the slot,
+  so a REENTRANT encode -- a tag write-fn that itself calls `encode` -- finds
+  nil and builds fresh rather than corrupting the outer document. The finally
+  parks it back after `.reset`, so a writer that THREW is clean before reuse
+  (the same `write-root!`-resets-first contract `encode-into!` reuse already
+  relies on) and retains no reference to the last document's strings while
+  parked.
+
+  BOUNDED: a writer whose buffer grew past `tl-writer-max-retain` is dropped
+  rather than parked, so one huge payload does not pin a huge buffer on every
+  thread that ever encoded one."
+  (ThreadLocal.))
+
+(def ^:private ^:const tl-writer-max-retain
+  "Largest buffer worth parking, 1 MiB. Above it the next call rebuilds from
+  4 KiB, which costs the ladder once rather than holding megabytes per thread."
+  1048576)
+
+(def ^:private ^ThreadLocal tl-reader
+  "One parked `Reader` per thread, reused by `decode` for byte-array input.
+
+  The same two arguments as `tl-writer`: a fresh Reader per call re-grows the
+  stringref registration table every document, and take-and-clear makes
+  reentrancy build fresh instead of corrupting. Parked pointing at an EMPTY
+  array, so it retains neither the caller's input bytes nor -- via
+  `resetState` -- any decoded strings. Options are NOT sticky: `decode` runs
+  `configure-reader!` on every call, which sets every field unconditionally."
+  (ThreadLocal.))
+
+;; NOT ^:const: a const def INLINES ITS VALUE at every call site, and a
+;; byte[] cannot be embedded in compiled code ("Can't embed object in code").
+(def ^:private tl-reader-empty (byte-array 0))
+
 (defn encode
   "Encode `v` to a fresh byte[]: ONE CBOR data item, and never anything else.
 
@@ -387,8 +432,22 @@
   no frame."
   (^bytes [v] (encode v nil))
   (^bytes [v opts]
-   (let [o (resolve-opts opts)]
-     (.toByteArray ^Writer (write-root! (writer 256) v o)))))
+   (let [o (resolve-opts opts)
+         ;; TAKE-AND-CLEAR from the thread-local cache -- see `tl-writer` for
+         ;; why this is safe and what it is worth. A nested `encode` (a tag
+         ;; handler that encodes) finds nil and builds fresh; the `finally`
+         ;; parks the writer back whatever happened, RESET so it retains no
+         ;; reference to this document's strings while it waits.
+         cached (let [w (.get ^ThreadLocal tl-writer)]
+                  (when w (.set ^ThreadLocal tl-writer nil))
+                  w)
+         ^Writer w (or cached (writer 4096))]
+     (try
+       (.toByteArray ^Writer (write-root! w v o))
+       (finally
+         (when (<= (alength ^bytes (.buffer w)) tl-writer-max-retain)
+           (.reset w)
+           (.set ^ThreadLocal tl-writer w)))))))
 
 (defn encode-into!
   "Encode `v` using the reusable writer `w`, returning a byte[]. Reusing `w`
@@ -705,8 +764,23 @@
   (`clojure/char`, `java/period`, …) are known names and never reach this."
   ([src] (decode src nil))
   ([src opts]
-   (with-decode-errors (.read (configure-reader! (reader-of src "decode")
-                                                 (opt/check-opts opts))))))
+   (if (bytes? src)
+     ;; The dominant call shape, through the thread-local cache -- see
+     ;; `tl-reader`. `configure-reader!` runs per call and sets every option
+     ;; field unconditionally, so nothing about the previous call is sticky.
+     (let [cached (let [r (.get ^ThreadLocal tl-reader)]
+                    (when r (.set ^ThreadLocal tl-reader nil))
+                    r)
+           ^Reader r (if cached
+                       (doto ^Reader cached (.reset ^bytes src))
+                       (Reader. ^bytes src))]
+       (try
+         (with-decode-errors (.read (configure-reader! r (opt/check-opts opts))))
+         (finally
+           (.reset r ^bytes tl-reader-empty)
+           (.set ^ThreadLocal tl-reader r))))
+     (with-decode-errors (.read (configure-reader! (reader-of src "decode")
+                                                   (opt/check-opts opts)))))))
 
 (defn decode-at
   "Decode the CBOR item starting at byte offset `off` in `src`.
