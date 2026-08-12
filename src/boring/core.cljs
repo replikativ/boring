@@ -91,6 +91,35 @@
   (wr/write-value! w v)
   w)
 
+(def ^:private cached-writer
+  "One parked Writer, reused by `encode` -- the ClojureScript face of the
+  JVM's `tl-writer`, without the ThreadLocal because a JS agent has one
+  thread. Same argument: a fresh 256-byte writer per call re-paid the buffer
+  growth ladder and the stringref/ident table climb every call -- a ladder the
+  JVM measured at 4x on a 15 KB payload (649 us fresh against 168 reused).
+
+  SAFE BECAUSE take-and-clear: `encode` takes the writer and nulls the slot,
+  so a REENTRANT encode -- a tag write-fn that itself calls `encode` -- finds
+  nil and builds fresh. `encode` is synchronous throughout, so event-loop
+  interleaving cannot observe a taken slot; reentrancy is the only way in.
+  The finally parks it back after `wr/reset!`, so a writer that threw is
+  clean and retains no reference to the last document's strings.
+
+  BOUNDED: a buffer grown past `writer-max-retain` is dropped rather than
+  parked -- the JVM's 1 MiB cap, which is also nippy's."
+  (volatile! nil))
+
+(def ^:private writer-max-retain 1048576)
+
+(def ^:private cached-reader
+  "One parked Reader, reused by `decode`. Same take-and-clear shape as
+  `cached-writer`; parked pointing at an EMPTY array so it retains neither
+  the caller's input nor any decoded strings. Options are not sticky:
+  `configure-reader!` sets every field per call."
+  (volatile! nil))
+
+(def ^:private empty-bytes (js/Uint8Array. 0))
+
 (defn encode
   "Encode `v` to a fresh Uint8Array: ONE CBOR data item, and never anything
   else.
@@ -105,7 +134,16 @@
   artifact, and `:index` is not an option here because it would change what the
   return value IS -- one item becomes a sequence."
   ([v] (encode v nil))
-  ([v opts] (wr/to-bytes (write-root! (wr/writer 256) v (resolve-opts opts)))))
+  ([v opts]
+   (let [o (resolve-opts opts)
+         taken (let [w @cached-writer] (when w (vreset! cached-writer nil)) w)
+         w (or taken (wr/writer 4096))]
+     (try
+       (wr/to-bytes (write-root! w v o))
+       (finally
+         (when (<= (.-length (wr/buffer w)) writer-max-retain)
+           (wr/reset! w)
+           (vreset! cached-writer w)))))))
 
 (defn encode-into!
   "Encode `v` using the reusable writer `w`, returning a Uint8Array. Reusing
@@ -236,8 +274,15 @@
   explicit constructor, or `boring.records/auto-registry`, both of which are
   portable."
   ([bs] (decode bs nil))
-  ([bs opts] (rd/read! (configure-reader! (rd/reader (bytes! bs "decode"))
-                                          (opt/check-opts opts)))))
+  ([bs opts]
+   (let [bs (bytes! bs "decode")
+         taken (let [r @cached-reader] (when r (vreset! cached-reader nil)) r)
+         r (if taken (do (rd/reset! taken bs) taken) (rd/reader bs))]
+     (try
+       (rd/read! (configure-reader! r (opt/check-opts opts)))
+       (finally
+         (rd/reset! r empty-bytes)
+         (vreset! cached-reader r))))))
 
 (defn decode-with
   "Decode using a reusable Reader. With `opts`, every option is re-applied on
