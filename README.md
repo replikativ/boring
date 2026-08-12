@@ -59,11 +59,16 @@ reach that can still carry edn faithfully: keywords, symbols, sets, ratios,
 records, metadata. A foreign reader gets your data as ordinary CBOR whether or
 not it knows what a keyword is.
 
-**The usual trade is that reach costs speed. Here it does not.** On the JVM
-boring beats nippy on every payload we measure and trades wins with [hako][].
-On ClojureScript it is always smaller on the wire than transit, faster on the
-datom-shaped data it was built for, and slower on generic data — see
-[Performance](doc/PERFORMANCE.md), which says exactly where.
+**Reach costs a little speed, and boring spends the rest of the budget
+closing that gap.** On the JVM, through each library's real API, it
+round-trips at parity with `nippy/fast` — decoding faster, encoding slower —
+and wins the string-heavy and same-shaped-map payloads it was built for while
+[hako][]'s FFM reader is faster on small and deeply nested maps. On
+ClojureScript it is always smaller on the wire than transit, faster on the
+datom-shaped data it was built for, and slower on generic data.
+[Performance](doc/PERFORMANCE.md) has the tables and says exactly where it
+wins and loses — no codec wins everywhere, and the honest picture is more
+useful than a flattering one.
 
 Getting there did not require changing a single byte of CBOR. Where boring
 needed more, it grew *inside* the format rather than around it: string
@@ -108,24 +113,32 @@ ClojureScript needs nothing.
 
 ## Speed
 
-JVM, µs/op, quiet machine, everyone's public API (a fresh writer and reader per
-call, as `nippy/fast-freeze` and `hako/encode` do). Lower is better; **bold**
-is the winner. Regenerate with `clojure -M:bench -m published`.
+JVM, µs/op, `power-saver`, nippy 3.9.0-beta1. **Bold is the winner of each
+row.** This measures a FRESH writer/reader per call — how `hako/encode` and
+`nippy/fast-freeze` are invoked — which is a worst case for boring, whose real
+`encode`/`decode` reuse a thread-local writer (see the stress-data table below
+for that reused-API comparison, where boring is at parity with `nippy/fast`).
+Regenerate with `clojure -M:bench -m published`.
 
 | payload | op | boring | boring `:shapes` | hako | nippy |
 |---|---|---:|---:|---:|---:|
-| small-map | encode | **0.14** | 0.22 | 0.20 | 0.24 |
-| small-map | decode | 0.31 | 0.31 | **0.25** | 0.29 |
-| mixed | encode | **0.13** | 0.21 | 0.18 | 0.27 |
-| mixed | decode | 0.21 | 0.21 | **0.18** | 0.22 |
-| nested-map-50 | encode | 5.29 | 5.60 | **4.08** | 7.01 |
-| nested-map-50 | decode | 7.08 | 7.11 | **4.34** | 8.06 |
-| datom-maps-200 | encode | 26.91 | 15.48 | **15.05** | 45.02 |
-| datom-maps-200 | decode | 21.01 | **11.41** | 11.54 | 49.97 |
-| long-vec-1k | encode | 6.74 | 6.76 | **6.65** | 10.91 |
-| long-vec-1k | decode | 11.05 | 11.07 | **4.65** | 10.23 |
-| str-maps-200 | encode | **23.17** | 25.48 | 23.31 | 36.50 |
-| str-maps-200 | decode | 22.63 | **13.77** | 23.20 | 38.86 |
+| small-map | encode | 0.82 | 1.27 | **0.68** | 0.95 |
+| small-map | decode | 0.92 | 1.13 | **0.71** | 0.97 |
+| mixed | encode | 0.77 | 1.21 | **0.65** | 0.68 |
+| mixed | decode | 0.67 | 0.63 | **0.62** | 0.84 |
+| nested-map-50 | encode | 14.42 | 15.11 | 14.20 | **13.97** |
+| nested-map-50 | decode | 22.13 | 22.05 | **14.09** | 18.25 |
+| datom-maps-200 | encode | 67.48 | 72.35 | **52.44** | 57.98 |
+| datom-maps-200 | decode | 69.39 | **35.94** | 38.93 | 81.73 |
+| long-vec-1k | encode | 15.61 | 15.80 | 16.76 | **13.21** |
+| long-vec-1k | decode | 36.91 | 36.05 | **32.60** | 34.56 |
+| str-maps-200 | encode | **63.43** | 66.70 | 82.45 | 74.97 |
+| str-maps-200 | decode | 69.55 | **54.58** | 79.51 | 106.44 |
+
+hako's FFM reader wins the small and nested maps; boring wins the string-heavy
+payloads (stringref) and the same-shaped-map decode (`:shapes`); nippy takes
+the flat numeric vectors. No codec wins everywhere. These absolute numbers are
+on `power-saver` and are for relative comparison, not throughput claims.
 
 Against nippy that is a win on **every encode cell**, plus the two large map
 payloads on decode — `datom-maps-200` by 2.5×, `str-maps-200` by 1.6×. The four
