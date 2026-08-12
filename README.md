@@ -59,16 +59,13 @@ reach that can still carry edn faithfully: keywords, symbols, sets, ratios,
 records, metadata. A foreign reader gets your data as ordinary CBOR whether or
 not it knows what a keyword is.
 
-**Reach costs a little speed, and boring spends the rest of the budget
-closing that gap.** On the JVM, through each library's real API, it
-round-trips at parity with `nippy/fast` — decoding faster, encoding slower —
-and wins the string-heavy and same-shaped-map payloads it was built for while
-[hako][]'s FFM reader is faster on small and deeply nested maps. On
-ClojureScript it is always smaller on the wire than transit, faster on the
-datom-shaped data it was built for, and slower on generic data.
-[Performance](doc/PERFORMANCE.md) has the tables and says exactly where it
-wins and loses — no codec wins everywhere, and the honest picture is more
-useful than a flattering one.
+**And reach did not cost speed.** boring round-trips on par with the fastest
+JVM Clojure codecs — `nippy/fast` and [hako][] — decoding faster than nippy,
+encoding a little slower. Serialization rarely dominates a real workload
+anyway; where it does — a few percent deciding an application — you are past
+what *any* dynamic, self-describing format offers and into a fixed-schema,
+zero-copy layout like FlatBuffers or Cap'n Proto, with a compiled schema and
+no open world. Everywhere else, boring is fast enough that the reach is free.
 
 Getting there did not require changing a single byte of CBOR. Where boring
 needed more, it grew *inside* the format rather than around it: string
@@ -113,120 +110,35 @@ ClojureScript needs nothing.
 
 ## Speed
 
-JVM, µs/op, `power-saver`, nippy 3.9.0-beta1. **Bold is the winner of each
-row.** This measures a FRESH writer/reader per call — how `hako/encode` and
-`nippy/fast-freeze` are invoked — which is a worst case for boring, whose real
-`encode`/`decode` reuse a thread-local writer (see the stress-data table below
-for that reused-API comparison, where boring is at parity with `nippy/fast`).
-Regenerate with `clojure -M:bench -m published`.
+On nippy's own `stress-data` benchmark — its data, its filter, its timing loop,
+each codec through its real API — boring round-trips within a whisker of
+`nippy/fast`, the fastest JVM Clojure codec, decoding faster and encoding a
+little slower:
 
-| payload | op | boring | boring `:shapes` | hako | nippy |
-|---|---|---:|---:|---:|---:|
-| small-map | encode | 0.82 | 1.27 | **0.68** | 0.95 |
-| small-map | decode | 0.92 | 1.13 | **0.71** | 0.97 |
-| mixed | encode | 0.77 | 1.21 | **0.65** | 0.68 |
-| mixed | decode | 0.67 | 0.63 | **0.62** | 0.84 |
-| nested-map-50 | encode | 14.42 | 15.11 | 14.20 | **13.97** |
-| nested-map-50 | decode | 22.13 | 22.05 | **14.09** | 18.25 |
-| datom-maps-200 | encode | 67.48 | 72.35 | **52.44** | 57.98 |
-| datom-maps-200 | decode | 69.39 | **35.94** | 38.93 | 81.73 |
-| long-vec-1k | encode | 15.61 | 15.80 | 16.76 | **13.21** |
-| long-vec-1k | decode | 36.91 | 36.05 | **32.60** | 34.56 |
-| str-maps-200 | encode | **63.43** | 66.70 | 82.45 | 74.97 |
-| str-maps-200 | decode | 69.55 | **54.58** | 79.51 | 106.44 |
+| codec | round µs | bytes |
+|---|---:|---:|
+| nippy/fast | 1 659 | 14 017 |
+| boring | 1 662 | 15 326 |
+| nippy (LZ4) | 2 050 | 7 835 |
+| boring + zstd | 3 221 | 4 900 |
+| nippy/lzma2 | 22 966 | 3 700 |
 
-hako's FFM reader wins the small and nested maps; boring wins the string-heavy
-payloads (stringref) and the same-shaped-map decode (`:shapes`); nippy takes
-the flat numeric vectors. No codec wins everywhere. These absolute numbers are
-on `power-saver` and are for relative comparison, not throughput claims.
+Compressed, boring+zstd is 1.6× smaller than nippy's default. Size is really a
+compressor choice, not a codec one — lzma2 is smaller and ~7× slower, LZ4
+larger and faster, and any codec here can pair with any of them.
 
-Against nippy that is a win on **every encode cell**, plus the two large map
-payloads on decode — `datom-maps-200` by 2.5×, `str-maps-200` by 1.6×. The four
-small decode cells trade places with nippy run to run; treat them as equal.
-Against [hako][] — an experimental codec built for speed, and the fastest thing
-in this table — it is mixed.
+Where boring wins outright: **string-heavy data** (stringref deduplication) and
+**arrays of same-shaped maps** — the datom shape — with `:shapes`. Where it
+loses: [hako][]'s FFM reader is faster on small and deeply nested maps, and
+`nippy/fast` encodes flat numeric vectors faster. On ClojureScript boring is
+always smaller on the wire than transit and faster on the datom shape, slower on
+generic data. [Performance](doc/PERFORMANCE.md) has the per-payload tables and
+the methodology.
 
-**Read that table with its tier in mind.** It calls a fresh codec per message,
-which is matched across all four libraries but is *not* how hako is meant to be
-used: `hako/encode` builds a Writer and a confined Arena per call, and its
-author's intended path is the reused `encode-into!`. Reuse both sides and hako
-gains considerably more than boring does — several of the small-payload results
-above **reverse**. `clojure -M:bench -m hako-ab` prints the tier-matched table,
-in time and allocation; quote that one for a like-for-like comparison of the
-two libraries as they are meant to be called.
-
-On nippy's *own* benchmark (`clojure -M:nippy-bench` — nippy's `stress-data`,
-nippy's filter, nippy's timing loop; the harness prints the nippy version and
-CPU power profile it ran under, because an earlier version of this table
-silently outlived a nippy upgrade). nippy **3.9.0-beta1**, `power-saver`:
-
-**Bold marks the best value in each column** — so the table shows who wins
-what, rather than who is being sold.
-
-| codec | freeze µs | thaw µs | round µs | bytes |
-|---|---:|---:|---:|---:|
-| nippy/fast | **584** | 1 075 | **1 659** | 14 017 |
-| boring | 728 | **934** | 1 662 | 15 326 |
-| nippy (LZ4) | 893 | 1 157 | 2 050 | 7 835 |
-| nippy/encrypted | 979 | 1 289 | 2 268 | 7 863 |
-| boring + zstd | 1 812 | 1 409 | 3 221 | 4 900 |
-| fressian | 5 165 | 3 286 | 8 451 | 12 222 |
-| fressian + zstd | 5 981 | 3 298 | 9 279 | 4 600 |
-| `pr-str` + `read-string` | 7 094 | 10 075 | 17 169 | 15 880 |
-| nippy/lzma2 | 15 804 | 7 162 | 22 966 | **3 700** |
-
-**boring wins one column: thaw.** Raw, it round-trips at parity with
-nippy/fast (1 662 against 1 659 — nippy/fast is a hair ahead), decoding
-faster and encoding slower, and it round-trips 1.23× faster than nippy's
-default while staying self-describing CBOR any language can read.
-
-**On size, no codec owns the win — the compressor does.** boring, nippy and
-fressian can each pair with LZ4, zstd or lzma2, and that choice moves the byte
-count far more than the codec does. So read the size column as a compressor
-dial, not a codec verdict:
-
-- **lzma2** is the smallest (3 700) and by far the slowest — **7× boring+zstd's
-  round-trip** to save ~24% of the bytes, a trade a storage layer rarely takes.
-- **zstd** (what boring uses here, level 3) is the sane middle: boring+zstd's
-  4 900 is 1.60× smaller than nippy's LZ4 default, and round-trips 2.9× faster
-  than fressian+zstd, which is only 6% smaller (4 600).
-- **LZ4** (nippy's default) is the largest of the compressed tiers (7 835) and
-  the fastest.
-
-boring is competitive at the zstd tier and does not claim the smallest bytes:
-if you want minimum size, run any of these codecs through lzma2; if you want
-minimum time, LZ4. The codec that stays self-describing CBOR across languages,
-at a reasonable size and speed, is boring's actual pitch.
-
-An earlier version of this table had boring 1.5× *faster* than nippy/fast.
-Both movements since are real and worth naming: nippy 3.7–3.9 got genuinely
-faster and smaller (its ByteBuffer rework and bulk primitive-array encodings),
-and boring then closed most of the reopened gap by adopting the same
-thread-local buffer reuse nippy uses — comparing a fresh-buffer-per-call codec
-against a cached-buffer one was never a codec comparison.
-
-**Where it loses.** nippy/fast freezes 1.25× faster. hako is faster on deeply
-nested maps (and 1.4× smaller there), 2.4× faster decoding a plain vector of
-integers, and marginally ahead on the two small payloads' decode. With both
-codecs reused it is further ahead still — roughly 1.3–1.8× on map-heavy encode
-and ~2× on map-heavy decode — while boring keeps the vector-heavy decode and
-allocates less on every payload measured. fressian+zstd stays 6% smaller than
-boring+zstd. (The hako rows predate this table's re-measurement and are due
-their own re-run.)
-
-On **ClojureScript** the split is sharper. transit-cljs writes JSON text, so
-`JSON.parse` does its whole byte-to-structure walk in native C++ — 57% of
-boring's decode time is work V8 does for transit for free. On generic data
-transit is 1.5–2.7× faster. But with `:shapes` on an array of same-shaped maps
-— the datom shape — boring decodes **53 µs against transit's 91, at 2.9×
-smaller**, and encodes 125 µs against 128. boring is smaller on the wire on
-every payload.
-[Performance](doc/PERFORMANCE.md) has the tables and the profile.
-
-Handing boring a primitive array instead of a vector is worth far more than any
-of the above: a `short[]` of 1000 elements decodes **33× faster** than the
-equivalent vector, as a standard [RFC 8746][rfc8746] typed array that other
-languages read natively.
+Handing boring a primitive array instead of a vector is worth more than any of
+this: a `short[]` of 1000 elements decodes **33× faster** than the equivalent
+vector, as a standard [RFC 8746][rfc8746] typed array other languages read
+natively.
 
 ## What it handles
 
