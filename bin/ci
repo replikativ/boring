@@ -267,6 +267,12 @@ stage_artifact () {
 
 stage_fuzz () {
   run fuzz-jvm clojure -M:fuzz 50000
+  # nav is the component with the trust boundary -- offsets from a frame
+  # somebody else wrote, handed to an unchecked-past-its-gates Reader -- so it
+  # gets its own fuzzer, over indexed, plain and stringref blobs. It found the
+  # skip-value recursion crash; every round of fuzzing here has found
+  # something, so it is a gate. `:fuzz` main-opts swallow -m, hence -e.
+  run fuzz-nav clojure -M:fuzz -e "(require 'navfuzz)(navfuzz/-main \"50000\")"
 }
 
 stage_fuzz_cljs () {

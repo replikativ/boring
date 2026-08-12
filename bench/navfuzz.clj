@@ -46,16 +46,34 @@
   (and (instance? clojure.lang.ExceptionInfo e)
        (= "boring" (some-> (ex-data e) :type namespace))))
 
+(defn- drain
+  "Realise a reducible fully, or short-circuit -- so `items`/scan cursors are
+  actually walked. Any realisation error propagates to the caller's catch."
+  [reducible]
+  (reduce (fn [_ c] (nav/value c) nil) nil reducible))
+
 (defn- run-ops
-  "Every nav operation the store layer actually uses, against one blob.
-  Returns nil or an untyped-failure description."
+  "Every nav operation the STORE LAYER drives on untrusted bytes, against one
+  blob: the per-blob open+walk+read a projection does, `items` enumeration of
+  a sealed sequence (the log shape), `count`/`nth` on that Items, and
+  `decode-seq` which reads the same bytes through the whole-value path. Returns
+  nil or an untyped-failure description."
   [^bytes bs opts path]
   (try
     (let [src (nav/source bs opts)]
-      ;; the open succeeded; now walk, read, realise
       (let [o (nav/walk-from src (nav/root-offset src) path)]
         (when-not (or (neg? o) (= -2 o)) (nav/value-at src o)))
       (nav/value (nav/root bs opts))
+      ;; SEQUENCE SURFACE. `items` finds the frame trailer and reports a count
+      ;; off it; a store enumerates a log this way, and `count`/`nth` read the
+      ;; sentinel node the fuzzer's frame mutations reach.
+      (let [it (nav/items bs opts)]
+        (let [n (count it)]
+          (when (pos? n) (nav/value (nth it (rem 0 n))))
+          (drain it)))
+      ;; And the whole-value seq path over the same bytes, which must agree
+      ;; that these are one item or refuse typed -- never crash.
+      (dorun (boring/decode-seq bs opts))
       nil)
     (catch clojure.lang.ExceptionInfo e
       (when-not (typed? e)
@@ -68,17 +86,30 @@
         seeds (map #(gen/generate g/gen-value 15 %) (range 150))
         ;; every seed sealed four ways; keep the value beside the bytes for
         ;; invariant 2 and for path derivation
-        corpus (vec (for [v (cons {:hdr {:a 1} :big (vec (repeat 40 {:x 1 :y "s"}))
-                                   :tail {:city "b"}} seeds)
-                          o [{:index 1 :index-min 4 :stringref false}
-                             {:index 16 :index-min 4 :stringref false}
-                             {:index 1 :index-min 4}
-                             {:index 16 :index-min 4}]
-                          :let [bs (try (boring/encode-indexed v o) (catch Throwable _ nil))]
-                          :when bs]
-                      [v bs (if (:stringref o false) {} {:stringref false})
-                       (alength ^bytes (boring/encode v (if (contains? o :stringref)
-                                                          {:stringref false} {})))]))
+        vs (cons {:hdr {:a 1} :big (vec (repeat 40 {:x 1 :y "s"})) :tail {:city "b"}} seeds)
+        ;; FOUR ENCODINGS PER SEED, because a store holds all of them and feeds
+        ;; each to `nav/source` on untrusted bytes: indexed (frame present) and
+        ;; plain, each stringref on and off. `data-len` is the value item's
+        ;; length, so the frame-only region is bytes past it -- for a plain
+        ;; blob there is no frame, so data-len == length and no frame-only
+        ;; mutation is attempted, which is correct: the whole thing is data.
+        corpus (vec (concat
+                     (for [v vs
+                           o [{:index 1 :index-min 4 :stringref false}
+                              {:index 16 :index-min 4 :stringref false}
+                              {:index 1 :index-min 4}
+                              {:index 16 :index-min 4}]
+                           :let [bs (try (boring/encode-indexed v o) (catch Throwable _ nil))]
+                           :when bs]
+                       [v bs (if (:stringref o false) {} {:stringref false})
+                        (alength ^bytes (boring/encode v (if (contains? o :stringref)
+                                                           {:stringref false} {})))])
+                     (for [v vs
+                           sr [true false]
+                           :let [bs (try (boring/encode v {:stringref sr})
+                                         (catch Throwable _ nil))]
+                           :when bs]
+                       [v bs {:stringref sr} (alength ^bytes bs)])))
         rnd (java.util.Random. 4242)
         tally (atom {}) bad (atom [])]
     (println "seed corpus:" (count corpus) "sealed documents")
