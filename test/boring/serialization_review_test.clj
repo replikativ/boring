@@ -622,7 +622,7 @@
             output was unaffected — it writes tag 0 — so this only bit on
             FOREIGN input, which is the interop case tag 1 exists for."
     (are [millis] (= millis (.getTime ^java.util.Date
-                                      (boring/decode (tag1-float millis))))
+                             (boring/decode (tag1-float millis))))
       915246245678                     ; .678 — not representable in binary
       1009843199999                    ; .999
       1700000000001                    ; .001
@@ -637,15 +637,15 @@
             just rounding the millis"
     ;; one second and one nanosecond
     (is (= 1 (.getNano ^java.time.Instant
-                       (boring/decode (tag1-seconds 1.000000001)
-                                      {:instant-type :instant})))))
+              (boring/decode (tag1-seconds 1.000000001)
+                             {:instant-type :instant})))))
 
   (testing "and sub-NANOsecond content rounds rather than refusing the document
             — an Instant cannot hold it, and a foreign producer writing extra
             digits should still be readable"
     (is (= 123456789 (.getNano ^java.time.Instant
-                               (boring/decode (tag1-seconds 0.12345678915)
-                                              {:instant-type :instant}))))))
+                      (boring/decode (tag1-seconds 0.12345678915)
+                                     {:instant-type :instant}))))))
 
 ;; ------------------------------------------------------------ RFC 3339 years
 
