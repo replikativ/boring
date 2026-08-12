@@ -96,6 +96,14 @@
    :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}}
    :main-opts ["-m" "fuzz"]}
 
+  ;; The NAV fuzzer -- its own alias rather than `:fuzz -e`, because `:fuzz`'s
+  ;; `-m fuzz` main-opt cannot be overridden by appending, so `-e` reaches
+  ;; fuzz/-main as a bogus arg. `-m navfuzz` takes the mutant count as its arg.
+  :fuzz-nav
+  {:extra-paths ["bench" "test" "target/classes"]
+   :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}}
+   :main-opts ["-m" "navfuzz"]}
+
   ;; Peers for comparative benchmarking. LOCAL ONLY -- hako needs a local
   ;; `clj -T:build install` from ../hako and JDK 25, so no CI job may use this
   ;; alias. See :fuzz above for what that cost us.

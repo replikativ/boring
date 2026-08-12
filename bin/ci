@@ -271,8 +271,9 @@ stage_fuzz () {
   # somebody else wrote, handed to an unchecked-past-its-gates Reader -- so it
   # gets its own fuzzer, over indexed, plain and stringref blobs. It found the
   # skip-value recursion crash; every round of fuzzing here has found
-  # something, so it is a gate. `:fuzz` main-opts swallow -m, hence -e.
-  run fuzz-nav clojure -M:fuzz -e "(require 'navfuzz)(navfuzz/-main \"50000\")"
+  # something, so it is a gate. Its own alias, because `:fuzz`'s -m cannot be
+  # overridden by appending -e (which reaches fuzz/-main as a bogus arg).
+  run fuzz-nav clojure -M:fuzz-nav 50000
 }
 
 stage_fuzz_cljs () {
