@@ -23,7 +23,10 @@
   Run on a QUIET machine:
 
       clojure -M:nippy-stress -m boring.nippy-bench"
-  (:require [boring.core :as boring]
+  (:require [clojure.java.io]
+            [clojure.java.shell]
+            [clojure.string]
+            [boring.core :as boring]
             [clojure.data.fressian :as fress]
             [taoensso.encore :as enc]
             [taoensso.nippy :as nippy])
@@ -85,6 +88,17 @@
 (defn -main [& _]
   (let [laps 1e4 warmup 25e3
         all  (nippy/stress-data {:comparable? true})]
+    ;; THE TABLE THAT CANNOT SAY WHAT IT MEASURED CANNOT BE CHECKED. The
+    ;; README carried rows from an older nippy for months because nothing
+    ;; recorded which version produced them -- nippy shrank 18% on /fast
+    ;; between releases and the drift read as our regression. Same for the
+    ;; CPU power profile, which moves absolute numbers ~3x on this machine.
+    (println "nippy" (or (some-> (clojure.java.io/resource "META-INF/maven/com.taoensso/nippy/pom.properties")
+                                 slurp (->> (re-find #"version=(\S+)")) second)
+                         "?")
+             " power profile:"
+             (try (clojure.string/trim (:out (clojure.java.shell/sh "powerprofilesctl" "get")))
+                  (catch Throwable _ "?")))
     (println (format "\nnippy's bench-data: %d of %d stress-data keys survive the\n"
                      (count bench-data) (count all))
              "reader+fressian filter. Excluded:"

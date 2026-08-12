@@ -143,31 +143,44 @@ in time and allocation; quote that one for a like-for-like comparison of the
 two libraries as they are meant to be called.
 
 On nippy's *own* benchmark (`clojure -M:nippy-bench` — nippy's `stress-data`,
-nippy's filter, nippy's timing loop), round-trip µs and bytes:
+nippy's filter, nippy's timing loop; the harness prints the nippy version and
+CPU power profile it ran under, because an earlier version of this table
+silently outlived a nippy upgrade). nippy **3.9.0-beta1**, `power-saver`:
 
-| codec | round µs | bytes |
-|---|---:|---:|
-| **boring** | **595** | 15 326 |
-| nippy/fast | 932 | 17 105 |
-| nippy (LZ4) | 1 102 | 8 518 |
-| **boring + zstd** | **1 102** | **4 900** |
-| nippy/encrypted | 1 164 | 8 546 |
-| fressian | 2 860 | 12 222 |
-| fressian + zstd | 3 124 | 4 600 |
-| `pr-str` + `read-string` | 5 369 | 15 880 |
-| nippy/lzma2 | 9 079 | 3 888 |
+| codec | freeze µs | thaw µs | round µs | bytes |
+|---|---:|---:|---:|---:|
+| nippy/fast | 584 | 1 075 | 1 659 | 14 017 |
+| **boring** | 728 | **934** | **1 662** | 15 326 |
+| nippy (LZ4) | 893 | 1 157 | 2 050 | 7 835 |
+| nippy/encrypted | 979 | 1 289 | 2 268 | 7 863 |
+| **boring + zstd** | 1 812 | 1 409 | 3 221 | **4 900** |
+| fressian | 5 165 | 3 286 | 8 451 | 12 222 |
+| fressian + zstd | 5 981 | 3 298 | 9 279 | 4 600 |
+| `pr-str` + `read-string` | 7 094 | 10 075 | 17 169 | 15 880 |
+| nippy/lzma2 | 15 804 | 7 162 | 22 966 | 3 700 |
 
-Raw, boring is about 1.5× nippy/fast. Compressed — which is what a storage
-layer actually writes — boring+zstd is **1.7× smaller** at within 10% of
-nippy's default round-trip time. Only nippy/lzma2 goes smaller, at 8× the time.
+Raw, boring round-trips **at parity with nippy/fast** (1 662 against 1 659) —
+faster to thaw, slower to freeze — and 1.23× faster than nippy's default,
+while staying self-describing CBOR any language can read. Compressed — which
+is what a storage layer actually writes — **boring+zstd is 1.60× smaller than
+nippy's default** at 1.6× its round-trip time. Only nippy/lzma2 goes smaller,
+at 7× boring+zstd's time.
 
-**Where it loses.** hako is faster on deeply nested maps (and 1.4× smaller
-there), 2.4× faster decoding a plain vector of integers, and marginally ahead
-on the two small payloads' decode. With both codecs reused it is further ahead
-still — roughly 1.3–1.8× on map-heavy encode and ~2× on map-heavy decode —
-while boring keeps the vector-heavy decode and allocates less on every payload
-measured. fressian+zstd stays 6% smaller than
-boring+zstd.
+An earlier version of this table had boring 1.5× *faster* than nippy/fast.
+Both movements since are real and worth naming: nippy 3.7–3.9 got genuinely
+faster and smaller (its ByteBuffer rework and bulk primitive-array encodings),
+and boring then closed most of the reopened gap by adopting the same
+thread-local buffer reuse nippy uses — comparing a fresh-buffer-per-call codec
+against a cached-buffer one was never a codec comparison.
+
+**Where it loses.** nippy/fast freezes 1.25× faster. hako is faster on deeply
+nested maps (and 1.4× smaller there), 2.4× faster decoding a plain vector of
+integers, and marginally ahead on the two small payloads' decode. With both
+codecs reused it is further ahead still — roughly 1.3–1.8× on map-heavy encode
+and ~2× on map-heavy decode — while boring keeps the vector-heavy decode and
+allocates less on every payload measured. fressian+zstd stays 6% smaller than
+boring+zstd. (The hako rows predate this table's re-measurement and are due
+their own re-run.)
 
 On **ClojureScript** the split is sharper. transit-cljs writes JSON text, so
 `JSON.parse` does its whole byte-to-structure walk in native C++ — 57% of
