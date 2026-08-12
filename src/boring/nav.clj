@@ -919,7 +919,8 @@
   Falls back to `skipFrom` on anything unexpected -- no node, no index, a slot
   that will not read -- because this is an optimisation and its failure mode
   must be slowness, never a different answer."
-  ^long [^Nav nav ^Reader r ^long vp]
+  (^long [^Nav nav ^Reader r ^long vp] (skip-value nav r vp 0))
+  (^long [^Nav nav ^Reader r ^long vp ^long sdepth]
   (let [m (.majorAt r vp)]
     ;; THE GATE IS PAID ON EVERY VALUE A SCAN STEPS OVER, and it is not free:
     ;; measured over 60 small values at stride 1, 4.23 us against 3.36 for the
@@ -932,7 +933,16 @@
     ;; without `headArgAt`'s possible multi-byte read. It bought nothing --
     ;; 4.27 against 4.23 -- because `headArgAt` on a small container reads
     ;; exactly those same bits. The cost is the call, not the read.
-    (if-not (and (or (= 4 m) (= 5 m))
+    ;; THE DEPTH CAP IS A HOSTILE-FRAME BOUND, not a data bound. The
+    ;; remainder below recurses through skip-value for each entry it walks,
+    ;; and the recursion argument comes off the FRAME: a crafted anchor chain
+    ;; -- each anchor legally in bounds, each a byte past the last -- nests
+    ;; one call per link, so the depth is attacker-chosen up to the file
+    ;; size. Honest anchors nest no deeper than the document does, and
+    ;; `:max-depth` caps documents at 1024; past that this falls back to the
+    ;; structural walk, which is slow and correct.
+    (if-not (and (< sdepth 1024)
+                 (or (= 4 m) (= 5 m))
                  (>= (.headArgAt r vp) jump-min-entries))
       (.skipFrom r vp)
       (let [ns* (node-slot nav vp)]
@@ -987,14 +997,26 @@
                   ;; jump lands and the remainder walk meets it: 107.3 us
                   ;; through `.skipFrom` against 3.78 recursing, 28.4x, on a
                   ;; byte-identical blob. `remainder-skip-test` pins it.
+                  ;; THE LAST ANCHOR MUST BE PAST THE CONTAINER HEAD. An
+                  ;; anchor AT the head recursed into skip-value(vp) forever
+                  ;; -- StackOverflowError, which is an Error, straight
+                  ;; through the RuntimeException catch below. `anchor-at`
+                  ;; bounds anchors to (0, data-end) but nothing tied them to
+                  ;; THIS container; a frame is bytes somebody else wrote.
+                  _ (when (<= (aget la 0) vp) (throw (ex-info "anchor at or before head" {})))
                   e (loop [q (long (aget la 0)) k (long span)]
                       (if (or (zero? k) (neg? q)) q
-                          (recur (long (if map?
-                                         (skip-value nav r (.skipFrom r q))
-                                         (skip-value nav r q)))
-                                 (dec k))))]
+                          ;; MONOTONIC OR WALK. Each step must land strictly
+                          ;; past where it started, or the loop is riding a
+                          ;; crafted cycle; `.skipFrom` consumes at least one
+                          ;; byte or throws typed, so the fallback restores
+                          ;; progress as well as truth.
+                          (let [q' (long (if map?
+                                           (skip-value nav r (.skipFrom r q) (inc sdepth))
+                                           (skip-value nav r q (inc sdepth))))]
+                            (recur (if (> q' q) q' (.skipFrom r q)) (dec k)))))]
               (if (and (> e vp) (<= e (.size r))) e (.skipFrom r vp)))
-            (catch RuntimeException _ (.skipFrom r vp))))))))
+            (catch RuntimeException _ (.skipFrom r vp)))))))))
 
 (defn- scan-map
   "Linear walk of a map's entries from `start`, at most `limit` of them.
