@@ -69,6 +69,16 @@
    {:hex "c074323031332d30332d32315432303a30343a30305a" :value [:instant "2013-03-21T20:04:00Z"] :roundtrip true :diag "0(\"2013-03-21T20:04:00Z\")"}
    {:hex "c11a514b67b0" :value [:instant "2013-03-21T20:04:00Z"] :roundtrip true :diag "1(1363896240)" :encoding-differs true :encoding-differs-reason "source uses tag 1 (epoch); boring writes instants as tag 0 (RFC 3339), which is lossless where a float epoch is not. Decodes to the same instant."}
    {:hex "c1fb41d452d9ec200000" :value [:instant "2013-03-21T20:04:00.5Z"] :roundtrip true :diag "1(1363896240.5)" :encoding-differs true :encoding-differs-reason "source uses tag 1 (epoch float); boring writes instants as tag 0 (RFC 3339)."}
+   ;; A tag-1 float whose value is NOT a dyadic rational. The .5 above cannot
+   ;; catch a precision bug -- one half is exactly representable in binary, so
+   ;; it survives any decomposition -- and while it was the only tag-1 float
+   ;; vector, the JVM reader read roughly half of all millisecond instants one
+   ;; millisecond EARLY and no test noticed. .678 is not representable: the
+   ;; nearest double is 915246245.67799997329711914, so a reader that
+   ;; reconstructs nanoseconds by subtracting the whole seconds and then
+   ;; truncates gives .677. ClojureScript was already exact here, so this also
+   ;; pins the two platforms to the same answer for the same bytes.
+   {:hex "c1fb41cb46c652d6c8b4" :value [:instant "1999-01-02T03:04:05.678Z"] :roundtrip true :diag "1(915246245.678)" :encoding-differs true :encoding-differs-reason "source uses tag 1 (epoch float); boring writes instants as tag 0 (RFC 3339)."}
    {:hex "d74401020304" :value [:tagged 23 [:bytes 1 2 3 4]] :roundtrip true :diag "23(h'01020304')"}
    {:hex "d818456449455446" :value [:tagged 24 [:bytes 100 73 69 84 70]] :roundtrip true :diag "24(h'6449455446')"}
    {:hex "d82076687474703a2f2f7777772e6578616d706c652e636f6d" :value [:uri "http://www.example.com"] :roundtrip true :diag "32(\"http://www.example.com\")"}

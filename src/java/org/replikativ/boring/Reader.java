@@ -236,6 +236,10 @@ public final class Reader {
      * whether 2020-02-30 exists -- is left to the date parser below, which is
      * the thing that actually knows.
      */
+    /** Divisor for splitting a nanosecond count into seconds and remainder. */
+    private static final java.math.BigInteger NANOS_PER_SECOND =
+        java.math.BigInteger.valueOf(1_000_000_000L);
+
     private static final java.util.regex.Pattern RFC3339 =
         java.util.regex.Pattern.compile(
             "\\d{4}-\\d{2}-\\d{2}[Tt]"
@@ -3088,9 +3092,49 @@ public final class Reader {
                         if (Double.isNaN(d) || Double.isInfinite(d))
                             throw Err.of("bad-tag-content",
                                 "boring: tag 1 epoch is not finite: " + d, "tag", 1L);
-                        long secs = (long) Math.floor(d);
-                        long nanos = Math.round((d - secs) * 1e9);
-                        t = java.time.Instant.ofEpochSecond(secs, nanos);
+                        // Decomposed through the value's SHORTEST ROUND-TRIPPING
+                        // DECIMAL, not by subtracting the whole seconds off.
+                        //
+                        // `d - secs` subtracts two numbers of very different
+                        // magnitude. At epoch scale a double resolves to about
+                        // 100ns, so 915246245.678 came back as 915246245s +
+                        // 677999973ns and the `toEpochMilli` below then
+                        // TRUNCATED it to .677. Roughly half of all
+                        // millisecond-precision instants read one millisecond
+                        // early, and never late -- measured across a spread of
+                        // modern timestamps, and on pre-1970 ones too.
+                        //
+                        // ClojureScript's `(js/Date. (* v 1000))` was exact for
+                        // the same bytes, so the two platforms silently
+                        // disagreed about one document. That is the divergence
+                        // `instantFn` was reshaped to remove, arriving instead
+                        // through the arithmetic.
+                        //
+                        // `BigDecimal.valueOf` goes via `Double.toString` --
+                        // the shortest decimal that round-trips to this double
+                        // -- so this asks what the value SAYS rather than what
+                        // the binary happens to be. The tag 1002 branch below
+                        // settled on the same technique for the same reason,
+                        // having first tried `Math.round` with a tolerance.
+                        //
+                        // Rounded AT nanoseconds rather than refused there:
+                        // sub-nanosecond content cannot fit an Instant in any
+                        // case, and a foreign producer's extra digits should
+                        // not fail an otherwise valid read. Everything an
+                        // Instant CAN hold is exact.
+                        java.math.BigInteger totalNanos =
+                            java.math.BigDecimal.valueOf(d)
+                                .movePointRight(9)
+                                .setScale(0, java.math.RoundingMode.HALF_EVEN)
+                                .toBigIntegerExact();
+                        java.math.BigInteger[] qr =
+                            totalNanos.divideAndRemainder(NANOS_PER_SECOND);
+                        // `longValueExact` raises ArithmeticException for an
+                        // epoch outside a long, which the catch below turns
+                        // into the typed out-of-range error. `ofEpochSecond`
+                        // normalises a negative nanosecond remainder itself.
+                        t = java.time.Instant.ofEpochSecond(qr[0].longValueExact(),
+                                                            qr[1].longValue());
                     } else {
                         java.math.BigInteger secs = integerContent(v, 1);
                         if (secs.bitLength() > 63)
