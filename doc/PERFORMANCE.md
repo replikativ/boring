@@ -54,22 +54,31 @@ covers the individual harnesses.
 
 ## JVM, µs/op
 
-Lower is better. **Bold** is the winner.
+Lower is better. **Bold is the winner of each row.** nippy 3.9.0-beta1,
+`power-saver`. FRESH writer/reader per call — how `hako/encode` and
+`nippy/fast-freeze` are invoked, and a worst case for boring, whose real
+`encode`/`decode` reuse a thread-local writer (the nippy stress-data table
+below is the reused-API comparison). Absolute numbers are for relative
+comparison on this profile, not throughput claims.
 
 | payload | op | boring | boring `:shapes` | hako | nippy |
 |---|---|---:|---:|---:|---:|
-| small-map | encode | **0.14** | 0.22 | 0.20 | 0.24 |
-| small-map | decode | 0.31 | 0.31 | **0.25** | 0.29 |
-| mixed | encode | **0.13** | 0.21 | 0.18 | 0.27 |
-| mixed | decode | 0.21 | 0.21 | **0.18** | 0.22 |
-| nested-map-50 | encode | 5.29 | 5.60 | **4.08** | 7.01 |
-| nested-map-50 | decode | 7.08 | 7.11 | **4.34** | 8.06 |
-| datom-maps-200 | encode | 26.91 | 15.48 | **15.05** | 45.02 |
-| datom-maps-200 | decode | 21.01 | **11.41** | 11.54 | 49.97 |
-| long-vec-1k | encode | 6.74 | 6.76 | **6.65** | 10.91 |
-| long-vec-1k | decode | 11.05 | 11.07 | **4.65** | 10.23 |
-| str-maps-200 | encode | **23.17** | 25.48 | 23.31 | 36.50 |
-| str-maps-200 | decode | 22.63 | **13.77** | 23.20 | 38.86 |
+| small-map | encode | 0.82 | 1.27 | **0.68** | 0.95 |
+| small-map | decode | 0.92 | 1.13 | **0.71** | 0.97 |
+| mixed | encode | 0.77 | 1.21 | **0.65** | 0.68 |
+| mixed | decode | 0.67 | 0.63 | **0.62** | 0.84 |
+| nested-map-50 | encode | 14.42 | 15.11 | 14.20 | **13.97** |
+| nested-map-50 | decode | 22.13 | 22.05 | **14.09** | 18.25 |
+| datom-maps-200 | encode | 67.48 | 72.35 | **52.44** | 57.98 |
+| datom-maps-200 | decode | 69.39 | **35.94** | 38.93 | 81.73 |
+| long-vec-1k | encode | 15.61 | 15.80 | 16.76 | **13.21** |
+| long-vec-1k | decode | 36.91 | 36.05 | **32.60** | 34.56 |
+| str-maps-200 | encode | **63.43** | 66.70 | 82.45 | 74.97 |
+| str-maps-200 | decode | 69.55 | **54.58** | 79.51 | 106.44 |
+
+hako's FFM reader wins the small and nested maps; boring wins the string-heavy
+payloads (stringref) and the same-shaped-map decode (`:shapes`); nippy takes
+the flat numeric vectors. No codec wins everywhere.
 
 Wire size, bytes:
 
@@ -82,31 +91,29 @@ Wire size, bytes:
 | long-vec-1k | 2 726 | 2 726 | 2 740 | 2 874 |
 | str-maps-200 | 7 550 | **4 570** | 9 741 | 11 465 |
 
-boring beats nippy on **all six encode cells** and on size for the two payloads
-where the shape machinery applies. On decode it wins the two large map payloads
-decisively — `datom-maps-200` by 2.5× and `str-maps-200` by 1.6× — and trades
-the other four with nippy inside the noise: nippy takes `small-map` and
-`long-vec-1k` decode in the table above, and a re-measurement on the same
-machine had it take `mixed` and `nested-map-50` decode as well.
+Read against nippy: boring wins the **string-heavy** payloads on both ops
+(`str-maps-200` encode and decode, the latter by 1.9×, where stringref pays),
+wins most decodes (`small-map`, `mixed`, `datom-maps-200`), and loses most
+encodes to nippy on the small and numeric shapes. On size it wins the two
+payloads where the shape machinery applies. No blanket "beats nippy" holds —
+an earlier version of this paragraph claimed exactly that ("all six encode
+cells", once even "all twelve"), and the table has never supported it. A claim
+its own evidence refutes is worse than no claim.
 
-This paragraph said "all twelve timing cells" for a while, which the table
-directly above it has never supported — `small-map` decode reads 0.31 against
-nippy's 0.29, and `long-vec-1k` decode 11.05 against 10.23. A claim that its
-own evidence refutes is worse than no claim. Against hako — an experimental codec built
-for speed — it wins the small-payload encodes, ties `datom-maps-200`, wins
-`str-maps-200` decode by 1.7× at **2.1× smaller on the wire**, and loses the
-nested-map and integer-vector rows (see below).
+Against **hako** — an experimental FFM codec built for speed — the picture is
+the mirror: hako wins the small and nested maps (its native `MemorySegment`
+reader is fastest there), and boring wins the string-heavy payloads and the
+same-shaped-map decode via `:shapes`. hako wins 7 of the 12 cells above, boring
+3, nippy 2.
 
-**The tier this table uses matters, and it flatters boring on the small rows.**
-Every codec here allocates fresh per call, which is matched — but `hako/encode`
-builds a Writer and a confined Arena each time, and hako's intended path is the
-reused `encode-into!`. Reuse both sides and the small-payload encode wins
-*reverse*: `small-map` goes from boring 0.50 / hako 1.08 µs to boring 0.86 /
-hako 0.59. `clojure -M:bench -m hako-ab` is the tier-matched table — time and
-allocation, T1/T2/T3 — and it is the one to quote when comparing the two
-libraries as each is meant to be called. Summarised: hako wins map-heavy encode
-(1.1–1.8×) and map-heavy decode (~2×); boring wins vector-heavy decode (~1.3×)
-and allocates less on every payload measured.
+**The tier this table uses matters.** Every codec here allocates a fresh
+writer/reader per call, which is matched across libraries — but it is a worst
+case for the two whose real API reuses: boring's `encode`/`decode` reuse a
+thread-local writer, and so does `nippy/fast-freeze` (via nippy's `with-bb`).
+For boring-vs-hako at each library's intended reuse tier, `clojure -M:bench -m
+hako-ab` prints the tier-matched table (time and allocation, T1/T2/T3); for
+boring-vs-nippy through the real reused API, the nippy stress-data table below
+is the one to read, where boring round-trips at parity with `nippy/fast`.
 
 The four small cells are close enough that the ordering is not stable across
 machines; treat 0.13 vs 0.18 µs as "the same". The gaps worth reading are the
