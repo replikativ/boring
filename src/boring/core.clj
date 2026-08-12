@@ -2945,20 +2945,23 @@
 ;; hiding it would reproduce the silent-wrong-hash failure this exists to stop.
 (defonce ^{:doc "True if the optional hasch integration is active."}
   hasch-integration?
-  (try
-    ;; HASCH ITSELF IS PROBED FIRST, not `boring.hasch`. The catch below reads
-    ;; as "the integration namespace is absent", and that was the same thing
-    ;; only while `boring/hasch.cljc` was missing from the jar -- which it was,
-    ;; silently, in every release. Shipping it made the two different: the
-    ;; require now FINDS the namespace and fails inside it on `hasch.benc`,
-    ;; wrapped in a Compiler$CompilerException that neither catch matches, so
-    ;; `(require 'boring.core)` threw for every consumer without hasch.
-    ;;
-    ;; Probing the optional dependency directly is what the comment above
-    ;; always claimed this did.
-    (require 'hasch.benc)
-    (require 'boring.hasch)
-    true
-    (catch java.io.FileNotFoundException _ false)
-    (catch ClassNotFoundException _ false)
-    (catch Exception _ false)))
+  ;; STAGED, so a hasch that is ABSENT reads false but a hasch that is
+  ;; PRESENT-BUT-BROKEN throws rather than reading false. `hasch.benc` is the
+  ;; optional dependency: probe it FIRST, catching only the "namespace absent"
+  ;; exceptions -- if it is missing we are a consumer without hasch and false
+  ;; is right. Once it loads, `boring.hasch` is OUR code and its require is
+  ;; UNGUARDED: a future hasch API change that breaks the integration must
+  ;; SURFACE at load, not be swallowed into `false`. A silent false is the
+  ;; exact content-addressing divergence `boring.hasch` exists to prevent --
+  ;; hasch on the classpath, but records and maps hashing differently because
+  ;; the integration quietly did not load. Historically this whole form was one
+  ;; try with a broad `(catch Exception _ false)`, which did that swallowing;
+  ;; and before THAT, `boring/hasch.cljc` was missing from the jar entirely, so
+  ;; the two states were indistinguishable. Shipping it (build.clj) plus this
+  ;; staging is what makes a Maven and a :local/root consumer agree.
+  (let [present? (try (require 'hasch.benc) true
+                      (catch java.io.FileNotFoundException _ false)
+                      (catch ClassNotFoundException _ false))]
+    (if present?
+      (do (require 'boring.hasch) true)     ; a load failure here PROPAGATES
+      false)))

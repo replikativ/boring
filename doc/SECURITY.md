@@ -152,8 +152,22 @@ availability or integrity, not RCE.
    reaches **37×** on documents made of many tiny containers — see below. Bulk
    payloads are 1×. Use `:max-items` to cap it.
 3. **Typed failure.** Every rejection is an `ex-info` with a `:type` keyword.
-   Nothing escapes as a raw `NullPointerException`, `ClassCastException` or
-   `StackOverflowError`, so a caller's `catch ExceptionInfo` is sufficient.
+   Nothing escapes as a raw `NullPointerException` or `ClassCastException`, so
+   a caller's `catch ExceptionInfo` is sufficient for those.
+
+   **The `:type` set is OPEN.** A minor release may introduce a new
+   `:boring/…` type for a newly-distinguished failure -- each new tag handler,
+   for instance, is a new site that can raise `:boring/bad-tag-content` or a
+   more specific sibling -- but a shipped type is never renamed or repurposed.
+   So dispatch with a default/`:else` branch; never an exhaustive `case` over
+   the current set, which a later release would break.
+
+   **One exposure remains for very deep nesting.** The depth guard
+   (`:max-depth`, default 1024) is enforced by counting recursion, and the
+   encoder/decoder recurse one stack frame per level -- so on a thread with a
+   small stack, a value nested near the limit can raise a raw
+   `StackOverflowError` before the guard fires. Set `:max-depth` low (cbor-x
+   uses 64) if you parse untrusted data on constrained threads.
 
    **`OutOfMemoryError` is the exception, and is deliberately not caught.** A
    heap exhausted by one decode is not a condition that decode can report and

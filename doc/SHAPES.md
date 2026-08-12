@@ -280,7 +280,11 @@ first implementation, not after fuzzing finds them:
    growth from hostile input is otherwise trivial. (cbor-x's 64 is a
    reasonable reference point.)
 2. **Validate the index.** A reference to an unregistered shape is a typed
-   error, `:boring/bad-shape-ref` — never a null or a silently empty map.
+   error (`:boring/bad-tag-content`, from the tag-39649 reader) — never a null
+   or a silently empty map. An earlier draft named a `:boring/bad-shape-ref`
+   type that was never implemented; the reader raises `:boring/bad-tag-content`
+   for a malformed shaped array, which is the same guarantee under the name the
+   code actually throws.
 3. **Validate arity.** A reference carrying a different number of values than
    its shape has keys is an error. 39649 already does this.
 4. **Reject duplicate keys** in a definition's key set, as `buildMap` does.

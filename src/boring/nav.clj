@@ -459,7 +459,7 @@
   ;; `:canonical` in it and re-resolving reads that as the caller trying to
   ;; override what the profile locks.
   (let [_ (when-not (or (map? opts) (nil? opts) (instance? NavContext opts))
-            (fail :boring/bad-options
+            (fail :boring/bad-argument
                   (str "boring.nav: expected an options map or a `nav/context`, got "
                        (some-> opts class .getName))
                   {:got (class opts)}))
@@ -1921,6 +1921,36 @@
   cursor (`(nav/offset (nav/root bs))`) purely to throw it away."
   ^long [s] (reader-root-offset ^Reader (.rdr ^Nav (source-of s))))
 
+;; --- the offset-layer sentinels, named -----------------------------------
+;;
+;; The offset layer returns a `long`: a real byte offset, or one of two
+;; sentinels. Naming them here means the contract lives in ONE place -- a
+;; future change to the values cannot silently desync a downstream `cond`, the
+;; way konserve-lmdb, kabel and datahike would each hardcode -1/-2 otherwise.
+;; Primitive `^long` in, boolean out, inlined so there is no boxing on scans.
+
+(def ^:no-doc ^:const absent-offset -1)
+(def ^:no-doc ^:const unnameable-offset -2)
+
+(defn absent?
+  "True when an offset-layer return means the path led to nothing -- no such
+  key, or an index out of range. See `walk-from`."
+  {:inline (fn [o] `(== (long ~o) -1))}
+  [^long o] (== o -1))
+
+(defn no-offset?
+  "True when the value is PRESENT but no byte offset can name it, so a caller
+  should fall back to the cursor `walk`/`value`. Tag structures and
+  shaped-array rows are the two cases. See `walk-from`."
+  {:inline (fn [o] `(== (long ~o) -2))}
+  [^long o] (== o -2))
+
+(defn found?
+  "True when the return is a real offset -- neither sentinel -- so
+  `value-at`/`long-at` will read it rather than raise `:boring/absent`."
+  {:inline (fn [o] `(not (neg? (long ~o))))}
+  [^long o] (not (neg? o)))
+
 ;; ------------------------------------------------------- the offset layer
 ;;
 ;; Everything below takes `(source, offset)` and returns a `long` or a scalar.
@@ -1930,8 +1960,19 @@
 ;; caller writing its own walker. konserve-lmdb wrote two, and both disagreed
 ;; with this namespace.
 ;;
-;; -1 MEANS ABSENT, everywhere, and that is the only sentinel. A caller that
-;; passes it on to `value-at` gets a typed error rather than a wrong answer.
+;; TWO SENTINELS, both negative, both refused by `value-at`/`long-at` as a
+;; typed `:boring/absent` rather than a wrong answer:
+;;
+;;   -1  ABSENT -- the path led nowhere (no such key, index out of range).
+;;   -2  PRESENT BUT UNNAMEABLE -- the value is there, but no offset can name
+;;       it, so fall back to the cursor `walk`. A tag structure and a shaped-
+;;       array row are the two cases: `walk-from` cannot descend a tag, and a
+;;       shaped row is synthesised, not a byte range.
+;;
+;; `walk-from`'s docstring is canonical for both; the predicates `absent?`,
+;; `no-offset?` and `found?` below name them so no caller hardcodes the
+;; numbers. This comment said "-1 is the only sentinel" through three releases
+;; that returned -2 from `walk-from`, `field-offset` and `nth-offset`.
 
 (defn probe
   "`k` encoded once, to hand to `field-offset` in a loop.

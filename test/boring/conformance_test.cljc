@@ -1061,7 +1061,7 @@
             Neither threw. The JVM has rejected both since `writeTag` gained its
             check; the platforms now agree."
     (doseq [bad [-1 -40 1.5]]
-      (is (= :boring/bad-tag
+      (is (= :boring/bad-tag-number
              (try (do (boring/encode (data/tagged-value bad 0) {:stringref false}) nil)
                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
                     (:type (ex-data e)))))
@@ -2253,7 +2253,7 @@
             document it cannot itself parse"
     (doseq [t [#?(:clj -1 :cljs (js/BigInt -1))
                #?(:clj -100 :cljs (js/BigInt -100))]]
-      (is (= :boring/bad-tag
+      (is (= :boring/bad-tag-number
              (err-type #(boring/encode (data/tagged-value t 0))))
           (str "tag " t))))
   (testing "a legal one still round-trips -- an UNINTERPRETED tag, so the

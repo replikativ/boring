@@ -1731,7 +1731,7 @@ public final class Writer {
 
     void writeTag(long tag) {
         if (tag < 0)
-            throw Err.of("bad-tag",
+            throw Err.of("bad-tag-number",
                 "boring: tag must be non-negative, got " + tag, "tag", tag);
         // THE STRINGREF MACHINERY IS THE CODEC'S, NOT THE CALLER'S. Tag 25 is
         // an index into a table this writer builds while encoding, and tag 256
@@ -1787,14 +1787,14 @@ public final class Writer {
         if (tag instanceof java.math.BigInteger) {
             java.math.BigInteger b = (java.math.BigInteger) tag;
             if (b.signum() < 0 || b.bitLength() > 64)
-                throw Err.of("bad-tag",
+                throw Err.of("bad-tag-number",
                     "boring: tag must be an unsigned 64-bit integer, got " + b);
             if (b.bitLength() > 63) { headU64(TAG, b.longValue()); return; }
             head(TAG, b.longValue());
             return;
         }
         if (!(tag instanceof Number))
-            throw Err.of("bad-tag", "boring: tag must be an integer, got "
+            throw Err.of("bad-tag-number", "boring: tag must be an integer, got "
                 + (tag == null ? "nil" : tag.getClass().getSimpleName()));
         // FRACTIONAL tags were truncated, not refused: `longValue()` turned tag
         // 1.5 into tag 1, so `(tagged-value 1.5 0)` and `(tagged-value 1 0)`
@@ -1802,7 +1802,7 @@ public final class Writer {
         // else is a mistake the caller should hear about, not a value to round.
         if (tag instanceof Double || tag instanceof Float
             || tag instanceof java.math.BigDecimal || tag instanceof clojure.lang.Ratio)
-            throw Err.of("bad-tag",
+            throw Err.of("bad-tag-number",
                 "boring: tag must be an integer, got " + tag);
         writeTag(((Number) tag).longValue());
     }
