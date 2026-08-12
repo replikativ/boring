@@ -147,24 +147,43 @@ nippy's filter, nippy's timing loop; the harness prints the nippy version and
 CPU power profile it ran under, because an earlier version of this table
 silently outlived a nippy upgrade). nippy **3.9.0-beta1**, `power-saver`:
 
+**Bold marks the best value in each column** — so the table shows who wins
+what, rather than who is being sold.
+
 | codec | freeze µs | thaw µs | round µs | bytes |
 |---|---:|---:|---:|---:|
-| nippy/fast | 584 | 1 075 | 1 659 | 14 017 |
-| **boring** | 728 | **934** | **1 662** | 15 326 |
+| nippy/fast | **584** | 1 075 | **1 659** | 14 017 |
+| boring | 728 | **934** | 1 662 | 15 326 |
 | nippy (LZ4) | 893 | 1 157 | 2 050 | 7 835 |
 | nippy/encrypted | 979 | 1 289 | 2 268 | 7 863 |
-| **boring + zstd** | 1 812 | 1 409 | 3 221 | **4 900** |
+| boring + zstd | 1 812 | 1 409 | 3 221 | 4 900 |
 | fressian | 5 165 | 3 286 | 8 451 | 12 222 |
 | fressian + zstd | 5 981 | 3 298 | 9 279 | 4 600 |
 | `pr-str` + `read-string` | 7 094 | 10 075 | 17 169 | 15 880 |
-| nippy/lzma2 | 15 804 | 7 162 | 22 966 | 3 700 |
+| nippy/lzma2 | 15 804 | 7 162 | 22 966 | **3 700** |
 
-Raw, boring round-trips **at parity with nippy/fast** (1 662 against 1 659) —
-faster to thaw, slower to freeze — and 1.23× faster than nippy's default,
-while staying self-describing CBOR any language can read. Compressed — which
-is what a storage layer actually writes — **boring+zstd is 1.60× smaller than
-nippy's default** at 1.6× its round-trip time. Only nippy/lzma2 goes smaller,
-at 7× boring+zstd's time.
+**boring wins one column: thaw.** Raw, it round-trips at parity with
+nippy/fast (1 662 against 1 659 — nippy/fast is a hair ahead), decoding
+faster and encoding slower, and it round-trips 1.23× faster than nippy's
+default while staying self-describing CBOR any language can read.
+
+**On size, no codec owns the win — the compressor does.** boring, nippy and
+fressian can each pair with LZ4, zstd or lzma2, and that choice moves the byte
+count far more than the codec does. So read the size column as a compressor
+dial, not a codec verdict:
+
+- **lzma2** is the smallest (3 700) and by far the slowest — **7× boring+zstd's
+  round-trip** to save ~24% of the bytes, a trade a storage layer rarely takes.
+- **zstd** (what boring uses here, level 3) is the sane middle: boring+zstd's
+  4 900 is 1.60× smaller than nippy's LZ4 default, and round-trips 2.9× faster
+  than fressian+zstd, which is only 6% smaller (4 600).
+- **LZ4** (nippy's default) is the largest of the compressed tiers (7 835) and
+  the fastest.
+
+boring is competitive at the zstd tier and does not claim the smallest bytes:
+if you want minimum size, run any of these codecs through lzma2; if you want
+minimum time, LZ4. The codec that stays self-describing CBOR across languages,
+at a reasonable size and speed, is boring's actual pitch.
 
 An earlier version of this table had boring 1.5× *faster* than nippy/fast.
 Both movements since are real and worth naming: nippy 3.7–3.9 got genuinely
