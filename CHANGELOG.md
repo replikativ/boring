@@ -348,6 +348,35 @@ here.
 
 ### Fixed
 
+- **The JVM read a tag-1 float instant up to a millisecond early.** The reader
+  rebuilt sub-second precision as `(d - secs) * 1e9`, subtracting two numbers of
+  very different magnitude: at epoch scale a double resolves to about 100 ns, so
+  `1(915246245.678)` came back as 915246245 s + 677999973 ns and the conversion
+  to milliseconds then truncated it to `.677`. Roughly half of all
+  millisecond-precision instants read one millisecond early, and never late —
+  pre-1970 values too. ClojureScript's `(js/Date. (* v 1000))` was exact for the
+  same bytes, so the two runtimes silently disagreed about one document.
+
+  boring's own output was never affected: it writes instants as tag 0 (RFC
+  3339), which is lossless where a float epoch is not. This only ever bit on
+  FOREIGN input — a producer that writes tag 1 as a float, which is what
+  `1(1363896240.5)` in Appendix A is and what clj-cbor emits — so it surfaced
+  from a real dump written by another library rather than from any round trip.
+
+  The seconds and nanoseconds now come from `BigDecimal.valueOf(d)`, the
+  shortest decimal that round-trips to the double, which asks what the value
+  *says* rather than what the binary happens to be. The tag-1002 duration branch
+  had already settled on the same technique for the same reason, having first
+  tried `Math.round` with a tolerance. Sub-nanosecond content rounds rather than
+  being refused, since an `Instant` cannot hold it and a foreign producer's extra
+  digits should not fail an otherwise valid read; everything an `Instant` *can*
+  hold is now exact, including genuine sub-millisecond precision.
+
+  The single tag-1-float vector in the conformance corpus was
+  `1(1363896240.5)`, and one half is exactly representable in binary — it
+  survives any decomposition, so it could not have caught this. There is now a
+  sibling with `.678`, which cannot.
+
 - **ClojureScript wrote index offsets past 2 GiB as negative numbers.**
   `seal-index!` emitted a 32-bit typed array unconditionally, and
   `Int32Array.from` wraps rather than refusing — so an offset at or above 2^31

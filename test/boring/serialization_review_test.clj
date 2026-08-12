@@ -598,6 +598,55 @@
                                   (.bytesBetween r st e))
                 (str "[" st " " e ")"))))))))
 
+;; ---------------------------------------------------- tag 1 epoch as a float
+
+(defn- tag1-seconds
+  "`1(<float64 seconds>)` — the shape clj-cbor and other producers write, which
+  boring itself never emits (it writes instants as tag 0)."
+  ^bytes [^double seconds]
+  (let [bb (java.nio.ByteBuffer/allocate 10)]
+    (.put bb (unchecked-byte 0xC1))
+    (.put bb (unchecked-byte 0xFB))
+    (.putDouble bb seconds)
+    (.array bb)))
+
+(defn- tag1-float ^bytes [^long millis]
+  (tag1-seconds (/ (double millis) 1000.0)))
+
+(deftest a-tag-1-float-decodes-to-the-millisecond-it-was-written-with
+  (testing "the reader reconstructed sub-second precision as `(d - secs) * 1e9`.
+            At epoch magnitude a double resolves to about 100ns, so
+            915246245.678 came back as 677999973ns and the conversion to
+            millis then TRUNCATED it: roughly half of all millisecond-precision
+            instants read one millisecond EARLY, and never late. boring's own
+            output was unaffected — it writes tag 0 — so this only bit on
+            FOREIGN input, which is the interop case tag 1 exists for."
+    (are [millis] (= millis (.getTime ^java.util.Date
+                                      (boring/decode (tag1-float millis))))
+      915246245678                     ; .678 — not representable in binary
+      1009843199999                    ; .999
+      1700000000001                    ; .001
+      253402300799999                  ; year 9999, upper end of RFC 3339
+      1500000000500                    ; .5 — exact either way, the old vector
+      0
+      -1                               ; just before the epoch
+      -2208988800123))                 ; 1900, where truncation biases the other way
+
+  (testing "sub-millisecond precision the format CAN carry is preserved rather
+            than rounded away — the reason to fix the decomposition instead of
+            just rounding the millis"
+    ;; one second and one nanosecond
+    (is (= 1 (.getNano ^java.time.Instant
+                       (boring/decode (tag1-seconds 1.000000001)
+                                      {:instant-type :instant})))))
+
+  (testing "and sub-NANOsecond content rounds rather than refusing the document
+            — an Instant cannot hold it, and a foreign producer writing extra
+            digits should still be readable"
+    (is (= 123456789 (.getNano ^java.time.Instant
+                               (boring/decode (tag1-seconds 0.12345678915)
+                                              {:instant-type :instant}))))))
+
 ;; ------------------------------------------------------------ RFC 3339 years
 
 (deftest a-year-outside-0000-9999-is-refused-rather-than-emitted-malformed
