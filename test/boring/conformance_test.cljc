@@ -32,15 +32,31 @@
 
 ;; ---------------------------------------------------------------- decode
 
+(defn- check-decodes [vectors]
+  (doseq [{:keys [hex value diag]} vectors]
+    (let [expected (c/->expected value)
+          r (try-decode hex interop-opts)]
+      (is (and (contains? r :ok) (c/equiv? expected (:ok r)))
+          (str hex (when diag (str "  " diag))
+               " -> expected " (pr-str expected)
+               " got " (pr-str (or (:ok r) (:err r))))))))
+
 (deftest appendix-a-decode
   (testing "every RFC 8949 Appendix A vector decodes to the expected value"
-    (doseq [{:keys [hex value diag]} v/appendix-a]
-      (let [expected (c/->expected value)
-            r (try-decode hex interop-opts)]
-        (is (and (contains? r :ok) (c/equiv? expected (:ok r)))
-            (str hex (when diag (str "  " diag))
-                 " -> expected " (pr-str expected)
-                 " got " (pr-str (or (:ok r) (:err r)))))))))
+    (check-decodes v/appendix-a)))
+
+(deftest regression-decode
+  (testing "and so does every vector of boring's own — decodes that were once
+            WRONG, pinned by the bytes that were wrong. Separate from
+            `appendix-a` because that name is a claim about provenance, not a
+            bag to put vectors in; the assertion is identical."
+    ;; NOT decoration. `rfc8949-forbidden-encodings-are-refused` was deleted
+    ;; from this file for filtering a list on a key no row carried: an empty
+    ;; doseq body, a green deftest, and nothing asserted. A list in a second
+    ;; place is exactly how that recurs, so the count is pinned here rather
+    ;; than assumed.
+    (is (seq v/regression) "the regression corpus must not be empty")
+    (check-decodes v/regression)))
 
 ;; ---------------------------------------------------------------- encode
 
@@ -59,9 +75,17 @@
        (number? (second value))
        (== (second value) (js-or-long-floor (second value)))))
 
+;; Both lists. The decode tests above are kept apart because "every Appendix A
+;; vector decodes" is a claim about PROVENANCE and should mean it; from here
+;; down the checks are about behaviour, where where a vector came from is
+;; irrelevant. Splitting the lists without this cost `regression` its
+;; encode-side coverage — one assertion, and the assertion count is how it was
+;; noticed.
+(def ^:private all-vectors (into (vec v/appendix-a) v/regression))
+
 (deftest appendix-a-encode-shortest
   (testing "roundtrip vectors re-encode to the same bytes under :shortest floats"
-    (doseq [{:keys [hex value roundtrip encode-forbidden encoding-differs]} v/appendix-a
+    (doseq [{:keys [hex value roundtrip encode-forbidden encoding-differs]} all-vectors
             :when (and roundtrip (not encode-forbidden) (not encoding-differs)
                        (or (c/width-checkable?) (not (integral-float-marker? value))))]
       (let [r (try-encode (c/->expected value) interop-opts)]
@@ -71,7 +95,7 @@
 (deftest encoding-differs-still-decodes-equal
   (testing "vectors we re-encode differently must still decode to the same
             value, and our own encoding must round-trip"
-    (doseq [{:keys [hex value encoding-differs]} v/appendix-a
+    (doseq [{:keys [hex value encoding-differs]} all-vectors
             :when encoding-differs]
       (let [expected (c/->expected value)
             ours (try-encode expected interop-opts)

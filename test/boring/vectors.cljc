@@ -1,5 +1,19 @@
-;; GENERATED from https://github.com/cbor/test-vectors (RFC 8949 Appendix A).
-;; Regenerate with scratchpad/gen_vectors.py — do not hand-edit the vector list.
+;; `appendix-a` was SEEDED from https://github.com/cbor/test-vectors (RFC 8949
+;; Appendix A) and has been curated by hand since. It is not machine-generated
+;; output: it deviates from that upstream file where the file is wrong, and each
+;; deviation carries a comment saying why — see `f818` below, which upstream
+;; still lists and RFC 8949 does not have.
+;;
+;; The header used to say "GENERATED ... regenerate with scratchpad/gen_vectors.py
+;; — do not hand-edit", which was misleading twice over: that script has never
+;; been in this repository, and the list had already been hand-edited when the
+;; instruction was written. It cost a contributor a wrong assumption in both
+;; directions at once.
+;;
+;; So: EDIT THIS BY HAND, and say why in a comment. But keep `appendix-a` to
+;; vectors that are actually in Appendix A — a test asserting "every RFC 8949
+;; Appendix A vector decodes" should mean it. Vectors of boring's own go in
+;; `regression` at the bottom.
 ;;
 ;; Fixture markers (realised by boring.conformance/->expected):
 ;;   [:bytes b...]      byte array          [:tagged n v]  tagged value
@@ -69,16 +83,8 @@
    {:hex "c074323031332d30332d32315432303a30343a30305a" :value [:instant "2013-03-21T20:04:00Z"] :roundtrip true :diag "0(\"2013-03-21T20:04:00Z\")"}
    {:hex "c11a514b67b0" :value [:instant "2013-03-21T20:04:00Z"] :roundtrip true :diag "1(1363896240)" :encoding-differs true :encoding-differs-reason "source uses tag 1 (epoch); boring writes instants as tag 0 (RFC 3339), which is lossless where a float epoch is not. Decodes to the same instant."}
    {:hex "c1fb41d452d9ec200000" :value [:instant "2013-03-21T20:04:00.5Z"] :roundtrip true :diag "1(1363896240.5)" :encoding-differs true :encoding-differs-reason "source uses tag 1 (epoch float); boring writes instants as tag 0 (RFC 3339)."}
-   ;; A tag-1 float whose value is NOT a dyadic rational. The .5 above cannot
-   ;; catch a precision bug -- one half is exactly representable in binary, so
-   ;; it survives any decomposition -- and while it was the only tag-1 float
-   ;; vector, the JVM reader read roughly half of all millisecond instants one
-   ;; millisecond EARLY and no test noticed. .678 is not representable: the
-   ;; nearest double is 915246245.67799997329711914, so a reader that
-   ;; reconstructs nanoseconds by subtracting the whole seconds and then
-   ;; truncates gives .677. ClojureScript was already exact here, so this also
-   ;; pins the two platforms to the same answer for the same bytes.
-   {:hex "c1fb41cb46c652d6c8b4" :value [:instant "1999-01-02T03:04:05.678Z"] :roundtrip true :diag "1(915246245.678)" :encoding-differs true :encoding-differs-reason "source uses tag 1 (epoch float); boring writes instants as tag 0 (RFC 3339)."}
+   ;; A `.678` sibling for the vector above lives in `regression` — it is not an
+   ;; Appendix A vector, so it does not belong in this list.
    {:hex "d74401020304" :value [:tagged 23 [:bytes 1 2 3 4]] :roundtrip true :diag "23(h'01020304')"}
    {:hex "d818456449455446" :value [:tagged 24 [:bytes 100 73 69 84 70]] :roundtrip true :diag "24(h'6449455446')"}
    {:hex "d82076687474703a2f2f7777772e6578616d706c652e636f6d" :value [:uri "http://www.example.com"] :roundtrip true :diag "32(\"http://www.example.com\")"}
@@ -111,3 +117,27 @@
    {:hex "bf61610161629f0203ffff" :value {"a" 1, "b" [2 3]} :roundtrip false :decode-only true}
    {:hex "826161bf61626163ff" :value ["a" {"b" "c"}] :roundtrip false :decode-only true}
    {:hex "bf6346756ef563416d7421ff" :value {"Fun" true, "Amt" -2} :roundtrip false :decode-only true}])
+
+;; Vectors of boring's OWN, in the same shape as `appendix-a` and run through
+;; the same machinery — but not from Appendix A, so kept apart from a list whose
+;; name is a claim about where its contents came from.
+;;
+;; These are regressions: each one is a decode that was WRONG, pinned by the
+;; bytes that were wrong. Because this file is `.cljc` they also hold the two
+;; runtimes to the same answer for the same bytes, which is where a reader
+;; defect most easily hides — a divergence needs no failing assertion on either
+;; platform alone to be a bug.
+(def regression
+  [;; A tag-1 float whose value is NOT a dyadic rational.
+   ;;
+   ;; `1(1363896240.5)` in `appendix-a` was the only tag-1 float vector, and one
+   ;; half is exactly representable in binary — it survives any decomposition,
+   ;; so it could not fail. Meanwhile the JVM reader rebuilt sub-second
+   ;; precision as `(d - secs) * 1e9`, and at epoch scale a double resolves to
+   ;; about 100ns: `.678` came back as 677999973ns and truncated to `.677`.
+   ;; Roughly half of all millisecond instants read one millisecond early, never
+   ;; late, and no test noticed.
+   ;;
+   ;; ClojureScript was already exact for these bytes, so this vector is also
+   ;; the parity pin: the platforms disagreed, and neither was failing.
+   {:hex "c1fb41cb46c652d6c8b4" :value [:instant "1999-01-02T03:04:05.678Z"] :roundtrip true :diag "1(915246245.678)" :encoding-differs true :encoding-differs-reason "source uses tag 1 (epoch float); boring writes instants as tag 0 (RFC 3339)."}])
