@@ -52,6 +52,21 @@ commands:
           keys:
             - v1-deps-{{ checksum "deps.edn" }}
             - v1-deps-
+      # On an exact cache hit this is a no-op. On a MISS the parallel jobs each
+      # cold-resolve from the network, where a transient malformed-POM response
+      # (aether `validateEffectiveDependency`) fails the job -- the flake that
+      # turned the `mutants` gate red on a docs-only PR. Resolve once here with
+      # a retry so a momentary repo hiccup does not fail the build.
+      - run:
+          name: Resolve deps (retry transient repo/POM failures)
+          command: |
+            for i in 1 2 3; do
+              clojure -P -M:test && exit 0
+              echo "dep resolution attempt $i failed (transient repo error?); retry in 5s" >&2
+              sleep 5
+            done
+            echo "dep resolution failed after 3 attempts" >&2
+            exit 1
   save-deps:
     steps:
       - save_cache:

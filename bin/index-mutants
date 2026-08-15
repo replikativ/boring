@@ -39,6 +39,27 @@ NSES="-n boring.index-robustness-test -n boring.seq-index-test -n boring.writer-
 
 FAILED=()
 
+# Run the index test namespaces once. Echo the failure COUNT, or the sentinel
+# `NORUN` when the suite never reached a result at all -- a dependency/compile
+# error, an OOM or a timeout. That distinction is the whole point of this
+# helper: a mutation the suite CATCHES prints "N failures" with N>0; a mutation
+# nothing catches prints "0 failures"; a suite that never RAN prints no
+# failures line at all. The old code collapsed the last two with `${n:-0}`, so a
+# dependency-resolution flake in CI read as "0 tests depend on it" for every
+# path -- a real coverage gate turned into a false coverage regression. Never
+# again: NORUN aborts with the environment error, it is not a coverage verdict.
+run_suite () {
+  local out count
+  out=$(timeout 1800 clojure -J-Xmx2g -M:test $NSES 2>&1)
+  count=$(printf '%s\n' "$out" | grep -oE '[0-9]+ failures' | tail -1 | grep -oE '^[0-9]+')
+  if [ -z "$count" ]; then
+    printf '%s\n' "$out" | tail -25 >&2
+    echo NORUN
+  else
+    echo "$count"
+  fi
+}
+
 check () {
   local label="$1" old="$2" new="$3"
   restore
@@ -50,13 +71,36 @@ if old not in s: sys.exit(1)
 open(p,'w').write(s.replace(old,new,1))
 PY
   local n
-  n=$(timeout 1800 clojure -J-Xmx2g -M:test $NSES 2>&1 | grep -oE '[0-9]+ failures' | tail -1 | grep -oE '^[0-9]+')
-  n=${n:-0}
+  n=$(run_suite)
+  if [ "$n" = NORUN ]; then
+    echo "   ABORT — the suite did not run to a result under mutation '$label'"
+    echo "   (dependency/compile error, OOM or timeout — tail above). This is NOT"
+    echo "   a coverage failure; the environment is broken. Fix it and re-run."
+    exit 2
+  fi
   printf "   %-34s %s test(s) depend on it\n" "$label" "$n"
   if [ "$n" -eq 0 ]; then FAILED+=("$label"); fi
 }
 
 echo "──▶ index-mutants"
+
+# Baseline first: the UNMUTATED suite must run to a result and be green.
+# If it does not run, coverage cannot be measured -- fail with THAT, loudly,
+# rather than proceeding to mislabel a broken environment as missing coverage.
+restore
+base=$(run_suite)
+if [ "$base" = NORUN ]; then
+  echo "   ABORT — the unmutated suite did not run to a result (dependency/"
+  echo "   compile error, OOM or timeout — tail above). Cannot measure coverage;"
+  echo "   this is NOT a coverage failure. Fix the environment and re-run."
+  exit 2
+fi
+if [ "$base" -ne 0 ]; then
+  echo "   ABORT — the unmutated suite has $base failing assertion(s); fix the"
+  echo "   suite before measuring mutation coverage (else survivors are hidden)."
+  exit 2
+fi
+
 # The variable is `seq-ok?` since per-node validation landed -- `ok?` named a
 # whole-index verdict that no longer exists.
 check "index load"            "          (when seq-ok?" "          (when (and seq-ok? false)"
