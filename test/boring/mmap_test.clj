@@ -400,3 +400,44 @@
                   the warning is demonstrated rather than asserted"
           (is (some? @escaped-cursor))
           (is (thrown? Throwable (nav/value (get @escaped-cursor "a")))))))))
+
+(def poke-opts {:profile :archival})
+
+(deftest poke!-overwrites-in-place-same-length
+  (if-not ffm?
+    (is true "skipped: this JVM has no java.lang.foreign (JDK < 22)")
+    (let [poke! (requiring-resolve 'boring.mmap/poke!)
+          rd    (fn [^File f] (boring/decode (java.nio.file.Files/readAllBytes (.toPath f))))]
+      (testing "a same-length poke lands in the file and matches assoc-in"
+        (let [data {"a" {"x" 10 "y" 2} "b" 5}
+              f (spit-bytes (boring/encode data poke-opts))]
+          (is (= 1 (poke! (.getPath f) ["a" "x"] 7 poke-opts)))
+          (is (= (assoc-in data ["a" "x"] 7) (rd f)))))
+      (testing "an indexed file pokes a back field without a full scan, index stays valid"
+        (let [data (into {} (for [i (range 300)] [(format "k%03d" i) (mod i 20)]))
+              f (spit-bytes (boring/encode-indexed data poke-opts))]
+          (poke! (.getPath f) ["k299"] 7 poke-opts)
+          (is (= (assoc data "k299" 7) (rd f)))))
+      (testing ":offset pokes a value that sits past a header, leaving the header untouched"
+        (let [value (boring/encode {"a" {"x" 10} "b" 5} poke-opts)
+              hdr   (byte-array (range 20))            ; arbitrary 20-byte prefix
+              blob  (byte-array (concat hdr value))
+              f     (spit-bytes blob)]
+          (poke! (.getPath f) ["a" "x"] 7 (assoc poke-opts :offset 20))
+          (let [b2 (java.nio.file.Files/readAllBytes (.toPath f))]
+            (is (= (seq (range 20)) (seq (take 20 b2))) "header bytes untouched")
+            (is (= {"a" {"x" 7} "b" 5}
+                   (boring/decode (java.util.Arrays/copyOfRange b2 20 (alength b2))))))))
+      (testing "a length-changing poke is refused and the file is left untouched"
+        (let [data {"a" 10 "b" 5}
+              f (spit-bytes (boring/encode data poke-opts))
+              before (java.nio.file.Files/readAllBytes (.toPath f))]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (poke! (.getPath f) ["a"] 1000000 poke-opts)))
+          (is (= (seq before) (seq (java.nio.file.Files/readAllBytes (.toPath f)))))))
+      (testing "a missing path is refused, file untouched"
+        (let [f (spit-bytes (boring/encode {"a" 1} poke-opts))
+              before (java.nio.file.Files/readAllBytes (.toPath f))]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (poke! (.getPath f) ["nope"] 1 poke-opts)))
+          (is (= (seq before) (seq (java.nio.file.Files/readAllBytes (.toPath f))))))))))

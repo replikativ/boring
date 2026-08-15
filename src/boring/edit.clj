@@ -182,22 +182,37 @@
       (= (alength ^bytes (boring/encode (nav/value-at src s) opts))
          (alength ^bytes (boring/encode v opts))))))
 
+(defn poke-plan
+  "Locate the value at `path` under `src` (a `boring.nav/source` over a byte[] or
+  a ByteSource) and, if replacing it with `v` keeps the encoded byte length,
+  return `{:offset <byte offset in src> :bytes <new encoded bytes>}`.
+
+  This is the source-agnostic core of a poke: it does no IO, so a caller with a
+  heap buffer and a caller with a memory-mapped segment share the same locate,
+  the same length check, and the same typed refusals. Throws
+  `:boring/path-absent` if `path` is missing and `:boring/not-pokeable` if the
+  new value's encoding is a different length -- in which case the caller must
+  splice (`update-in-bytes`) rather than overwrite."
+  [src path v opts]
+  (let [eopts (dissoc opts :index)
+        s (start-of src (nav/root-offset src) path)]
+    (when (neg? s)
+      (throw (ex-info (str "boring.edit: no value at path " (pr-str path))
+                      {:type :boring/path-absent :path path})))
+    (let [old-len (alength ^bytes (boring/encode (nav/value-at src s) eopts))
+          ins ^bytes (boring/encode v eopts)]
+      (when (not= old-len (alength ins))
+        (throw (ex-info "boring.edit: poke would change the byte length"
+                        {:type :boring/not-pokeable :old old-len :new (alength ins)})))
+      {:offset s :bytes ins})))
+
 (defn poke-in-bytes
   "Overwrite the value at `path` with `v` IN PLACE, requiring the encoded length
   to be unchanged; returns the same `blob` array, mutated. Throws
   `:boring/not-pokeable` if the length differs (use `update-in-bytes`) and
   `:boring/path-absent` if the path is missing. Leaves any index frame valid --
-  nothing shifted."
+  nothing shifted. See `poke-plan` for the memory-mapped counterpart."
   ^bytes [^bytes blob path v opts]
-  (let [src (nav/source blob nil)
-        s (start-of src (nav/root-offset src) path)]
-    (when (neg? s)
-      (throw (ex-info (str "boring.edit: no value at path " (pr-str path))
-                      {:type :boring/path-absent :path path})))
-    (let [old-len (alength ^bytes (boring/encode (nav/value-at src s) opts))
-          ins ^bytes (boring/encode v opts)]
-      (when (not= old-len (alength ins))
-        (throw (ex-info "boring.edit: poke would change the byte length"
-                        {:type :boring/not-pokeable :old old-len :new (alength ins)})))
-      (System/arraycopy ins 0 blob s (alength ins))
-      blob)))
+  (let [{:keys [offset ^bytes bytes]} (poke-plan (nav/source blob nil) path v opts)]
+    (System/arraycopy bytes 0 blob (int offset) (alength bytes))
+    blob))

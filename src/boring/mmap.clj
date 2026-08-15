@@ -28,7 +28,8 @@
   The mapping lives until the arena closes. Closing it invalidates every cursor
   derived from it -- access after close throws a typed FFM error rather than
   reading freed memory, which is the property `MappedByteBuffer` never had."
-  (:require [boring.nav :as nav])
+  (:require [boring.nav :as nav]
+            [boring.edit :as edit])
   (:import (java.io File)
            (java.lang.foreign Arena MemorySegment)
            (java.nio.channels FileChannel FileChannel$MapMode)
@@ -81,6 +82,19 @@
                                      (into-array StandardOpenOption
                                                  [StandardOpenOption/READ]))]
       (.map ch FileChannel$MapMode/READ_ONLY 0 (.size ch) arena))))
+
+(defn mmap-segment-rw
+  "Map `file` READ_WRITE into `arena`. The segment is valid until the arena
+  closes, and writes to it go to the file's pages -- call `.force` on the
+  segment (or a slice) to msync them. The file must already be at least
+  `.size ch` bytes; this maps exactly the current length and does not grow it."
+  ^MemorySegment [file ^Arena arena]
+  (let [^File f (if (instance? File file) file (File. (str file)))]
+    (with-open [ch (FileChannel/open (.toPath f)
+                                     (into-array StandardOpenOption
+                                                 [StandardOpenOption/READ
+                                                  StandardOpenOption/WRITE]))]
+      (.map ch FileChannel$MapMode/READ_WRITE 0 (.size ch) arena))))
 
 (defn- sub-segment
   "`seg`, narrowed to `:offset`/`:length` if either is given.
@@ -201,3 +215,38 @@
      (with-open [a# arena#]
        (let [~binding c#]
          ~@body))))
+
+(defn poke!
+  "Overwrite the value at `path` inside a memory-mapped CBOR document IN PLACE,
+  requiring the new value `v` to encode to the SAME byte length. This is the one
+  edit that needs no rewrite: nothing shifts, so any offset index stays valid and
+  only the touched pages are dirtied -- a field update in a gigabyte file costs a
+  page write, not a re-encode.
+
+  Opens `file` READ_WRITE, writes the new bytes at the located offset, and
+  msyncs (`.force`). `:offset`/`:length` narrow to a value that is not the whole
+  file -- a konserve blob's value sits past its 20-byte header and metadata, so
+  `(poke! path v (assoc opts :offset (+ 20 meta-size)))`. `opts` must be the
+  deterministic, stringref-off profile the value was written with.
+
+  Throws `:boring/not-pokeable` if the new encoding is a different length (splice
+  with `boring.edit/update-in-bytes` instead) and `:boring/path-absent` if the
+  path is missing; in both cases the file is left untouched. Returns the number
+  of bytes written.
+
+  DURABILITY. `.force` msyncs the dirtied pages, but an in-place overwrite is not
+  torn-write safe on its own -- a crash mid-write can leave a value half-updated.
+  Use this where a single writer holds the file and either the value fits a
+  sector-atomic write or a higher layer can detect and recover (see the
+  durability modes in `konserve.mmap`)."
+  ^long [file path v opts]
+  (let [eopts (dissoc opts :offset :length)
+        arena (Arena/ofShared)]
+    (try
+      (let [seg (sub-segment (mmap-segment-rw file arena) opts)
+            {:keys [offset ^bytes bytes]}
+            (edit/poke-plan (nav/source (segment-source seg) eopts) path v eopts)]
+        (MemorySegment/copy (MemorySegment/ofArray bytes) 0 seg (long offset) (alength bytes))
+        (.force seg)
+        (alength bytes))
+      (finally (.close ^java.lang.AutoCloseable arena)))))
