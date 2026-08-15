@@ -13,12 +13,16 @@ with its own runtime and its own everything, and chose not to, because a
 language that only talks to itself is a silo no matter how good it is. That
 decision is why Clojure has libraries, deployment stories and a job market.
 
-The community made the opposite decision about serialization, and mostly did
-not notice. [nippy][] and [hako][] are fast and JVM-only. [fressian][] is
+The community made the opposite decision about *data*, and mostly did not
+notice: the language bet on an open host it did not control, while serialization
+stayed in-house. [nippy][] and [hako][] are fast and JVM-only. [fressian][] is
 portable across Clojure and speaks to no other language. [transit][] was
 explicitly designed for reach — that part is not a criticism — but in practice
 its reach is Clojure, ClojureScript and a short list of ports, several of them
-unmaintained, against a specification still at 0.8.
+unmaintained, against a specification still at 0.8; and where it *did* ride an
+open transport — transit-msgpack — it wrote its own `~#tag` dialect on top
+rather than msgpack's native types. Reach in the transport is not reach in the
+format.
 
 **The argument for reach is stronger for data than it ever was for code**,
 because code runs in a world you control and data does not. When you write
@@ -48,8 +52,11 @@ bet it is making:
 > changes.
 
 That is a reasonable position for a wire protocol and a poor one for an
-archive — and an archive is what [datahike][] needed, which is why boring
-exists.
+archive — and an archive is what [datahike][] needed. None of this is a charge
+of bad judgment: fressian gave Datomic a durable, richly-typed store, transit
+gave app-to-app and the browser a fast path, and CBOR only became an Internet
+Standard in 2020. The point is not that anyone chose wrong; it is that the open
+format now exists — and is worth *joining* rather than wrapping.
 
 boring takes the reach: it is [CBOR][rfc8949] — **IETF STD 94**, a full
 Internet Standard since December 2020, with [implementations in 26
@@ -58,6 +65,11 @@ notation. It is the format with the widest
 reach that can still carry edn faithfully: keywords, symbols, sets, ratios,
 records, metadata. A foreign reader gets your data as ordinary CBOR whether or
 not it knows what a keyword is.
+
+And boring rides no dialect on top of it — it *speaks* CBOR. Where transit wrote
+its own tags over an open transport, boring's extensions are CBOR's own, so a
+`cbor2` or `ciborium` reader gets idiomatic CBOR, not a Clojure-only encoding it
+must special-case.
 
 **And reach did not cost speed.** boring round-trips on par with the fastest
 JVM Clojure codecs — `nippy/fast` and [hako][] — decoding faster than nippy,
