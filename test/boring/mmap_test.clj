@@ -441,3 +441,20 @@
           (is (thrown? clojure.lang.ExceptionInfo
                        (poke! (.getPath f) ["nope"] 1 poke-opts)))
           (is (= (seq before) (seq (java.nio.file.Files/readAllBytes (.toPath f))))))))))
+
+(deftest poke-update!-applies-a-fn-in-place
+  (if-not ffm?
+    (is true "skipped: this JVM has no java.lang.foreign (JDK < 22)")
+    (let [poke-update! (requiring-resolve 'boring.mmap/poke-update!)
+          rd (fn [^File f] (boring/decode (java.nio.file.Files/readAllBytes (.toPath f))))]
+      (testing "a same-length fn result is poked in place, returns [old new]"
+        (let [data {"n" 10 "s" "x"}
+              f (spit-bytes (boring/encode data poke-opts))]
+          (is (= [10 11] (poke-update! (.getPath f) ["n"] inc poke-opts)))
+          (is (= (assoc data "n" 11) (rd f)))))
+      (testing "a length-changing fn result is refused, file untouched"
+        (let [f (spit-bytes (boring/encode {"n" 10} poke-opts))
+              before (java.nio.file.Files/readAllBytes (.toPath f))]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (poke-update! (.getPath f) ["n"] (fn [x] (+ x 1000000)) poke-opts)))
+          (is (= (seq before) (seq (java.nio.file.Files/readAllBytes (.toPath f))))))))))

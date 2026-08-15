@@ -250,3 +250,30 @@
         (.force seg)
         (alength bytes))
       (finally (.close ^java.lang.AutoCloseable arena)))))
+
+(defn poke-update!
+  "Apply `f` to the value at `path` in a memory-mapped document and, if `(f old)`
+  encodes to the SAME byte length, overwrite it in place and msync -- returning
+  `[old new]`. One mapping does the read and the write, so a same-length update
+  (a counter, a status flag) never reads the rest of the value.
+
+  Throws `:boring/not-pokeable` when the result is a different length (the caller
+  splices instead) and `:boring/path-absent` when `path` is missing; the file is
+  untouched in both cases. `:offset`/`:length` and `opts` are as for `poke!`."
+  [file path f opts]
+  (let [eopts (dissoc opts :offset :length)
+        arena (Arena/ofShared)]
+    (try
+      (let [seg (sub-segment (mmap-segment-rw file arena) opts)
+            src (nav/source (segment-source seg) eopts)
+            off (edit/path-offset src path)]
+        (when (neg? off)
+          (throw (ex-info (str "boring.mmap: no value at path " (pr-str path))
+                          {:type :boring/path-absent :path path})))
+        (let [old (nav/value-at src off)
+              nv (f old)
+              nb ^bytes (edit/encode-same-length old nv eopts)]
+          (MemorySegment/copy (MemorySegment/ofArray nb) 0 seg (long off) (alength nb))
+          (.force seg)
+          [old nv]))
+      (finally (.close ^java.lang.AutoCloseable arena)))))

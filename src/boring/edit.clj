@@ -182,6 +182,39 @@
       (= (alength ^bytes (boring/encode (nav/value-at src s) opts))
          (alength ^bytes (boring/encode v opts))))))
 
+(def absent
+  "Returned by `value-at-path` when the path does not resolve -- distinct from a
+  stored `nil`, which is a real value."
+  ::absent)
+
+(defn value-at-path
+  "The value at `path` in encoded `blob`, or `absent` if the path is missing.
+  Reads only what the path touches; `absent` is distinct from a stored `nil`."
+  [^bytes blob path opts]
+  (let [src (nav/source blob (dissoc opts :index))
+        s (start-of src (nav/root-offset src) path)]
+    (if (neg? s) absent (nav/value-at src s))))
+
+(defn path-offset
+  "Byte offset of the value at `path` under `src` (a `boring.nav/source`), or -1
+  if any step is absent. The offset-layer entry point a memory-mapped editor
+  needs before reading or overwriting a value."
+  ^long [src path]
+  (start-of src (nav/root-offset src) path))
+
+(defn encode-same-length
+  "Encode `new-val`, requiring it to be the same byte length as `old-val`'s
+  encoding; returns the new bytes or throws `:boring/not-pokeable`. The check a
+  poke turns on: only an equal-length replacement can go in without a shift."
+  ^bytes [old-val new-val opts]
+  (let [eopts (dissoc opts :index)
+        ol (alength ^bytes (boring/encode old-val eopts))
+        nb ^bytes (boring/encode new-val eopts)]
+    (when (not= ol (alength nb))
+      (throw (ex-info "boring.edit: value would change the byte length"
+                      {:type :boring/not-pokeable :old ol :new (alength nb)})))
+    nb))
+
 (defn poke-plan
   "Locate the value at `path` under `src` (a `boring.nav/source` over a byte[] or
   a ByteSource) and, if replacing it with `v` keeps the encoded byte length,
