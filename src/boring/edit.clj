@@ -83,12 +83,51 @@
       (.toByteArray out))
     data))
 
+(defn- seal-onto
+  "Seal a GIVEN index map onto `data`, or return `data` when the map is nil."
+  ^bytes [^bytes data ix eopts]
+  (if ix
+    (let [w (boring/writer 8192 eopts)
+          out (java.io.ByteArrayOutputStream. (+ (alength data) 64))]
+      (.write out data)
+      (boring/seal-index! w out ix (alength data))
+      (.toByteArray out))
+    data))
+
+(defn shift-index-map
+  "Shift a pre-seal index map for a LEAF-REPLACE splice at value-start `E` with
+  byte delta `D`: every absolute offset strictly greater than `E` moves by `+D`,
+  counts and sorted flags unchanged. The edited value starts at `E` and does not
+  move; everything after it does, at any nesting depth (ancestors start before
+  `E`). The result equals what `build-index` would produce on the spliced bytes
+  -- byte for byte -- so `:maintain` and `:rebuild` seal identical frames.
+
+  ONLY VALID FOR A LEAF REPLACE. A structural edit (add/remove key) re-encodes a
+  container, changing its index nodes arbitrarily rather than shifting them, so
+  this must not be used there."
+  [ix ^long E ^long D]
+  (let [sh (fn [^long o] (if (> o E) (+ o D) o))]
+    (-> ix
+        (assoc :containers (long-array (map sh (:containers ix))))
+        (assoc :slots (mapv (fn [row] (long-array (map sh row))) (:slots ix))))))
+
+(defn- maintain-index
+  "Re-seal `data` (the spliced bytes) with `orig-blob`'s frame shifted for a
+  leaf replace at `E`/`D` -- O(index size), no data walk. If `orig-blob` carried
+  no frame, `data` stays unindexed."
+  ^bytes [^bytes orig-blob ^bytes data E D eopts]
+  (seal-onto data (some-> (nav/frame->index-map orig-blob eopts)
+                          (shift-index-map (long E) (long D)))
+             eopts))
+
 (defn- finish
-  "Apply the `:index` policy to freshly spliced `data`."
+  "Apply the `:index` policy to freshly spliced `data`. `:maintain` degrades to
+  `:rebuild` here: a structural edit changed a container's shape, so there is no
+  shift that preserves it -- only the leaf-replace path can maintain."
   ^bytes [^bytes data index-mode eopts]
   (case index-mode
     :drop data
-    :rebuild (reindex data eopts)))
+    (:rebuild :maintain) (reindex data eopts)))
 
 (defn- parent-cursor
   "The cursor at `parent-path` (empty path -> the root cursor), or nil when the
@@ -143,8 +182,13 @@
        (structural blob (butlast path) #(update % (last path) f) opts)
        (let [old-val (nav/value-at src s)
              old-len (alength ^bytes (boring/encode old-val eopts))
-             ins ^bytes (boring/encode (f old-val) eopts)]
-         (finish (splice-bytes blob s (+ s old-len) ins dlen) index-mode eopts))))))
+             ins ^bytes (boring/encode (f old-val) eopts)
+             data (splice-bytes blob s (+ s old-len) ins dlen)]
+         ;; A leaf replace only shifts bytes -- container structure is unchanged
+         ;; -- so `:maintain` can move the frame's offsets instead of rebuilding.
+         (if (= index-mode :maintain)
+           (maintain-index blob data s (- (alength ins) old-len) eopts)
+           (finish data index-mode eopts)))))))
 
 (defn assoc-in-bytes
   "Set the value at `path` to `v`. Replaces an existing leaf by a value-level

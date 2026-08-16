@@ -28,10 +28,11 @@
   The mapping lives until the arena closes. Closing it invalidates every cursor
   derived from it -- access after close throws a typed FFM error rather than
   reading freed memory, which is the property `MappedByteBuffer` never had."
-  (:require [boring.nav :as nav]
+  (:require [boring.core :as boring]
+            [boring.nav :as nav]
             [boring.edit :as edit])
-  (:import (java.io File)
-           (java.lang.foreign Arena MemorySegment)
+  (:import (java.io File RandomAccessFile)
+           (java.lang.foreign Arena MemorySegment ValueLayout)
            (java.nio.channels FileChannel FileChannel$MapMode)
            (java.nio.file StandardOpenOption)
            (org.replikativ.boring ByteSource)
@@ -250,6 +251,113 @@
         (.force seg)
         (alength bytes))
       (finally (.close ^java.lang.AutoCloseable arena)))))
+
+(defn- gbyte ^long [^MemorySegment seg ^long i]
+  (bit-and (.get seg ValueLayout/JAVA_BYTE i) 0xff))
+
+(defn- value-data-len
+  "Length of the value's DATA section within `[voff, file-size)` -- where its
+  index frame begins, or the whole value length when there is no frame. Reads
+  the 9-byte footer only."
+  ^long [^MemorySegment seg ^long voff ^long file-size]
+  (let [vlen (- file-size voff)]
+    (if (< vlen 9)
+      vlen
+      (if (not= 0x48 (gbyte seg (- file-size 9)))
+        vlen
+        (let [dl (loop [i 0 acc 0]
+                   (if (= i 8) acc
+                       (recur (inc i) (+ (* acc 256) (gbyte seg (+ (- file-size 8) i))))))]
+          (if (and (>= dl 0) (< dl vlen)) dl vlen))))))
+
+(defn splice!
+  "In-place SIZE-CHANGING edit of a memory-mapped document: replace the value at
+  `path` with `v`, which may encode to a different length. The file grows or
+  shrinks and only the bytes AFTER the edit shift -- within the mapping, no full
+  read, no rewrite, no temp file -- and the offset index is MAINTAINED (shifted,
+  not rebuilt). msyncs. Returns `[old-len new-len]`.
+
+  This is the counterpart to `poke!` for the case where the length changes. The
+  cost is one in-map memmove of the tail after the edit (memory-bandwidth bound)
+  plus an O(index) frame reshuffle; a value edited near its end is nearly free, a
+  value edited near its front moves its whole tail. Compared to a decode / edit /
+  re-encode it never materialises the value and compared to a temp-file rewrite
+  it touches only the pages from the edit onward.
+
+  `:offset`/`:length` narrow to a value past a header (konserve blobs). `opts`
+  must be the deterministic, stringref-off profile the value was written with.
+  Only LEAF replaces are handled -- the caller resolves the path to an existing
+  value; a missing path throws `:boring/path-absent`. A framed value whose frame
+  cannot be reconstructed throws `:boring/unmaintainable-index` so the caller can
+  fall back to a rebuild.
+
+  NOT CRASH-SAFE on its own: it mutates live bytes, so a crash mid-splice can
+  leave the value torn. Pair with a torn-write detector (see `konserve.mmap`
+  durability modes) or use it only where the value is reproducible."
+  [file path v opts]
+  (let [eopts (dissoc opts :offset :length)
+        voff (long (or (:offset opts) 0))
+        ^File f (if (instance? File file) file (File. (str file)))]
+    ;; Phase 1: read + locate + compute the new bytes, under a read mapping.
+    (let [plan
+          (with-open [arena (Arena/ofShared)]
+            (let [size0 (.length f)
+                  seg0 (mmap-segment f arena)
+                  vseg (.asSlice seg0 voff (- size0 voff))
+                  src (nav/source (segment-source vseg) eopts)
+                  off (edit/path-offset src path)]
+              (when (neg? off)
+                (throw (ex-info (str "boring.mmap/splice!: no value at path " (pr-str path))
+                                {:type :boring/path-absent :path path})))
+              (let [old-val (nav/value-at src off)
+                    old-bytes ^bytes (boring/encode old-val eopts)
+                    old-len (alength old-bytes)
+                    ins ^bytes (boring/encode v eopts)
+                    d (- (alength ins) old-len)
+                    data-len (value-data-len seg0 voff size0)
+                    framed (< data-len (- size0 voff))
+                    ixmap (when framed
+                            (some-> (nav/frame->index-map (segment-source vseg) eopts)
+                                    (edit/shift-index-map off (long d))))
+                    _ (when (and framed (nil? ixmap))
+                        (throw (ex-info "boring.mmap/splice!: framed value has no reconstructable index"
+                                        {:type :boring/unmaintainable-index})))
+                    frame' (when ixmap
+                             (let [w (boring/writer 8192 eopts)
+                                   out (java.io.ByteArrayOutputStream. 256)]
+                               (boring/seal-index! w out ixmap (+ data-len (long d)))
+                               (.toByteArray out)))
+                    ;; the data after the edited leaf: [off+old-len, data-len) in value coords
+                    tail-len (- data-len (+ off old-len))
+                    tail (byte-array tail-len)]
+                (MemorySegment/copy vseg (+ off old-len) (MemorySegment/ofArray tail) 0 tail-len)
+                {:size0 size0 :voff voff :off (+ voff off)
+                 :old-len old-len :ins ins :d d
+                 :data-len data-len :tail tail :frame' frame'})))]
+      ;; Phase 2: grow/shrink the file and write, under a fresh write mapping.
+      (let [{:keys [size0 off old-len ins d data-len tail frame']} plan
+            d (long d)
+            new-data-len (+ (long data-len) d)
+            frame-len (long (if frame' (alength ^bytes frame') 0))
+            new-size (+ (long voff) new-data-len frame-len)]
+        (when (> new-size size0) (.setLength (RandomAccessFile. f "rw") new-size))
+        (with-open [arena (Arena/ofShared)]
+          (let [seg (mmap-segment-rw f arena)
+                ^bytes ins ins
+                ^bytes tail tail
+                ^bytes frame' frame']
+            ;; write the new leaf
+            (MemorySegment/copy (MemorySegment/ofArray ins) 0 seg (long off) (alength ins))
+            ;; place the tail after it
+            (MemorySegment/copy (MemorySegment/ofArray tail) 0 seg (+ (long off) (alength ins))
+                                (alength tail))
+            ;; write the maintained frame at the new data end
+            (when frame'
+              (MemorySegment/copy (MemorySegment/ofArray frame') 0 seg (+ (long voff) new-data-len)
+                                  frame-len))
+            (.force seg)))
+        (when (< new-size size0) (.setLength (RandomAccessFile. f "rw") new-size))
+        [old-len (+ (long old-len) d)]))))
 
 (defn poke-update!
   "Apply `f` to the value at `path` in a memory-mapped document and, if `(f old)`

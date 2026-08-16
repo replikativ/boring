@@ -458,3 +458,37 @@
           (is (thrown? clojure.lang.ExceptionInfo
                        (poke-update! (.getPath f) ["n"] (fn [x] (+ x 1000000)) poke-opts)))
           (is (= (seq before) (seq (java.nio.file.Files/readAllBytes (.toPath f))))))))))
+
+(deftest splice!-in-place-size-change-maintains-index
+  (if-not ffm?
+    (is true "skipped: this JVM has no java.lang.foreign (JDK < 22)")
+    (let [splice! (requiring-resolve 'boring.mmap/splice!)
+          rd (fn [^File f] (boring/decode (java.nio.file.Files/readAllBytes (.toPath f))))]
+      (testing "unframed value grows in place"
+        (let [f (spit-bytes (boring/encode {"a" {"x" 1} "b" 5} poke-opts))]
+          (is (= [1 5] (splice! (.getPath f) ["a" "x"] 1000000000 poke-opts)))
+          (is (= {"a" {"x" 1000000000} "b" 5} (rd f)))))
+      (testing "framed value: front/back/nested grow, index stays a valid jump"
+        (let [m (assoc (into {} (for [i (range 400)] [(format "k%03d" i) i])) "z" [1 2 3])
+              f (spit-bytes (boring/encode-indexed m poke-opts))]
+          (splice! (.getPath f) ["k000"] 5000000000 poke-opts)
+          (splice! (.getPath f) ["k399"] 5000000000 poke-opts)
+          (splice! (.getPath f) ["z" 1] 5000000000 poke-opts)
+          (is (= (-> m (assoc "k000" 5000000000) (assoc "k399" 5000000000) (assoc-in ["z" 1] 5000000000))
+                 (rd f)))
+          (let [bs (java.nio.file.Files/readAllBytes (.toPath f))]
+            (is (= 200 (nav/value (get (nav/root bs) "k200"))))
+            (is (= 5000000000 (nav/value (get (nav/root bs) "k399")))))))
+      (testing "shrink in place"
+        (let [f (spit-bytes (boring/encode {"a" 1000000000 "b" 5} poke-opts))]
+          (splice! (.getPath f) ["a"] 7 poke-opts)
+          (is (= {"a" 7 "b" 5} (rd f)))))
+      (testing "offset past a header"
+        (let [value (boring/encode {"a" {"x" 1} "b" 5} poke-opts)
+              blob  (byte-array (concat (range 20) value))
+              f     (spit-bytes blob)]
+          (splice! (.getPath f) ["a" "x"] 1000000000 (assoc poke-opts :offset 20))
+          (let [b2 (java.nio.file.Files/readAllBytes (.toPath f))]
+            (is (= (seq (range 20)) (seq (take 20 b2))))
+            (is (= {"a" {"x" 1000000000} "b" 5}
+                   (boring/decode (java.util.Arrays/copyOfRange b2 20 (alength b2)))))))))))

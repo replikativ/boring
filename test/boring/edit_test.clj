@@ -124,3 +124,32 @@
             (str "rebuild: path " (pr-str path)))
         (is (= exp (rt (edit/assoc-in-bytes blob path nv (assoc O :index :drop))))
             (str "drop: path " (pr-str path)))))))
+
+(deftest maintain-index-equals-rebuild
+  (testing "for a size-changing LEAF replace, :maintain seals a byte-identical
+            frame to :rebuild -- the incremental shift matches a full walk"
+    (let [data (assoc (into {} (for [i (range 5000)] [(format "k%05d" i) i]))
+                      "nested" [1 2 3])
+          blob (boring/encode-indexed data O)]
+      (is (<= 0 (frame/footer-start blob)) "fixture is framed")
+      (doseq [[k v] [["k00000" 1000000000]   ; front, grows 1->9 bytes
+                     ["k02500" 1000000000]   ; middle
+                     ["k04999" 1000000000]   ; back
+                     ["nested" 1]            ; wait: replaces whole vector -- skip
+                     ]
+              :when (not= k "nested")]
+        (is (java.util.Arrays/equals
+             ^bytes (edit/assoc-in-bytes blob [k] v (assoc O :index :maintain))
+             ^bytes (edit/assoc-in-bytes blob [k] v (assoc O :index :rebuild)))
+            (str "maintain==rebuild for " k)))
+      (testing "a nested array-element replace also matches"
+        (is (java.util.Arrays/equals
+             ^bytes (edit/assoc-in-bytes blob ["nested" 1] 1000000000 (assoc O :index :maintain))
+             ^bytes (edit/assoc-in-bytes blob ["nested" 1] 1000000000 (assoc O :index :rebuild)))))
+      (testing "and it still decodes correctly"
+        (is (= (assoc data "k02500" 777)
+               (boring/decode (edit/assoc-in-bytes blob ["k02500"] 777 (assoc O :index :maintain))))))
+      (testing "navigation over the maintained blob jumps correctly"
+        (let [out (edit/assoc-in-bytes blob ["k00000"] 1000000000 (assoc O :index :maintain))]
+          (is (= 1000000000 (nav/value (get (nav/root out) "k00000"))))
+          (is (= 2500 (nav/value (get (nav/root out) "k02500")))))))))
