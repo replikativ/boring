@@ -173,3 +173,38 @@
           (is (= 125 (nav/value (nth (get (nav/root out) "big") 125))))
           (is (= 249 (nav/value (nth (get (nav/root out) "big") 249))))
           (is (= 5   (nav/value (get (nav/root out) "z")))))))))
+
+(deftest paths-dispatch-on-container-type
+  (testing "keyword keys, integer vector indices, and INTEGER MAP KEYS all resolve
+            like clojure.core/get-in -- dispatch is on the container, not the key"
+    (let [data {:a {:x 1} :v [10 20 30] :m {1 "x" 2 "y"}}
+          blob (boring/encode data O)]
+      (is (= (assoc-in data [:a :x] 99) (rt (edit/assoc-in-bytes blob [:a :x] 99 O)))
+          "keyword path")
+      (is (= (assoc-in data [:v 1] 99) (rt (edit/assoc-in-bytes blob [:v 1] 99 O)))
+          "vector index")
+      (is (= (assoc-in data [:m 1] "Z") (rt (edit/assoc-in-bytes blob [:m 1] "Z" O)))
+          "replace an integer map key (not an array index)")
+      (is (= (assoc-in data [:m 3] "NEW") (rt (edit/assoc-in-bytes blob [:m 3] "NEW" O)))
+          "add an integer map key")
+      (is (= (update data :m dissoc 1) (rt (edit/dissoc-in-bytes blob [:m 1] O)))
+          "remove an integer map key")
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (edit/assoc-in-bytes blob [:a :x :deeper] 1 O))
+          "a non-container parent is a typed path-absent, not a coll error"))))
+
+(deftest same-length-keeps-the-frame
+  (testing "a same-length replace overwrites in place and leaves a framed blob's
+            index frame byte-identical -- the d==0 fast path skips reindexing"
+    (let [data (into {} (for [i (range 300)] [(format "k%03d" i) (mod i 20)]))
+          blob (boring/encode-indexed data O)]
+      (is (<= 0 (frame/footer-start blob)) "fixture is framed")
+      (let [out (edit/assoc-in-bytes blob ["k100"] 7 O)]   ; 3 and 7 are both one byte
+        (is (= (assoc data "k100" 7) (rt out)))
+        (is (= (count blob) (count out)) "same total length")
+        (is (java.util.Arrays/equals
+             ^bytes (java.util.Arrays/copyOfRange blob (frame/footer-start blob) (count blob))
+             ^bytes (java.util.Arrays/copyOfRange out (frame/footer-start out) (count out)))
+            "the index frame is untouched")
+        (is (= 7 (nav/value (get (nav/root out) "k100"))))
+        (is (= 10 (nav/value (get (nav/root out) "k250"))))))))

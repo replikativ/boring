@@ -397,11 +397,15 @@ growing a nested value does not shift the bytes that enclose it.
 ```clojure
 (require '[boring.edit :as edit])
 
-(def bs (boring/encode {"a" {"x" 1} "b" 5} {:profile :archival}))
+(def bs (boring/encode {:user/name "Ada" :scores [99 100]} {:profile :archival}))
 
-(boring/decode (edit/assoc-in-bytes bs ["a" "x"] 1000000 {:profile :archival}))
-;; => {"a" {"x" 1000000}, "b" 5}   -- only "x" was re-encoded
+(boring/decode (edit/assoc-in-bytes bs [:scores 1] 42 {:profile :archival}))
+;; => {:user/name "Ada", :scores [99 42]}   -- only that element was re-encoded
 ```
+
+Paths resolve like `clojure.core/get-in` — a key into a map (keyword, string,
+symbol, even an integer key), an index into a vector — dispatching on the
+container, not on the shape of the key.
 
 `update-in-bytes`, `assoc-in-bytes` and `dissoc-in-bytes` are **byte-for-byte
 indistinguishable from decode → `clojure.core/update-in` → encode** — a
