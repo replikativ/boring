@@ -400,3 +400,119 @@
                   the warning is demonstrated rather than asserted"
           (is (some? @escaped-cursor))
           (is (thrown? Throwable (nav/value (get @escaped-cursor "a")))))))))
+
+(def poke-opts {:profile :archival})
+
+(deftest poke!-overwrites-in-place-same-length
+  (if-not ffm?
+    (is true "skipped: this JVM has no java.lang.foreign (JDK < 22)")
+    (let [poke! (requiring-resolve 'boring.mmap/poke!)
+          rd    (fn [^File f] (boring/decode (java.nio.file.Files/readAllBytes (.toPath f))))]
+      (testing "a same-length poke lands in the file and matches assoc-in"
+        (let [data {"a" {"x" 10 "y" 2} "b" 5}
+              f (spit-bytes (boring/encode data poke-opts))]
+          (is (= 1 (poke! (.getPath f) ["a" "x"] 7 poke-opts)))
+          (is (= (assoc-in data ["a" "x"] 7) (rd f)))))
+      (testing "an indexed file pokes a back field without a full scan, index stays valid"
+        (let [data (into {} (for [i (range 300)] [(format "k%03d" i) (mod i 20)]))
+              f (spit-bytes (boring/encode-indexed data poke-opts))]
+          (poke! (.getPath f) ["k299"] 7 poke-opts)
+          (is (= (assoc data "k299" 7) (rd f)))))
+      (testing ":offset pokes a value that sits past a header, leaving the header untouched"
+        (let [value (boring/encode {"a" {"x" 10} "b" 5} poke-opts)
+              hdr   (byte-array (range 20))            ; arbitrary 20-byte prefix
+              blob  (byte-array (concat hdr value))
+              f     (spit-bytes blob)]
+          (poke! (.getPath f) ["a" "x"] 7 (assoc poke-opts :offset 20))
+          (let [b2 (java.nio.file.Files/readAllBytes (.toPath f))]
+            (is (= (seq (range 20)) (seq (take 20 b2))) "header bytes untouched")
+            (is (= {"a" {"x" 7} "b" 5}
+                   (boring/decode (java.util.Arrays/copyOfRange b2 20 (alength b2))))))))
+      (testing "a length-changing poke is refused and the file is left untouched"
+        (let [data {"a" 10 "b" 5}
+              f (spit-bytes (boring/encode data poke-opts))
+              before (java.nio.file.Files/readAllBytes (.toPath f))]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (poke! (.getPath f) ["a"] 1000000 poke-opts)))
+          (is (= (seq before) (seq (java.nio.file.Files/readAllBytes (.toPath f)))))))
+      (testing "a missing path is refused, file untouched"
+        (let [f (spit-bytes (boring/encode {"a" 1} poke-opts))
+              before (java.nio.file.Files/readAllBytes (.toPath f))]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (poke! (.getPath f) ["nope"] 1 poke-opts)))
+          (is (= (seq before) (seq (java.nio.file.Files/readAllBytes (.toPath f))))))))))
+
+(deftest poke-update!-applies-a-fn-in-place
+  (if-not ffm?
+    (is true "skipped: this JVM has no java.lang.foreign (JDK < 22)")
+    (let [poke-update! (requiring-resolve 'boring.mmap/poke-update!)
+          rd (fn [^File f] (boring/decode (java.nio.file.Files/readAllBytes (.toPath f))))]
+      (testing "a same-length fn result is poked in place, returns [old new]"
+        (let [data {"n" 10 "s" "x"}
+              f (spit-bytes (boring/encode data poke-opts))]
+          (is (= [10 11] (poke-update! (.getPath f) ["n"] inc poke-opts)))
+          (is (= (assoc data "n" 11) (rd f)))))
+      (testing "a length-changing fn result is refused, file untouched"
+        (let [f (spit-bytes (boring/encode {"n" 10} poke-opts))
+              before (java.nio.file.Files/readAllBytes (.toPath f))]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (poke-update! (.getPath f) ["n"] (fn [x] (+ x 1000000)) poke-opts)))
+          (is (= (seq before) (seq (java.nio.file.Files/readAllBytes (.toPath f))))))))))
+
+(deftest splice!-in-place-size-change-maintains-index
+  (if-not ffm?
+    (is true "skipped: this JVM has no java.lang.foreign (JDK < 22)")
+    (let [splice! (requiring-resolve 'boring.mmap/splice!)
+          rd (fn [^File f] (boring/decode (java.nio.file.Files/readAllBytes (.toPath f))))]
+      (testing "unframed value grows in place"
+        (let [f (spit-bytes (boring/encode {"a" {"x" 1} "b" 5} poke-opts))]
+          (is (= [1 5] (splice! (.getPath f) ["a" "x"] 1000000000 poke-opts)))
+          (is (= {"a" {"x" 1000000000} "b" 5} (rd f)))))
+      (testing "framed value: front/back/nested grow, index stays a valid jump"
+        (let [m (assoc (into {} (for [i (range 400)] [(format "k%03d" i) i])) "z" [1 2 3])
+              f (spit-bytes (boring/encode-indexed m poke-opts))]
+          (splice! (.getPath f) ["k000"] 5000000000 poke-opts)
+          (splice! (.getPath f) ["k399"] 5000000000 poke-opts)
+          (splice! (.getPath f) ["z" 1] 5000000000 poke-opts)
+          (is (= (-> m (assoc "k000" 5000000000) (assoc "k399" 5000000000) (assoc-in ["z" 1] 5000000000))
+                 (rd f)))
+          (let [bs (java.nio.file.Files/readAllBytes (.toPath f))]
+            (is (= 200 (nav/value (get (nav/root bs) "k200"))))
+            (is (= 5000000000 (nav/value (get (nav/root bs) "k399")))))))
+      (testing "shrink in place"
+        (let [f (spit-bytes (boring/encode {"a" 1000000000 "b" 5} poke-opts))]
+          (splice! (.getPath f) ["a"] 7 poke-opts)
+          (is (= {"a" 7 "b" 5} (rd f)))))
+      (testing "offset past a header"
+        (let [value (boring/encode {"a" {"x" 1} "b" 5} poke-opts)
+              blob  (byte-array (concat (range 20) value))
+              f     (spit-bytes blob)]
+          (splice! (.getPath f) ["a" "x"] 1000000000 (assoc poke-opts :offset 20))
+          (let [b2 (java.nio.file.Files/readAllBytes (.toPath f))]
+            (is (= (seq (range 20)) (seq (take 20 b2))))
+            (is (= {"a" {"x" 1000000000} "b" 5}
+                   (boring/decode (java.util.Arrays/copyOfRange b2 20 (alength b2)))))))))))
+
+(deftest splice!-review-regressions
+  (if-not ffm?
+    (is true "skipped: this JVM has no java.lang.foreign (JDK < 22)")
+    (let [splice! (requiring-resolve 'boring.mmap/splice!)
+          rd (fn [^File f] (boring/decode (java.nio.file.Files/readAllBytes (.toPath f))))]
+      (testing "finding 1: replacing a whole indexed array is REFUSED in place --
+                a shift would corrupt its nodes -- so the caller can rebuild;
+                the file is left untouched"
+        (let [data {"big" (vec (range 300)) "z" 5}
+              f (spit-bytes (boring/encode-indexed data poke-opts))
+              before (java.nio.file.Files/readAllBytes (.toPath f))]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"index node"
+                                (splice! (.getPath f) ["big"] (vec (range 250)) poke-opts)))
+          (is (= (seq before) (seq (java.nio.file.Files/readAllBytes (.toPath f))))
+              "untouched on refusal")))
+      (testing "finding 3: an UNFRAMED value ending in a footer-shaped byte string still splices"
+        (let [data {"a" 1 "b" (byte-array [0 0 0 0 0 0 0 5])}  ; last bytes look like a footer
+              f (spit-bytes (boring/encode data poke-opts))]
+          (is (neg? (boring.frame/footer-start (boring/encode data poke-opts))) "fixture is unframed")
+          (splice! (.getPath f) ["a"] 1000000000 poke-opts)   ; must not throw unmaintainable
+          (let [got (rd f)]
+            (is (= 1000000000 (get got "a")))
+            (is (= (seq (byte-array [0 0 0 0 0 0 0 5])) (seq (get got "b"))))))))))

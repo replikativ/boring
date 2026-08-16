@@ -3228,6 +3228,38 @@
   (not (zero? (bit-and (.byteAt r (+ sorted-data (quot i 8)))
                        (bit-shift-left 1 (rem i 8))))))
 
+(defn frame->index-map
+  "Reconstruct the pre-seal index map from an already-SEALED blob `bs`, by
+  READING its frame rather than re-walking its data. The result is the shape
+  `boring.core/seal-index!` takes -- `{:containers <long[]>, :counts <int[]>,
+  :slots <vec of long[]>, :sorted <vec of bool>}` -- with every offset absolute.
+  Returns nil when `bs` carries no usable frame.
+
+  This is what makes INCREMENTAL index maintenance possible. A stored blob keeps
+  the sealed frame, not the map, so after an edit shifts the bytes a caller that
+  wants to move the offsets and re-seal -- rather than rebuild the index by
+  walking the whole value -- gets the map back here in O(index size) instead of
+  O(value size). It is the exact inverse of `seal-index!` for the elements that
+  reach the wire; `:walk` is a build-time decision input and is not recovered,
+  because `seal-index!` does not read it.
+
+  Reuses `boring.nav`'s own frame decoders (`container-at`, `count-at`,
+  `slot-at`, `sorted-at?`), so it cannot drift from how the index is actually
+  read at lookup time."
+  ([bs] (frame->index-map bs nil))
+  ([bs opts]
+   (let [^Nav nav (source-of (source bs opts))
+         ^Index ix (nav-idx nav)
+         n  (long (or (:containers ix) 0))]
+     (when (pos? n)
+       (let [^Reader r (.rdr nav)
+             sdata (.sorted-data ix)]
+         {:stride     (:stride ix)
+          :containers (long-array (map (fn [i] (container-at r ix (long i))) (range n)))
+          :counts     (int-array  (map (fn [i] (count-at r ix (long i))) (range n)))
+          :slots      (mapv (fn [i] (slot-at r ix (long i))) (range n))
+          :sorted     (mapv (fn [i] (sorted-at? r sdata (long i))) (range n))})))))
+
 (defn- byte-string-at
   "Data offset and length of the DEFINITE-length byte string at `off`, or nil.
 
