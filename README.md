@@ -386,6 +386,47 @@ found by walking the index, without materialising the rest.
 [Storage](doc/STORAGE.md) covers the model, memory mapping, serving a mapping
 to a socket, writing logs, compression, and what can be updated in place.
 
+## Editing without decoding
+
+The mirror image of reading without decoding: change one leaf of a large value
+without materialising the rest. `boring.edit` navigates to the target and
+**splices only the changed bytes back in** — an ancestor header never moves,
+because a CBOR map/array head carries an element *count*, not a byte length, so
+growing a nested value does not shift the bytes that enclose it.
+
+```clojure
+(require '[boring.edit :as edit])
+
+(def bs (boring/encode {"a" {"x" 1} "b" 5} {:profile :archival}))
+
+(boring/decode (edit/assoc-in-bytes bs ["a" "x"] 1000000 {:profile :archival}))
+;; => {"a" {"x" 1000000}, "b" 5}   -- only "x" was re-encoded
+```
+
+`update-in-bytes`, `assoc-in-bytes` and `dissoc-in-bytes` are **byte-for-byte
+indistinguishable from decode → `clojure.core/update-in` → encode** — a
+generative property test asserts exactly that over thousands of random nested
+values and paths. A same-length change is a **poke** — overwrite the value's
+bytes in place, leaving any [offset index](doc/INDEX.md) valid. A size-changing
+change is a **splice**; when the value carries an index, `:index :maintain`
+*shifts* the frame's offsets instead of rebuilding it, byte-identical to a
+rebuild and measurably cheaper.
+
+Memory-mapped, this becomes an edit with **no copy and no full re-encode**.
+`boring.mmap/poke!` overwrites a same-length value in a mapped file in place;
+`boring.mmap/splice!` grows or shrinks the file and memmoves only the tail after
+the edit within the mapping. Updating a field deep in a gigabyte-sized value
+costs a page write, not a re-serialization.
+
+Two honest constraints. Editing needs a **deterministic, stringref-off profile**
+(`:archival` or `:canonical`) — the same profiles you would use for storage — so
+that a value's bytes do not depend on what was encoded before it. And an
+in-place edit **mutates live bytes**, so it is not crash-safe on its own; it is
+for a single writer, or paired with a torn-write detector. [Editing](doc/EDITING.md)
+has the full API, the semantics, the numbers, and the durability story;
+[konserve][]'s filestore wires it into `update-in!`/`assoc-in!` with a
+crash-safe default.
+
 ## Status
 
 **The library is beta. The format is not.**
@@ -438,6 +479,8 @@ wire, which is where it is exercised on real data.
 - [Shapes](doc/SHAPES.md) — the key-stripping extension, shipped and proposed
 - [Index](doc/INDEX.md) — the offset index: frame layout, how navigation turns
   a node into a jump, and where it does not pay
+- [Editing](doc/EDITING.md) — splice/poke `update-in` on encoded bytes and
+  memory-mapped files, index maintenance, and the durability story
 - [Storage](doc/STORAGE.md) — navigation, memory mapping, log writing,
   compression, and in-place update
 - [Migrate codec](doc/MIGRATE-CODEC.md) — boring vs clj-cbor vs EDN-lines as a
