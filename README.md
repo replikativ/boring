@@ -5,8 +5,12 @@
 [![circleci](https://circleci.com/gh/replikativ/boring.svg?style=shield)](https://circleci.com/gh/replikativ/boring)
 [![last-commit](https://img.shields.io/github/last-commit/replikativ/boring/main.svg)](https://github.com/replikativ/boring/commits/main)
 
-**Fast, portable serialization for Clojure and ClojureScript — in a format the
-rest of the world can already read.**
+**Fast, portable CBOR serialization for Clojure and ClojureScript — in a format
+the rest of the world can already read.**
+
+Yes, the name is the joke: [CBOR][rfc8949] is *boring* — a standard, unexciting
+binary format that every language already reads — and that is precisely why you
+want it holding your data. This library speaks it natively.
 
 Clojure is a hosted language on purpose. Rich Hickey could have built a Lisp
 with its own runtime and its own everything, and chose not to, because a
