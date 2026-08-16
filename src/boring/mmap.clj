@@ -300,76 +300,70 @@
   [file path v opts]
   (let [eopts (dissoc opts :offset :length)
         voff (long (or (:offset opts) 0))
-        ^File f (if (instance? File file) file (File. (str file)))]
-    ;; Phase 1: read + locate + compute the new bytes, under a read mapping.
-    (let [plan
-          (with-open [arena (Arena/ofShared)]
-            (let [size0 (.length f)
-                  seg0 (mmap-segment f arena)
-                  vseg (.asSlice seg0 voff (- size0 voff))
-                  src (nav/source (segment-source vseg) eopts)
-                  off (edit/path-offset src path)]
-              (when (neg? off)
-                (throw (ex-info (str "boring.mmap/splice!: no value at path " (pr-str path))
-                                {:type :boring/path-absent :path path})))
-              (let [old-val (nav/value-at src off)
-                    old-bytes ^bytes (boring/encode old-val eopts)
-                    old-len (alength old-bytes)
-                    ins ^bytes (boring/encode v eopts)
-                    d (- (alength ins) old-len)
-                    ;; Whether the value is framed is decided by the STRONG frame
-                    ;; detector (frame->index-map / nav-idx), not the 9-byte
-                    ;; footer heuristic in value-data-len -- a value that merely
-                    ;; ends in a footer-shaped byte string is unframed and must
-                    ;; still splice.
-                    raw-ix (nav/frame->index-map (segment-source vseg) eopts)
-                    framed (some? raw-ix)
-                    ;; A shift is only valid when the replaced value spans no
-                    ;; index node. If it does -- the value is itself an indexed
-                    ;; container -- refuse, so the caller rebuilds.
-                    _ (when (and framed (edit/spans-index-node? raw-ix off old-len))
-                        (throw (ex-info "boring.mmap/splice!: replaced value spans an index node; the index cannot be maintained in place"
-                                        {:type :boring/unmaintainable-index})))
-                    data-len (if framed (value-data-len seg0 voff size0) (- size0 voff))
-                    ixmap (some-> raw-ix (edit/shift-index-map off (long d)))
-                    frame' (when ixmap
-                             (let [w (boring/writer 8192 eopts)
-                                   out (java.io.ByteArrayOutputStream. 256)]
-                               (boring/seal-index! w out ixmap (+ data-len (long d)))
-                               (.toByteArray out)))
-                    ;; the data after the edited leaf: [off+old-len, data-len) in value coords
-                    tail-len (- data-len (+ off old-len))
-                    tail (byte-array tail-len)]
-                (MemorySegment/copy vseg (+ off old-len) (MemorySegment/ofArray tail) 0 tail-len)
-                {:size0 size0 :voff voff :off (+ voff off)
-                 :old-len old-len :ins ins :d d
-                 :data-len data-len :tail tail :frame' frame'})))]
-      ;; Phase 2: grow/shrink the file and write, under a fresh write mapping.
-      (let [{:keys [size0 off old-len ins d data-len tail frame']} plan
-            d (long d)
-            new-data-len (+ (long data-len) d)
-            frame-len (long (if frame' (alength ^bytes frame') 0))
-            new-size (+ (long voff) new-data-len frame-len)]
-        (when (> new-size size0)
-          (with-open [raf (RandomAccessFile. f "rw")] (.setLength raf new-size)))
-        (with-open [arena (Arena/ofShared)]
-          (let [seg (mmap-segment-rw f arena)
-                ^bytes ins ins
-                ^bytes tail tail
-                ^bytes frame' frame']
-            ;; write the new leaf
-            (MemorySegment/copy (MemorySegment/ofArray ins) 0 seg (long off) (alength ins))
-            ;; place the tail after it
-            (MemorySegment/copy (MemorySegment/ofArray tail) 0 seg (+ (long off) (alength ins))
-                                (alength tail))
-            ;; write the maintained frame at the new data end
-            (when frame'
-              (MemorySegment/copy (MemorySegment/ofArray frame') 0 seg (+ (long voff) new-data-len)
-                                  frame-len))
-            (.force seg)))
-        (when (< new-size size0)
-          (with-open [raf (RandomAccessFile. f "rw")] (.setLength raf new-size)))
-        [old-len (+ (long old-len) d)]))))
+        ^File f (if (instance? File file) file (File. (str file)))
+        ;; Phase 1: read + locate + compute the new bytes, under a read mapping.
+        plan (with-open [arena (Arena/ofShared)]
+               (let [size0 (.length f)
+                     seg0 (mmap-segment f arena)
+                     vseg (.asSlice seg0 voff (- size0 voff))
+                     src (nav/source (segment-source vseg) eopts)
+                     off (edit/path-offset src path)]
+                 (when (neg? off)
+                   (throw (ex-info (str "boring.mmap/splice!: no value at path " (pr-str path))
+                                   {:type :boring/path-absent :path path})))
+                 (let [old-len (alength ^bytes (boring/encode (nav/value-at src off) eopts))
+                       ins ^bytes (boring/encode v eopts)
+                       d (- (alength ins) old-len)
+                       ;; Whether the value is framed is decided by the STRONG frame
+                       ;; detector (frame->index-map / nav-idx), not the 9-byte footer
+                       ;; heuristic in value-data-len -- a value that merely ends in a
+                       ;; footer-shaped byte string is unframed and must still splice.
+                       raw-ix (nav/frame->index-map (segment-source vseg) eopts)
+                       framed (some? raw-ix)]
+                   ;; A shift is only valid when the replaced value spans no index
+                   ;; node. If it does -- the value is itself an indexed container --
+                   ;; refuse, so the caller rebuilds.
+                   (when (and framed (edit/spans-index-node? raw-ix off old-len))
+                     (throw (ex-info "boring.mmap/splice!: replaced value spans an index node; the index cannot be maintained in place"
+                                     {:type :boring/unmaintainable-index})))
+                   (let [data-len (if framed (value-data-len seg0 voff size0) (- size0 voff))
+                         ixmap (some-> raw-ix (edit/shift-index-map off (long d)))
+                         frame' (when ixmap
+                                  (let [w (boring/writer 8192 eopts)
+                                        out (java.io.ByteArrayOutputStream. 256)]
+                                    (boring/seal-index! w out ixmap (+ data-len (long d)))
+                                    (.toByteArray out)))
+                         ;; data after the edited leaf: [off+old-len, data-len), value coords
+                         tail-len (- data-len (+ off old-len))
+                         tail (byte-array tail-len)]
+                     (MemorySegment/copy vseg (+ off old-len) (MemorySegment/ofArray tail) 0 tail-len)
+                     {:size0 size0 :voff voff :off (+ voff off)
+                      :old-len old-len :ins ins :d d
+                      :data-len data-len :tail tail :frame' frame'}))))
+        ;; Phase 2: grow/shrink the file and write, under a fresh write mapping.
+        {:keys [size0 off old-len ins d data-len tail frame']} plan
+        d (long d)
+        new-data-len (+ (long data-len) d)
+        frame-len (long (if frame' (alength ^bytes frame') 0))
+        new-size (+ (long voff) new-data-len frame-len)]
+    (when (> new-size size0)
+      (with-open [raf (RandomAccessFile. f "rw")] (.setLength raf new-size)))
+    (with-open [arena (Arena/ofShared)]
+      (let [seg (mmap-segment-rw f arena)
+            ^bytes ins ins
+            ^bytes tail tail
+            ^bytes frame' frame']
+        ;; write the new leaf, then the tail after it, then the maintained frame
+        (MemorySegment/copy (MemorySegment/ofArray ins) 0 seg (long off) (alength ins))
+        (MemorySegment/copy (MemorySegment/ofArray tail) 0 seg (+ (long off) (alength ins))
+                            (alength tail))
+        (when frame'
+          (MemorySegment/copy (MemorySegment/ofArray frame') 0 seg (+ (long voff) new-data-len)
+                              frame-len))
+        (.force seg)))
+    (when (< new-size size0)
+      (with-open [raf (RandomAccessFile. f "rw")] (.setLength raf new-size)))
+    [old-len (+ (long old-len) d)]))
 
 (defn poke-update!
   "Apply `f` to the value at `path` in a memory-mapped document and, if `(f old)`
