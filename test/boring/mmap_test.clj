@@ -492,3 +492,27 @@
             (is (= (seq (range 20)) (seq (take 20 b2))))
             (is (= {"a" {"x" 1000000000} "b" 5}
                    (boring/decode (java.util.Arrays/copyOfRange b2 20 (alength b2)))))))))))
+
+(deftest splice!-review-regressions
+  (if-not ffm?
+    (is true "skipped: this JVM has no java.lang.foreign (JDK < 22)")
+    (let [splice! (requiring-resolve 'boring.mmap/splice!)
+          rd (fn [^File f] (boring/decode (java.nio.file.Files/readAllBytes (.toPath f))))]
+      (testing "finding 1: replacing a whole indexed array is REFUSED in place --
+                a shift would corrupt its nodes -- so the caller can rebuild;
+                the file is left untouched"
+        (let [data {"big" (vec (range 300)) "z" 5}
+              f (spit-bytes (boring/encode-indexed data poke-opts))
+              before (java.nio.file.Files/readAllBytes (.toPath f))]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"index node"
+                                (splice! (.getPath f) ["big"] (vec (range 250)) poke-opts)))
+          (is (= (seq before) (seq (java.nio.file.Files/readAllBytes (.toPath f))))
+              "untouched on refusal")))
+      (testing "finding 3: an UNFRAMED value ending in a footer-shaped byte string still splices"
+        (let [data {"a" 1 "b" (byte-array [0 0 0 0 0 0 0 5])}  ; last bytes look like a footer
+              f (spit-bytes (boring/encode data poke-opts))]
+          (is (neg? (boring.frame/footer-start (boring/encode data poke-opts))) "fixture is unframed")
+          (splice! (.getPath f) ["a"] 1000000000 poke-opts)   ; must not throw unmaintainable
+          (let [got (rd f)]
+            (is (= 1000000000 (get got "a")))
+            (is (= (seq (byte-array [0 0 0 0 0 0 0 5])) (seq (get got "b"))))))))))

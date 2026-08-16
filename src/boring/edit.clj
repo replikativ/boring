@@ -111,14 +111,30 @@
         (assoc :containers (long-array (map sh (:containers ix))))
         (assoc :slots (mapv (fn [row] (long-array (map sh row))) (:slots ix))))))
 
+(defn spans-index-node?
+  "Whether the replaced value's OLD byte span `[E, E+old-len)` contains any
+  indexed container offset. A uniform shift is only valid when it does NOT: if
+  the replaced value is itself (or contains) an indexed container, its internal
+  index nodes describe bytes that the new value no longer has, and shifting them
+  wholesale by the value-level delta corrupts the index -- silently for arrays,
+  which trust their anchors. In that case the caller must rebuild, not shift."
+  [ix ^long E ^long old-len]
+  (let [end (+ E old-len)]
+    (boolean (some (fn [o] (let [o (long o)] (and (>= o E) (< o end))))
+                   (:containers ix)))))
+
 (defn- maintain-index
-  "Re-seal `data` (the spliced bytes) with `orig-blob`'s frame shifted for a
-  leaf replace at `E`/`D` -- O(index size), no data walk. If `orig-blob` carried
-  no frame, `data` stays unindexed."
-  ^bytes [^bytes orig-blob ^bytes data E D eopts]
-  (seal-onto data (some-> (nav/frame->index-map orig-blob eopts)
-                          (shift-index-map (long E) (long D)))
-             eopts))
+  "Re-seal `data` (the spliced bytes) with `orig-blob`'s frame shifted for a leaf
+  replace at `E`/`D` -- O(index size), no data walk. Falls back to a full rebuild
+  when the replaced value spanned an index node (see `spans-index-node?`), since
+  a shift would corrupt those nodes. If `orig-blob` carried no frame, `data` stays
+  unindexed."
+  ^bytes [^bytes orig-blob ^bytes data E D old-len eopts]
+  (if-let [ix (nav/frame->index-map orig-blob eopts)]
+    (if (spans-index-node? ix (long E) (long old-len))
+      (reindex data eopts)
+      (seal-onto data (shift-index-map ix (long E) (long D)) eopts))
+    data))
 
 (defn- finish
   "Apply the `:index` policy to freshly spliced `data`. `:maintain` degrades to
@@ -187,20 +203,16 @@
          ;; A leaf replace only shifts bytes -- container structure is unchanged
          ;; -- so `:maintain` can move the frame's offsets instead of rebuilding.
          (if (= index-mode :maintain)
-           (maintain-index blob data s (- (alength ins) old-len) eopts)
+           (maintain-index blob data s (- (alength ins) old-len) old-len eopts)
            (finish data index-mode eopts)))))))
 
 (defn assoc-in-bytes
   "Set the value at `path` to `v`. Replaces an existing leaf by a value-level
-  splice, or adds/inserts by re-encoding the parent container (which keeps map
-  keys in the profile's canonical order). See `update-in-bytes`."
+  splice (delegating to `update-in-bytes`), or adds/inserts a missing key by
+  re-encoding the parent container -- which keeps map keys in the profile's
+  canonical order. See `update-in-bytes`."
   (^bytes [^bytes blob path v] (assoc-in-bytes blob path v {:profile :archival}))
-  (^bytes [^bytes blob path v opts]
-   (let [src (nav/source blob nil)
-         s (start-of src (nav/root-offset src) path)]
-     (if (neg? s)
-       (structural blob (butlast path) #(assoc % (last path) v) opts)
-       (update-in-bytes blob path (constantly v) opts)))))
+  (^bytes [^bytes blob path v opts] (update-in-bytes blob path (constantly v) opts)))
 
 (defn dissoc-in-bytes
   "Remove the key at the end of `path` from its parent map, re-encoding only that
@@ -209,11 +221,6 @@
   (^bytes [^bytes blob path] (dissoc-in-bytes blob path {:profile :archival}))
   (^bytes [^bytes blob path opts]
    (structural blob (butlast path) #(dissoc % (last path)) opts)))
-
-(defn assoc-in-bytes
-  "Replace the value at an existing `path` with `v`. See `update-in-bytes`."
-  (^bytes [^bytes blob path v] (assoc-in-bytes blob path v {:profile :archival}))
-  (^bytes [^bytes blob path v opts] (update-in-bytes blob path (constantly v) opts)))
 
 (defn same-length?
   "Whether replacing the value at `path` with `v` keeps the encoded byte length

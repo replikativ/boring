@@ -153,3 +153,23 @@
         (let [out (edit/assoc-in-bytes blob ["k00000"] 1000000000 (assoc O :index :maintain))]
           (is (= 1000000000 (nav/value (get (nav/root out) "k00000"))))
           (is (= 2500 (nav/value (get (nav/root out) "k02500")))))))))
+
+(deftest maintain-falls-back-when-replacing-an-indexed-container
+  (testing "replacing a whole INDEXED container (array/map) can't be a uniform
+            shift -- :maintain must fall back to :rebuild and stay byte-identical
+            and navigable (regression: review finding 1)"
+    (let [data {"big" (vec (range 300)) "z" 5}          ; big is an indexed array
+          blob (boring/encode-indexed data O)
+          newbig (vec (range 250))]
+      (is (<= 0 (frame/footer-start blob)) "fixture is framed")
+      (is (java.util.Arrays/equals
+           ^bytes (edit/assoc-in-bytes blob ["big"] newbig (assoc O :index :maintain))
+           ^bytes (edit/assoc-in-bytes blob ["big"] newbig (assoc O :index :rebuild)))
+          "container replace: maintain == rebuild")
+      (let [out (edit/assoc-in-bytes blob ["big"] newbig (assoc O :index :maintain))]
+        (is (= (assoc data "big" newbig) (boring/decode out)))
+        (testing "and array navigation into the replaced container is correct, not garbage"
+          (is (= 0   (nav/value (nth (get (nav/root out) "big") 0))))
+          (is (= 125 (nav/value (nth (get (nav/root out) "big") 125))))
+          (is (= 249 (nav/value (nth (get (nav/root out) "big") 249))))
+          (is (= 5   (nav/value (get (nav/root out) "z")))))))))

@@ -314,14 +314,21 @@
                     old-len (alength old-bytes)
                     ins ^bytes (boring/encode v eopts)
                     d (- (alength ins) old-len)
-                    data-len (value-data-len seg0 voff size0)
-                    framed (< data-len (- size0 voff))
-                    ixmap (when framed
-                            (some-> (nav/frame->index-map (segment-source vseg) eopts)
-                                    (edit/shift-index-map off (long d))))
-                    _ (when (and framed (nil? ixmap))
-                        (throw (ex-info "boring.mmap/splice!: framed value has no reconstructable index"
+                    ;; Whether the value is framed is decided by the STRONG frame
+                    ;; detector (frame->index-map / nav-idx), not the 9-byte
+                    ;; footer heuristic in value-data-len -- a value that merely
+                    ;; ends in a footer-shaped byte string is unframed and must
+                    ;; still splice.
+                    raw-ix (nav/frame->index-map (segment-source vseg) eopts)
+                    framed (some? raw-ix)
+                    ;; A shift is only valid when the replaced value spans no
+                    ;; index node. If it does -- the value is itself an indexed
+                    ;; container -- refuse, so the caller rebuilds.
+                    _ (when (and framed (edit/spans-index-node? raw-ix off old-len))
+                        (throw (ex-info "boring.mmap/splice!: replaced value spans an index node; the index cannot be maintained in place"
                                         {:type :boring/unmaintainable-index})))
+                    data-len (if framed (value-data-len seg0 voff size0) (- size0 voff))
+                    ixmap (some-> raw-ix (edit/shift-index-map off (long d)))
                     frame' (when ixmap
                              (let [w (boring/writer 8192 eopts)
                                    out (java.io.ByteArrayOutputStream. 256)]
@@ -340,7 +347,8 @@
             new-data-len (+ (long data-len) d)
             frame-len (long (if frame' (alength ^bytes frame') 0))
             new-size (+ (long voff) new-data-len frame-len)]
-        (when (> new-size size0) (.setLength (RandomAccessFile. f "rw") new-size))
+        (when (> new-size size0)
+          (with-open [raf (RandomAccessFile. f "rw")] (.setLength raf new-size)))
         (with-open [arena (Arena/ofShared)]
           (let [seg (mmap-segment-rw f arena)
                 ^bytes ins ins
@@ -356,7 +364,8 @@
               (MemorySegment/copy (MemorySegment/ofArray frame') 0 seg (+ (long voff) new-data-len)
                                   frame-len))
             (.force seg)))
-        (when (< new-size size0) (.setLength (RandomAccessFile. f "rw") new-size))
+        (when (< new-size size0)
+          (with-open [raf (RandomAccessFile. f "rw")] (.setLength raf new-size)))
         [old-len (+ (long old-len) d)]))))
 
 (defn poke-update!
