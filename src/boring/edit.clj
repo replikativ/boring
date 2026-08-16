@@ -45,18 +45,28 @@
   (let [f (frame/footer-start blob)]
     (if (neg? f) (alength blob) f)))
 
+(defn- child-offset
+  "Offset of `k`'s value in the container at `off`, dispatching on the CONTAINER
+  type the way `clojure.core/get-in` does -- a map key (of ANY type, integer keys
+  included) via `field-offset`, an array index via `nth-offset` -- rather than on
+  the key's type. Returns -1 when absent. `field-offset` returns -2 for a
+  non-map, which is the signal to try an array index."
+  ^long [src ^long off k]
+  (let [fo (long (nav/field-offset src off k))]
+    (cond
+      (not= fo -2) fo
+      (integer? k) (long (nav/nth-offset src off (long k)))
+      :else -1)))
+
 (defn- start-of
   "Byte offset of the value at `path` under `root`, or -1 if any step is absent.
-  Integer path elements index arrays (`nth-offset`); everything else is a map
-  key (`field-offset`)."
+  Dispatches on container type (see `child-offset`), so a map keyed by integers
+  and a vector indexed by integers both resolve correctly."
   ^long [src ^long root path]
   (loop [off root ks (seq path)]
     (if (nil? ks)
       off
-      (let [k (first ks)
-            nxt (long (if (integer? k)
-                        (nav/nth-offset src off (long k))
-                        (nav/field-offset src off k)))]
+      (let [nxt (child-offset src off (first ks))]
         (if (neg? nxt) -1 (recur nxt (next ks)))))))
 
 (defn- splice-bytes
@@ -145,33 +155,36 @@
     :drop data
     (:rebuild :maintain) (reindex data eopts)))
 
-(defn- parent-cursor
-  "The cursor at `parent-path` (empty path -> the root cursor), or nil when the
-  path does not resolve to a container that can be re-encoded."
-  [^bytes blob parent-path]
-  (reduce (fn [c k]
-            (if (nav/container? c)
-              (if (integer? k) (nth c k nil) (get c k))
-              (reduced nil)))
-          (nav/root blob) parent-path))
-
 (defn- structural
   "Re-encode ONLY the parent container at `parent-path` after `(coll-fn parent)`,
   and splice it back. O(parent), not O(document). This is the general path for
   edits that change a container's shape -- adding or removing a key, changing an
-  array's length -- where a value-level splice cannot express the new header."
+  array's length -- where a value-level splice cannot express the new header.
+
+  Works off the offset layer, so it dispatches on container type like the rest of
+  `boring.edit` -- a parent map keyed by integers is handled the same as one
+  keyed by keywords."
   ^bytes [^bytes blob parent-path coll-fn opts]
   (let [index-mode (get opts :index :rebuild)
         eopts (dissoc opts :index)
-        pc (parent-cursor blob parent-path)]
-    (when-not (nav/container? pc)
+        dlen (data-len blob)
+        src (nav/source blob nil)
+        ps (if (seq parent-path)
+             (start-of src (nav/root-offset src) parent-path)
+             (nav/root-offset src))]
+    (when (neg? ps)
       (throw (ex-info (str "boring.edit: no container at path " (pr-str parent-path))
                       {:type :boring/path-absent :path parent-path})))
-    (let [[ps pe] (nav/byte-span pc)
-          np (coll-fn (nav/value pc))
-          ins ^bytes (boring/encode np eopts)
-          data (splice-bytes blob ps pe ins (data-len blob))]
-      (finish data index-mode eopts))))
+    (let [old-parent (nav/value-at src ps)]
+      (when-not (coll? old-parent)
+        (throw (ex-info (str "boring.edit: value at path " (pr-str parent-path)
+                             " is not a container")
+                        {:type :boring/path-absent :path parent-path})))
+      (let [old-len (alength ^bytes (boring/encode old-parent eopts))
+            np (coll-fn old-parent)
+            ins ^bytes (boring/encode np eopts)
+            data (splice-bytes blob ps (+ ps old-len) ins dlen)]
+        (finish data index-mode eopts)))))
 
 (defn update-in-bytes
   "Return new bytes for `blob` with the value at `path` replaced by `(f old)`.
@@ -199,12 +212,20 @@
        (let [old-val (nav/value-at src s)
              old-len (alength ^bytes (boring/encode old-val eopts))
              ins ^bytes (boring/encode (f old-val) eopts)
-             data (splice-bytes blob s (+ s old-len) ins dlen)]
-         ;; A leaf replace only shifts bytes -- container structure is unchanged
-         ;; -- so `:maintain` can move the frame's offsets instead of rebuilding.
-         (if (= index-mode :maintain)
-           (maintain-index blob data s (- (alength ins) old-len) old-len eopts)
-           (finish data index-mode eopts)))))))
+             d (- (alength ins) old-len)]
+         (if (zero? d)
+           ;; SAME LENGTH -- nothing shifts, so overwrite in place and leave any
+           ;; frame untouched. Skips the splice's frame work automatically; a
+           ;; caller need not know to reach for a poke.
+           (let [out (aclone blob)]
+             (System/arraycopy ins 0 out (int s) (alength ins))
+             out)
+           ;; A leaf replace only shifts bytes -- container structure is unchanged
+           ;; -- so `:maintain` can move the frame's offsets instead of rebuilding.
+           (let [data (splice-bytes blob s (+ s old-len) ins dlen)]
+             (if (= index-mode :maintain)
+               (maintain-index blob data s d old-len eopts)
+               (finish data index-mode eopts)))))))))
 
 (defn assoc-in-bytes
   "Set the value at `path` to `v`. Replaces an existing leaf by a value-level

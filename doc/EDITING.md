@@ -33,15 +33,19 @@ the data — only the frame, which is optional and rebuildable.
 ```clojure
 (require '[boring.edit :as edit])
 
-(def bs (boring/encode {"a" {"x" 1 "y" [10 20 30]} "b" 5} {:profile :archival}))
+(def bs (boring/encode {:a {:x 1 :y [10 20 30]} :b 5} {:profile :archival}))
 
-(edit/assoc-in-bytes bs ["a" "x"] 1000000 opts)   ; replace a leaf
-(edit/update-in-bytes bs ["a" "x"] inc opts)      ; apply a fn
-(edit/dissoc-in-bytes bs ["a" "x"] opts)          ; remove a key
+(edit/assoc-in-bytes bs [:a :x] 1000000 opts)   ; replace a leaf
+(edit/update-in-bytes bs [:a :x] inc opts)      ; apply a fn
+(edit/dissoc-in-bytes bs [:a :x] opts)          ; remove a key
 ```
 
-Integer path elements index arrays, everything else is a map key —
-`["a" "y" 1]` is index 1 of the vector under `"a"`.
+**Paths resolve on the container, exactly like `clojure.core/get-in`** — a map
+key (keyword, string, symbol, or an integer *key*) descends a map, an integer
+*index* descends a vector. `[:a :y 1]` is index 1 of the vector under `:a`; a
+map keyed by integers is read as a map, not mistaken for an array. A missing
+step is `:boring/path-absent`, and a step that lands on a scalar where a
+container was needed is the same — a typed error, never a wrong answer.
 
 **The guarantee is equivalence.** For any value the reader would decode, the
 bytes these produce decode to exactly what `clojure.core`'s
@@ -95,6 +99,13 @@ When the new value encodes to the *same* number of bytes, nothing shifts:
 `poke-in-bytes` overwrites the value's bytes in place and any index stays valid.
 `poke-plan` is the source-agnostic core (locate + length check), shared with the
 memory-mapped path.
+
+**You do not have to reach for it explicitly.** `update-in-bytes` and
+`boring.mmap/splice!` detect a same-length result and take the poke path
+automatically — overwriting in place, leaving the frame untouched, and skipping
+the splice's tail move and reindex. The explicit `poke*` functions exist for the
+case where you want the length change to be an *error* (`:boring/not-pokeable`)
+rather than a silent splice — for a fixed-width slot whose size must never move.
 
 Same length is **byte-wise**, not element-count-wise, and it is brittle for
 arbitrary values — boring encodes integers minimal-width, so `1`→`1000` already

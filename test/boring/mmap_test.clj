@@ -516,3 +516,21 @@
           (let [got (rd f)]
             (is (= 1000000000 (get got "a")))
             (is (= (seq (byte-array [0 0 0 0 0 0 0 5])) (seq (get got "b"))))))))))
+
+(deftest splice!-same-length-takes-the-poke-path
+  (if-not ffm?
+    (is true "skipped: this JVM has no java.lang.foreign (JDK < 22)")
+    (let [splice! (requiring-resolve 'boring.mmap/splice!)
+          rd (fn [^File f] (boring/decode (java.nio.file.Files/readAllBytes (.toPath f))))]
+      (testing "a same-length splice returns [old old] and leaves an index frame valid"
+        (let [data (assoc (into {} (for [i (range 300)] [(format "k%03d" i) i])) "s" "hello")
+              f (spit-bytes (boring/encode-indexed data poke-opts))
+              before (java.nio.file.Files/readAllBytes (.toPath f))]
+          (is (= [6 6] (splice! (.getPath f) ["s"] "world" poke-opts))
+              "\"hello\"/\"world\" are the same length -> poke, [old old]")
+          (is (= (assoc data "s" "world") (rd f)))
+          (is (= (alength before) (alength (java.nio.file.Files/readAllBytes (.toPath f))))
+              "file size unchanged")
+          (let [bs (java.nio.file.Files/readAllBytes (.toPath f))]
+            (is (= 250 (nav/value (get (nav/root bs) "k250")))
+                "index still a valid jump")))))))
