@@ -284,8 +284,11 @@
   re-encode it never materialises the value and compared to a temp-file rewrite
   it touches only the pages from the edit onward.
 
-  `:offset`/`:length` narrow to a value past a header (konserve blobs). `opts`
-  must be the deterministic, stringref-off profile the value was written with.
+  `:offset` narrows to a value past a header (konserve blobs); the value is taken
+  to run from `:offset` to end-of-file, so `:length` is NOT honored here (unlike
+  `poke!`) -- a splice grows/shrinks the file, so a value followed by more bytes
+  is not a shape this supports. `opts` must be the deterministic, stringref-off
+  profile the value was written with.
   Only LEAF replaces are handled -- the caller resolves the path to an existing
   value; a missing path throws `:boring/path-absent`. A framed value whose frame
   cannot be reconstructed throws `:boring/unmaintainable-index` so the caller can
