@@ -104,9 +104,29 @@ reused `encode-into!`. Reuse both sides and the small-payload encode wins
 *reverse*: `small-map` goes from boring 0.50 / hako 1.08 µs to boring 0.86 /
 hako 0.59. `clojure -M:bench -m hako-ab` is the tier-matched table — time and
 allocation, T1/T2/T3 — and it is the one to quote when comparing the two
-libraries as each is meant to be called. Summarised: hako wins map-heavy encode
-(1.1–1.8×) and map-heavy decode (~2×); boring wins vector-heavy decode (~1.3×)
-and allocates less on every payload measured.
+libraries as each is meant to be called. Summarised, both codecs reused (power-saver, A/B interleaved, min over 60
+rounds, median of three runs — the ratios are stable, the absolute µs are not).
+Ratio = boring µs ÷ hako µs; **> 1 means hako is faster, < 1 means boring is**:
+
+| payload | encode (T3, reused, no copy) | decode (T2, reused reader) |
+|---|---:|---:|
+| small-map | 1.64× hako | 1.37× hako |
+| mixed | 1.67× hako | **0.63× — boring** |
+| nested-map-50 | 1.36× hako | 1.46× hako |
+| datom-maps-200 | 1.46× hako | 1.77× hako |
+| datom-vec-1k | 1.72× hako | **0.50× — boring** |
+| long-vec-1k | **0.89× — boring** | 1.20× hako |
+
+So hako leads map-heavy encode ~1.2–1.7× and most map decodes ~1.4–1.8×, while
+boring wins the `mixed` decode, wins the nested-vector (`datom-vec`) decode by
+~2×, and ties the plain long-vector encode; the plain long-vector *decode* is
+the noisiest cell (hako ~1.2× here, but it swings across harnesses). On **heap**
+allocation boring wins essentially every encode cell — dramatically on
+primitive vectors (40 vs 2 800 B at T2 encode) — while hako edges the
+keyword-heavy map decodes. That axis is **heap-only**: it does not count hako's
+off-heap arena, which is hako's real low-allocation advantage, so read it as GC
+pressure, not total memory. Regenerate with `clojure -M:bench -m hako-ab` (also
+wired into `bench/suite.clj`).
 
 The four small cells are close enough that the ordering is not stable across
 machines; treat 0.13 vs 0.18 µs as "the same". The gaps worth reading are the

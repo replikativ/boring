@@ -60,7 +60,8 @@ records, metadata. A foreign reader gets your data as ordinary CBOR whether or
 not it knows what a keyword is.
 
 **The usual trade is that reach costs speed. Here it does not.** On the JVM
-boring beats nippy on every payload we measure and trades wins with [hako][].
+boring beats nippy on every encode we measure and on the map-heavy decodes, and
+runs even with it on the small ones; it trades wins with [hako][].
 On ClojureScript it is always smaller on the wire than transit, faster on the
 datom-shaped data it was built for, and slower on generic data — see
 [Performance](doc/PERFORMANCE.md), which says exactly where.
@@ -163,11 +164,13 @@ nippy's default round-trip time. Only nippy/lzma2 goes smaller, at 8× the time.
 
 **Where it loses.** hako is faster on deeply nested maps (and 1.4× smaller
 there), 2.4× faster decoding a plain vector of integers, and marginally ahead
-on the two small payloads' decode. With both codecs reused it is further ahead
-still — roughly 1.3–1.8× on map-heavy encode and ~2× on map-heavy decode —
-while boring keeps the vector-heavy decode and allocates less on every payload
-measured. fressian+zstd stays 6% smaller than
-boring+zstd.
+on the two small payloads' decode. With both codecs reused (the tier-matched
+`hako-ab` table), hako leads map-heavy encode by ~1.2–1.7× and most map decodes
+by ~1.4–1.8×, while boring wins the `mixed` decode, keeps the nested-vector
+decode by ~2×, and ties the plain long-vector encode. On heap allocation boring
+wins essentially every encode cell; hako edges the keyword-heavy map decodes —
+but that axis is heap-only and excludes hako's off-heap arena, which is hako's
+real low-allocation advantage. fressian+zstd stays 6% smaller than boring+zstd.
 
 On **ClojureScript** the split is sharper. transit-cljs writes JSON text, so
 `JSON.parse` does its whole byte-to-structure walk in native C++ — 57% of

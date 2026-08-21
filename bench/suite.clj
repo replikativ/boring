@@ -31,6 +31,7 @@
   first."
   (:require [ab]
             [bench]
+            [hako-ab]
             [published]
             [boring.core :as boring]
             [compressors]
@@ -89,6 +90,14 @@
     (when (run? :ab)
       (banner "TIMING, A/B interleaved — the comparison to trust")
       (ab/-main "no-warmup"))
+
+    ;; The tier-matched boring-vs-hako table (T1/T2/T3, time + heap alloc). This
+    ;; is the one to quote when comparing the two libraries as each is meant to
+    ;; be called -- it reuses BOTH sides, unlike `ab`, which pairs boring reused
+    ;; against hako per-call. It runs its own warmup over both codecs.
+    (when (run? :hako-ab)
+      (banner "HAKO A/B — tier-matched boring vs hako, reused both sides (time + heap alloc)")
+      (hako-ab/-main))
 
     (when (run? :criterium)
       (banner "TIMING, criterium — absolute µs/op, slowest and noisiest")
