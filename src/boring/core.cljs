@@ -1446,7 +1446,29 @@
 
     (def registry
       (-> (boring/tag-registry)
-          (boring/register-record \"my.ns.Point\" map->Point)))
+          (boring/register-record \"my.ns/Point\" map->Point)))
+
+  `wire-name` is `boring.data/record-type-name` of an instance of the type, and
+  the SLASH is load-bearing: a record's wire name is `namespace/Name`, not the
+  JVM class name. `record-type-name` explains why — a dot is ambiguous, since
+  `a.b.c.D` could split either way — and it returns the same string on both
+  platforms, so one registration serves data written on either.
+
+  DERIVE it rather than writing it out:
+
+    (boring/register-record (boring.data/record-type-name (map->Point {}))
+                            map->Point)
+
+  A name that does not match what the writer emits fails SILENTLY. There is no
+  error: an unregistered record decodes to a `boring.data/UnknownRecord` carrying
+  the same name and fields, and re-encodes to identical bytes — which is a
+  deliberate property (see below), and also means a typo'd or wrongly-formed
+  registration looks exactly like a record you never registered. Any `instance?`
+  check the caller makes on the decoded value then answers false, and whatever
+  the caller meant to do with that type quietly does not happen.
+
+  Writing needs no registration: a record always encodes with its own type
+  name, so the type is never silently flattened to a map.
 
   The constructor must be passed explicitly here: advanced compilation minifies
   constructor names, so there is nothing to reflect on. `record-type-name`
