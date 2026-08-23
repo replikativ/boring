@@ -15,7 +15,7 @@
    Use it on your own registry, in your own test suite:
 
      (deftest my-records-are-navigable
-       (is (nil? (nc/check-record registry \"my.ns.Point\"
+       (is (nil? (nc/check-record registry \"my.ns/Point\"
                                   [(->Point 1 2) (->Point 0 0)]))))
 
    Returns nil when everything agrees, or a map describing the FIRST

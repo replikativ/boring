@@ -226,16 +226,32 @@
 
     (def registry
       (-> (boring/tag-registry)
-          (boring/register-record \"my.ns.Point\" map->Point)))
+          (boring/register-record \"my.ns/Point\" map->Point)))
 
-  The wire name is `boring.data/record-type-name` of an instance — on the JVM the
-  class name, and ClojureScript munges its own name to match, so a record
-  written on either platform reads on the other under one registration.
+  `wire-name` is `boring.data/record-type-name` of an instance of the type, and
+  the SLASH is load-bearing: a record's wire name is `namespace/Name`, not the
+  JVM class name. `record-type-name` explains why — a dot is ambiguous, since
+  `a.b.c.D` could split either way — and it returns the same string on both
+  platforms, so one registration serves data written on either.
+
+  DERIVE it rather than writing it out:
+
+    (boring/register-record (boring.data/record-type-name (map->Point {}))
+                            map->Point)
+
+  A name that does not match what the writer emits fails SILENTLY. There is no
+  error: an unregistered record decodes to a `boring.data/UnknownRecord` carrying
+  the same name and fields, and re-encodes to identical bytes — which is a
+  deliberate property (see below), and also means a typo'd or wrongly-formed
+  registration looks exactly like a record you never registered. Any `instance?`
+  check the caller makes on the decoded value then answers false, and whatever
+  the caller meant to do with that type quietly does not happen.
 
   Writing needs no registration: a record always encodes with its own type
-  name, so the type is never silently flattened to a map. Without a
-  registration a record decodes to a `boring.data/UnknownRecord` carrying the
-  same name and fields, which re-encodes to identical bytes.
+  name, so the type is never silently flattened to a map.
+
+  Without a registration a record decodes to a `boring.data/UnknownRecord`
+  carrying the same name and fields, which re-encodes to identical bytes.
 
   Security: the reader looks `wire-name` up in this registry. There is no
   `Class.forName` path, so a hostile document cannot cause an arbitrary class
@@ -295,7 +311,7 @@
   not an exception, not a slow path. Check it rather than assert it:
 
     (require '[boring.nav-conformance :as nc])
-    (nc/check-record registry \"my.ns.Point\" [(->Point 1 2) (->Point 3 4)])
+    (nc/check-record registry \"my.ns/Point\" [(->Point 1 2) (->Point 3 4)])
 
   JVM-only, because `boring.nav` is. A `.cljc` registration shared with
   ClojureScript should call this from a JVM-only branch."
