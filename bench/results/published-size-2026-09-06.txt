@@ -1,0 +1,40 @@
+Recorded: 2026-09-06
+Source revision: d14ad50 (documentation-only working changes)
+Command: clojure -M:bench -m published size
+OS: Linux
+Runtime: Java HotSpot(TM) 64-Bit Server VM 25.0.1
+Dependencies (clojure -A:bench -Stree):
+  com.taoensso/nippy 3.9.0-beta1
+  com.s-exp/hako 1.0.0-alpha35 (locally installed comparison build)
+  org.clojure/data.fressian 1.1.0
+  org.fressian/fressian 0.6.8
+  com.github.luben/zstd-jni 1.5.6-8
+
+No timing measurements were made in this run.
+The harness labels nippy/freeze as "own LZ4"; that API uses its default
+compression policy and may leave a value uncompressed.
+
+Wire size, bytes:
+
+| payload | boring | boring :shapes | hako | nippy |
+|---|---:|---:|---:|---:|
+| small-map | 56 | 56 | 43 | 41 |
+| mixed | 63 | 63 | 55 | 53 |
+| nested-map-50 | 1,561 | 1,561 | 1,079 | 1,191 |
+| datom-maps-200 | 9,952 | 4,982 | 5,165 | 5,592 |
+| long-vec-1k | 2,726 | 2,726 | 2,740 | 2,746 |
+| str-maps-200 | 7,550 | 4,570 | 9,741 | 11,336 |
+
+Wire size after compression, bytes:
+
+| payload | boring+zstd | boring :shapes+zstd | hako+zstd | fressian+zstd | nippy (own LZ4) |
+|---|---:|---:|---:|---:|---:|
+| small-map | 65 | 65 | 52 | 60 | 45 |
+| mixed | 72 | 72 | 64 | 69 | 57 |
+| nested-map-50 | 354 | 354 | 388 | 345 | 1,195 |
+| datom-maps-200 | 1,121 | 1,237 | 1,168 | 1,014 | 5,596 |
+| long-vec-1k | 1,851 | 1,851 | 1,861 | 1,503 | 2,750 |
+| str-maps-200 | 1,062 | 1,168 | 1,118 | 982 | 2,489 |
+
+The run also emitted a JDK deprecation warning for
+io.airlift.compress.lz4.UnsafeUtil using sun.misc.Unsafe::objectFieldOffset.

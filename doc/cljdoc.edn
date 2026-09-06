@@ -11,6 +11,7 @@
   ["Guides" {}
    ["Interop with other languages" {:file "doc/INTEROP.md"}]
    ["Storage" {:file "doc/STORAGE.md"}]
+   ["Editing encoded values" {:file "doc/EDITING.md"}]
    ["Extending" {:file "doc/EXTENDING.md"}]
    ["Performance" {:file "doc/PERFORMANCE.md"}]
    ["Datahike dump codec" {:file "doc/MIGRATE-CODEC.md"}]]
