@@ -1,186 +1,160 @@
 # Performance
 
-Numbers, methodology, and the cases where boring loses.
+Boring's performance depends on the data, the API, and how much of the result
+the application needs. These measurements cover full encoding and decoding,
+compression, and selective reads.
+
+The timing tables below are recorded results, not a new benchmark run.
+Their original environment descriptions are retained where available.
+Do not combine figures from different tables as if they came from one run.
 
 ## Methodology
 
-Everything below was taken with:
+The committed harnesses define the payloads and calls being compared:
 
-- **A quiet machine.** Load average ≈ 4. An earlier round of numbers was taken
-  on a loaded box and had to be withdrawn: run-to-run variance under load
-  exceeded 60%, which is larger than most of the differences being measured.
-- **Fresh objects per call, for every library.** boring through
-  `boring/decode`, hako through `hako/decode`, nippy through
-  `nippy/fast-thaw` — each allocating its own reader per call. An earlier
-  version of our benchmark compared boring's *reused, warm-cache* reader
-  against hako's fresh one, which flattered boring and was not a fair
-  comparison.
-- **criterium `quick-benchmark`, mean**, for the published tables. The
-  interleaved A/B harness (`bench/ab.clj`) reports a minimum of 8 rounds
-  instead, because it exists to compare two boring variants under load, where
-  the minimum approximates the uncontended cost and the mean measures the
-  machine. Do not mix figures from the two.
-- **Allocation measured with `getThreadAllocatedBytes`**, which is
-  deterministic and immune to load, wherever a claim can be made about
-  allocation instead of time.
+| Harness | Measurement |
+| --- | --- |
+| [published.clj](../bench/published.clj) | Public encode/decode APIs, wire sizes, compression, typed arrays |
+| [hako_ab.clj](../bench/hako_ab.clj) | Matched reuse and copy tiers for boring and hako |
+| [nippy_bench.clj](../test-nippy/boring/nippy_bench.clj) | Nippy's stress-data comparison |
+| [capability.clj](../bench/capability.clj) | Selected fields and columns versus full decoding |
+| [nav.clj](../bench/nav.clj) | Cursor operations, sequence lookup, and index construction |
+| [ClojureScript comparison](../bench/cljs/cljsbench/compare.cljs) | Reused boring and Transit readers/writers in Node |
 
-- **A warm process, not a warm cell.** Per-cell warmup is not enough: hako's
-  small-map encode measured 2.52 / 1.30 / 1.15 / 1.08 µs across four
-  consecutive runs of the *same* cell, so whichever cell runs first is
-  penalised and the first block of any table is fiction. The suite warms every
-  payload through every codec before it measures anything. Two byte-identical
-  boring variants once timed 76% apart without this.
+The `published` harness calls `boring/encode`, `boring/decode`,
+`hako/encode`, `hako/decode`, and Nippy's fast APIs. Internal object reuse
+is therefore library-dependent. Earlier descriptions called this a
+fresh-reader/writer comparison, which the current harness does not establish.
+Use `hako-ab` when the reuse tier itself is the question.
 
-Reproduce with:
+For new timing runs, use a quiet machine, warm all payload/codec combinations,
+and record the runtime, CPU, power profile, dependency versions, and commit.
+The published harness reports Criterium means; interleaved A/B harnesses use
+minimum-based statistics to reduce contention effects. Those statistics answer
+different questions.
 
+Allocation measurements use `getThreadAllocatedBytes` where available.
+They report heap allocation, excluding off-heap arenas and other processes.
+Lower heap allocation can reduce GC pressure without implying lower total
+memory use or faster execution.
+
+```sh
+clojure -M:bench -m published
+clojure -M:bench -m published size
+clojure -M:bench -m hako-ab
+clojure -M:nippy-bench
+bin/bench
 ```
-clojure -M:bench -m published        # exactly the tables on this page
-clojure -M:bench -m published size   # the deterministic sections only; seconds
-clojure -M:nippy-bench               # nippy's own benchmark, unmodified
-bin/bench                            # the wider suite; several minutes
-```
 
-Every table below is emitted verbatim by one of the first three commands. They
-used to be hand-maintained, and had drifted: the wire-size table quoted 6 951
-bytes for a `datom-maps-200` that now measures 9 952, because the *payload*
-definition it was taken from was never committed. The payloads live in
-`bench/published.clj` now.
-
-Output lands in `target/bench/<timestamp>.txt` with the machine description at
-the top, because a benchmark number without its hardware is a rumour. Sizes run
-first on purpose — they are deterministic, so they are the one section worth
-keeping from a run that turns out to be too noisy to trust. `bench/README.md`
-covers the individual harnesses.
+The `:bench` alias requires a locally installed hako comparison build and
+JDK 25. See [bench/README.md](../bench/README.md) for setup and individual
+harnesses. `bin/bench` saves output and machine details under
+`target/bench/`; when running a harness directly, retain its output with
+the revision and environment.
 
 ## JVM, µs/op
 
-Lower is better. **Bold is the winner of each row.** nippy 3.9.0-beta1,
-`power-saver`. FRESH writer/reader per call — how `hako/encode` and
-`nippy/fast-freeze` are invoked, and a worst case for boring, whose real
-`encode`/`decode` reuse a thread-local writer (the nippy stress-data table
-below is the reused-API comparison). Absolute numbers are for relative
-comparison on this profile, not throughput claims.
+Recorded with Nippy 3.9.0-beta1 and the `power-saver` profile.
+The original table does not carry a complete machine/commit record, so use it
+as historical workload evidence and rerun before making a deployment decision.
+Lower times are better.
 
 | payload | op | boring | boring `:shapes` | hako | nippy |
 |---|---|---:|---:|---:|---:|
-| small-map | encode | 0.82 | 1.27 | **0.68** | 0.95 |
-| small-map | decode | 0.92 | 1.13 | **0.71** | 0.97 |
-| mixed | encode | 0.77 | 1.21 | **0.65** | 0.68 |
-| mixed | decode | 0.67 | 0.63 | **0.62** | 0.84 |
-| nested-map-50 | encode | 14.42 | 15.11 | 14.20 | **13.97** |
-| nested-map-50 | decode | 22.13 | 22.05 | **14.09** | 18.25 |
-| datom-maps-200 | encode | 67.48 | 72.35 | **52.44** | 57.98 |
-| datom-maps-200 | decode | 69.39 | **35.94** | 38.93 | 81.73 |
-| long-vec-1k | encode | 15.61 | 15.80 | 16.76 | **13.21** |
-| long-vec-1k | decode | 36.91 | 36.05 | **32.60** | 34.56 |
-| str-maps-200 | encode | **63.43** | 66.70 | 82.45 | 74.97 |
-| str-maps-200 | decode | 69.55 | **54.58** | 79.51 | 106.44 |
+| small-map | encode | 0.82 | 1.27 | 0.68 | 0.95 |
+| small-map | decode | 0.92 | 1.13 | 0.71 | 0.97 |
+| mixed | encode | 0.77 | 1.21 | 0.65 | 0.68 |
+| mixed | decode | 0.67 | 0.63 | 0.62 | 0.84 |
+| nested-map-50 | encode | 14.42 | 15.11 | 14.20 | 13.97 |
+| nested-map-50 | decode | 22.13 | 22.05 | 14.09 | 18.25 |
+| datom-maps-200 | encode | 67.48 | 72.35 | 52.44 | 57.98 |
+| datom-maps-200 | decode | 69.39 | 35.94 | 38.93 | 81.73 |
+| long-vec-1k | encode | 15.61 | 15.80 | 16.76 | 13.21 |
+| long-vec-1k | decode | 36.91 | 36.05 | 32.60 | 34.56 |
+| str-maps-200 | encode | 63.43 | 66.70 | 82.45 | 74.97 |
+| str-maps-200 | decode | 69.55 | 54.58 | 79.51 | 106.44 |
 
-hako's FFM reader wins the small and nested maps; boring wins the string-heavy
-payloads (stringref) and the same-shaped-map decode (`:shapes`); nippy takes
-the flat numeric vectors. No codec wins everywhere.
+In this run, boring with shapes has the lowest datom-map decode time.
+Hako leads the small-map and nested-map decodes; boring leads the
+string-keyed-map cases. The `nested-map-50` fixture is a map containing
+50 small maps, not a chain 50 levels deep.
 
-Wire size, bytes:
+### Wire size
+
+Sizes in bytes, rerun on 2026-09-06 at `d14ad50`, JDK 25.0.1, with Nippy
+3.9.0-beta1 and hako 1.0.0-alpha35. The Nippy sizes differ from the previous
+table, so they are reported separately from the historical timings above.
+The [raw size output](../bench/results/published-size-2026-09-06.txt) records
+the command, revision, and dependency versions.
 
 | payload | boring | boring `:shapes` | hako | nippy |
 |---|---:|---:|---:|---:|
-| small-map | 56 | 56 | 43 | **41** |
-| mixed | 63 | 63 | 55 | **53** |
-| nested-map-50 | 1 561 | 1 561 | **1 079** | 1 381 |
-| datom-maps-200 | 9 952 | **4 982** | 5 165 | 10 665 |
-| long-vec-1k | 2 726 | 2 726 | 2 740 | 2 874 |
-| str-maps-200 | 7 550 | **4 570** | 9 741 | 11 465 |
+| small-map | 56 | 56 | 43 | 41 |
+| mixed | 63 | 63 | 55 | 53 |
+| nested-map-50 | 1 561 | 1 561 | 1 079 | 1 191 |
+| datom-maps-200 | 9 952 | 4 982 | 5 165 | 5 592 |
+| long-vec-1k | 2 726 | 2 726 | 2 740 | 2 746 |
+| str-maps-200 | 7 550 | 4 570 | 9 741 | 11 336 |
 
-Read against nippy: boring wins the **string-heavy** payloads on both ops
-(`str-maps-200` encode and decode, the latter by 1.9×, where stringref pays),
-wins most decodes (`small-map`, `mixed`, `datom-maps-200`), and loses most
-encodes to nippy on the small and numeric shapes. On size it wins the two
-payloads where the shape machinery applies. No blanket "beats nippy" holds —
-an earlier version of this paragraph claimed exactly that ("all six encode
-cells", once even "all twelve"), and the table has never supported it. A claim
-its own evidence refutes is worse than no claim.
+Shapes reduce repeated keys in the two arrays of maps. They do not apply to
+`nested-map-50` because its maps are values of a map rather than rows of
+one array.
 
-Against **hako** — an experimental FFM codec built for speed — the picture is
-the mirror: hako wins the small and nested maps (its native `MemorySegment`
-reader is fastest there), and boring wins the string-heavy payloads and the
-same-shaped-map decode via `:shapes`. hako wins 7 of the 12 cells above, boring
-3, nippy 2.
+### Tier-matched: `hako-ab`, both codecs reused
 
-**The tier this table uses matters.** Every codec here allocates a fresh
-writer/reader per call, which is matched across libraries — but it is a worst
-case for the two whose real API reuses: boring's `encode`/`decode` reuse a
-thread-local writer, and so does `nippy/fast-freeze` (via nippy's `with-bb`).
-For boring-vs-hako at each library's intended reuse tier, `clojure -M:bench -m
-hako-ab` prints the tier-matched table (time and allocation, T1/T2/T3); for
-boring-vs-nippy through the real reused API, the nippy stress-data table below
-is the one to read, where boring round-trips at parity with `nippy/fast`.
-
-### Tier-matched — `hako-ab`, both codecs reused
-
-`clojure -M:bench -m hako-ab` (also wired into `bench/suite.clj`), power-saver,
-A/B interleaved, min over 60 rounds, median of three runs — the ratios are
-stable, the absolute µs are not. Ratio = boring µs ÷ hako µs; **> 1 means hako
-is faster, < 1 means boring is**:
+Recorded with `power-saver`, interleaved A/B measurements, minimum over
+60 rounds and median of three runs. Ratio is boring time divided by hako
+time: below 1 favours boring.
 
 | payload | encode (T3, reused, no copy) | decode (T2, reused reader) |
 |---|---:|---:|
 | small-map | 1.64× hako | 1.37× hako |
-| mixed | 1.67× hako | **0.63× — boring** |
+| mixed | 1.67× hako | 0.63× boring |
 | nested-map-50 | 1.36× hako | 1.46× hako |
 | datom-maps-200 | 1.46× hako | 1.77× hako |
-| datom-vec-1k | 1.72× hako | **0.50× — boring** |
-| long-vec-1k | **0.89× — boring** | 1.20× hako |
+| datom-vec-1k | 1.72× hako | 0.50× boring |
+| long-vec-1k | 0.89× boring | 1.20× hako |
 
-hako leads map-heavy encode ~1.2–1.7× and most map decodes ~1.4–1.8×, while
-boring wins the `mixed` decode, wins the nested-vector (`datom-vec`) decode by
-~2×, and ties the plain long-vector encode; the plain long-vector *decode* is
-the noisiest cell. On **heap** allocation boring wins essentially every encode
-cell — dramatically on primitive vectors (40 vs 2 800 B at T2 encode) — while
-hako edges the keyword-heavy map decodes. That axis is **heap-only**: it does
-not count hako's off-heap arena, which is hako's real low-allocation advantage,
-so read it as GC pressure rather than total memory.
+T3 encoding reuses buffers without copying the result; T2 decoding reuses the
+reader. These differ from allocating independent byte arrays through a
+convenience API. The recorded results favour hako for map-heavy encoding and
+several decodes, and boring for mixed-value and datom-vector decoding.
 
-The four small cells are close enough that the ordering is not stable across
-machines; treat 0.13 vs 0.18 µs as "the same". The gaps worth reading are the
-ones with a stated cause.
+Heap allocation is a separate comparison: hako's native arena is not included
+in the thread-allocation counter. Consult the harness output for time and
+allocation at each tier.
 
 ### Compressed
 
-The row that actually matters for a storage or wire codec, since konserve, kabel
-and every HTTP transport compress. zstd level 3, and nippy's own built-in LZ4
-for the `nippy/freeze` column:
+Sizes from the same rerun after zstd level 3, except Nippy's column, which
+uses `nippy/freeze` with its default compression policy. That policy may leave
+a value uncompressed. Include compression only when the application uses it;
+uncompressed data can be useful for direct navigation.
 
-| payload | boring+zstd | boring `:shapes`+zstd | hako+zstd | fressian+zstd | nippy (own LZ4) |
+| payload | boring+zstd | boring `:shapes`+zstd | hako+zstd | fressian+zstd | nippy/freeze (default) |
 |---|---:|---:|---:|---:|---:|
-| small-map | 65 | 65 | 52 | 60 | **45** |
-| mixed | 72 | 72 | 64 | 69 | **57** |
-| nested-map-50 | 354 | 354 | 388 | **345** | 1 385 |
-| datom-maps-200 | 1 121 | 1 237 | 1 168 | **1 014** | 2 488 |
-| long-vec-1k | 1 851 | 1 851 | 1 861 | **1 503** | 2 878 |
-| str-maps-200 | 1 062 | 1 168 | 1 118 | **982** | 2 493 |
+| small-map | 65 | 65 | 52 | 60 | 45 |
+| mixed | 72 | 72 | 64 | 69 | 57 |
+| nested-map-50 | 354 | 354 | 388 | 345 | 1 195 |
+| datom-maps-200 | 1 121 | 1 237 | 1 168 | 1 014 | 5 596 |
+| long-vec-1k | 1 851 | 1 851 | 1 861 | 1 503 | 2 750 |
+| str-maps-200 | 1 062 | 1 168 | 1 118 | 982 | 2 489 |
 
-Two things worth noting:
+Compression reduces the size differences between formats. Its choice matters:
+the Nippy column includes a different compressor and is not a codec-only
+comparison.
 
-- **Compression erases most of the uncompressed size differences.** boring's
-  9 952-byte `datom-maps-200` and nippy/fast's 10 665 both land near 1.1 KB.
-  Only nippy's own LZ4 is meaningfully worse, and that is LZ4 versus zstd, not
-  a format property. Choosing a codec on uncompressed size is choosing on a
-  number your storage layer deletes.
-- **`:shapes` is a small *loss* under compression** — 1 237 against 1 121 on
-  `datom-maps-200`. It removes exactly the repetition zstd is best at, and
-  replaces it with a header zstd cannot exploit. `:shapes` is a win when you do
-  not compress (2× smaller, and 1.8× faster to decode) and roughly a 10% cost
-  when you do. The same reasoning applies to stringref, which is why it is on
-  by default but not load-bearing.
+For `datom-maps-200`, shapes reduce raw size but increase zstd output from
+1,121 to 1,237 bytes. Repeated keys are also useful input to a general-purpose
+compressor. This result does not establish that shapes always increase
+compressed size; the [deflate experiment](SHAPES.md#size-and-decoding-trade-offs)
+has a different result.
 
-fressian+zstd is 5–20% ahead of boring+zstd on four of six payloads. That is a
-real, if small, loss, and it is the entire remaining size argument for fressian.
+### On Nippy's benchmark
 
-### On nippy's benchmark
-
-`clojure -M:nippy-bench` reruns nippy's own benchmark — nippy's `stress-data`,
-nippy's reader+fressian filter, nippy's timing loop — across all six codecs
-nippy reports, plus boring and the compressed tiers:
+`clojure -M:nippy-bench` uses Nippy's stress data, its reader/Fressian filter,
+and its timing loop. The recorded run used Nippy 3.9.0-beta1 and
+`power-saver`.
 
 | codec | freeze µs | thaw µs | round µs | bytes |
 |---|---:|---:|---:|---:|
@@ -196,517 +170,265 @@ nippy reports, plus boring and the compressed tiers:
 | `pr-str` + `read-string` | 7 094 | 10 075 | 17 169 | 15 880 |
 | nippy/lzma2 | 15 804 | 7 162 | 22 966 | 3 700 |
 
-Measured against nippy **3.9.0-beta1** on `power-saver`; the harness now
-prints both, because the previous table outlived a nippy upgrade unnoticed —
-nippy/fast's output shrank 18% between releases and the drift read as our
-regression until the byte columns gave it away.
+The raw boring and `nippy/fast` round trips are close in this run. Boring's
+decode is faster and its encode slower. The compressed rows show the
+size/latency trade-off: boring plus zstd is smaller than Nippy's LZ4 output
+and takes longer to round-trip. Nippy's LZMA2 result is smaller again, with a
+substantially higher time.
 
-Raw against raw, boring round-trips at parity with nippy/fast (1 662 against
-1 659): thaw 13% faster, freeze 1.25× behind. Against nippy's default it is
-1.23× faster, and over 5× fressian.
+## Reading: byte arrays, buffers, and navigation
 
-The size column needs the compressed rows to be read fairly: `nippy/freeze`
-compresses above a size threshold, so its 7 835 is a codec *plus* a compressor
-against boring's raw 15 326. Put both behind a compressor and **boring+zstd
-lands at 4 900 bytes against nippy's 7 835 — 1.60× smaller — at 1.6× the
-round-trip time.** nippy/lzma2 is smaller still at 3 700, for 7× boring+zstd's
-round-trip. fressian+zstd is 6% smaller than boring+zstd and 2.9× slower.
+Boring uses one structural reader with source-specific access. Heap reads use
+the byte-array path. `BufferSource` accepts `ByteBuffer` on JDK 9+;
+`SegmentSource` supports memory segments and mapped files on JDK 22+.
 
-## Reading: `byte[]`, FFM, and navigation
-
-hako builds on `java.lang.foreign` — a confined `Arena` owning a native
-`MemorySegment`. boring's reader does not, and the reason is measured rather
-than assumed, because the first attempt got it wrong.
-
-### The microbenchmark lied
-
-A microbenchmark of the access pattern a CBOR codec has — a header byte then an
-unaligned scalar — reports a native segment at **parity** with `byte[]`,
-provided you never use `withOrder(BIG_ENDIAN)`. That layout costs 4.1× on stock
-HotSpot by declining to intrinsify; access in native order and
-`Long.reverseBytes` (a bswap intrinsic, byte-identical output) and the penalty
-vanishes. `byteArrayViewVarHandle`, by contrast, is endian-neutral. **That
-endian rule still holds and `SegmentSource` depends on it** — it is the one
-result from that probe that survived.
-
-So a segment-based reader was built. It cost **14–50% on decode** and ~2.5× the
-stack per recursive level — enough that `maxDepth`'s 1024 default rose *above*
-the real stack limit and the depth cap silently stopped being a cap.
-
-`clj-async-profiler` said why: ~25% of samples in `checkValidStateRaw`,
-`checkIndex`, `checkSegment`, `checkBounds` — per-access bounds and liveness
-checks. A tight loop over a constant layout lets the JIT hoist all of it, which
-is exactly what the microbenchmark measured. A recursive, branchy decoder does
-not. **A microbenchmark of an access pattern is not a benchmark of a decoder
-built on it.**
-
-The probe itself is not in the repo. Its headline number was withdrawn, and a
-probe that reproduces a withdrawn conclusion is worse than no probe: someone
-runs it, sees parity, and re-opens a settled question. What survived is written
-down here and in `SegmentSource`, which is where it is load-bearing.
-
-`ByteBuffer` is the JDK-9-compatible alternative and is worse *for the Reader's
-own accessors*: it ties `byte[]` on sequential scans but runs **2.29×** on the
-data-dependent walk a head parser actually performs, against `MemorySegment`'s
-1.22×. That is why the Reader branches on `byte[]` and reaches
-`MemorySegment` through `SegmentSource` for a mapped file.
-
-**It did not stay rejected as a `ByteSource`, and the reason is reach rather
-than speed.** `BufferSource` wraps any `java.nio.ByteBuffer` — NIO channels,
-Netty, `MappedByteBuffer`, and log engines that hand out a read-only slice into
-an mmap they never copied. `SegmentSource` needs JDK 22; this runs on 9
-alongside the rest of `src/java`, so it is also the only off-heap source
-available to a caller who cannot move yet.
-
-One thing about it IS measured and worth keeping: reading through a
-`ByteBuffer` field goes **megamorphic** if one process meets more than two
-`ByteBuffer` implementation classes — `HeapByteBuffer`, `HeapByteBufferR`,
-`DirectByteBuffer`, `DirectByteBufferR` — and that costs about 8%. Any
-benchmark comparing buffer kinds must therefore use one shape per JVM, or it
-measures a megamorphic call site for everything after the second.
-
-**No numbers are quoted here for `BufferSource` against `SegmentSource`, and
-that is deliberate.** An earlier version of this section reported them at
-parity (38.1 µs against 40.3) and an mmap'd slice at parity with anonymous
-`allocateDirect` — all measured over files in `/tmp`, which on this machine is
-**tmpfs**. A mapping backed by tmpfs is memory; it never faults a page from
-storage, so a comparison against `allocateDirect` was memory against memory and
-could not have shown a difference even if one exists. The numbers were not
-wrong about what they measured, they were wrong about what they were *for*.
-
-Re-measuring properly needs mappings over real storage, which this repository
-has no harness for. Until it does, the honest statement is the narrow one:
-`BufferSource` exists for **reach** — it runs on JDK 9 and takes a buffer from
-any source — and whether the FFM path is faster over a real disk is untested.
-
-### What shipped: one parser, two accessors
-
-The structural logic is single-source — a second head parser is what drifts,
-silently — but the loads branch on whether the source is a heap array. That
-recovers the loss in full (`datom-maps-200` decode: 53.39 µs before, 72.06
-all-segment, **53.06** with the branch; allocation identical).
-
-Because the `byte[]` path then touches no FFM, the FFM types moved out of
-`Reader` behind a JDK-9-named `ByteSource`. `src/java` compiles at
-`--release 9`, `src/java22` holds the one `MemorySegment` implementation, and
-one jar carries both since the JVM rejects a class only when it *loads* it. The
-full suite passes on **JDK 21**, which cannot load FFM at all; 22+ adds mmap.
-
-Off-heap decode costs **1.35×** heap decode, and only that path pays it
-(shared/global arena 1.35×, confined 1.46×). It also means: to realise a whole
-subtree from a mapping, stage its byte span into a scratch array and decode
-through the array path (67.5 µs) rather than in place (75.4 µs).
+There is no committed real-storage harness establishing a general speed
+ranking between those two off-heap sources. Measurements on tmpfs or native
+allocated memory do not establish disk-backed page-fault behaviour.
 
 ### Reading a field without decoding the value it is in
 
-Every other table on this page compares codecs: how fast bytes become a value
-and back. On those, boring, hako and nippy sit within a factor of two or three
-and the winner depends on the payload. None of it says why you would pick one.
+This experiment asks each codec for the same selected values. Boring uses
+navigation; the hako and Nippy arms in this harness decode their whole stored
+value first. This compares those access paths, not just decoder throughput.
 
-This table is the reason. hako's read API is `decode`, `decode-into!` and
-`decode-many`; nippy's is `thaw`. There is no partial read, no cursor, no early
-stop — `decode-many` returns a vector, not a lazy seq. To see one field of one
-row, both must build every row. That is not a handicap imposed by the
-benchmark; it is the question a store asks, and the cost of answering it is
-what `boring.nav` exists to remove.
+The boring settings are
+`encode-indexed` with `{:shapes true :stringref true}`.
+The harness calls that combination `:store`; it is not a valid
+`:profile` option.
 
-A table of datom-shaped rows, `{:e :a :v :tx :added}`, written with the
-`:store` settings — `encode-indexed` with `{:shapes true :stringref true}`.
-(**Not a `:profile` value**; `:profile` takes `:clojure`, `:interop`,
-`:archival`, `:canonical` or `:canonical-rfc7049`, and `{:profile :store}`
-raises `:boring/bad-option`. It is shorthand used in this document and in
-`bench/capability.clj` for that combination of options.)
-`clojure -M:bench -m capability`:
+Reproduce with `clojure -M:bench -m capability`:
 
 | 5 000 rows × 5 fields | boring | hako | nippy |
 |---|---:|---:|---:|
-| **size** | **134 465 B** | 138 766 B | 273 865 B |
-| one field of one row | **0.94 µs** | 236 µs | 1 005 µs |
-| sum one column | **110 µs** | 267 µs | 1 070 µs |
-| filter on one column, project another | **114 µs** | 267 µs | 1 070 µs |
-| heap allocated, one field of one row | **4 048 B** | 987 344 B | — |
-| heap allocated, sum one column | **121 120 B** | 1 107 320 B | 6 306 800 B |
+| size | 134 465 B | 138 766 B | 273 865 B |
+| one field of one row | 0.94 µs | 236 µs | 1 005 µs |
+| sum one column | 110 µs | 267 µs | 1 070 µs |
+| filter on one column, project another | 114 µs | 267 µs | 1 070 µs |
+| heap allocated, one field of one row | 4 048 B | 987 344 B | — |
+| heap allocated, sum one column | 121 120 B | 1 107 320 B | 6 306 800 B |
 
-**The point read scales and the column scan does not**, and the difference is
-the whole design. Against hako it is 16.8× at 200 rows, 75× at 1 000 and 251×
-at 5 000, because boring is O(log n) in the index and hako is O(n) in the
-decode. The column scan is a flat ~2.4× at every size, because both sides visit
-every row; what boring saves there is the allocation, not the walk.
+The point read skips most rows. The column operations visit every row but
+construct fewer objects and decode fewer fields.
 
-**Most of the win is navigation, not the codec, and the harness says so.**
-boring's *own* full decode is the fourth column, and on a column scan it loses
-to hako — 231 µs against 267 at 5 000 rows only because stringref shrinks the
-input, and 2.1× slower than boring's navigating path on the same bytes. A table
-that omitted that row would be claiming a codec advantage boring does not have.
+The same recorded experiment reports 231 µs for boring's full-decode column
+scan, compared with 110 µs for navigation and 267 µs for hako's decode path.
+That additional boring baseline helps distinguish selective-access gains
+from codec differences.
 
-Shapes and stringref **compose**; an earlier draft of the harness assumed they
-competed and left 24% on the floor. Shapes hoist the keys out of every row,
-stringref then dedupes the repeated values that remain, and only together do
-they land under hako:
+Shapes and stringref can be combined. The smaller fixture from this harness
+has the following sizes:
 
 | 200-row table | bytes |
 |---|---:|
 | plain | 12 613 |
 | stringref only | 10 037 |
 | shapes only | 6 648 |
-| **shapes + stringref** | **5 063** |
+| shapes + stringref | 5 063 |
 | hako | 5 165 |
 
-All four are navigable. Combining stringref with an index is what the pointer
-table in the index frame is for.
+These payloads differ from the `published` fixture; their byte counts should
+not be substituted into its tables.
 
 ### Navigation
 
-`boring.nav` is a read-only cursor — `ILookup` (so `clojure.core/get-in`
-works), `Indexed`, `Counted`, `Seqable`, `IReduceInit`, and a `clojure.zip`
-zipper. `clojure -M:bench -m nav`:
+`clojure -M:bench -m nav` compares cursor operations with decoding first:
 
 | 68 KB, 200 records | nav | decode + `get-in` | ratio |
 |---|---:|---:|---:|
-| `get-in` one leaf (heap) | 5.9 µs | 124 µs | **21×** |
-| `count` the top-level map | 0.08 µs | 121 µs | **1400×** |
+| `get-in` one leaf (heap) | 5.9 µs | 124 µs | 21× |
+| `count` the top-level map | 0.08 µs | 121 µs | 1400× |
 | reduce over all 200, one field each | 57 µs | 125 µs | 2.2× |
-| `get-in` one leaf (mmap'ed) | 6.2 µs | 131 µs | **21×** |
-| locate a 1 MiB blob vs materialise it | 0.6 µs | 185 µs | **290×** |
+| `get-in` one leaf (mmap'ed) | 6.2 µs | 131 µs | 21× |
+| locate a 1 MiB blob vs materialise it | 0.6 µs | 185 µs | 290× |
 
-`count` is O(1) — the element count is in the head. The reduce row is only 2.2×
-because it visits every record. Skipping is 3–11× cheaper than decoding for
-structure and **18×** for a bytestring, which is length-prefixed, so ignoring
-one is a jump whose cost does not scale with its size.
+A container's count is available in its CBOR header. A reduction visits all
+records, so it has less to skip than a single-field lookup. A byte string can
+be skipped from its length without visiting its payload.
 
-A log is a CBOR sequence, walked by `nav/items`:
+For a sequence:
 
 | 5 000 events, 360 KB | nav | decode-seq | ratio |
 |---|---:|---:|---:|
-| scan for matching events | 1 542 µs | 5 330 µs | **3.5×** |
-| first event only (early exit) | 3.9 µs | 2.2 µs | **0.6×** |
+| scan for matching events | 1 542 µs | 5 330 µs | 3.5× |
+| first event only (early exit) | 3.9 µs | 2.2 µs | 0.6× |
 
-**That second row is where nav loses, and it is the useful one.** `decode-seq`
-is already lazy, so stopping at the first item decodes only that item — and for
-one small item a cursor plus a key probe costs more than decoding it.
-Navigation wins by what it *skips*.
+`decode-seq` is already lazy. When only the first small event is needed,
+constructing and probing a cursor costs more than decoding that event.
 
-Write such a file with the options on the **writer**, not per call:
+The navigator supports indexed string references in one document.
+Navigable sequences require stringref off; `write-seq!` enforces that.
+See [Index](INDEX.md) for configuration and the trust boundary.
 
-```clojure
-(let [w (boring/writer 65536 {:stringref false})]
-  (with-open [out (BufferedOutputStream. (FileOutputStream. f) 262144)]
-    (doseq [e events] (boring/write-to! w e out))))
-```
+### Mmap reads and writes
 
-`resolve-opts` merges the caller's map over the profile defaults on every
-encode, which costs ~250 heap bytes per event — and it bites hardest here,
-because a **sequence** needs `:stringref false` and so cannot use the nil-opts
-fast path. Resolved once on the writer, a log event costs **301 → 15** bytes
-through `encode-buffered!` and **248 → 0** through `write-to!`.
+The recorded `clojure -M:bench -m mmap` experiment found selective mapping
+faster than one `pread` per item. For appending 200,000 items, a
+`BufferedOutputStream` took 130 ms, mapping 171 ms, and encode-only work
+105 ms. These results favour buffered streaming for that append workload;
+they do not describe the cost of updating existing mapped fields.
 
-That restriction is specific to sequences and does not apply to a single
-document. `write-root!` resets the writer per top-level item, so every item
-opens its own namespace numbered from zero, while one index frame carries one
-pointer table and can describe at most one of them. `write-seq!` therefore
-forces `:stringref false` at every stride and refuses an explicit `true` rather
-than dropping it silently. A per-section pointer table would lift this; the
-economics are measured and it is not yet worth the format bump.
+[Editing](EDITING.md) covers the latter case, including byte movement,
+index maintenance, and durability I/O.
 
-Two constraints are enforced, not documented-and-hoped. **A stringref document
-is navigable only if its index carries a pointer table** — a cursor holding
-only an offset cannot resolve an index into a table built from the strings that
-precede it, so the table is written into the index frame and `encode-indexed`
-is what puts it there. A stringref document written *without* an index is
-refused, loudly, rather than answered wrongly. And indefinite-length containers
-cannot be descended: their count is not on the wire, so `Counted` would lie —
-boring never writes them.
+### Compression and lookup granularity
 
-Tags are opaque *by default*: `get` realises through the ordinary reader and
-delegates, because a tag's reader is an arbitrary function and structure does
-not imply semantics. Three have descent because boring wrote them and knows
-they preserve structure — shaped arrays, records, and RFC 8746 typed arrays.
-The shaped-array case is the one above.
-
-### mmap: good for reading, not for writing
-
-`clojure -M:bench -m mmap`. Selective decode over a mapping beats a `pread` per
-item **2.3×**, and costs 3–17% over a no-copy floor.
-
-Writing is the opposite. Appending 200 000 items: `BufferedOutputStream`
-**130 ms**, mmap 171 ms, encode-only floor **105 ms**. A mapping faults per
-4 KiB page while `write(2)` hands the kernel one prepared buffer. The floor
-matters more than the ranking — **I/O is 19% of the job** — so a writer that
-encoded straight into a mapping would compete for that 19% against an overhead
-larger than the copy it removes. The actionable finding is that an unbuffered
-`FileOutputStream` is **2.9× slower** than wrapping it.
-
-### Compression: chunk at page size
-
-Compression and mmap'ed selective access pull against each other: mmap pages at
-4 KiB, a compressed block only decodes whole. zstd level 3, random lookups:
+A random lookup must decompress its containing chunk before navigating it.
+This recorded zstd-level-3 experiment varied chunk size:
 
 | chunk | compressed | ratio | ns/lookup | vs raw |
 |---|---:|---:|---:|---:|
 | uncompressed | 15.4 MB | 1.00× | 1 498 | 1.0× |
-| **4 KB** | **1.59 MB** | **9.7×** | **5 400** | **3.6×** |
+| 4 KB | 1.59 MB | 9.7× | 5 400 | 3.6× |
 | 64 KB | 1.22 MB | 12.7× | 55 987 | 37× |
 | 256 KB | 1.21 MB | 12.8× | 201 755 | 135× |
 
-Lookup cost scales with chunk size; ratio saturates almost immediately. 4 KB
-reaches 77% of whole-file ratio and aligns with the page granularity mmap gives
-you anyway. This is the argument *against* filesystem compression at its defaults: btrfs
-compresses 128 KiB extents and ZFS a 128 KiB recordsize, landing at the bottom
-of that table. **The knob exists, though** — `zfs create -o recordsize=16K` —
-and [STORAGE.md](STORAGE.md) has the worked version. An earlier draft of this
-sentence said there was none, which was wrong, and the correction had been made
-in one document and not the other. Compression also forecloses zero-copy — a chunk
-must be decompressed to the heap — so it and the blob win are alternatives for
-the same bytes.
-
-## Optimisations that did not work
-
-Four attempts to close the gap against Postgres JSONB on small documents
-(0.11 µs/row for a three-step path extraction). One worked. The three that did
-not are recorded because each is an idea that looks obviously right, and the
-reason all three failed is the same.
-
-Baseline: navigating a 229-byte blob, three-step path, ~0.2–0.5 µs/document
-depending on run. Machine was loaded and on the `powersave` governor, so the
-ratios below are within-run comparisons; absolute figures are not publishable.
-
-| attempt | result |
-|---|---|
-| Shared encoded-key cache (`nav/context`) | **2.4× faster** — shipped |
-| Pack records into one indexed CBOR sequence | 0.80× — *worse* |
-| Compiled path: no `Cursor`, no probe lookup, primitive offsets | 0.78× — *worse* |
-| Reuse one `Reader` across documents via `reset` | 1.00× microbench, 0.92× in a real LMDB scan |
-
-**What separates the one that worked from the three that did not:** the probe
-cache removed repeated WORK — encoding the same four keywords 4000 times. The
-other three removed repeated ALLOCATION and DISPATCH, which on the JVM is
-already close to free. TLAB allocation is a pointer bump and young-gen
-collection of short-lived objects costs little, so removing it buys nothing and
-the indirection added to remove it costs something.
-
-The compiled path is the sharpest example: it cut navigation allocation from
-208 B to 80 B per document, a 2.6× reduction, and still ran slower.
-
-Reader reuse is worth a note of its own. In a tight microbenchmark it was 1.26×
-on the first round, 1.24× on the second and 1.00× on the third — the reusing
-path was flat while the ordinary path CONVERGED DOWN to meet it, because the JIT
-eventually eliminates the per-document Reader itself. Measuring one round would
-have "proved" a 1.26× win that does not exist at steady state. It also loses in
-a real LMDB scan, where the loop body is large enough that the saving is noise.
-
-The generalisable rule: **on the JVM, look for repeated work, not repeated
-allocation.** A C intuition about `palloc` does not transfer.
-
-Where the remaining gap against Postgres actually is: a hand-written LMDB
-cursor loop costs 0.10–0.12 µs/document, which is Postgres's entire budget for
-the same query. Panama is not the overhead. The gap is boring's per-document
-navigation, and none of the three attempts above touched it in a way the JVM
-had not already handled.
-
-## Where boring loses
-
-### Deeply nested maps — 1.4× bigger, 1.6× slower
-
-`nested-map-50` is 1 561 bytes against hako's 1 079, and decodes in 7.08 µs
-against 4.34.
-
-The cause is understood: 50 maps share a key set, but they are *nested* rather
-than collected into an array, so shaped arrays do not fire — 1 561 bytes either
-way. Stringref deduplicates the key *strings*, but every occurrence still pays
-a tag-39 identifier wrapper, a stringref reference and a map header.
-
-Under compression the size half of this loss inverts: 354 bytes against hako's
-388.
-
-This is the case [SHAPES.md](SHAPES.md) specifies tag 39650 for. Measured on a
-comparable payload, define-then-reference takes a map-of-maps from 7 126 to
-3 946 bytes (−44.6%). It is specified and deliberately not shipped in the first
-release.
-
-### A plain vector of integers — 2.4× slower
-
-`long-vec-1k` decodes in 11.05 µs against hako's 4.65. This is the largest
-remaining gap in the table, and it is a decode-side gap only — encode is a tie
-at 6.74 against 6.65.
-
-Handing boring a **primitive array** instead of a vector changes the picture
-entirely, because it becomes an [RFC 8746][rfc8746] typed array — a raw
-little-endian memory image:
-
-| representation | bytes | decode |
-|---|---:|---:|
-| vector of 1000 ints | 2 726 | 11.10 µs |
-| `long[]` (tag 79) | 8 008 | 1.25 µs |
-| `int[]` (tag 78) | 4 008 | 0.69 µs |
-| **`short[]` (tag 77)** | **2 008** | **0.34 µs** |
-| hako vector | 2 740 | 4.61 µs |
-
-`short[]` decodes **33× faster than the vector and is smaller on the wire**.
-On the JVM that is a bulk `VarHandle` read; in JavaScript it is a `TypedArray`
-view over the buffer, which is genuinely zero-copy.
-
-Unusually, the fastest path is also the most portable one: RFC 8746 is a
-registered standard that other CBOR libraries read natively.
-
-Automatically narrowing a homogeneous integer *vector* to a typed array would
-close this gap — measured at **5 144 bytes and 1.65 µs against 7 133 and 37.11
-µs** for a 512-row four-column payload, i.e. smaller *and* 22× faster. It needs
-narrowest-fit selection per column to avoid `long[]`'s 2.3× size penalty, and
-is specified in [SHAPES.md](SHAPES.md) as the columnar extension.
+Larger chunks improved compression but increased lookup cost in this fixture.
+Choose chunk size using expected reads, cache behaviour, and storage costs.
+Application-level chunk decompression and filesystem compression have
+different cache and I/O paths; these numbers are not measurements of ZFS or
+btrfs defaults.
 
 ## ClojureScript
 
-node v23.11, ns/op, reused writer and reader on both sides (transit's `tw`/`tr`
-are created once, so boring's are too). Regenerate with:
+Recorded on Node v23.11 with reused readers and writers for boring and
+Transit. Times are ns/op.
 
-```
+```sh
 clojure -M:cljs-compare -m cljs.main -co '{:language-in :ecmascript-next}' \
   -O advanced -t node -o target/cljs-compare.js -c cljsbench.compare
 node target/cljs-compare.js
 ```
 
-An earlier version of this page claimed boring "beats transit-cljs on every
-axis — 1.6x encode, 2.6x decode, 2.9x smaller". That is wrong as a general
-claim. It holds for one payload shape, with `:shapes` enabled, and the reverse
-holds elsewhere.
+The comparison alias also needs the local fress benchmark dependency described
+in `deps.edn`.
 
 ### Decode, ns/op
 
 | payload | boring | boring `:shapes` | transit | JSON.parse |
 |---|---:|---:|---:|---:|
-| small-map | 2 253 | 2 244 | **1 055** | 224 |
-| mixed | 1 470 | 1 475 | **627** | 172 |
-| string-100 | 349 | 350 | **135** | 46 |
-| nested-map-50 | 43 207 | 43 192 | **24 997** | 6 991 |
-| datom-maps-200 | 199 111 | **52 820** | 91 042 | 33 727 |
-| datom-vec-1k | 242 767 | 240 819 | **152 313** | 97 903 |
-| long-vec-1k | **10 030** | 10 094 | 12 733 | 5 609 |
+| small-map | 2 253 | 2 244 | 1 055 | 224 |
+| mixed | 1 470 | 1 475 | 627 | 172 |
+| string-100 | 349 | 350 | 135 | 46 |
+| nested-map-50 | 43 207 | 43 192 | 24 997 | 6 991 |
+| datom-maps-200 | 199 111 | 52 820 | 91 042 | 33 727 |
+| datom-vec-1k | 242 767 | 240 819 | 152 313 | 97 903 |
+| long-vec-1k | 10 030 | 10 094 | 12 733 | 5 609 |
 
 ### Encode, ns/op
 
 | payload | boring | boring `:shapes` | transit | JSON.stringify |
 |---|---:|---:|---:|---:|
-| small-map | 1 702 | 1 825 | **895** | 123 |
-| nested-map-50 | 41 870 | 41 652 | **25 263** | 3 557 |
-| datom-maps-200 | 194 045 | **124 680** | 128 435 | 20 144 |
-| datom-vec-1k | 705 819 | 729 565 | **449 123** | 71 121 |
-| long-vec-1k | 40 961 | 41 061 | **39 041** | 8 427 |
+| small-map | 1 702 | 1 825 | 895 | 123 |
+| nested-map-50 | 41 870 | 41 652 | 25 263 | 3 557 |
+| datom-maps-200 | 194 045 | 124 680 | 128 435 | 20 144 |
+| datom-vec-1k | 705 819 | 729 565 | 449 123 | 71 121 |
+| long-vec-1k | 40 961 | 41 061 | 39 041 | 8 427 |
 
 ### Size, bytes
 
-boring is smaller on every payload:
+Boring is smaller than Transit for every payload in this table, not
+necessarily smaller than JSON:
 
 | payload | boring | boring `:shapes` | transit | JSON |
 |---|---:|---:|---:|---:|
-| small-map | **56** | 56 | 75 | 48 |
-| nested-map-50 | **1 561** | 1 561 | 2 176 | 1 621 |
-| datom-maps-200 | 9 952 | **4 982** | 14 307 | 13 091 |
-| datom-vec-1k | **25 748** | 25 748 | 39 000 | 40 991 |
-| long-vec-1k | **2 726** | 2 726 | 3 891 | 3 891 |
+| small-map | 56 | 56 | 75 | 48 |
+| nested-map-50 | 1 561 | 1 561 | 2 176 | 1 621 |
+| datom-maps-200 | 9 952 | 4 982 | 14 307 | 13 091 |
+| datom-vec-1k | 25 748 | 25 748 | 39 000 | 40 991 |
+| long-vec-1k | 2 726 | 2 726 | 3 891 | 3 891 |
 
-### Why transit wins on JS, and where it does not
+### Why Transit wins on JS, and where it does not
 
-transit-cljs `:json` writes JSON text, so **`JSON.parse` does the entire
-byte-to-structure walk in native C++** and transit only pays for the JS-level
-walk that builds Clojure values. boring parses binary in JavaScript. Profiling
-`datom-maps-200` decode (`node --cpu-prof`) puts boring's time at:
+Transit JSON uses the JavaScript engine's native parser before constructing
+ClojureScript values. Boring parses CBOR in JavaScript. In these results,
+Transit leads most general-purpose full-decode cases.
 
-| | share |
-|---|---:|
-| byte scan / dispatch | 31.8% |
-| string decode (`TextDecoder` + UTF-8 validation) | 25.4% |
-| collection building (transients) | 16.8% |
-| keyword interning | 13.5% |
-| other, GC | 12.5% |
+Shapes reduce repeated keys and their parsing work: `datom-maps-200`
+decodes in about 53 µs with shapes versus 91 µs with Transit, with a smaller
+encoding. The numeric-vector decode also favours boring. These benefits do
+not extend automatically to maps stored outside arrays.
 
-The first two — **57% of decode** — are what V8 does natively for transit. That
-is a structural disadvantage of binary-in-JS, not a defect, and it is why the
-fastest JS CBOR codecs generate their decoders with `new Function`/`eval` (which
-a strict Content Security Policy forbids, and which boring does not do).
+### Comparing equivalent JSON results
 
-boring wins where the format advantage beats native text parsing:
-
-- **`:shapes` on an array of same-shaped maps.** Stripping the repeated keys
-  removes most of the scan and all of the repeated keyword interning:
-  `datom-maps-200` decodes in **53 µs against transit's 91 µs — 1.7× faster, at
-  2.9× smaller** — and encode is now ahead too, 125 µs against 128. This is the datom shape boring exists for.
-  It does nothing for `nested-map-50` (maps nested, not collected) or
-  `datom-vec-1k` (vectors, not maps), which is why those rows are flat.
-- **Dense numeric data.** `long-vec-1k` decodes in 9.8 µs against 12.6 —
-  CBOR integers are 1–3 binary bytes where JSON must parse decimal text. A
-  typed array widens this to more than an order of magnitude.
-
-Everywhere else — small maps, plain strings, nested maps — **transit is 1.5–2.7×
-faster and boring is 1.3–1.4× smaller**. If you are CPU-bound in a browser on
-generic data, transit is the faster choice today; boring's case on JS is wire
-size, cross-language reach, and the shaped-array path.
-
-### The JSON column is not the bar it looks like
-
-`JSON.parse` returns plain JS objects with string keys. boring and transit
-return ClojureScript persistent maps with keyword keys. Those are different
-jobs, and the difference is most of the apparent gap. On `datom-maps-200`:
+`JSON.parse` produces plain objects with string keys. Boring and Transit
+produce ClojureScript collections and keyword keys. A separate recorded
+experiment includes that conversion cost:
 
 | | ns |
 |---|---:|
 | `JSON.parse` → plain JS objects | 34 348 |
 | `JSON.parse` + a hand-written CLJS build that knows the 5 keys | 43 420 |
-| **boring `:shapes`** | **45 127** |
+| boring `:shapes` | 45 127 |
 | boring, generic | 170 279 |
 | `JSON.parse` + `js->clj :keywordize-keys` | 197 026 |
 | CLJS construction alone, nothing parsed | 4 297 |
 
-**With `:shapes`, boring is within 4% of `JSON.parse` doing the same job** —
-45.1 µs against 43.4, where the JSON side has been hand-specialised to the same
-five keys boring's shape header carries. That is about as close to the native
-parser as anything returning Clojure values gets.
+For this five-key fixture, shaped boring is close to a specialised JSON
+conversion and faster than `js->clj :keywordize-keys`.
+Applications using plain JS objects or their own conversion code should
+compare against those paths rather than assume the generic conversion cost.
+These timings are from a separate run from the preceding table.
 
-**Against what a CLJS app actually writes, boring wins outright.** Nobody
-hand-unrolls their keys; they call `js->clj`, and that costs 197 µs — **4.4×
-slower than boring `:shapes`**, and slower than boring's generic path too. For
-reading into ClojureScript data, boring is the faster option today.
+## Design experiments
 
-The last row decides what is left to optimise: building the result — 200
-`PersistentArrayMap`s and a vector — costs **4.3 µs, under 10% of the shaped
-decode**. What remains is parsing, not construction.
+The following results explain implementation choices. They are retained as
+experiments rather than current comparative throughput claims.
 
-### A WASM decoder: measured, ~6–10%
+### Heap and off-heap access
 
-An optional WASM module with a JS fallback is the obvious way to buy
-native-speed scanning. `bench/wasm/` is the experiment: a CBOR skeleton walker
-in C that counts items and constructs nothing — the *most* a WASM module could
-take off the JS decoder, since strings and Clojure values have to be built on
-the JS side regardless.
+A segment-only reader experiment increased full-decode time and recursive
+stack use. Profiling attributed substantial work to bounds and arena-liveness
+checks that a tight accessor microbenchmark had allowed the JIT to hoist.
+Keeping heap access in the shared reader avoided paying those checks on the
+byte-array path.
+
+The original standalone accessor probe was not committed. Its timings should
+not be used to select a storage backend or infer the speed of a complete
+decoder.
+
+### Optimisations that did not work
+
+On a small-document LMDB navigation workload, these recorded within-run
+comparisons used a loaded machine and the `powersave` governor:
+
+| attempt | result |
+|---|---|
+| Shared encoded-key cache (`nav/context`) | 2.4× faster (implemented) |
+| Pack records into one indexed CBOR sequence | 0.80× (slower) |
+| Compiled path: no `Cursor`, no probe lookup, primitive offsets | 0.78× (slower) |
+| Reuse one `Reader` across documents via `reset` | 1.00× microbench, 0.92× in a real LMDB scan |
+
+The shared key cache eliminated repeated key encoding. The other changes
+reduced allocation or dispatch without improving the measured scan.
+For example, the compiled path reduced allocation from 208 to 80 bytes per
+document while taking longer. This is evidence about those paths, not a
+general rule that allocation never matters on the JVM.
+
+### Primitive arrays
+
+The `published` harness also compares the same thousand integer values in
+vectors and JVM primitive arrays. Arrays use RFC 8746 typed encodings, allowing
+bulk reads; they also change the result type and numeric range.
+
+The deterministic sizes are 2,726 bytes for a vector, 8,008 for `long[]`,
+4,008 for `int[]`, and 2,008 for `short[]`. Run
+`clojure -M:bench -m published` for matching current decode timings.
+Use a narrower array only when the values fit and the application wants an
+array. Boring does not automatically transpose maps into typed columns.
+
+### A WASM scanner
+
+The [WASM experiment](../bench/wasm/) walks CBOR structure in C without
+constructing strings or ClojureScript values:
 
 | | JS | WASM | |
 |---|---:|---:|---:|
 | skeleton scan, generic (9 952 B) | 21 317 ns | 10 471 ns | 2.04× |
 | skeleton scan, `:shapes` (4 982 B) | 9 806 ns | 5 242 ns | 1.87× |
 
-WASM is genuinely ~2× at the scan, and the buffer copy is not the obstacle —
-10 KB costs ~120 ns. The problem is the share:
-
-| | scan share of decode | saving if ALL of it moved |
-|---|---:|---:|
-| generic (170 279 ns) | 12.5% | **6.4%** |
-| `:shapes` (45 127 ns) | 21.7% | **10.1%** |
-
-That is a ceiling, not an estimate: it assumes JS consumes whatever index WASM
-writes for free, and a CBOR header is already one byte with the major type in
-its top three bits, so reading an index entry is not obviously cheaper than
-reading the header it replaces.
-
-Two things pin the ceiling there. **Strings cannot move** — a JS string cannot
-be a view into WASM memory, so every one is copied and transcoded UTF-8 →
-UTF-16; this is the wall a Rust JSON parser in WASM hits at ~8× *slower* than
-native `JSON.parse`, and boring's string time is already inside `TextDecoder`
-either way. **Clojure values cannot move** — `Keyword`, `PersistentArrayMap`
-and `PersistentVector` are JS objects WASM cannot allocate.
-
-Against that, `:shapes` takes the same payload from 170 µs to 45 — **3.8×** —
-with no second implementation to keep conformant. Widening where shapes fire
-(tag 39650, [SHAPES.md](SHAPES.md)) is worth more than a WASM scanner by a wide
-margin, and `nested-map-50` — where boring is furthest behind transit — is
-exactly that case.
-
-[rfc8746]: https://www.rfc-editor.org/rfc/rfc8746
+The scanner was roughly twice as fast in this experiment. Relative to the
+complete JS decode measured in that run, replacing only the scan would save
+about 6–10% under an optimistic model that ignores result-handoff work.
+This is not a measured integrated WASM decoder, nor a ceiling for every
+possible WASM design. No WASM decoder is shipped.
