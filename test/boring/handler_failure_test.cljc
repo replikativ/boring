@@ -126,6 +126,7 @@
        (doseq [[nm v] [["clojure/sorted-set" (into (sorted-set) [1 2])]
                        ["clojure/char" \a]
                        ["clojure/queue" (into clojure.lang.PersistentQueue/EMPTY [1 2])]
+                       ["clojure/seq" (list 1 2)]
                        ["java/period" (java.time.Period/ofDays 3)]
                        ["java/object-array" (object-array [1 "a"])]]]
          (let [reg (boring/register-record-class (boring/tag-registry) Pt nm)

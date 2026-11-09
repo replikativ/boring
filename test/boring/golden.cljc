@@ -122,6 +122,13 @@
    ["queue"            (into #?(:clj clojure.lang.PersistentQueue/EMPTY
                                 :cljs cljs.core/PersistentQueue.EMPTY)
                              [:a :b])              {}]
+   ;; A seq: ON under :clojure and :archival, a plain array under :interop.
+   ;; The empty case is frozen too -- `()` and an empty lazy seq share it.
+   ["seq-list"         (list :a :b)                {}]
+   ["seq-lazy"         (map inc [1 2])             {}]
+   ["seq-empty"        ()                          {}]
+   ["seq-archival"     (list 1 (list 2) [3])       {:profile :archival}]
+   ["seq-interop"      (list 1 2)                  {:profile :interop}]
    ["with-meta"        (with-meta [1 2] {:m true}) {}]
    ["with-meta-nested" [(with-meta {:a 1} {:i 1})] {}]
 

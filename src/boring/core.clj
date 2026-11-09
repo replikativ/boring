@@ -13,6 +13,11 @@
                     | :canonical-rfc7049
     :float-policy   :preserve-width (default) | :shortest
     :stringref      true (default under :clojure) | false
+    :seqs           true (default under :clojure and :archival) | false
+                    -- write Clojure seqs (lists, lazy seqs, conses) as the
+                    tag-27 marker `clojure/seq`, so they decode as seqs
+                    rather than vectors. Locked off under :interop and the
+                    canonical profiles, where a sequence is a plain array.
 
   See doc/COMPATIBILITY.md for what each profile promises about the bytes.
   :float-policy exists because datahike's dumps must not narrow a double to a
@@ -152,6 +157,7 @@
   (set! (.-canonical w) (boolean (:canonical opts)))
   (set! (.-legacyCanonicalOrder w) (= :rfc7049 (:canonical-order opts)))
   (set! (.-shapes w) (boolean (:shapes opts)))
+  (set! (.-seqs w) (boolean (:seqs opts)))
   (set! (.-permitReservedSimpleValues w)
         (boolean (:permit-reserved-simple-values opts)))
   (set! (.-maxDepth w) (int (get opts :max-depth 1024)))

@@ -135,13 +135,19 @@
 
 (deftest type-widening-is-value-preserving
   (testing "CBOR has one integer type and one array type, so boxed widths and
-            seq flavours do not survive. `=` holds in every case, which is why
-            these are widening rather than the silent corruption a Character
-            becoming a String was."
+            vector flavours do not survive. `=` holds in every case, which is
+            why these are widening rather than the silent corruption a
+            Character becoming a String was."
     (doseq [[k cls] [[:byte Long] [:short Long] [:integer Long]
-                     [:list           clojure.lang.PersistentVector]
                      [:subvec         clojure.lang.PersistentVector]
-                     [:lazy-seq       clojure.lang.PersistentVector]
-                     [:lazy-seq-empty clojure.lang.PersistentVector]
                      [:map-entry      clojure.lang.PersistentVector]]]
-      (widens-to k cls))))
+      (widens-to k cls)))
+  (testing "seqs are NOT among them any more: `clojure/seq` brings every seq
+            flavour back as a seq -- a chunked seq over the decoded vector, or
+            `()` when empty -- which is what nippy itself returns for every
+            seq that is not a PersistentList. Only the concrete class differs."
+    (doseq [[k cls] [[:list           clojure.lang.PersistentVector$ChunkedSeq]
+                     [:lazy-seq       clojure.lang.PersistentVector$ChunkedSeq]
+                     [:lazy-seq-empty clojure.lang.PersistentList$EmptyList]]]
+      (widens-to k cls)
+      (is (seq? (round-trip (get data k))) (str k " -- is a seq")))))

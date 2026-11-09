@@ -23,7 +23,9 @@
                                         ; profile forces it off
             :float-policy :preserve-width  ; lossless; :shortest is canonical-only
             :canonical false            ; canonicalisation is opt-in
-            :canonical-order :rfc8949}
+            :canonical-order :rfc8949
+            :seqs true}                 ; a seq decodes as a seq, not a vector;
+                                        ; off under :interop and canonical
            opt/default-opts))))
 
 (deftest read-site-decode-guards-are-frozen

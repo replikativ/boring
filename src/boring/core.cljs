@@ -77,6 +77,7 @@
   (set! (.-canonical w) (boolean (:canonical opts)))
   (set! (.-legacyCanonicalOrder w) (= :rfc7049 (:canonical-order opts)))
   (set! (.-shapes w) (boolean (:shapes opts)))
+  (set! (.-seqs w) (boolean (:seqs opts)))
   (set! (.-registry w) (:registry opts))
   (set! (.-maxDepth w) (get opts :max-depth 1024))
   (set! (.-permitReservedSimpleValues w)

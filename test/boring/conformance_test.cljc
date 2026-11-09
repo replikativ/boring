@@ -741,6 +741,49 @@
             (str label ": expected " (pr-str (type expected))
                  " got " (pr-str (type back))))))))
 
+(defn- no-vector-where-a-seq-was
+  "Walks `orig` and `back` in parallel and returns true when every seq in
+  `orig` is a seq (and not a vector) at the same place in `back`."
+  [orig back]
+  (cond
+    (seq? orig)    (and (seq? back) (not (vector? back))
+                        (= (count orig) (count back))
+                        (every? true? (map no-vector-where-a-seq-was orig back)))
+    (map? orig)    (every? (fn [[k v]] (no-vector-where-a-seq-was v (get back k))) orig)
+    (vector? orig) (and (vector? back)
+                        (every? true? (map no-vector-where-a-seq-was orig back)))
+    :else true))
+
+(deftest seqs-come-back-as-seqs
+  (testing "a seq is written as 27([\"clojure/seq\", array]) under the default
+            and :archival profiles, and decodes to a seq -- at every depth, not
+            only at the root"
+    (doseq [p [nil {:profile :archival}]
+            [label v] f/seqs-preserved]
+      (let [back (boring/decode (boring/encode v p))]
+        (is (= v back) (str label " " p " -- value"))
+        (is (no-vector-where-a-seq-was v back)
+            (str label " " p ": got " (pr-str back))))))
+
+  (testing "the profiles that promise agreement with encoders that have no
+            seqs write a PLAIN ARRAY, and so read back a vector"
+    (doseq [p [{:profile :interop} {:profile :canonical}
+               {:profile :canonical-rfc7049} {:seqs false}]
+            [label v] f/seqs-preserved
+            :when (seq? v)]
+      (let [back (boring/decode (boring/encode v p))]
+        (is (= v back) (str label " " p " -- value"))
+        (is (vector? back) (str label " " p ": got " (pr-str (type back)))))))
+
+  (testing "the marker WRAPS the array: the payload is byte for byte what the
+            bare encoding writes, so a reader that does not know the name still
+            gets the elements"
+    ;; 27(["clojure/seq", [1, 2, 3]])
+    (is (= "d81b826b636c6f6a7572652f73657183010203"
+           (c/bytes->hex (boring/encode (list 1 2 3) {:profile :archival}))))
+    (is (= "83010203"
+           (c/bytes->hex (boring/encode (list 1 2 3) {:profile :interop}))))))
+
 (deftest ordered-collections-keep-type-and-order
   (testing "sorted maps, sorted sets and queues survive as themselves, carried
             by reserved tag-27 names -- the same mechanism records use, no
@@ -2310,7 +2353,18 @@
   (testing "an array still works, and so do the two shapes both platforms admit"
     (is (= #{1 2} (dec-hex (tag27-hex "clojure/sorted-set" "820201"))))
     (is (= #{} (dec-hex (tag27-hex "clojure/sorted-set" "f6"))))
-    (is (= #{1 2} (dec-hex (tag27-hex "clojure/sorted-set" "d90102820201"))))))
+    (is (= #{1 2} (dec-hex (tag27-hex "clojure/sorted-set" "d90102820201")))))
+  (testing "`clojure/seq` is stricter: an ARRAY and nothing else. A set has no
+            element order to restore and null is not an array, so both are
+            refused on both platforms rather than guessed at"
+    (doseq [arg ["f8ac" "a10102" "f6" "d90102820201" "01"]]
+      (is (= :boring/bad-tag-content
+             (err-type #(dec-hex (tag27-hex "clojure/seq" arg))))
+          (str "clojure/seq " arg)))
+    (is (= '(2 1) (dec-hex (tag27-hex "clojure/seq" "820201"))))
+    (is (seq? (dec-hex (tag27-hex "clojure/seq" "820201"))))
+    (is (= () (dec-hex (tag27-hex "clojure/seq" "80"))))
+    (is (seq? (dec-hex (tag27-hex "clojure/seq" "80"))))))
 
 (deftest rfc-3339-grammar-is-the-same-grammar-on-both-platforms
   (testing "RFC 3339 has no expanded-year production; `Instant.parse` accepts

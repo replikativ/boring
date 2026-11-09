@@ -136,6 +136,11 @@ def _tag_hook(*args):
         return Keyword(s) if s.startswith(":") else Symbol(s)
     if tag.tag == TAG_GENERIC_OBJECT:
         type_name, fields = tag.value
+        if type_name == "clojure/seq":
+            # A Clojure seq (list, lazy seq). Python has one sequence type, so
+            # the marker only says "this was not a vector": the argument IS the
+            # array, and that is the idiomatic reading.
+            return fields
         return Record(type_name, fields)
     if tag.tag == TAG_SET:
         # Values may be unhashable (a decoded list); fall back to a list rather

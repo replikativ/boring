@@ -2020,6 +2020,10 @@
                                "clojure/sorted-set")
                "clojure/queue"      (into cljs.core/PersistentQueue.EMPTY
                                           (seq-content argument "clojure/queue"))
+               ;; A seq over the decoded vector, `()` when empty -- the JVM's
+               ;; choice, for the same reason: one object on top of the array.
+               "clojure/seq"        (or (seq (list-marker-content argument "clojure/seq"))
+                                        ())
                ;; ClojureScript has no character type -- `\a` READS as the
                ;; one-character string -- and no java.time, so these markers
                ;; name a type this platform cannot build. They are VALIDATED

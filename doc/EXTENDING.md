@@ -126,7 +126,8 @@ it — see [Records you cannot construct](#records-you-cannot-construct-and-why-
 
 A handful of tag-27 names are reserved by boring for types CBOR cannot
 otherwise distinguish — `clojure/sorted-map`, `clojure/sorted-set`,
-`clojure/queue`, `clojure/with-meta`, `clojure/char`, `java/period`. They carry
+`clojure/queue`, `clojure/seq`, `clojure/with-meta`, `clojure/char`,
+`java/period`. They carry
 a slash separating the owning runtime from the type — and so, since this
 release, does every record name: `my-ns/MyRecord`. The old claim here was that
 a slash made collision impossible; it does not any more, and the honest
