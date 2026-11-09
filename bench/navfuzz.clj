@@ -24,6 +24,7 @@
 
   Run: clojure -M:fuzz -m navfuzz [n]"
   (:require [boring.core :as boring]
+            [boring.frame :as frame]
             [boring.nav :as nav]
             [clojure.test.check.generators :as gen]
             [boring.generative-test :as g]))
@@ -93,6 +94,16 @@
         ;; length, so the frame-only region is bytes past it -- for a plain
         ;; blob there is no frame, so data-len == length and no frame-only
         ;; mutation is attempted, which is correct: the whole thing is data.
+        ;;
+        ;; READ OFF THE BLOB'S OWN FOOTER, not re-derived by encoding `v` again.
+        ;; It was `(alength (encode v ...))` with stringref ON for the
+        ;; stringref-on corpus -- but when nothing clears `:index-min`,
+        ;; `encode-indexed` returns the PLAIN encoding with stringref OFF and no
+        ;; frame at all. A value repeating a string then re-encoded SHORTER than
+        ;; the blob, so `data-len < length`, and the "frame-only" mutations
+        ;; landed in the data and were reported as frame damage changing the
+        ;; decode. Latent until `clojure/seq`: a value with two seqs repeats
+        ;; that name, which generated seeds almost never did with a string.
         corpus (vec (concat
                      (for [v vs
                            o [{:index 1 :index-min 4 :stringref false}
@@ -102,8 +113,8 @@
                            :let [bs (try (boring/encode-indexed v o) (catch Throwable _ nil))]
                            :when bs]
                        [v bs (if (:stringref o false) {} {:stringref false})
-                        (alength ^bytes (boring/encode v (if (contains? o :stringref)
-                                                           {:stringref false} {})))])
+                        (let [f (long (frame/footer-start bs))]
+                          (if (neg? f) (alength ^bytes bs) f))])
                      (for [v vs
                            sr [true false]
                            :let [bs (try (boring/encode v {:stringref sr})
