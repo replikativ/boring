@@ -91,7 +91,7 @@
    Listed here as well as in `Reader.isReservedRecordName` on purpose: this is
    the check that the Java list has not fallen behind the switch beside it."
   ["clojure/sorted-map" "clojure/sorted-set" "clojure/with-meta" "clojure/char"
-   "clojure/ex-info" "clojure/queue" "java/throwable" "java/boolean-array"
+   "clojure/ex-info" "clojure/queue" "clojure/seq" "java/throwable" "java/boolean-array"
    "java/char-array" "java/string-array" "java/object-array" "java/period"])
 
 (deftest no-reserved-name-is-descendable

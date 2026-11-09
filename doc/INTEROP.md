@@ -63,6 +63,7 @@ CBOR has no tag for, under names carrying the same **slash**:
 | `clojure/sorted-map` | a map | a sorted map is a CBOR map; unmarked it returns unsorted |
 | `clojure/sorted-set` | an array | same, for sets |
 | `clojure/queue` | an array | a queue is a CBOR array; unmarked it returns a vector |
+| `clojure/seq` | an array | a list or lazy seq is a CBOR array; unmarked it returns a vector. Written by the default profile, not by `:interop` |
 | `clojure/with-meta` | `[meta, value]` | Clojure metadata, which has nowhere else to go |
 | `clojure/char` | a 1-character string | `(= \a "a")` is **false** in Clojure |
 | `java/period` | an ISO-8601 string, e.g. `"P1Y1M1D"` | a *date* amount; RFC 9581's tag 1002 carries *seconds* |
@@ -78,15 +79,15 @@ optimisation for seeking within a file, never data, and boring itself falls
 back to scanning whenever it is absent or stale.
 
 For a foreign reader, ignoring the others is safe and lossy in a predictable
-direction — a sorted map arrives as a map, a queue as an array, a char as a
-one-character string. Handling `clojure/with-meta` is worth the four lines, since
+direction — a sorted map arrives as a map, a queue or a seq as an array, a
+char as a one-character string. Handling `clojure/with-meta` is worth the four lines, since
 otherwise every annotated value arrives wrapped:
 
 ```python
 def tag27(name, arg):
     if name == "clojure/with-meta":
         return tag27_value(arg[1])       # or keep arg[0] if you want the meta
-    if name in ("clojure/queue", "clojure/sorted-set"):
+    if name in ("clojure/seq", "clojure/queue", "clojure/sorted-set"):
         return arg
     ...
 ```
@@ -279,7 +280,7 @@ If you are writing data for a consumer you do not control:
 (boring/encode value {:profile :interop})
 ```
 
-That disables stringref and shapes. Every byte is then a registered CBOR
+That disables stringref, shapes and the `clojure/seq` marker. Every byte is then a registered CBOR
 construct, and any conformant decoder produces the right structure without a
 single hook — at the cost of a larger document.
 

@@ -1778,6 +1778,7 @@ public final class Reader {
             case "clojure/char":
             case "clojure/ex-info":
             case "clojure/queue":
+            case "clojure/seq":
             case "java/throwable":
             case "java/boolean-array":
             case "java/char-array":
@@ -3455,6 +3456,24 @@ public final class Reader {
                                     + " period: " + ps + " (canonically " + p + ")",
                                     "tag", 27L);
                             return p;
+                        }
+                        case "clojure/seq": {
+                            // A seq over the vector the payload already decoded
+                            // to: one object on top of the array decode, chunked
+                            // for map/filter/reduce, O(1) count. nippy's choice
+                            // for every non-list seq. NOT a PersistentList,
+                            // which costs a cons cell per element to build and
+                            // buys only `list?` -- a seq never offered indexed
+                            // access, so neither does what comes back.
+                            //
+                            // An ARRAY and nothing else (listMarkerContent):
+                            // a set or a map payload has no element order to
+                            // restore, and null is not an array.
+                            java.util.List l2 = listMarkerContent(argument, "clojure/seq");
+                            Object s2 = l2 instanceof clojure.lang.Seqable
+                                ? ((clojure.lang.Seqable) l2).seq()
+                                : clojure.lang.RT.seq(l2);
+                            return s2 == null ? clojure.lang.PersistentList.EMPTY : s2;
                         }
                         case "clojure/queue": {
                             Object q = clojure.lang.PersistentQueue.EMPTY;

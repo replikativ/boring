@@ -93,6 +93,8 @@ public final class Writer {
     private static final String NAME_SORTED_MAP = "clojure/sorted-map";
     private static final String NAME_SORTED_SET = "clojure/sorted-set";
     private static final String NAME_QUEUE      = "clojure/queue";
+    /** A Clojure seq (`seq?`), around an ordinary array -- see {@link #seqs}. */
+    private static final String NAME_SEQ        = "clojure/seq";
     private static final String NAME_WITH_META  = "clojure/with-meta";
 
     /**
@@ -319,6 +321,21 @@ public final class Writer {
     public Object opts;
 
     public boolean shapes = false;
+
+    /**
+     * Write a Clojure seq (any {@code ISeq}: lists, lazy seqs, conses, ranges)
+     * as tag 27 {@code ["clojure/seq", <array>]}, so it decodes as a seq
+     * rather than a vector. The payload is the same array the bare encoding
+     * writes, shaped or indexed exactly as it would be, so a reader that does
+     * not know the name still gets the elements.
+     *
+     * Off here, on under {@code :profile :clojure} and {@code :archival}, which
+     * is what {@code boring.core} configures. A raw {@code new Writer(n)} keeps
+     * the plain-CBOR reading of a sequence. Without the marker {@code '(count ?v)}
+     * came back {@code [count ?v]}: equal under {@code =}, but not {@code seq?},
+     * and with a different hasch content address.
+     */
+    public boolean seqs = false;
 
     /**
      * Encode-side nesting cap. The reader has had one since §10j; the writer had
@@ -2782,6 +2799,7 @@ public final class Writer {
         scratch.stringref = false;
         scratch.registry = this.registry;
         scratch.legacyCanonicalOrder = this.legacyCanonicalOrder;
+        scratch.seqs = this.seqs;
         scratch.permitReservedSimpleValues = this.permitReservedSimpleValues;
         scratch.inclMetadata = this.inclMetadata;
         scratch.maxDepth = this.maxDepth;
@@ -3572,6 +3590,15 @@ public final class Writer {
         }
         if (x instanceof List) {
             List l = (List) x;
+            // The marker wraps the array below; it does not replace it. Inside
+            // this branch rather than before it so that only an ISeq that is
+            // also a List is marked -- a head written for something that then
+            // turns out unencodable would leave a half-written frame.
+            if (seqs && x instanceof clojure.lang.ISeq) {
+                head(TAG, TAG_GENERIC_OBJ);
+                head(ARRAY, 2);
+                writeString(NAME_SEQ);
+            }
             if (shapes && !canonical) {
                 Object[] shape = unionShape(l);
                 if (shape != null) { writeShapedArray(l, shape); return; }

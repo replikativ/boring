@@ -12,13 +12,14 @@
 
   Each entry: [label value expected]. These are not defects, they are the
   format: CBOR's wire has arrays, maps and a tagged set, and nothing finer. A
-  Clojure-specific codec like nippy keeps a list distinct from a vector because
-  it never has to be read by anything but Clojure; that is precisely the trade
-  boring makes in the other direction.
+  subvector and a map entry ARE vectors in Clojure, so an array reading back as
+  a plain vector loses nothing a caller could observe beyond the class.
 
   Pinned rather than left implicit, because `=` HIDES all of it -- (= (list 1 2)
   [1 2]) is true, so a value-equality test passes while the type quietly
-  changes. The same blind spot that let a Character become a String.
+  changes. The same blind spot that let a Character become a String, and that
+  hid seqs collapsing to vectors here until `clojure/seq` -- see
+  `seqs-preserved`.
 
   Runs on both platforms, which is the point: these are the cases where
   ClojureScript's collection zoo differs from the JVM's and a codec that
@@ -26,14 +27,37 @@
   only. fress cannot write LazySeq, Subvec, Cons, KeySeq or PersistentTreeMap in
   a browser at all; boring writes them because it dispatches on sequential?,
   map? and set?."
-  [["list"          (list 1 2 3)                       [1 2 3]]
-   ["lazy-seq"      (map inc [1 2 3])                  [2 3 4]]
-   ["lazy-seq-empty" (map inc [])                      []]
-   ["cons"          (cons 1 [2 3])                     [1 2 3]]
-   ["subvec"        (subvec [1 2 3 4] 1 3)             [2 3]]
-   ["keys-seq"      (keys (array-map :a 1 :b 2))       [:a :b]]
-   ["map-entry"     (first (array-map :a 1))           [:a 1]]
-   ["keys-seq2"     (keys (array-map :x 1))            [:x]]])
+  [["subvec"        (subvec [1 2 3 4] 1 3)             [2 3]]
+   ["map-entry"     (first (array-map :a 1))           [:a 1]]])
+
+(def seqs-preserved
+  "Seqs, which come back as SEQS under the default and `:archival` profiles,
+  carried by the reserved tag-27 name `clojure/seq` around the same array the
+  bare encoding writes.
+
+  Each entry: [label value]. What comes back is `seq?` and equal, NOT the same
+  class: every seq kind decodes to a seq over the decoded vector (`()` when
+  empty), as nippy does for every seq that is not a PersistentList. A seq
+  never offered indexed access, so nothing a caller could rely on is lost.
+
+  These were in `shape-collapse` until the marker existed, and came back as
+  vectors: value-equal under `=`, but not `seq?` -- so `'(count ?v)` read as a
+  lookup ref in a datahike query -- and with a different hasch content address
+  than the value that was written.
+
+  The canonical and interop profiles still write a plain array and read back a
+  vector; they promise agreement with encoders that have no seqs."
+  [["list"           (list 1 2 3)]
+   ["list-empty"     ()]
+   ["lazy-seq"       (map inc [1 2 3])]
+   ["lazy-seq-empty" (map inc [])]
+   ["cons"           (cons 1 [2 3])]
+   ["range"          (range 3)]
+   ["vector-seq"     (seq [1 2 3])]
+   ["keys-seq"       (keys (array-map :a 1 :b 2))]
+   ["keys-seq2"      (keys (array-map :x 1))]
+   ["quoted-form"    '(count ?v)]
+   ["nested"         {:q ['(count ?v) (list (list 1) [2 (cons 3 ())])]}]])
 
 (def ordered-collections
   "Collections whose TYPE and ORDER both survive, via reserved tag-27 names.

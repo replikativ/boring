@@ -73,6 +73,12 @@ fn convert_tag(tag: u64, inner: &Value) -> Clj {
         },
         27 => match inner {
             Value::Array(a) if a.len() == 2 => match &a[0] {
+                // A Clojure seq. The marker only says "this was not a vector";
+                // its argument IS the array, which is the idiomatic reading here.
+                Value::Text(name) if name == "clojure/seq" => match &a[1] {
+                    Value::Array(_) => convert(&a[1]),
+                    _ => Clj::Other(27, Box::new(convert(inner))),
+                },
                 Value::Text(name) => Clj::Record(name.clone(), Box::new(convert(&a[1]))),
                 _ => Clj::Other(27, Box::new(convert(inner))),
             },
@@ -377,6 +383,7 @@ fn main() -> ExitCode {
     check!("bool-false", Clj::Bool(false));
     check!("null", Clj::Null);
     check!("vector", Clj::Array(vec![Clj::Int(1), Clj::Int(2), Clj::Int(3)]));
+    check!("seq", Clj::Array(vec![Clj::Int(1), Clj::Int(2), Clj::Int(3)]));
     check!("bytes", Clj::Bytes(vec![0x01, 0x02, 0xfd]));
 
     // Tag 39 is where Clojure shows through, and the reason it matters is that
@@ -503,7 +510,7 @@ fn main() -> ExitCode {
     }
 
     if failures.is_empty() {
-        println!("ok — 21 values read from boring's CBOR by Rust/ciborium");
+        println!("ok — 22 values read from boring's CBOR by Rust/ciborium");
         ExitCode::SUCCESS
     } else {
         println!("FAIL — {} problem(s):", failures.len());

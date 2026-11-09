@@ -34,11 +34,19 @@
 
 ;; ---------------------------------------------------------------- profiles
 
+;; `:seqs` -- write a Clojure seq (`seq?`: lists, lazy seqs, conses, ranges) as
+;; the tag-27 marker `clojure/seq` around an ordinary array, so it decodes as a
+;; seq rather than a vector. ON where the profile promises that Clojure types
+;; survive (:clojure, :archival), OFF where it promises agreement with
+;; encoders that have no seqs (:interop and both canonical profiles), where a
+;; sequence simply IS an array. Without it `'(count ?v)` decoded as
+;; `[count ?v]`: equal under `=`, but not `seq?`, and with a different hasch
+;; content address -- so a value did not survive its own round trip.
 (def profile-defaults
   {:clojure   {:stringref true  :float-policy :preserve-width :canonical false
-               :canonical-order :rfc8949}
+               :canonical-order :rfc8949 :seqs true}
    :interop   {:stringref false :float-policy :preserve-width :canonical false
-               :shapes false :canonical-order :rfc8949}
+               :shapes false :canonical-order :rfc8949 :seqs false}
    ;; :archival differs from :interop in exactly one bit -- sorted map keys --
    ;; and from :canonical in exactly one -- float width. That is not an accident:
    ;; determinism and type identity are separate axes, and RFC 8949's
@@ -50,9 +58,9 @@
    ;; dumps actually need could not be said. It does NOT claim RFC deterministic
    ;; conformance -- that name belongs to :canonical alone.
    :archival  {:stringref false :float-policy :preserve-width :canonical true
-               :shapes false :canonical-order :rfc8949}
+               :shapes false :canonical-order :rfc8949 :seqs true}
    :canonical {:stringref false :float-policy :shortest       :canonical true
-               :shapes false :canonical-order :rfc8949}
+               :shapes false :canonical-order :rfc8949 :seqs false}
    ;; clj-cbor's length-first key order (RFC 7049 3.9), as its own profile
    ;; rather than a knob on :canonical.
    ;;
@@ -63,7 +71,7 @@
    ;; not appear in the profile name produce a mismatch nobody can see. Naming
    ;; it makes the choice impossible to make by accident.
    :canonical-rfc7049 {:stringref false :float-policy :shortest :canonical true
-                       :shapes false :canonical-order :rfc7049}})
+                       :shapes false :canonical-order :rfc7049 :seqs false}})
 
 ;; Keys a profile DEFINES. Passing a conflicting value asks for two
 ;; incompatible things at once, and the previous behaviour was to silently
@@ -81,14 +89,14 @@
 ;; :interop, where either width is legal CBOR that every reader understands.
 (def profile-locked
   {:clojure           #{:canonical :canonical-order}
-   :interop           #{:canonical :canonical-order :stringref :shapes}
+   :interop           #{:canonical :canonical-order :stringref :shapes :seqs}
    ;; Everything is locked, as under :canonical: both bits are what the profile
    ;; MEANS. `:float-policy :shortest` here would just be :canonical spelled
    ;; oddly, and `:canonical false` would just be :interop -- two more ways to
    ;; say things that already have names.
-   :archival          #{:canonical :canonical-order :stringref :shapes :float-policy}
-   :canonical         #{:canonical :canonical-order :stringref :shapes :float-policy}
-   :canonical-rfc7049 #{:canonical :canonical-order :stringref :shapes :float-policy}})
+   :archival          #{:canonical :canonical-order :stringref :shapes :float-policy :seqs}
+   :canonical         #{:canonical :canonical-order :stringref :shapes :float-policy :seqs}
+   :canonical-rfc7049 #{:canonical :canonical-order :stringref :shapes :float-policy :seqs}})
 
 ;; RESOLUTION IS IDEMPOTENT, and it is marked rather than inferred.
 ;;
@@ -313,6 +321,7 @@
    ;; decoding.
    :stringref                    {:pred boolish? :want "true or false"}
    :shapes                       {:pred boolish? :want "true or false"}
+   :seqs                         {:pred boolish? :want "true or false"}
    :incl-metadata?               {:pred boolish? :want "true or false"}
    :permit-reserved-simple-values {:pred boolish? :want "true or false"}
    :tolerate-unknown-tags        {:pred boolish? :want "true or false"}
@@ -427,10 +436,10 @@
   "The gate for the DECODE side: validate, and return `opts` untouched.
 
   Not `resolve-opts`, because no profile key reaches a Reader -- a profile
-  names `:stringref`, `:float-policy`, `:canonical`, `:canonical-order` and
-  `:shapes`, and `configure-reader!` reads none of them. Merging would allocate
-  a fresh map of ~230-300 bytes on every `decode` call that passes options, to
-  add five keys nothing downstream looks at.
+  names `:stringref`, `:float-policy`, `:canonical`, `:canonical-order`,
+  `:shapes` and `:seqs`, and `configure-reader!` reads none of them. Merging
+  would allocate a fresh map of ~230-300 bytes on every `decode` call that
+  passes options, to add six keys nothing downstream looks at.
 
   The profile is still LOOKED UP, so `{:profile :nope}` is refused here as it
   is on the encode side. That asymmetry -- `decode` and `decode-seq` accepting

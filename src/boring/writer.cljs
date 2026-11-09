@@ -54,6 +54,8 @@
 (def ^:const NAME-SORTED-MAP "clojure/sorted-map")
 (def ^:const NAME-SORTED-SET "clojure/sorted-set")
 (def ^:const NAME-QUEUE      "clojure/queue")
+;; A seq (`seq?`) around an ordinary array; see `:seqs` in boring.options.
+(def ^:const NAME-SEQ        "clojure/seq")
 (def ^:const NAME-WITH-META  "clojure/with-meta")
 ;; See the JVM Writer for the rationale and the provisional-tag caveat.
 (def ^:const TAG-SHAPED-ARRAY 39649)
@@ -164,14 +166,18 @@
                  ^:mutable depthOffset
                  ;; Pre-resolved core options for reusable writers. Kept opaque
                  ;; here to avoid coupling the byte emitter back to core.
-                 ^:mutable opts])
+                 ^:mutable opts
+                 ;; Write a seq as tag 27 `clojure/seq` around its array, so it
+                 ;; decodes as a seq rather than a vector. Off for a bare
+                 ;; `writer`, as on the JVM; `boring.core` sets it per profile.
+                 ^:mutable seqs])
 
 (defn writer
   ([] (writer 256))
   ([size]
    (let [b (js/Uint8Array. (max 64 size))]
      (Writer. b (js/DataView. (.-buffer b)) 0 (js/Map.) 0 true true false false false nil
-              (js/Map.) true false 0 1024 false nil false 0 nil))))
+              (js/Map.) true false 0 1024 false nil false 0 nil false))))
 
 (defn reset! [^Writer w]
   (set! (.-pos w) 0)
@@ -553,6 +559,7 @@
     (set! (.-canonical scratch) true)
     (set! (.-preserveWidth scratch) (.-preserveWidth w))
     (set! (.-legacyCanonicalOrder scratch) (.-legacyCanonicalOrder w))
+    (set! (.-seqs scratch) (.-seqs w))
     (set! (.-registry scratch) (.-registry w))
     (set! (.-inclMetadata scratch) (.-inclMetadata w))
     (set! (.-permitReservedSimpleValues scratch) (.-permitReservedSimpleValues w))
@@ -1083,6 +1090,11 @@
     (or (vector? x) (seq? x) (list? x))
     (let [v (if (and (counted? x) (vector? x)) x (vec x))
           ks (when (and (.-shapes w) (not (.-canonical w))) (union-shape v))]
+      ;; The marker wraps the array; it does not replace it. `list?` implies
+      ;; `seq?` here (List and EmptyList are both ISeq), so one test covers both.
+      (when (and (.-seqs w) (seq? x))
+        (head! w TAG TAG-GENERIC-OBJ) (head! w ARRAY 2)
+        (write-string! w NAME-SEQ))
       (if ks
         (write-shaped-array! w v ks)
         (do (head! w ARRAY (count v))

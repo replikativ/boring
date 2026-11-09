@@ -34,6 +34,7 @@ EXPECTED = {
     "bool-false":   False,
     "null":         None,
     "vector":       [1, 2, 3],
+    "seq":          [1, 2, 3],  # 27(["clojure/seq", [1, 2, 3]]), unwrapped
     "bytes":        b"\x01\x02\xfd",
 
     # --- registered tags cbor2 handles natively -------------------------

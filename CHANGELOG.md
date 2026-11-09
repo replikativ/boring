@@ -9,6 +9,20 @@ here.
 
 ## Unreleased
 
+### Changed
+
+- **Seqs round-trip as seqs.** A list, lazy seq, cons or range is now written as
+  tag 27 `["clojure/seq", <array>]` under the default `:clojure` profile and
+  under `:archival`, and decodes to a seq (a chunked seq over the decoded
+  vector, `()` when empty) instead of a vector. Before, `'(count ?v)` decoded
+  as `[count ?v]`, which is `=` but not `seq?` and has a different hasch
+  content address. `:interop`, `:canonical` and `:canonical-rfc7049` still
+  write a plain array; `{:seqs false}` turns the marker off under `:clojure`.
+  Data written before this still decodes as before. A boring reader without
+  the name decodes the frame as an unknown record, so readers must be upgraded
+  before writers. The Python and Rust reference readers unwrap the marker to a
+  plain list.
+
 ### Added
 
 - **Random access into encoded CBOR**, and the sealed offset index that makes it

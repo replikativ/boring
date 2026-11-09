@@ -98,7 +98,8 @@ This example runs on both platforms. The encoded result is a JVM byte array
 or a JavaScript `Uint8Array`.
 
 The default encoding supports keywords, symbols, sets, records, metadata,
-sorted collections, queues, numbers, dates, UUIDs, and arrays. Some types have
+sorted collections, queues, seqs (a list stays a seq, not a vector), numbers,
+dates, UUIDs, and arrays. Some types have
 different representations on the two platforms: for example, a JVM
 `BigDecimal` becomes a `boring.data/Decimal` in ClojureScript, and a URI
 becomes a tagged value. [Compatibility](doc/COMPATIBILITY.md) describes the

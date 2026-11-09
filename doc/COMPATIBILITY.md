@@ -144,18 +144,26 @@ would lose:
 | `clojure/sorted-map` | Map |
 | `clojure/sorted-set` | Array |
 | `clojure/queue` | Array |
+| `clojure/seq` | Array — a list, lazy seq, cons or range |
 | `clojure/with-meta` | `[metadata, value]` |
 | `clojure/char` | One-character string |
 | `java/period` | Canonical ISO-8601 period |
 | `clojure/ex-info`, `java/throwable` | Error data, as above |
 
 Metadata is included by default; `{:incl-metadata? false}` disables it.
+`clojure/seq` is written under `:clojure` and `:archival` and decodes to a
+seq over the decoded vector (`()` when empty), so `'(count ?v)` comes back
+`seq?` rather than as `[count ?v]`. The concrete class is not preserved: a
+`PersistentList`, a `LazySeq` and a `Cons` all come back as the same kind of
+seq. `:interop`, `:canonical` and `:canonical-rfc7049` write a plain array, as
+does `{:seqs false}` under `:clojure`. Data written before the marker existed
+holds plain arrays and still decodes to vectors.
 A caller's registry takes precedence over built-in markers, so avoid these
 names unless deliberately overriding their meaning.
 
 #### What a marker decodes to on ClojureScript
 
-Sorted collections, queues, metadata, and `ex-info` reconstruct natively on
+Sorted collections, queues, seqs, metadata, and `ex-info` reconstruct natively on
 both platforms. Types missing from ClojureScript retain their tag-27 frame:
 
 | Marker | JVM | ClojureScript |
@@ -247,7 +255,8 @@ The registration draft is in [IANA registration](IANA-REGISTRATION.md).
  :float-policy :preserve-width
  :canonical true
  :shapes false
- :canonical-order :rfc8949}
+ :canonical-order :rfc8949
+ :seqs true}
 ```
 
 It sorts map keys and preserves float width, which is useful for database dumps
@@ -260,6 +269,7 @@ that requires that rule.
 | Stringref and shapes | Off | Off | Off |
 | Map keys | Unsorted | Bytewise sorted | Bytewise sorted |
 | Float width | Preserved | Preserved | Shortest representation |
+| Seqs | Plain array | `clojure/seq` | Plain array |
 | Type tags | Retained | Retained | Retained, subject to numeric narrowing |
 
 Stable encoding depends on the encoded types, metadata, options, and custom

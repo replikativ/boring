@@ -28,6 +28,10 @@
    "bool-false"   false
    "null"         nil
    "vector"       [1 2 3]
+   ;; A seq, which the default profile wraps as 27(["clojure/seq", [1 2 3]]).
+   ;; A reader that knows the name unwraps it to a plain list; one that does
+   ;; not still finds the array as the frame's argument.
+   "seq"          (list 1 2 3)
    "map"          {:a 1 :b "two"}
    "set"          #{1 2 3}
    "record"       (->Point 3 4)
