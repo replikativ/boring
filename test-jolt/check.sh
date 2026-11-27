@@ -19,15 +19,17 @@ artifact="$out/maven/org/replikativ/boring/$version"
 mkdir -p "$artifact" "$out/consumer" "$out/gold"
 cp "target/release/$jar" "$artifact/"
 unzip -p "$artifact/$jar" META-INF/maven/org.replikativ/boring/pom.xml > "$artifact/boring-$version.pom"
-cp test-jolt/indexed_cases.clj test-jolt/record_cases.clj "$out/consumer/"
+cp test-jolt/canonical_cases.clj test-jolt/indexed_cases.clj test-jolt/record_cases.clj "$out/consumer/"
 cat > "$out/consumer/deps.edn" <<EDN
 {:paths ["."] :mvn/local-repo "$out/maven"
  :deps {org.replikativ/boring {:mvn/version "$version"}}}
 EDN
 
 oracle='{:aliases {:oracle {:extra-paths ["test-jolt"]}}}'
+clojure -Sdeps "$oracle" -M:oracle -m canonical-cases
 clojure -Sdeps "$oracle" -M:oracle -m index-oracle "$out/gold"
 clojure -Sdeps "$oracle" -M:oracle -m record-cases write "$out/gold"
 cd "$out/consumer"
 "$JOLT" -m indexed-cases "$out/gold"
 "$JOLT" -m record-cases read "$out/gold"
+"$JOLT" -m canonical-cases
