@@ -1,7 +1,8 @@
 (ns boring.plain
   "Portable reader and writer for definite-length CBOR and Boring's keyword
   and millisecond timestamp tags. Supports optional text references and container indexes."
-  (:require [boring.index-packing :as packing]
+  (:require [boring.data :as data]
+            [boring.index-packing :as packing]
             [boring.frame :as frame])
   (:import [java.io ByteArrayOutputStream]
            [java.time Instant]
@@ -33,6 +34,15 @@
           (head! out 3 size)
           (.write ^ByteArrayOutputStream out ^bytes bs)))))
 
+(def ^:dynamic *registry* nil)
+(def ^:dynamic ^:private *tag-depth* 0)
+
+(defn- invoke-handler [kind id f arg]
+  (try (f arg)
+       (catch Exception e
+         (throw (ex-info (str "Boring " kind " failed")
+                         {:type :boring/handler-failed :handler kind :id id} e)))))
+
 (declare emit!)
 
 (defn- container! [out v]
@@ -57,7 +67,24 @@
 
 (defn- emit! [out v]
   (when *items* (vswap! *items* inc))
-  (cond
+  (if-let [{:keys [tag writer]} (when (and *registry* (some? v)
+                       (not (or (integer? v) (string? v) (keyword? v) (boolean? v))))
+              (get-in *registry* [:writers (type v)]))]
+    (do (when (>= *tag-depth* 128) (throw (ex-info "Recursive tag writer" {:tag tag})))
+        (head! out 6 tag)
+        (binding [*tag-depth* (inc *tag-depth*)]
+          (emit! out (invoke-handler "tag writer" tag writer v))))
+    (cond
+    (data/tagged-value? v) (do (head! out 6 (:tag v)) (emit! out (:value v)))
+    (or (data/unknown-record? v) (record? v))
+    (let [name (if (data/unknown-record? v) (data/record-type v) (data/record-type-name v))
+          fields (if (data/unknown-record? v) (data/record-fields v) v)]
+      (head! out 6 27)
+      (head! out 4 2)
+      (when *items* (vswap! *items* inc))
+      (emit! out name)
+      (when *items* (vswap! *items* inc))
+      (container! out fields))
     (nil? v) (.write ^ByteArrayOutputStream out 246)
     (boolean? v) (.write ^ByteArrayOutputStream out (if v 245 244))
     (and (integer? v) (<= Long/MIN_VALUE v Long/MAX_VALUE))
@@ -67,7 +94,7 @@
     (instance? Date v) (do (head! out 6 0)
                            (emit! out (str (Instant/ofEpochMilli (.getTime ^Date v)))))
     (or (vector? v) (and (map? v) (not (record? v)) (not (sorted? v)))) (container! out v)
-    :else (throw (ex-info "Unsupported plain CBOR value" {:type (type v)}))))
+    :else (throw (ex-info "Unsupported plain CBOR value" {:type (type v)})))))
 
 (defn encode [v]
   (let [out (ByteArrayOutputStream.)]
@@ -130,14 +157,22 @@
                         (vreset! refs [])
                         (try (child) (finally (vreset! refs parent))))
                       (let [v (child)]
-                      (case n
+                      (if-let [reader (get-in *registry* [:readers n])]
+                        (invoke-handler "tag reader" n reader v)
+                        (case n
+                        27 (let [[name fields] v]
+                             (when-not (and (vector? v) (= 2 (count v)) (string? name))
+                               (throw (ex-info "Malformed record frame" {:type :boring/bad-frame})))
+                             (if-let [ctor (get-in *registry* [:records name])]
+                               (invoke-handler "record constructor" name ctor fields)
+                               (data/frame-for name fields)))
                         0 (Date. (.toEpochMilli (Instant/parse v)))
                         25 (if (and @refs (integer? v) (<= 0 v) (< v (count @refs)))
                              (nth @refs v) (throw (ex-info "Invalid string reference" {:index v})))
                         39 (if (and (string? v) (.startsWith ^String v ":"))
                              (keyword (subs v 1))
                              (throw (ex-info "Unsupported identifier" {:value v})))
-                        (throw (ex-info "Unsupported CBOR tag" {:tag n})))))
+                        (data/tagged-value n v)))))
                   7 (case n 20 false 21 true 22 nil (throw (ex-info "Unsupported simple value" {:head h})))
                   (throw (ex-info "Unsupported CBOR type" {:head h})))))]
       (let [v (item 0)]

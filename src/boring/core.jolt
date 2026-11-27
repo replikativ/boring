@@ -2,16 +2,30 @@
   "Jolt byte-array codec for definite CBOR values and Boring's container index."
   (:require [boring.plain :as plain]))
 
+(defn tag-registry [] {:writers {} :readers {} :records {}})
+
+(defn register-tag [reg tag cls write-fn read-fn]
+  (when-not (and (integer? tag) (<= 0 tag Long/MAX_VALUE) (not (#{25 256} tag)))
+    (throw (ex-info "Invalid or reserved CBOR tag" {:type :boring/bad-tag-number :tag tag})))
+  (cond-> reg
+    (and cls write-fn) (assoc-in [:writers cls] {:tag tag :writer write-fn})
+    read-fn (assoc-in [:readers tag] read-fn)))
+
+(defn register-record [reg wire-name ctor] (assoc-in reg [:records wire-name] ctor))
+
+(defn register-records [reg ctors]
+  (reduce-kv (fn [r n ctor] (register-record r (str n) ctor)) reg ctors))
+
 (defn encode
   ([v] (encode v nil))
-  ([v opts] (plain/encode-value v opts)))
+  ([v opts] (binding [plain/*registry* (:registry opts)] (plain/encode-value v (dissoc opts :registry)))))
 
 (defn encode-indexed
   ([v] (plain/encode-indexed v))
-  ([v opts] (plain/encode-indexed v opts)))
+  ([v opts] (binding [plain/*registry* (:registry opts)] (plain/encode-indexed v (dissoc opts :registry)))))
 
 (defn decode
   ([bs] (plain/decode bs))
   ([bs opts]
-   (when (seq opts) (throw (ex-info "Unsupported decoding options" {:options opts})))
-   (plain/decode bs)))
+   (when (seq (dissoc opts :registry)) (throw (ex-info "Unsupported decoding options" {:options opts})))
+   (binding [plain/*registry* (:registry opts)] (plain/decode bs))))

@@ -14,6 +14,6 @@
       (is (= v (plain/decode reference))))))
 
 (deftest malformed-and-unsupported
-  (doseq [octets [[97] [97 255] [1 2] [249 0 20] [216 99 1]
+  (doseq [octets [[97] [97 255] [1 2] [249 0 20] [216 25 1]
                   [162 1 2 1 3] [27 128 0 0 0 0 0 0 0]]]
     (is (thrown? Exception (plain/decode (byte-array (map unchecked-byte octets)))))))
