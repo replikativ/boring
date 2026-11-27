@@ -168,7 +168,7 @@
 ;;
 ;; Slots go on the wire as differences from the previous entry, PER NODE, in the
 ;; narrowest of u8 / u16 / i32 / i64 -- all of it inside one byte string whose
-;; head is a 2-bit width code per node (`boring.core/pack-slots`). The width is
+;; head is a 2-bit width code per node (`boring.index-packing/pack-slots`). The width is
 ;; a declaration in that table rather than a CBOR element type, so these read
 ;; the code back rather than a class, and check that every width still answers
 ;; identically: narrowing is a size decision and nothing else.

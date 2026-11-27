@@ -50,6 +50,7 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [boring.core :as boring]
+            [boring.index-packing :as packing]
             [boring.nav :as nav]
             [boring.frame]
             [boring.conformance :as c]
@@ -235,10 +236,10 @@
   [stride
    (int-array containers)
    (int-array counts)
-   (#'boring/pack-slots (mapv long-array slots) (long-array containers)
-                        (int-array (or pack-counts counts))
-                        (long (or pack-stride stride)))
-   (#'boring/pack-sorted sorted)])
+   (packing/pack-slots (mapv long-array slots) (long-array containers)
+                       (int-array (or pack-counts counts))
+                       (long (or pack-stride stride)))
+   (packing/pack-sorted sorted)])
 
 (defn- accepted?
   "Did the reader actually USE the index, as opposed to detecting the frame and

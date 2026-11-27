@@ -451,7 +451,7 @@
             ;; different directions.
             ;;
             ;; The width is now a 2-BIT CODE PER NODE inside that byte string --
-            ;; see `boring.core/pack-slots`. Node 0 is the sequence node, which
+            ;; see `boring.index-packing/pack-slots`. Node 0 is the sequence node, which
             ;; is the only one these payloads have.
             ^bytes slots (nth (boring.data/frame-payload
                                (.readFrom (Reader. ^bytes bs)

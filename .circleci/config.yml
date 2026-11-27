@@ -179,6 +179,15 @@ jobs:
           command: bin/ci artifact
       - store-logs
 
+  jolt:
+    executor: clj-node
+    steps:
+      - checkout
+      - restore-deps
+      - run:
+          name: Verify packaged codec on stock Jolt
+          command: test-jolt/check.sh
+
   cljs:
     executor: clj-node
     steps:
@@ -243,6 +252,7 @@ workflows:
           setup_cljs: false
       - jvm
       - ffm
+      - jolt
       - cljs
       - interop
       - fuzz
@@ -279,6 +289,7 @@ workflows:
             - tools/setup
             - jvm
             - ffm
+            - jolt
             - cljs
             - interop
             - fuzz

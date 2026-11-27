@@ -16,13 +16,20 @@
 (defn register-records [reg ctors]
   (reduce-kv (fn [r n ctor] (register-record r (str n) ctor)) reg ctors))
 
+(defn- write-value [writer v opts]
+  (let [seqs (get opts :seqs true)]
+    (when-not (boolean? seqs)
+      (throw (ex-info "Expected a boolean for :seqs" {:seqs seqs})))
+    (binding [plain/*registry* (:registry opts) plain/*seqs* seqs]
+      (writer v (dissoc opts :registry :seqs)))))
+
 (defn encode
   ([v] (encode v nil))
-  ([v opts] (binding [plain/*registry* (:registry opts)] (plain/encode-value v (dissoc opts :registry)))))
+  ([v opts] (write-value plain/encode-value v opts)))
 
 (defn encode-indexed
-  ([v] (plain/encode-indexed v))
-  ([v opts] (binding [plain/*registry* (:registry opts)] (plain/encode-indexed v (dissoc opts :registry)))))
+  ([v] (encode-indexed v nil))
+  ([v opts] (write-value plain/encode-indexed v opts)))
 
 (defn decode
   ([bs] (plain/decode bs))
