@@ -36,6 +36,7 @@
 
 (def ^:dynamic *registry* nil)
 (def ^:dynamic *seqs* true)
+(def ^:dynamic *incl-metadata?* true)
 (def ^:dynamic ^:private *tag-depth* 0)
 
 (defn- invoke-handler [kind id f arg]
@@ -66,7 +67,7 @@
         (when (and collect? (pos? n))
           (vswap! *nodes* update :candidates conj [start m? slots (quot walk n)]))))))
 
-(defn- emit! [out v]
+(defn- emit-body! [out v]
   (when *items* (vswap! *items* inc))
   (if-let [{:keys [tag writer]} (when (and *registry* (some? v)
                                            (not (or (integer? v) (string? v) (keyword? v) (boolean? v))))
@@ -103,6 +104,21 @@
                    (container! out v))
       (or (vector? v) (and (map? v) (not (record? v)) (not (sorted? v)))) (container! out v)
       :else (throw (ex-info "Unsupported plain CBOR value" {:type (type v)})))))
+
+(defn- emit! [out v]
+  (if-let [m (when *incl-metadata?* (not-empty (meta v)))]
+    (do
+      (when (>= *tag-depth* 128) (throw (ex-info "Recursive metadata" {:tag 27})))
+      (when *items* (vswap! *items* + 3))
+      (head! out 6 27)
+      (head! out 4 2)
+      (emit! out "clojure/with-meta")
+      (head! out 4 2)
+      (binding [*tag-depth* (inc *tag-depth*)]
+        (emit! out m)
+        ;; The registered writer sees the original value, including its metadata.
+        (emit-body! out v)))
+    (emit-body! out v)))
 
 (defn encode [v]
   (let [out (ByteArrayOutputStream.)]
@@ -171,7 +187,13 @@
                             27 (let [[name fields] v]
                                  (when-not (and (vector? v) (= 2 (count v)) (string? name))
                                    (throw (ex-info "Malformed record frame" {:type :boring/bad-frame})))
-                                 (if (= name "clojure/seq")
+                                 (case name
+                                   "clojure/with-meta"
+                                   (do
+                                     (when-not (and (vector? fields) (= 2 (count fields)) (map? (first fields)))
+                                       (throw (ex-info "Malformed metadata frame" {:type :boring/bad-frame})))
+                                     (with-meta (second fields) (first fields)))
+                                   "clojure/seq"
                                    (if (vector? fields)
                                      (or (seq fields) ())
                                      (throw (ex-info "Expected array for clojure/seq" {:type :boring/bad-frame})))

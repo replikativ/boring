@@ -17,11 +17,15 @@
   (reduce-kv (fn [r n ctor] (register-record r (str n) ctor)) reg ctors))
 
 (defn- write-value [writer v opts]
-  (let [seqs (get opts :seqs true)]
+  (let [seqs (get opts :seqs true)
+        incl-meta (get opts :incl-metadata? true)]
+    (when-not (boolean? incl-meta)
+      (throw (ex-info "Expected a boolean for :incl-metadata?" {:incl-metadata? incl-meta})))
     (when-not (boolean? seqs)
       (throw (ex-info "Expected a boolean for :seqs" {:seqs seqs})))
-    (binding [plain/*registry* (:registry opts) plain/*seqs* seqs]
-      (writer v (dissoc opts :registry :seqs)))))
+    (binding [plain/*registry* (:registry opts) plain/*seqs* seqs
+              plain/*incl-metadata?* incl-meta]
+      (writer v (dissoc opts :registry :seqs :incl-metadata?)))))
 
 (defn encode
   ([v] (encode v nil))

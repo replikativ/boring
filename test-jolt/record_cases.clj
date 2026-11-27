@@ -14,7 +14,9 @@
 (defn -main [mode dir]
   (assert (= point-name (data/record-type-name point)))
   (doseq [[label writer] [["ordinary" b/encode] ["indexed" b/encode-indexed]]
-          [i v] (map-indexed vector [point token [point token] (vec (repeat 128 point))])]
+          [i v] (map-indexed vector [point token [point token] (vec (repeat 128 point))
+                                    (with-meta [token (with-meta point {:child true})] {:root true})
+                                    (vec (repeat 128 (with-meta token {:index true})))])]
     (let [bs (writer v {:registry registry})
           file (str dir "/record-" label "-" i)]
       (if (= mode "write")
@@ -22,6 +24,12 @@
         (let [oracle (Files/readAllBytes (Paths/get file (make-array String 0)))]
           (assert (= (seq oracle) (seq bs)) (str label "/" i))
           (assert (= v (b/decode oracle {:registry registry})))
+          (when (= i 4)
+            (let [back (b/decode oracle {:registry registry})]
+              (assert (= {:root true} (meta back)))
+              (assert (= {:child true} (meta (second back))))
+              (assert (nil? (meta (b/decode (writer v {:registry registry :incl-metadata? false})
+                                            {:registry registry}))))))
           (when (= i 0)
             (let [unknown (b/decode oracle)]
               (assert (data/unknown-record? unknown))
