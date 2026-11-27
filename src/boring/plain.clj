@@ -5,8 +5,9 @@
             [boring.index-packing :as packing]
             [boring.frame :as frame])
   (:import [java.io ByteArrayOutputStream]
+           [java.nio ByteBuffer]
            [java.time Instant]
-           [java.util Date]))
+           [java.util Date UUID]))
 
 (defn- head! [out major n]
   (let [width (cond (< n 24) 0 (<= n 255) 1 (<= n 65535) 2
@@ -29,8 +30,9 @@
           (head! out 6 25)
           (when *items* (vswap! *items* inc))
           (head! out 0 index))
-      (do (when (and *symbols* (>= size (packing/min-len-for-index (count (:table @*symbols*)))))
-            (vswap! *symbols* update :table assoc v [(count (:table @*symbols*)) off]))
+      (do (when (and *symbols* (>= size (packing/min-len-for-index (:next-index @*symbols*))))
+            (vswap! *symbols* (fn [{:keys [next-index] :as state}]
+                                (-> state (assoc-in [:table v] [next-index off]) (update :next-index inc)))))
           (head! out 3 size)
           (.write ^ByteArrayOutputStream out ^bytes bs)))))
 
@@ -47,10 +49,29 @@
 
 (declare emit!)
 
+(defn- bytes! [out bs]
+  (let [n (alength bs)]
+    (when (and *symbols* (>= n (packing/min-len-for-index (:next-index @*symbols*))))
+      (vswap! *symbols* update :next-index inc))
+    (head! out 2 n)
+    (.write ^ByteArrayOutputStream out ^bytes bs)))
+
+(defn- check-byte-keys! [xs]
+  ;; Host arrays compare by identity. CBOR map keys and set elements compare by content.
+  (reduce (fn [seen x]
+            (if (bytes? x)
+              (let [k (vec x)]
+                (when (contains? seen k)
+                  (throw (ex-info "Duplicate byte string key or set element" {})))
+                (conj seen k))
+              seen))
+          #{} xs))
+
 (defn- container! [out v]
   (let [m? (map? v) n (count v) start (.size ^ByteArrayOutputStream out)
         collect? (and *nodes* (>= n (:min @*nodes*)))
         start-items (when collect? @*items*)]
+    (when m? (check-byte-keys! (keys v)))
     (head! out (if m? 5 4) n)
     (loop [xs (seq v) slots [] walk 0]
       (if xs
@@ -93,6 +114,18 @@
       (head! out (if (neg? v) 1 0) (if (neg? v) (bit-not v) v))
       (string? v) (text! out v)
       (keyword? v) (do (head! out 6 39) (emit! out (str v)))
+      (bytes? v) (bytes! out v)
+      (uuid? v) (let [buf (ByteBuffer/allocate 16)]
+                  (.putLong buf (.getMostSignificantBits ^UUID v))
+                  (.putLong buf (.getLeastSignificantBits ^UUID v))
+                  (head! out 6 37)
+                  (when *items* (vswap! *items* inc))
+                  (bytes! out (.array buf)))
+      (and (set? v) (not (sorted? v)))
+      (do (check-byte-keys! v)
+          (head! out 6 258)
+          (when *items* (vswap! *items* inc))
+          (binding [*nodes* nil] (container! out v)))
       (instance? Date v) (do (head! out 6 0)
                              (emit! out (str (Instant/ofEpochMilli (.getTime ^Date v)))))
       (seq? v) (do (when *seqs*
@@ -131,7 +164,7 @@
   (if (get opts :stringref true)
     (let [out (ByteArrayOutputStream.)]
       (head! out 6 256)
-      (binding [*symbols* (volatile! {:table {} :used #{}})] (emit! out v))
+      (binding [*symbols* (volatile! {:table {} :used #{} :next-index 0})] (emit! out v))
       (.toByteArray out))
     (encode v)))
 
@@ -162,6 +195,12 @@
                 (case major
                   0 n
                   1 (bit-not n)
+                  2 (do (when (> n (- size @pos)) (throw (ex-info "Truncated byte string" {:offset @pos})))
+                        (let [raw (java.util.Arrays/copyOfRange bs @pos (+ @pos n))]
+                          (vswap! pos + n)
+                          (when (and @refs (>= n (packing/min-len-for-index (count @refs))))
+                            (vswap! refs conj raw))
+                          raw))
                   3 (do (when (> n (- size @pos)) (throw (ex-info "Truncated text" {:offset @pos})))
                         (let [raw (byte-array (repeatedly n #(unchecked-byte (octet))))
                               text (String. ^bytes raw "UTF-8")]
@@ -172,7 +211,7 @@
                           text))
                   4 (vec (repeatedly n child))
                   5 (loop [left n, m (array-map)]
-                      (if (zero? left) m
+                      (if (zero? left) (do (check-byte-keys! (keys m)) m)
                           (let [k (child) v (child)]
                             (when (contains? m k) (throw (ex-info "Duplicate CBOR key" {:key k})))
                             (recur (dec left) (assoc m k v)))))
@@ -203,6 +242,19 @@
                             0 (Date. (.toEpochMilli (Instant/parse v)))
                             25 (if (and @refs (integer? v) (<= 0 v) (< v (count @refs)))
                                  (nth @refs v) (throw (ex-info "Invalid string reference" {:index v})))
+                            37 (do (when-not (and (bytes? v) (= 16 (alength v)))
+                                     (throw (ex-info "Invalid UUID byte string" {:tag 37})))
+                                   (let [buf (ByteBuffer/wrap v)
+                                         high (.getLong buf)
+                                         low (.getLong buf)]
+                                     (UUID. high low)))
+                            258 (do (when-not (vector? v)
+                                      (throw (ex-info "Expected array for set" {:tag 258})))
+                                    (check-byte-keys! v)
+                                    (let [s (set v)]
+                                      (when-not (= (count s) (count v))
+                                        (throw (ex-info "Duplicate set element" {:tag 258})))
+                                      s))
                             39 (if (and (string? v) (.startsWith ^String v ":"))
                                  (keyword (subs v 1))
                                  (throw (ex-info "Unsupported identifier" {:value v})))
@@ -212,10 +264,6 @@
       (let [v (item 0)]
         (when (< @pos size) (throw (ex-info "Trailing CBOR data" {:offset @pos})))
         v))))
-
-(defn- bytes! [out bs]
-  (head! out 2 (alength bs))
-  (.write ^ByteArrayOutputStream out ^bytes bs))
 
 (defn- int-table! [out values]
   (let [buffer (ByteArrayOutputStream.)]
@@ -236,7 +284,7 @@
 (defn- indexed-bytes [v stride minimum refs?]
   (let [out (ByteArrayOutputStream.)
         nodes (volatile! {:min minimum :candidates []})
-        symbols (when refs? (volatile! {:table {} :used #{}}))]
+        symbols (when refs? (volatile! {:table {} :used #{} :next-index 0}))]
     (when refs? (head! out 6 256))
     (binding [*nodes* nodes *items* (volatile! 0) *symbols* symbols] (emit! out v))
     (let [body (.toByteArray out)
