@@ -16,7 +16,10 @@
   (doseq [[label writer] [["ordinary" b/encode] ["indexed" b/encode-indexed]]
           [i v] (map-indexed vector [point token [point token] (vec (repeat 128 point))
                                     (with-meta [token (with-meta point {:child true})] {:root true})
-                                    (vec (repeat 128 (with-meta token {:index true})))])]
+                                    (vec (repeat 128 (with-meta token {:index true})))
+                                    #{:only}
+                                    (vec (repeat 128 [#uuid "12345678-1234-1234-9234-123456789012"
+                                                      "after UUID" "after UUID"]))])]
     (let [bs (writer v {:registry registry})
           file (str dir "/record-" label "-" i)]
       (if (= mode "write")
