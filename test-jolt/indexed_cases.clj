@@ -2,6 +2,7 @@
   (:import [java.nio.file Files Paths]))
 (def values
   [(mapv (fn [i] (array-map :attribute-name "repeated-value" :entity-id i)) (range 512))
+   [(symbol "op") (symbol "datahike.kabel" "dispatch") (symbol "datahike.kabel" "dispatch")]
    () (list 1 2) (map inc (range 256)) [] [1 2] (vec (range 256))
    (vec (repeat 50 (vec (repeat 25 :x/abc))))
    (apply array-map (mapcat #(vector (str %) (vec (range 10))) (range 100)))])
