@@ -158,21 +158,83 @@
     (emit! out v)
     (.toByteArray out)))
 
-(defn encode-value [v opts]
-  (when-not (and (every? #{:stringref} (keys opts)) (boolean? (get opts :stringref true)))
-    (throw (ex-info "Unsupported encoding options" {:options opts})))
-  (if (get opts :stringref true)
-    (let [out (ByteArrayOutputStream.)]
-      (head! out 6 256)
-      (binding [*symbols* (volatile! {:table {} :used #{} :next-index 0})] (emit! out v))
-      (.toByteArray out))
-    (encode v)))
+(defn- check-depth [limit]
+  (when-not (and (integer? limit) (<= 1 limit 128))
+    (throw (ex-info "Expected a Jolt nesting limit from 1 to 128" {:max-depth limit})))
+  limit)
 
-(defn decode [bs]
-  (let [pos (volatile! 0)
+(defn- compare-wire [a b]
+  (let [an (alength a) bn (alength b) end (min an bn)]
+    (loop [i 0]
+      (if (= i end)
+        (compare an bn)
+        (let [x (bit-and 255 (aget a i)) y (bit-and 255 (aget b i))]
+          (if (= x y) (recur (inc i)) (compare x y)))))))
+
+(defn- canonical! [out v depth limit]
+  ;; The Jolt canonical writer supports the untagged data model. Reject any
+  ;; extension that would otherwise silently acquire a different wire identity.
+  (when (and *incl-metadata?* (seq (meta v)))
+    (throw (ex-info "Canonical metadata is unsupported on Jolt" {})))
+  (cond
+    (or (vector? v) (seq? v) (and (map? v) (not (record? v)) (not (sorted? v))))
+    (do
+      (when (>= depth limit) (throw (ex-info "CBOR nesting limit" {:max-depth limit})))
+      (if (map? v)
+        (let [entries (mapv (fn [[k value]]
+                              (let [key-out (ByteArrayOutputStream.)]
+                                (canonical! key-out k (inc depth) limit)
+                                [(.toByteArray key-out) value])) v)
+              entries (sort-by first compare-wire entries)]
+          (head! out 5 (count v))
+          (loop [xs (seq entries) prev nil]
+            (when xs
+              (let [[k value] (first xs)]
+                (when (and prev (zero? (compare-wire prev k)))
+                  (throw (ex-info "Duplicate canonical map key" {})))
+                (.write ^ByteArrayOutputStream out ^bytes k)
+                (canonical! out value (inc depth) limit)
+                (recur (next xs) k)))))
+        (do (head! out 4 (count v))
+            (doseq [value v] (canonical! out value (inc depth) limit)))))
+    (or (nil? v) (boolean? v) (string? v) (bytes? v)
+        (and (integer? v) (<= Long/MIN_VALUE v Long/MAX_VALUE)))
+    (emit-body! out v)
+    :else (throw (ex-info "Unsupported canonical CBOR value on Jolt" {:type (type v)}))))
+
+(defn encode-value [v opts]
+  (if (= :canonical (:profile opts))
+    (let [out (ByteArrayOutputStream.)
+          limit (check-depth (get opts :max-depth 128))]
+      (when-not (and (every? #{:profile :stringref :max-depth} (keys opts))
+                     (false? (get opts :stringref false)) (nil? *registry*))
+        (throw (ex-info "Unsupported canonical encoding options" {:options opts})))
+      (canonical! out v 0 limit)
+      (.toByteArray out))
+    (do
+      (when-not (and (every? #{:stringref} (keys opts)) (boolean? (get opts :stringref true)))
+        (throw (ex-info "Unsupported encoding options" {:options opts})))
+      (if (get opts :stringref true)
+        (let [out (ByteArrayOutputStream.)]
+          (head! out 6 256)
+          (binding [*symbols* (volatile! {:table {} :used #{} :next-index 0})] (emit! out v))
+          (.toByteArray out))
+        (encode v)))))
+
+(defn decode-with-options [bs opts]
+  (let [limit (check-depth (get opts :max-depth 128))
+        max-items (get opts :max-items 0)
+        budget (when (and (integer? max-items) (pos? max-items)) (volatile! max-items))
+        pos (volatile! 0)
         footer (frame/footer-start bs)
         size (if (neg? footer) (alength bs) footer)
         refs (volatile! nil)]
+    (when-not (and (every? #{:stringref :max-depth :max-items :tolerate-unknown-tags :on-unknown-record} (keys opts))
+                   (boolean? (get opts :stringref true))
+                   (boolean? (get opts :tolerate-unknown-tags true))
+                   (#{:fallback :error} (get opts :on-unknown-record :fallback))
+                   (integer? max-items) (<= 0 max-items Long/MAX_VALUE))
+      (throw (ex-info "Unsupported decoding options" {:options opts})))
     (letfn [(octet []
               (when (>= @pos size) (throw (ex-info "Truncated CBOR" {:offset @pos})))
               (let [v (bit-and 255 (aget bs @pos))] (vswap! pos inc) v))
@@ -188,7 +250,9 @@
                                 next (+ (* value 256) b)]
                             (recur (dec left) next)))))))
             (item [depth]
-              (when (> depth 128) (throw (ex-info "CBOR nesting limit" {:offset @pos})))
+              (when (and budget (neg? (vswap! budget dec)))
+                (throw (ex-info "CBOR item limit" {:max-items max-items})))
+              (when (> depth limit) (throw (ex-info "CBOR nesting limit" {:offset @pos})))
               (let [h (octet) major (quot h 32)
                     n (if (= major 7) (mod h 32) (arg (mod h 32)))
                     child #(item (inc depth))]
@@ -238,7 +302,9 @@
                                      (throw (ex-info "Expected array for clojure/seq" {:type :boring/bad-frame})))
                                    (if-let [ctor (get-in *registry* [:records name])]
                                      (invoke-handler "record constructor" name ctor fields)
-                                     (data/frame-for name fields))))
+                                     (if (= :error (:on-unknown-record opts))
+                                       (throw (ex-info "Unknown record" {:name name}))
+                                       (data/frame-for name fields)))))
                             0 (Date. (.toEpochMilli (Instant/parse v)))
                             25 (if (and @refs (integer? v) (<= 0 v) (< v (count @refs)))
                                  (nth @refs v) (throw (ex-info "Invalid string reference" {:index v})))
@@ -258,12 +324,16 @@
                             39 (if (string? v)
                                  (if (.startsWith ^String v ":") (keyword (subs v 1)) (symbol v))
                                  (throw (ex-info "Unsupported identifier" {:value v})))
-                            (data/tagged-value n v)))))
+                            (if (get opts :tolerate-unknown-tags true)
+                              (data/tagged-value n v)
+                              (throw (ex-info "Unknown CBOR tag" {:tag n})))))))
                   7 (case n 20 false 21 true 22 nil (throw (ex-info "Unsupported simple value" {:head h})))
                   (throw (ex-info "Unsupported CBOR type" {:head h})))))]
       (let [v (item 0)]
         (when (< @pos size) (throw (ex-info "Trailing CBOR data" {:offset @pos})))
         v))))
+
+(defn decode [bs] (decode-with-options bs {}))
 
 (defn- int-table! [out values]
   (let [buffer (ByteArrayOutputStream.)]
