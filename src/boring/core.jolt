@@ -1,0 +1,17 @@
+(ns boring.core
+  "Jolt byte-array codec for definite CBOR values and Boring's container index."
+  (:require [boring.plain :as plain]))
+
+(defn encode
+  ([v] (encode v nil))
+  ([v opts] (plain/encode-value v opts)))
+
+(defn encode-indexed
+  ([v] (plain/encode-indexed v))
+  ([v opts] (plain/encode-indexed v opts)))
+
+(defn decode
+  ([bs] (plain/decode bs))
+  ([bs opts]
+   (when (seq opts) (throw (ex-info "Unsupported decoding options" {:options opts})))
+   (plain/decode bs)))

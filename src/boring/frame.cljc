@@ -38,9 +38,10 @@
   neither — a stream has no length, and its buffer positions move under
   refills. It is a shape check on an already-decoded value, so a caller
   relying on it must gate it on end-of-input separately."
-  (:require [boring.data :as data]
+  (:require #?(:jolt [boring.definite :as definite])
+            [boring.data :as data]
             #?(:cljs [boring.reader :as rd]))
-  #?(:clj (:import (org.replikativ.boring Reader))))
+  #?@(:jolt [] :clj [(:import (org.replikativ.boring Reader))]))
 
 (def ^:const index-name
   "Tag-27 type name for a sequence/container index."
@@ -61,7 +62,8 @@
 (defn- ends-at
   "Where the item at `p` ends, walking heads only — never building a value."
   ^long [bs ^long p]
-  #?(:clj (.skipFrom (Reader. ^bytes bs) p)
+  #?(:jolt (definite/end-at bs p)
+     :clj (.skipFrom (Reader. ^bytes bs) p)
      :cljs (rd/skip-from (rd/reader bs) p)))
 
 ;; ------------------------------------------------------------ the prefix
