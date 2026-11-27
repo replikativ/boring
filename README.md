@@ -82,6 +82,8 @@ Source dependencies also need the Java classes compiled. After adding a
 `:git/url` or `:local/root` dependency, run `clj -X:deps prep`;
 use `-Sforce` when recompiling changed Java sources.
 
+Stock Jolt uses the same Maven dependency. Its byte-array codec supports ordinary and indexed writes. See the [Jolt API and compatibility tests](test-jolt/README.md) for supported values and options.
+
 ## Encode and decode
 
 ```clojure

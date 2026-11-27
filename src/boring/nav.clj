@@ -769,7 +769,7 @@
   The two shapes differ by what the reference carries that the literal does
   not. A bare `tag 25` stands for the string itself, so the whole probe is
   compared. A repeated keyword is `tag 39` wrapping the reference, and the
-  defining literal is the TEXT alone -- `boring.core/pack-stringrefs` records
+  defining literal is the TEXT alone -- `boring.index-packing/pack-stringrefs` records
   where the text starts, not where its tag-39 wrapper does -- so the probe is
   compared past its own two-byte `d8 27`.
 
@@ -1185,7 +1185,7 @@
     ;; an anchor, so moving from one to the next JUMPS OVER the value instead of
     ;; walking it. Measured 2.72x on a 20-key hash map of 1000-int vectors --
     ;; and Clojure maps are unsorted by default, so that is the ordinary case
-    ;; rather than a corner. See `boring.core/pack-sorted` and commit 825657f.
+    ;; rather than a corner. See `boring.index-packing/pack-sorted` and commit 825657f.
     ;; THE STRIDE IS PER NODE, and the reader is not told which one -- it
     ;; derives it. A node's anchor count equals its entry count only when it was
     ;; written at stride 1, because `anchor-count(n, k) = ((n-1)/k)+1` reaches
@@ -3053,7 +3053,7 @@
    never a decode. It USED TO descend into `slots` as well and record where each
    of its elements began, because `slots` was one typed array per node and
    decoding them all to serve a lookup that visits one or two was half the cost
-   of opening an index. `slots` is now a single byte string (`core/pack-slots`),
+   of opening an index. `slots` is now a single byte string (`boring.index-packing/pack-slots`),
    so there is nothing to locate -- one bulk read gets all of it."
   [^Reader r ^long ptr]
   (let [pair (.headEndAt r ptr)                 ; ["boring/index", payload]
@@ -3083,7 +3083,7 @@
   Element 5 of a seven-element payload: `(index -> defining offset)` for the
   entries some tag 25 actually references, so a cursor holding an offset can
   resolve one by JUMPING to where the string was written instead of by having
-  decoded every string before it. See `boring.core/pack-stringrefs`.
+  decoded every string before it. See `boring.index-packing/pack-stringrefs`.
 
   ONE O(1) GATE, matching the one the slot table gets. The count is not stored,
   so `(dec len)` must divide exactly by the pair width -- a single modulo rather

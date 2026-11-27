@@ -20,7 +20,7 @@
 
     org.replikativ.boring.Reader/minLenForIndex     decode side
     org.replikativ.boring.Writer/minLenForIndex     encode side
-    boring.core/min-len-for-index                   JVM pointer-table derivation
+    boring.index-packing/min-len-for-index                   JVM pointer-table derivation
     boring.reader.cljs/min-len-for-index            cljs decode side
     boring.core.cljs/min-len-for-index              cljs pointer-table derivation
 
@@ -33,7 +33,8 @@
   #40 asked for this and called it cheap insurance. It is: the rule is four
   lines and the failure it prevents is undetectable at runtime."
   (:require [clojure.test :refer [deftest is testing]]
-            [boring.core])
+            [boring.core]
+            [boring.index-packing :as packing])
   (:import (org.replikativ.boring Reader Writer)))
 
 (defn- private-static
@@ -46,7 +47,7 @@
 (deftest the-stringref-threshold-agrees-across-every-implementation
   (let [reader-fn (private-static Reader "minLenForIndex")
         writer-fn (private-static Writer "minLenForIndex")
-        core-fn @#'boring.core/min-len-for-index]
+        core-fn packing/min-len-for-index]
     (testing "the documented rule itself, at the boundaries that define it"
       (is (= [3 3 4 4 5 5 7] (mapv core-fn [0 23 24 255 256 65535 65536]))))
     (testing "and all three JVM implementations answer identically, over the

@@ -252,7 +252,16 @@
   split either way -- and `/` is legal in neither part. It is also what boring's
   own reserved tag-27 names already use: `clojure/sorted-map`, `java/period`."
   [x]
-  #?(:clj (.recordName org.replikativ.boring.TagRegistry/EMPTY (class x))
+  #?(:jolt (let [cn (.getName (class x))
+                 i (.lastIndexOf cn ".")]
+             (if (neg? i) cn
+                 (let [pkg (subs cn 0 i)
+                       candidates (filter #(= pkg (.replace ^String % "-" "_"))
+                                          (map (comp str ns-name) (all-ns)))
+                       n (if (and (not (some #{pkg} candidates)) (= 1 (count candidates)))
+                           (first candidates) pkg)]
+                   (str n "/" (subs cn (inc i))))))
+     :clj (.recordName org.replikativ.boring.TagRegistry/EMPTY (class x))
      :cljs (let [s (pr-str x)
                  i (.indexOf s "{")]
              (if (and (pos? i) (= "#" (subs s 0 1)))
