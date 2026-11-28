@@ -373,6 +373,8 @@
                   (long-array (mapcat identity (sort-by first (filter #(contains? (:used refs) (first %))
                                                                       (vals (:table refs)))))))]
       (if (and (empty? kept) (or (nil? refs) (and (empty? (:used refs)) (<= end 4096))))
+        ;; With no reference or index frame, removing the namespace already
+        ;; gives the exact unreferenced encoding.
         (if refs (java.util.Arrays/copyOfRange body 3 end) body)
         (let [containers (long-array (map first kept))
               counts (int-array (map second kept))]
@@ -388,7 +390,11 @@
           (when refs (bytes! out (packing/pack-stringrefs pairs)))
           (bytes! out (byte-array (map #(unchecked-byte (unsigned-bit-shift-right end %))
                                        [56 48 40 32 24 16 8 0])))
-          (.toByteArray out))))))
+          (let [bs (.toByteArray out)]
+            (if (and refs? (< (alength bs) 4096))
+              (let [alt (indexed-bytes v stride minimum false)]
+                (if (< (alength alt) (alength bs)) alt bs))
+              bs)))))))
 
 (defn encode-indexed
   "Encode the supported plain values with Boring container indexes and text references."
@@ -399,8 +405,4 @@
                     (integer? index) (pos? index) (integer? index-min) (<= 0 index-min)
                     (boolean? stringref))
        (throw (ex-info "Unsupported index options" {:options opts})))
-     (let [bs (indexed-bytes v index index-min stringref)]
-       (if (and stringref (< (alength bs) 4096))
-         (let [alt (indexed-bytes v index index-min false)]
-           (if (< (alength alt) (alength bs)) alt bs))
-         bs)))))
+     (indexed-bytes v index index-min stringref))))

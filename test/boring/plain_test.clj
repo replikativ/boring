@@ -17,3 +17,13 @@
   (doseq [octets [[97] [97 255] [1 2] [249 0 20] [216 25 1]
                   [162 1 2 1 3] [27 128 0 0 0 0 0 0 0]]]
     (is (thrown? Exception (plain/decode (byte-array (map unchecked-byte octets)))))))
+
+(deftest indexed-unreferenced-value-is-written-once
+  (let [v (Object.)
+        calls (atom 0)
+        writer (fn [_] (swap! calls inc) "payload")]
+    (binding [plain/*registry* {:writers {Object {:tag 42 :writer writer}}}]
+      (let [expected (plain/encode-indexed v {:stringref false})]
+        (reset! calls 0)
+        (is (java.util.Arrays/equals ^bytes expected ^bytes (plain/encode-indexed v)))
+        (is (= 1 @calls))))))
