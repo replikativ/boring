@@ -1,7 +1,10 @@
 (ns indexed-cases (:require [boring.core :as boring])
   (:import [java.nio.file Files Paths]))
 (def values
-  [(mapv (fn [i] (array-map :attribute-name "repeated-value" :entity-id i)) (range 512))
+  [;; Integers on either side of each CBOR argument-width transition.
+   [0 23 24 255 256 65535 65536 4294967295 4294967296 Long/MAX_VALUE
+    -1 -24 -25 -256 -257 -65536 -65537 -4294967296 -4294967297 Long/MIN_VALUE]
+   (mapv (fn [i] (array-map :attribute-name "repeated-value" :entity-id i)) (range 512))
    [(symbol "op") (symbol "datahike.kabel" "dispatch") (symbol "datahike.kabel" "dispatch")]
    () (list 1 2) (map inc (range 256)) [] [1 2] (vec (range 256))
    (vec (repeat 50 (vec (repeat 25 :x/abc))))
