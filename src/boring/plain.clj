@@ -70,19 +70,20 @@
           #{} xs))
 
 (defn- container! [out v]
-  (let [m? (map? v) n (count v) start (.size ^ByteArrayOutputStream out)
-        collect? (and *nodes* (>= n (:min @*nodes*)))
+  (let [m? (map? v) n (count v)
+        collect? (and *nodes* (>= n (:min @*nodes*)) (or m? (> n (:stride @*nodes*))))
+        start (when collect? (.size ^ByteArrayOutputStream out))
         start-items (when collect? @*items*)]
     (when m? (check-byte-keys! (keys v)))
     (head! out (if m? 5 4) n)
     (loop [xs (seq v) slots [] walk 0]
       (if xs
-        (let [at (.size ^ByteArrayOutputStream out)
+        (let [at (when collect? (.size ^ByteArrayOutputStream out))
               walk (if collect? (+ walk (- @*items* start-items)) walk)]
           (if m?
             (let [[k x] (first xs)]
               (binding [*nodes* nil] (emit! out k))
-              (let [key-end (.size ^ByteArrayOutputStream out)]
+              (let [key-end (when collect? (.size ^ByteArrayOutputStream out))]
                 (emit! out x)
                 (recur (next xs) (if collect? (conj slots [at key-end]) slots) walk)))
             (do (emit! out (first xs))
@@ -355,7 +356,7 @@
 
 (defn- indexed-bytes [v stride minimum refs?]
   (let [out (ByteArrayOutputStream.)
-        nodes (volatile! {:min minimum :candidates []})
+        nodes (volatile! {:min minimum :stride stride :candidates []})
         symbols (when refs? (volatile! {:table {} :used #{} :next-index 0}))]
     (when refs? (head! out 6 256))
     (binding [*nodes* nodes *items* (volatile! 0) *symbols* symbols] (emit! out v))
