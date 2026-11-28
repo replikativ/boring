@@ -5,6 +5,9 @@
    [(symbol "op") (symbol "datahike.kabel" "dispatch") (symbol "datahike.kabel" "dispatch")]
    () (list 1 2) (map inc (range 256)) [] [1 2] (vec (range 256))
    (vec (repeat 50 (vec (repeat 25 :x/abc))))
+   ;; Short parents can contain indexed children. Unsorted maps may use step one.
+   (mapv (fn [n] (vec (repeat n (vec (range 64))))) [15 16 17])
+   (apply array-map (mapcat #(vector % (vec (range 64))) ["d" "c" "b" "a"]))
    (apply array-map (mapcat #(vector (str %) (vec (range 10))) (range 100)))])
 
 (defn -main [dir]
