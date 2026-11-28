@@ -3,6 +3,10 @@
 (def values
   [(mapv (fn [i] (array-map :attribute-name "repeated-value" :entity-id i)) (range 512))
    [(symbol "op") (symbol "datahike.kabel" "dispatch") (symbol "datahike.kabel" "dispatch")]
+   (array-map :immutable? true :key "abc123" :type :edn :revision "r1")
+   ;; The three-byte text header and three-byte stringref namespace bring
+   ;; these first-pass bodies to 4095, 4096 and 4097 bytes.
+   (apply str (repeat 4089 "a")) (apply str (repeat 4090 "a")) (apply str (repeat 4091 "a"))
    () (list 1 2) (map inc (range 256)) [] [1 2] (vec (range 256))
    (vec (repeat 50 (vec (repeat 25 :x/abc))))
    (apply array-map (mapcat #(vector (str %) (vec (range 10))) (range 100)))])
