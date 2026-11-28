@@ -14,8 +14,10 @@
                     (<= n 4294967295) 4 :else 8)]
     (.write ^ByteArrayOutputStream out
             (+ (* 32 major) (case width 0 n 1 24 2 25 4 26 8 27)))
-    (doseq [i (reverse (range width))]
-      (.write ^ByteArrayOutputStream out (bit-and 255 (unsigned-bit-shift-right n (* i 8)))))))
+    (loop [shift (* 8 (dec width))]
+      (when (>= shift 0)
+        (.write ^ByteArrayOutputStream out (bit-and 255 (unsigned-bit-shift-right n shift)))
+        (recur (- shift 8))))))
 
 (def ^:dynamic ^:private *symbols* nil)
 (def ^:dynamic ^:private *nodes* nil)
